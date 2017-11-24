@@ -1,5 +1,4 @@
 <?xml version="1.0" encoding="UTF-8"?>
-
 <!--
   ~ Copyright (c) 2017 the original author or authors.
   ~
@@ -28,6 +27,7 @@
 
     <modules>
         <module>candybox-core</module>
+        <module>candybox-store</module>
     </modules>
 
     <properties>
@@ -128,7 +128,7 @@
         <dependencies>
             <dependency>
                 <groupId>me.predatorray.candybox</groupId>
-                <artifactId>candybox-common</artifactId>
+                <artifactId>candybox-core</artifactId>
                 <version>${project.version}</version>
             </dependency>
 

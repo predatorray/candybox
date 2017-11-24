@@ -25,9 +25,14 @@
     </parent>
     <modelVersion>4.0.0</modelVersion>
 
-    <artifactId>candybox-core</artifactId>
+    <artifactId>candybox-store</artifactId>
 
     <dependencies>
+        <dependency>
+            <groupId>me.predatorray.candybox</groupId>
+            <artifactId>candybox-core</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>junit</groupId>
             <artifactId>junit</artifactId>
