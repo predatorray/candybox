@@ -1,1 +1,1 @@
-# candybox
+# CandyBox
