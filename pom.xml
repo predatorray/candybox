@@ -28,6 +28,7 @@
     <modules>
         <module>candybox-core</module>
         <module>candybox-store</module>
+        <module>candybox-discovery</module>
     </modules>
 
     <properties>
@@ -35,6 +36,8 @@
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
         <maven.compiler.source>1.8</maven.compiler.source>
         <maven.compiler.target>1.8</maven.compiler.target>
+
+        <grpc.version>1.8.0</grpc.version>
     </properties>
 
     <licenses>
@@ -43,6 +46,17 @@
             <url>http://www.apache.org/licenses/LICENSE-2.0.txt</url>
         </license>
     </licenses>
+
+    <scm>
+        <url>https://github.com/predatorray/candybox</url>
+        <connection>scm:git:git://github.com/predatorray/candybox.git</connection>
+        <developerConnection>scm:git:git@github.com:predatorray/candybox.git</developerConnection>
+    </scm>
+
+    <issueManagement>
+        <url>https://github.com/predatorray/candybox/issues</url>
+        <system>GitHub Issues</system>
+    </issueManagement>
 
     <developers>
         <developer>
@@ -121,6 +135,19 @@
                     </execution>
                 </executions>
             </plugin>
+
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>cobertura-maven-plugin</artifactId>
+                <version>2.7</version>
+                <configuration>
+                    <formats>
+                        <format>html</format>
+                        <format>xml</format>
+                    </formats>
+                    <check />
+                </configuration>
+            </plugin>
         </plugins>
     </build>
 
@@ -148,6 +175,22 @@
                 <groupId>org.slf4j</groupId>
                 <artifactId>slf4j-api</artifactId>
                 <version>1.7.25</version>
+            </dependency>
+
+            <dependency>
+                <groupId>io.grpc</groupId>
+                <artifactId>grpc-netty</artifactId>
+                <version>${grpc.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.grpc</groupId>
+                <artifactId>grpc-protobuf</artifactId>
+                <version>${grpc.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.grpc</groupId>
+                <artifactId>grpc-stub</artifactId>
+                <version>${grpc.version}</version>
             </dependency>
         </dependencies>
     </dependencyManagement>

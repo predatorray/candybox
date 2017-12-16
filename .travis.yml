@@ -3,4 +3,6 @@ jdk:
   - oraclejdk8
 install: true
 script:
-  - ./mvnw clean install
+  - ./mvnw clean cobertura:cobertura install
+after_success:
+  - bash <(curl -s https://codecov.io/bash)
