@@ -16,14 +16,31 @@
 
 package me.predatorray.candybox.discovery;
 
-public class LocalDiscovery implements Discovery {
+import java.io.IOException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+
+/**
+ * A local implementation of Discovery which stores service groups and their endpoints in memory.
+ *
+ * <p>A typical use case of this class is to avoid unnecessary network connections finding a service group which
+ * resides on the same JVM.</p>
+ *
+ * @author Wenhao Ji
+ */
+public class LocalDiscovery extends AbstractDiscovery {
+
+    private final ConcurrentMap<String, ServiceGroup> serviceGroups = new ConcurrentHashMap<>();
 
     @Override
     public ServiceGroup getServiceGroup(String serviceGroupName) {
-        return new InMemoryServiceGroup(serviceGroupName);
+        ensureNotClosed();
+        return serviceGroups.computeIfAbsent(serviceGroupName, InMemoryServiceGroup::new);
     }
 
     @Override
-    public void close() {
+    public void close() throws IOException {
+        super.close();
+        serviceGroups.clear();
     }
 }

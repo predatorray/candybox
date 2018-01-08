@@ -16,9 +16,11 @@
 
 package me.predatorray.candybox.discovery;
 
+import org.junit.Assert;
 import org.junit.Test;
 
 import static org.junit.Assert.*;
+import static org.mockito.Mockito.mock;
 
 public class LocalDiscoveryTest {
 
@@ -28,5 +30,29 @@ public class LocalDiscoveryTest {
             ServiceGroup serviceGroup = localDiscovery.getServiceGroup("srv1");
             assertTrue(serviceGroup instanceof InMemoryServiceGroup);
         }
+    }
+
+    @Test
+    public void twoServiceGroupsOfTheSameNameActIdentically() throws Exception {
+        final String serviceGroupName = "srv1";
+        final Endpoint endpoint = mock(Endpoint.class);
+        try (LocalDiscovery localDiscovery = new LocalDiscovery()) {
+            ServiceGroup[] identicalGroups = new ServiceGroup[] {
+                    localDiscovery.getServiceGroup(serviceGroupName),
+                    localDiscovery.getServiceGroup(serviceGroupName)
+            };
+            identicalGroups[0].advertise(endpoint);
+
+            Assert.assertEquals(identicalGroups[0].discoverAllAvailableEndpoints(),
+                    identicalGroups[1].discoverAllAvailableEndpoints());
+        }
+    }
+
+    @Test(expected = IllegalStateException.class)
+    public void invokeMethodOnAClosedInstanceIsNotLegal() throws Exception {
+        LocalDiscovery localDiscovery = new LocalDiscovery();
+        localDiscovery.close();
+
+        localDiscovery.getServiceGroup("any");
     }
 }

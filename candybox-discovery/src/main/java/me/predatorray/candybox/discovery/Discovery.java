@@ -46,12 +46,14 @@ public interface Discovery extends Closeable {
      * be created using the provided name, a {@link IllegalArgumentException} should be thrown.
      *
      * <p>This method MUST never return {@code null}. A {@link DiscoveryException} should be thrown if the ServiceGroup
-     * cannot be created or resolved because of some other exception occurred.
+     * cannot be created or resolved because of some other exceptions occurred.
      *
      * @param serviceGroupName the name of the service group
      * @return a non-null ServiceGroup instance
      * @throws IllegalArgumentException if the serviceGroupName doesn't obey the naming convention of the implementation
+     * @throws IllegalStateException if this method is called on a closed Discovery instance
      * @throws DiscoveryException if the group cannot be created or resolved by its name because of any other errors
      */
-    ServiceGroup getServiceGroup(String serviceGroupName) throws IllegalArgumentException, DiscoveryException;
+    ServiceGroup getServiceGroup(String serviceGroupName) throws IllegalArgumentException, IllegalStateException,
+            DiscoveryException;
 }
