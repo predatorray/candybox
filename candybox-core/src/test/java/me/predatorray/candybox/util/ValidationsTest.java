@@ -16,6 +16,7 @@
 
 package me.predatorray.candybox.util;
 
+import org.junit.Assert;
 import org.junit.Test;
 
 import static org.junit.Assert.*;
@@ -32,5 +33,67 @@ public class ValidationsTest {
     @Test(expected = IllegalArgumentException.class)
     public void throwsIllegalArgumentExceptionIfNull() throws Exception {
         Validations.notNull(null);
+    }
+
+    @Test
+    public void oneIsPositive() throws Exception {
+        final long n = 1L;
+        long validated = Validations.positive(1L);
+        Assert.assertEquals(n, validated);
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void zeroIsNotPositive() throws Exception {
+        Validations.positive(0L);
+    }
+
+    @Test
+    public void zeroIsNonNegative() throws Exception {
+        final long n = 0L;
+        long validated = Validations.nonnegative(n);
+        Assert.assertEquals(n, validated);
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void minusOneIsNotNonNegative() throws Exception {
+        Validations.nonnegative(-1L);
+    }
+
+    @Test
+    public void returnsTheSameObjectIfConditionSatisfied() throws Exception {
+        Object object = new Object();
+        Object validated = Validations.that(object, true, "");
+        assertSame(object, validated);
+    }
+
+    @Test
+    public void exceptionIsThrownIfConditionNotSatisfied() throws Exception {
+        String message = "message";
+        Object object = new Object();
+        try {
+            Validations.that(object, false, message);
+            fail("IllegalArgumentException is expected to be thrown");
+        } catch (IllegalArgumentException e) {
+            Assert.assertEquals(message, e.getMessage());
+        }
+    }
+
+    @Test
+    public void returnsTheSameObjectIfConditionFunctionSatisfied() throws Exception {
+        Object object = new Object();
+        Object validated = Validations.that(object, obj -> true, "");
+        assertSame(object, validated);
+    }
+
+    @Test
+    public void exceptionIsThrownIfConditionFunctionNotSatisfied() throws Exception {
+        String message = "message";
+        Object object = new Object();
+        try {
+            Validations.that(object, obj -> false, message);
+            fail("IllegalArgumentException is expected to be thrown");
+        } catch (IllegalArgumentException e) {
+            Assert.assertEquals(message, e.getMessage());
+        }
     }
 }
