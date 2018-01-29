@@ -30,7 +30,7 @@ public class ObjectKey {
     private final byte[] binary;
 
     public ObjectKey(String stringKey) {
-        this(stringKey.getBytes(DEFAULT_CHARSET));
+        this(Validations.notNull(stringKey).getBytes(DEFAULT_CHARSET));
     }
 
     public ObjectKey(byte[] key) {

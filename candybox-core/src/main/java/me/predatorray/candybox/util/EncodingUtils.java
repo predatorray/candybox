@@ -29,7 +29,7 @@ public class EncodingUtils {
         if (n == 0 && isZeroMaximum) {
             return 1 << 16;
         } else {
-            return n;
+            return n & 0xffff;
         }
     }
 }

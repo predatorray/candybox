@@ -43,8 +43,7 @@ public class CandyBlock implements Closeable {
     private final long dataSize;
     private final int checksum;
 
-    public CandyBlock(Path superBlockPath, BlockLocation blockLocation)
-            throws IOException {
+    public CandyBlock(Path superBlockPath, BlockLocation blockLocation) throws IOException {
         this.superBlockPath = Validations.notNull(superBlockPath);
         this.blockLocation = Validations.notNull(blockLocation);
 

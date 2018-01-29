@@ -66,7 +66,7 @@ public class Validations {
     }
 
     /**
-     * Validate if the object satisfy the condition, throws {@link IllegalArgumentException} if not.
+     * Validate if the object satisfies the condition, throws {@link IllegalArgumentException} if not.
      * @param obj the object to be validated
      * @param condition the condition that the object must satisfy
      * @param message the error message thrown when the object does not satisfy the condition
@@ -82,7 +82,7 @@ public class Validations {
     }
 
     /**
-     * Validate if the object satisfy the condition, throws {@link IllegalArgumentException} if not.
+     * Validate if the object satisfies the condition, throws {@link IllegalArgumentException} if not.
      * @param obj the object to be validated
      * @param condition the condition function that the object must satisfy.
      *                  The function returns true case satisfied, false otherwise.
