@@ -101,7 +101,7 @@ public class SuperBlock implements Closeable {
             superBlockOutput.write(objectKey.getBinary());
 
             superBlockOutput.writeShort(flags);
-            superBlockOutput.writeInt((int) dataSize); // TODO test ?
+            superBlockOutput.writeInt((int) dataSize);
 
             CRC32 crc32 = new CRC32();
 
@@ -124,7 +124,7 @@ public class SuperBlock implements Closeable {
             }
             long value = crc32.getValue();
             superBlockOutput.writeInt((int) value);
-            superBlockOutput.flush(); // FIXME inconsistent
+            superBlockOutput.flush();
         } catch (IOException e) {
             corrupt = true;
             throw e;
@@ -136,6 +136,7 @@ public class SuperBlock implements Closeable {
     }
 
     public MappedByteBuffer openMappedByteBuffer() throws IOException {
+        // FIXME mmap size greater than Integer.MAX_VALUE
         return superBlockAppendChannel.map(FileChannel.MapMode.READ_ONLY, 0, size());
     }
 
@@ -149,14 +150,20 @@ public class SuperBlock implements Closeable {
         return new CandyBlock(superBlockPath, location);
     }
 
-    @Deprecated
-    public CandyBlockInputStream openInputStreamOfCandyBlockAt(BlockLocation location) throws IOException {
+    public void changeFlagsOfCandyBlockAt(ObjectKey objectKey, BlockLocation location, short flags)
+            throws IOException {
+        Validations.notNull(objectKey);
         Validations.notNull(location);
-        long size = size();
-        if (location.isOutOfRange(size)) {
-            throw new IllegalArgumentException("the location " + location + " is out of the superblock size " + size);
-        }
-        return new CandyBlockInputStream(superBlockPath, location);
+
+        long position = 6 + objectKey.getSize() + location.getOffset();
+        MappedByteBuffer flagsMap = superBlockAppendChannel.map(FileChannel.MapMode.READ_WRITE, position, 2);
+        flagsMap.putShort(flags);
+    }
+
+    public void recover(SuperBlockIndex index) throws IOException {
+        this.offset = Files.size(superBlockPath);
+        // TODO
+        this.corrupt = false;
     }
 
     public long size() throws IOException {
