@@ -53,31 +53,40 @@ public class CandyBlock implements Closeable {
         MappedByteBuffer candyBlockMemoryMap = blockReadChannel.map(FileChannel.MapMode.READ_ONLY,
                 blockLocation.getOffset(), blockLocation.getLength());
 
-        this.magicNumber = new MagicNumber(candyBlockMemoryMap.getInt());
-        if (!SuperBlock.DEFAULT_MAGIC_NUMBER.equals(magicNumber)) {
-            throw new UnsupportedBlockFormatException(magicNumber);
+        try {
+            this.magicNumber = new MagicNumber(candyBlockMemoryMap.getInt());
+            if (!SuperBlock.DEFAULT_MAGIC_NUMBER.equals(magicNumber)) {
+                throw new UnsupportedBlockFormatException(magicNumber);
+            }
+
+            int keySize = EncodingUtils.toUnsignedShort(candyBlockMemoryMap.getShort(), true);
+            if (keySize <= 0) {
+                throw new MalformedBlockException("Non-positive key size: " + keySize);
+            }
+            byte[] keyInBytes = new byte[keySize];
+            candyBlockMemoryMap.get(keyInBytes);
+            this.objectKey = new ObjectKey(keyInBytes);
+
+            this.flags = candyBlockMemoryMap.getShort();
+
+            this.dataSize = EncodingUtils.toUnsignedInt(candyBlockMemoryMap.getInt(), false);
+            if (this.dataSize < 0) {
+                throw new MalformedBlockException("Negative key size: " + keySize);
+            }
+
+            int dataChecksumOffset = (int) (12 + keySize + dataSize); // FIXME overflow
+            this.checksum = candyBlockMemoryMap.getInt(dataChecksumOffset);
+
+            candyBlockMemoryMap.limit(dataChecksumOffset);
+            this.objectDataMap = candyBlockMemoryMap.slice();
+        } catch (IOException | Error e) {
+            try {
+                this.blockReadChannel.close();
+            } catch (Exception closeException) {
+                e.addSuppressed(closeException);
+            }
+            throw e;
         }
-
-        int keySize = EncodingUtils.toUnsignedShort(candyBlockMemoryMap.getShort(), true);
-        if (keySize <= 0) {
-            throw new MalformedBlockException("Non-positive key size: " + keySize);
-        }
-        byte[] keyInBytes = new byte[keySize];
-        candyBlockMemoryMap.get(keyInBytes);
-        this.objectKey = new ObjectKey(keyInBytes);
-
-        this.flags = candyBlockMemoryMap.getShort();
-
-        this.dataSize = EncodingUtils.toUnsignedInt(candyBlockMemoryMap.getInt(), false);
-        if (this.dataSize < 0) {
-            throw new MalformedBlockException("Negative key size: " + keySize);
-        }
-
-        int dataChecksumOffset = (int) (12 + keySize + dataSize); // FIXME overflow
-        this.checksum = candyBlockMemoryMap.getInt(dataChecksumOffset);
-
-        candyBlockMemoryMap.limit(dataChecksumOffset);
-        this.objectDataMap = candyBlockMemoryMap.slice();
     }
 
     public MagicNumber getMagicNumber() {

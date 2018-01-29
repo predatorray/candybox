@@ -19,8 +19,22 @@ package me.predatorray.candybox.util;
 import java.io.Closeable;
 import java.io.IOException;
 
+/**
+ * Common IO utilities
+ *
+ * @author Wenhao Ji
+ */
 public class IOUtils {
 
+    /**
+     * Close the closeable instance if not null and suppress any IOException occurred during the
+     * {@link Closeable#close()} invocation if the throwable is present.
+     *
+     * @param closeable the instance to be closed (nullable)
+     * @param throwable the more important throwable (nullable)
+     * @param <T> the type of the throwable
+     * @throws T the same as the {@code throwable} argument, if it is present
+     */
     public static <T extends Throwable> void closeAndSuppress(Closeable closeable, T throwable) throws T {
         if (closeable == null) {
             return;

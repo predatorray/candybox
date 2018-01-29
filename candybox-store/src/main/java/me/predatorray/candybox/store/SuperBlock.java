@@ -156,10 +156,11 @@ public class SuperBlock implements Closeable {
         Validations.notNull(location);
 
         long position = 6 + objectKey.getSize() + location.getOffset();
-        FileChannel superBlockWriteChannel = FileChannel.open(superBlockPath, StandardOpenOption.WRITE,
-                StandardOpenOption.READ);
-        MappedByteBuffer flagsMap = superBlockWriteChannel.map(FileChannel.MapMode.READ_WRITE, position, 2);
-        flagsMap.putShort(flags);
+        try (FileChannel superBlockWriteChannel = FileChannel.open(superBlockPath, StandardOpenOption.WRITE,
+                StandardOpenOption.READ)) {
+            MappedByteBuffer flagsMap = superBlockWriteChannel.map(FileChannel.MapMode.READ_WRITE, position, 2);
+            flagsMap.putShort(flags);
+        }
     }
 
     public void recover(SuperBlockIndex index) throws IOException {
