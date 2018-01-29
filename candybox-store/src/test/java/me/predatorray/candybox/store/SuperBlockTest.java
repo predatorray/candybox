@@ -16,6 +16,7 @@
 
 package me.predatorray.candybox.store;
 
+import me.predatorray.candybox.ObjectFlags;
 import me.predatorray.candybox.ObjectKey;
 import org.junit.After;
 import org.junit.Assert;
@@ -50,13 +51,17 @@ public class SuperBlockTest {
         sut.close();
     }
 
-    private void assertObjectEquals(ObjectKey expectedObjectKey, byte[] expectedData, BlockLocation storedLocation)
+    private void assertObjectEquals(ObjectKey expectedObjectKey, byte[] expectedData, BlockLocation storedLocation,
+                                    short flags)
             throws IOException {
         try (CandyBlock candyBlock = sut.openCandyBlockAt(storedLocation)) {
             // magic number
             Assert.assertEquals(SuperBlock.DEFAULT_MAGIC_NUMBER, candyBlock.getMagicNumber());
             // object key
             Assert.assertEquals(expectedObjectKey, candyBlock.getObjectKey());
+
+            // flags
+            Assert.assertEquals(flags, candyBlock.getFlags());
 
             // checksum
             CRC32 crc32 = new CRC32();
@@ -86,7 +91,7 @@ public class SuperBlockTest {
         }
         Assert.assertEquals(new BlockLocation(0L, blockSize(objectKey, data)), location);
 
-        assertObjectEquals(objectKey, data, location);
+        assertObjectEquals(objectKey, data, location, ObjectFlags.NONE);
     }
 
     @Test
@@ -116,7 +121,7 @@ public class SuperBlockTest {
             expectedOffset += expectedBlockSize;
         }
 
-        assertObjectEquals(objectKeys[objectKeys.length - 1], data[data.length - 1], lastLocation);
+        assertObjectEquals(objectKeys[objectKeys.length - 1], data[data.length - 1], lastLocation, ObjectFlags.NONE);
     }
 
     @Test
@@ -132,7 +137,7 @@ public class SuperBlockTest {
         }
         Assert.assertEquals(new BlockLocation(0L, blockSize(objectKey, data) - discard), location);
 
-        assertObjectEquals(objectKey, Arrays.copyOf(data, dataSize), location);
+        assertObjectEquals(objectKey, Arrays.copyOf(data, dataSize), location, ObjectFlags.NONE);
     }
 
     @Test
@@ -146,7 +151,7 @@ public class SuperBlockTest {
         }
 
         Assert.assertEquals(new BlockLocation(0, blockSize(objectKey, empty)), location);
-        assertObjectEquals(objectKey, empty, location);
+        assertObjectEquals(objectKey, empty, location, ObjectFlags.NONE);
     }
 
     @Test(expected = EOFException.class)
@@ -161,6 +166,38 @@ public class SuperBlockTest {
                 sut.append(objectKey, dataInputStream, dataSize);
             }
         }
+    }
+
+    @Test
+    public void flagsAreActuallyModified() throws Exception {
+        final ObjectKey objectKey = new ObjectKey("foobar");
+        final byte[] data = new byte[] { 1, 2, 3 };
+
+        BlockLocation location;
+        try (ByteArrayInputStream dataInputStream = new ByteArrayInputStream(data)) {
+            location = sut.append(objectKey, dataInputStream, data.length);
+        }
+
+        final short deleted = ObjectFlags.DELETED;
+        sut.changeFlagsOfCandyBlockAt(objectKey, location, deleted);
+
+        assertObjectEquals(objectKey, data, location, deleted);
+    }
+
+    @Test
+    public void flagsAreNotModifiedIfPassingTheSame() throws Exception {
+        final ObjectKey objectKey = new ObjectKey("foobar");
+        final byte[] data = new byte[] { 1, 2, 3 };
+
+        BlockLocation location;
+        try (ByteArrayInputStream dataInputStream = new ByteArrayInputStream(data)) {
+            location = sut.append(objectKey, dataInputStream, data.length);
+        }
+
+        final short noneFlags = ObjectFlags.NONE;
+        sut.changeFlagsOfCandyBlockAt(objectKey, location, noneFlags);
+
+        assertObjectEquals(objectKey, data, location, noneFlags);
     }
 
     private static long blockSize(ObjectKey key, byte[] data) {

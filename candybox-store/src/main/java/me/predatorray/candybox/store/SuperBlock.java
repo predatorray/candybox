@@ -156,7 +156,9 @@ public class SuperBlock implements Closeable {
         Validations.notNull(location);
 
         long position = 6 + objectKey.getSize() + location.getOffset();
-        MappedByteBuffer flagsMap = superBlockAppendChannel.map(FileChannel.MapMode.READ_WRITE, position, 2);
+        FileChannel superBlockWriteChannel = FileChannel.open(superBlockPath, StandardOpenOption.WRITE,
+                StandardOpenOption.READ);
+        MappedByteBuffer flagsMap = superBlockWriteChannel.map(FileChannel.MapMode.READ_WRITE, position, 2);
         flagsMap.putShort(flags);
     }
 
