@@ -16,26 +16,31 @@
 
 package me.predatorray.candybox.store;
 
+import me.predatorray.candybox.ObjectFlags;
 import me.predatorray.candybox.ObjectKey;
 import me.predatorray.candybox.util.EncodingUtils;
 import me.predatorray.candybox.util.Validations;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 
 public class CandyBlock implements Closeable {
+
+    public static final int DATA_SIZE_FIXED_LENGTH_IN_BYTES = 4;
 
     private final Path superBlockPath;
     private final BlockLocation blockLocation;
 
-    private final FileChannel blockReadChannel;
-
-    private final ByteBuffer objectDataMap;
+    private final List<? extends ByteBuffer> objectDataMaps;
 
     private final MagicNumber magicNumber;
     private final ObjectKey objectKey;
@@ -43,49 +48,71 @@ public class CandyBlock implements Closeable {
     private final long dataSize;
     private final int checksum;
 
-    public CandyBlock(Path superBlockPath, BlockLocation blockLocation) throws IOException {
+    CandyBlock(Path superBlockPath, BlockLocation blockLocation) throws IOException {
+        this(superBlockPath, blockLocation, Integer.MAX_VALUE);
+    }
+
+    CandyBlock(Path superBlockPath, BlockLocation blockLocation, int maximumByteBufferSize) throws IOException {
         this.superBlockPath = Validations.notNull(superBlockPath);
         this.blockLocation = Validations.notNull(blockLocation);
+        Validations.positive(maximumByteBufferSize);
 
-        this.blockReadChannel = FileChannel.open(superBlockPath, StandardOpenOption.READ);
+        long startOffset = blockLocation.getOffset();
 
-        // FIXME mmap size greater than Integer.MAX_VALUE
-        MappedByteBuffer candyBlockMemoryMap = blockReadChannel.map(FileChannel.MapMode.READ_ONLY,
-                blockLocation.getOffset(), blockLocation.getLength());
+        long dataBlockOffset;
+        try (RandomAccessFile raf = new RandomAccessFile(superBlockPath.toFile(), "r")) {
+            raf.seek(startOffset);
 
-        try {
-            this.magicNumber = new MagicNumber(candyBlockMemoryMap.getInt());
+            // magic number
+            this.magicNumber = new MagicNumber(raf.readInt());
             if (!SuperBlock.DEFAULT_MAGIC_NUMBER.equals(magicNumber)) {
                 throw new UnsupportedBlockFormatException(magicNumber);
             }
 
-            int keySize = EncodingUtils.toUnsignedShort(candyBlockMemoryMap.getShort(), true);
+            // object key size
+            int keySize = EncodingUtils.toUnsignedShort(raf.readShort(), true);
             if (keySize <= 0) {
                 throw new MalformedBlockException("Non-positive key size: " + keySize);
             }
+
+            // object key
             byte[] keyInBytes = new byte[keySize];
-            candyBlockMemoryMap.get(keyInBytes);
+            raf.readFully(keyInBytes);
             this.objectKey = new ObjectKey(keyInBytes);
 
-            this.flags = candyBlockMemoryMap.getShort();
+            // flags
+            this.flags = raf.readShort();
 
-            this.dataSize = EncodingUtils.toUnsignedInt(candyBlockMemoryMap.getInt(), false);
+            // data size
+            this.dataSize = EncodingUtils.toUnsignedInt(raf.readInt(), false);
             if (this.dataSize < 0) {
                 throw new MalformedBlockException("Negative key size: " + keySize);
             }
 
-            int dataChecksumOffset = (int) (12 + keySize + dataSize); // FIXME overflow
-            this.checksum = candyBlockMemoryMap.getInt(dataChecksumOffset);
+            dataBlockOffset = startOffset + MagicNumber.FIXED_LENGTH_IN_BYTES +
+                    ObjectKey.OBJECT_KEY_SIZE_FIXED_LENGTH_IN_BYTES + keySize +
+                    ObjectFlags.FIXED_LENGTH_IN_BYTES + DATA_SIZE_FIXED_LENGTH_IN_BYTES;
+            raf.seek(dataBlockOffset + dataSize);
+            this.checksum = raf.readInt();
+        }
 
-            candyBlockMemoryMap.limit(dataChecksumOffset);
-            this.objectDataMap = candyBlockMemoryMap.slice();
-        } catch (IOException | Error e) {
-            try {
-                this.blockReadChannel.close();
-            } catch (Exception closeException) {
-                e.addSuppressed(closeException);
+        if (this.dataSize == 0) {
+            objectDataMaps = Collections.emptyList();
+        } else {
+            try (FileChannel dataBlockChannel = FileChannel.open(superBlockPath, StandardOpenOption.READ)) {
+                int objectDataMapSize = (int) ((dataSize + maximumByteBufferSize - 1L) / maximumByteBufferSize);
+                ArrayList<MappedByteBuffer> objectDataMaps = new ArrayList<>(objectDataMapSize);
+                long mapOffset = dataBlockOffset;
+                long remaining = dataSize;
+                for (int i = 0; i < objectDataMapSize; i++) {
+                    long mapLength = Math.min(remaining, maximumByteBufferSize);
+                    MappedByteBuffer buffer = dataBlockChannel.map(FileChannel.MapMode.READ_ONLY, mapOffset, mapLength);
+                    objectDataMaps.add(buffer);
+                    mapOffset += mapLength;
+                    remaining -= mapLength;
+                }
+                this.objectDataMaps = Collections.unmodifiableList(objectDataMaps);
             }
-            throw e;
         }
     }
 
@@ -109,8 +136,16 @@ public class CandyBlock implements Closeable {
         return checksum;
     }
 
-    public ByteBuffer getObjectDataMap() {
-        return objectDataMap;
+    public List<ByteBuffer> getObjectDataMaps() {
+        if (objectDataMaps.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        List<ByteBuffer> duplication = new ArrayList<>(objectDataMaps.size());
+        for (ByteBuffer objectDataMap : objectDataMaps) {
+            duplication.add(objectDataMap.duplicate());
+        }
+        return duplication;
     }
 
     @Override
@@ -118,8 +153,8 @@ public class CandyBlock implements Closeable {
         return superBlockPath + " " + blockLocation;
     }
 
+    @Deprecated
     @Override
     public void close() throws IOException {
-        blockReadChannel.close();
     }
 }

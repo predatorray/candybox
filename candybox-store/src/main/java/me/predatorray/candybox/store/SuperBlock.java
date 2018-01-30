@@ -32,6 +32,8 @@ import java.nio.file.Files;
 import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.zip.CRC32;
 
 public class SuperBlock implements Closeable {
@@ -136,17 +138,30 @@ public class SuperBlock implements Closeable {
     }
 
     public MappedByteBuffer openMappedByteBuffer() throws IOException {
-        // FIXME mmap size greater than Integer.MAX_VALUE
         return superBlockAppendChannel.map(FileChannel.MapMode.READ_ONLY, 0, size());
     }
 
-    public MappedByteBuffer openMappedByteBuffer(BlockLocation location) throws IOException {
+    public List<MappedByteBuffer> openMappedByteBuffer(BlockLocation location) throws IOException {
         Validations.notNull(location);
-        return superBlockAppendChannel.map(FileChannel.MapMode.READ_ONLY, location.getOffset(), location.getLength());
+        ensureBlockIsWithinRange(location);
+        // FIXME mmap size greater than Integer.MAX_VALUE
+
+        int bufferSize = (int) ((location.getLength() + Integer.MAX_VALUE - 1L) / Integer.MAX_VALUE);
+        ArrayList<MappedByteBuffer> buffers = new ArrayList<>(bufferSize);
+        long mapOffset = location.getOffset();
+        long remaining = location.getLength();
+        for (int i = 0; i < bufferSize; i++) {
+            long mapLength = Math.min(remaining, Integer.MAX_VALUE);
+            MappedByteBuffer buffer = superBlockAppendChannel.map(FileChannel.MapMode.READ_ONLY, mapOffset, mapLength);
+            buffers.add(buffer);
+            mapOffset += mapLength;
+        }
+        return buffers;
     }
 
-    public CandyBlock openCandyBlockAt(BlockLocation location) throws IOException {
+    public CandyBlock getCandyBlockAt(BlockLocation location) throws IOException {
         Validations.notNull(location);
+        ensureBlockIsWithinRange(location);
         return new CandyBlock(superBlockPath, location);
     }
 
@@ -154,6 +169,7 @@ public class SuperBlock implements Closeable {
             throws IOException {
         Validations.notNull(objectKey);
         Validations.notNull(location);
+        ensureBlockIsWithinRange(location);
 
         long position = 6 + objectKey.getSize() + location.getOffset();
         try (FileChannel superBlockWriteChannel = FileChannel.open(superBlockPath, StandardOpenOption.WRITE,
@@ -171,6 +187,14 @@ public class SuperBlock implements Closeable {
 
     public long size() throws IOException {
         return Files.size(superBlockPath);
+    }
+
+    private void ensureBlockIsWithinRange(BlockLocation location) throws IOException {
+        long superBlockSize = offset;
+        if (location.isOutOfRange(superBlockSize)) {
+            throw new IllegalArgumentException("The block locations " + location +
+                    " is out of the super block range (size = " + superBlockSize + " bytes)");
+        }
     }
 
     @Override

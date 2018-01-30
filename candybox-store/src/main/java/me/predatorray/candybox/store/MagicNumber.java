@@ -24,13 +24,16 @@ import java.util.Objects;
 
 public class MagicNumber {
 
+    public static final int FIXED_LENGTH_IN_BYTES = 4;
+
     private final int value;
 
     public MagicNumber(String textInterpretation) {
         this(ByteBuffer.wrap(Validations.that(
                 Validations.notNull(textInterpretation).getBytes(StandardCharsets.ISO_8859_1),
-                bytes -> bytes.length == 4,
-                "The text interpretation must be a 4-bytes string encoding in ISO_8859_1")).getInt());
+                bytes -> bytes.length == FIXED_LENGTH_IN_BYTES,
+                "The text interpretation must be a " + FIXED_LENGTH_IN_BYTES + "-bytes string encoding in ISO_8859_1"))
+                .getInt());
     }
 
     public MagicNumber(int value) {

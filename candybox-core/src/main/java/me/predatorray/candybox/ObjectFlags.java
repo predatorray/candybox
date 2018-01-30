@@ -18,6 +18,8 @@ package me.predatorray.candybox;
 
 public abstract class ObjectFlags {
 
+    public static final int FIXED_LENGTH_IN_BYTES = 2;
+
     private ObjectFlags() {
     }
 

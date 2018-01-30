@@ -24,7 +24,8 @@ import java.util.Arrays;
 
 public class ObjectKey {
 
-    public static final int MAXIMUM_KEY_SIZE = 1 << 16;
+    public static final int OBJECT_KEY_SIZE_FIXED_LENGTH_IN_BYTES = 2;
+    public static final int MAXIMUM_KEY_SIZE = 1 << (OBJECT_KEY_SIZE_FIXED_LENGTH_IN_BYTES * 8);
 
     private static final Charset DEFAULT_CHARSET = StandardCharsets.UTF_8;
     private final byte[] binary;

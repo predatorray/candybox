@@ -26,10 +26,13 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.EOFException;
 import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.Channels;
+import java.nio.channels.WritableByteChannel;
 import java.util.Arrays;
 import java.util.zip.CRC32;
 
@@ -54,7 +57,7 @@ public class SuperBlockTest {
     private void assertObjectEquals(ObjectKey expectedObjectKey, byte[] expectedData, BlockLocation storedLocation,
                                     short flags)
             throws IOException {
-        try (CandyBlock candyBlock = sut.openCandyBlockAt(storedLocation)) {
+        try (CandyBlock candyBlock = sut.getCandyBlockAt(storedLocation)) {
             // magic number
             Assert.assertEquals(SuperBlock.DEFAULT_MAGIC_NUMBER, candyBlock.getMagicNumber());
             // object key
@@ -73,9 +76,18 @@ public class SuperBlockTest {
             Assert.assertEquals((long) expectedData.length, candyBlock.getDataSize());
 
             // data
-            ByteBuffer objectDataMap = candyBlock.getObjectDataMap();
-            byte[] actualData = new byte[objectDataMap.remaining()];
-            objectDataMap.get(actualData);
+            byte[] actualData;
+            try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                 WritableByteChannel baosChannel = Channels.newChannel(baos)) {
+                for (ByteBuffer byteBuffer : candyBlock.getObjectDataMaps()) {
+                    long remaining = byteBuffer.remaining();
+                    while (remaining > 0) {
+                        remaining -= baosChannel.write(byteBuffer);
+                    }
+                }
+                baos.flush();
+                actualData = baos.toByteArray();
+            }
             Assert.assertArrayEquals(expectedData, actualData);
         }
     }
