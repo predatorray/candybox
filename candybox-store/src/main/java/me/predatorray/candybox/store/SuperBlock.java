@@ -144,7 +144,6 @@ public class SuperBlock implements Closeable {
     public List<MappedByteBuffer> openMappedByteBuffer(BlockLocation location) throws IOException {
         Validations.notNull(location);
         ensureBlockIsWithinRange(location);
-        // FIXME mmap size greater than Integer.MAX_VALUE
 
         int bufferSize = (int) ((location.getLength() + Integer.MAX_VALUE - 1L) / Integer.MAX_VALUE);
         ArrayList<MappedByteBuffer> buffers = new ArrayList<>(bufferSize);

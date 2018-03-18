@@ -45,6 +45,19 @@ public class Validations {
      * @return the validated number
      * @throws IllegalArgumentException if the number is zero or negative
      */
+    public static int positive(int n) throws IllegalStateException {
+        if (n <= 0) {
+            throw new IllegalArgumentException("A positive number is required: " + n);
+        }
+        return n;
+    }
+
+    /**
+     * Validate if the number is positive (n &gt; 0), throws {@link IllegalArgumentException} if not.
+     * @param n the number to be validated
+     * @return the validated number
+     * @throws IllegalArgumentException if the number is zero or negative
+     */
     public static long positive(long n) throws IllegalStateException {
         if (n <= 0) {
             throw new IllegalArgumentException("A positive number is required: " + n);

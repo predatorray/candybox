@@ -37,9 +37,11 @@ public class ValidationsTest {
 
     @Test
     public void oneIsPositive() throws Exception {
-        final long n = 1L;
-        long validated = Validations.positive(1L);
-        Assert.assertEquals(n, validated);
+        final long l = 1L;
+        Assert.assertEquals(l, Validations.positive(l));
+
+        final int i = 1;
+        Assert.assertEquals(i, Validations.positive(i));
     }
 
     @Test(expected = IllegalArgumentException.class)
