@@ -17,6 +17,8 @@
 package me.predatorray.candybox.util;
 
 import java.io.Closeable;
+import java.io.DataInputStream;
+import java.io.EOFException;
 import java.io.IOException;
 
 /**
@@ -49,5 +51,17 @@ public class IOUtils {
         if (throwable != null) {
             throw throwable;
         }
+    }
+
+    public static Short readShortOrNone(DataInputStream in) throws IOException {
+        int ch1 = in.read();
+        if (ch1 < 0) {
+            return null;
+        }
+        int ch2 = in.read();
+        if (ch2 < 0) {
+            throw new EOFException();
+        }
+        return (short) ((ch1 << 8) + (ch2 << 0));
     }
 }

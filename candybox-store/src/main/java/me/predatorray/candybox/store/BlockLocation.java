@@ -66,7 +66,7 @@ public class BlockLocation {
      *     <li>The starting offset is greater than or equal to the size of the super-block;</li>
      *     <li>The offset of the block's end, which equals {@code offset + length} is greater than
      *     the size of the super-block</li>
-     * </ol></p>
+     * </ol>
      *
      * @param superBlockTotalLength the length of the super-block where this block belongs
      * @return {@code true} if the location is out of the range of the super-block where it belongs,

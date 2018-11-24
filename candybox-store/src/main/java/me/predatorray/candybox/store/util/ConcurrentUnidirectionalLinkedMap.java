@@ -18,11 +18,13 @@ package me.predatorray.candybox.store.util;
 
 import me.predatorray.candybox.util.Validations;
 
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.stream.Collectors;
 
 public class ConcurrentUnidirectionalLinkedMap<K, V> {
 
@@ -40,6 +42,16 @@ public class ConcurrentUnidirectionalLinkedMap<K, V> {
     public ConcurrentUnidirectionalLinkedMap(int capacity) {
         this.queueCapacity = Validations.positive(capacity);
         this.map = new ConcurrentHashMap<>(capacity);
+    }
+
+    public ConcurrentUnidirectionalLinkedMap(Map<K, V> initialData, int capacity) {
+        Validations.notNull(initialData);
+        this.queueCapacity = Validations.positive(capacity);
+        this.map = new ConcurrentHashMap<>(capacity);
+
+        Map<K, Entry<K, V>> initialEntryDataMap = initialData.entrySet().stream()
+                .collect(Collectors.toMap(Map.Entry::getKey, Entry::new));
+        this.map.putAll(initialEntryDataMap);
     }
 
     public boolean put(K key, V value) {
@@ -104,6 +116,10 @@ public class ConcurrentUnidirectionalLinkedMap<K, V> {
         Entry(K key, V value) {
             this.key = key;
             this.value = value;
+        }
+
+        Entry(Map.Entry<K, V> mapEntry) {
+            this(mapEntry.getKey(), mapEntry.getValue());
         }
 
         public K getKey() {

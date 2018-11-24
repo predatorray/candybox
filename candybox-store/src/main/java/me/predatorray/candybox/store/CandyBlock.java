@@ -18,14 +18,15 @@ package me.predatorray.candybox.store;
 
 import me.predatorray.candybox.ObjectFlags;
 import me.predatorray.candybox.ObjectKey;
-import me.predatorray.candybox.util.EncodingUtils;
 import me.predatorray.candybox.util.Validations;
 
 import java.io.Closeable;
+import java.io.DataInputStream;
 import java.io.IOException;
-import java.io.RandomAccessFile;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
+import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -60,58 +61,50 @@ public class CandyBlock implements Closeable {
         long startOffset = blockLocation.getOffset();
 
         long dataBlockOffset;
-        try (RandomAccessFile raf = new RandomAccessFile(superBlockPath.toFile(), "r")) {
-            raf.seek(startOffset);
-
-            // magic number
-            this.magicNumber = new MagicNumber(raf.readInt());
-            if (!SuperBlock.DEFAULT_MAGIC_NUMBER.equals(magicNumber)) {
-                throw new UnsupportedBlockFormatException(magicNumber);
-            }
-
-            // object key size
-            int keySize = EncodingUtils.toUnsignedShort(raf.readShort(), true);
-            if (keySize <= 0) {
-                throw new MalformedBlockException("Non-positive key size: " + keySize);
-            }
-
-            // object key
-            byte[] keyInBytes = new byte[keySize];
-            raf.readFully(keyInBytes);
-            this.objectKey = new ObjectKey(keyInBytes);
-
-            // flags
-            this.flags = raf.readShort();
-
-            // data size
-            this.dataSize = EncodingUtils.toUnsignedInt(raf.readInt(), false);
-            if (this.dataSize < 0) {
-                throw new MalformedBlockException("Negative key size: " + keySize);
-            }
-
-            dataBlockOffset = startOffset + MagicNumber.FIXED_LENGTH_IN_BYTES +
-                    ObjectKey.OBJECT_KEY_SIZE_FIXED_LENGTH_IN_BYTES + keySize +
-                    ObjectFlags.FIXED_LENGTH_IN_BYTES + DATA_SIZE_FIXED_LENGTH_IN_BYTES;
-            raf.seek(dataBlockOffset + dataSize);
-            this.checksum = raf.readInt();
-        }
-
-        if (this.dataSize == 0) {
-            objectDataMaps = Collections.emptyList();
-        } else {
-            try (FileChannel dataBlockChannel = FileChannel.open(superBlockPath, StandardOpenOption.READ)) {
-                int objectDataMapSize = (int) ((dataSize + maximumByteBufferSize - 1L) / maximumByteBufferSize);
-                ArrayList<MappedByteBuffer> objectDataMaps = new ArrayList<>(objectDataMapSize);
-                long mapOffset = dataBlockOffset;
-                long remaining = dataSize;
-                for (int i = 0; i < objectDataMapSize; i++) {
-                    long mapLength = Math.min(remaining, maximumByteBufferSize);
-                    MappedByteBuffer buffer = dataBlockChannel.map(FileChannel.MapMode.READ_ONLY, mapOffset, mapLength);
-                    objectDataMaps.add(buffer);
-                    mapOffset += mapLength;
-                    remaining -= mapLength;
+        try (FileChannel dataBlockChannel = FileChannel.open(superBlockPath, StandardOpenOption.READ);) {
+            try (InputStream fileChannelIn = Channels.newInputStream(dataBlockChannel.position(startOffset));
+                 SuperBlockInputStream input = new SuperBlockInputStream(new DataInputStream(fileChannelIn))) {
+                // magic number
+                this.magicNumber = input.readMagicNumber();
+                if (!SuperBlock.DEFAULT_MAGIC_NUMBER.equals(magicNumber)) {
+                    throw new UnsupportedBlockFormatException(magicNumber);
                 }
-                this.objectDataMaps = Collections.unmodifiableList(objectDataMaps);
+
+                this.objectKey = input.readObjectKey();
+                this.flags = input.readFlags();
+                this.dataSize = input.readDataSize();
+                if (this.dataSize < 0) {
+                    throw new MalformedBlockException("Negative key size: " + this.dataSize);
+                }
+
+                dataBlockOffset = startOffset + MagicNumber.FIXED_LENGTH_IN_BYTES +
+                        ObjectKey.OBJECT_KEY_SIZE_FIXED_LENGTH_IN_BYTES + this.objectKey.getSize() +
+                        ObjectFlags.FIXED_LENGTH_IN_BYTES + DATA_SIZE_FIXED_LENGTH_IN_BYTES;
+                long checksumOffset = dataBlockOffset + dataSize;
+
+                try (InputStream fileChecksumIn = Channels.newInputStream(dataBlockChannel.position(checksumOffset));
+                     SuperBlockInputStream checksumInput = new SuperBlockInputStream(
+                             new DataInputStream(fileChecksumIn))) {
+                    this.checksum = checksumInput.readChecksum();
+
+                    if (this.dataSize == 0) {
+                        objectDataMaps = Collections.emptyList();
+                    } else {
+                        int objectDataMapSize = (int) ((dataSize + maximumByteBufferSize - 1L) / maximumByteBufferSize);
+                        ArrayList<MappedByteBuffer> objectDataMaps = new ArrayList<>(objectDataMapSize);
+                        long mapOffset = dataBlockOffset;
+                        long remaining = dataSize;
+                        for (int i = 0; i < objectDataMapSize; i++) {
+                            long mapLength = Math.min(remaining, maximumByteBufferSize);
+                            MappedByteBuffer buffer = dataBlockChannel.map(FileChannel.MapMode.READ_ONLY, mapOffset,
+                                    mapLength);
+                            objectDataMaps.add(buffer);
+                            mapOffset += mapLength;
+                            remaining -= mapLength;
+                        }
+                        this.objectDataMaps = Collections.unmodifiableList(objectDataMaps);
+                    }
+                }
             }
         }
     }

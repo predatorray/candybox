@@ -17,60 +17,152 @@
 package me.predatorray.candybox.store;
 
 import me.predatorray.candybox.ObjectKey;
+import me.predatorray.candybox.store.util.BackOffPolicy;
 import me.predatorray.candybox.store.util.ConcurrentUnidirectionalLinkedMap;
+import me.predatorray.candybox.store.util.IterativeExecutor;
+import me.predatorray.candybox.store.util.IterativeExecutorService;
+import me.predatorray.candybox.store.util.IterativeRunnable;
 import me.predatorray.candybox.util.Validations;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.concurrent.*;
+import java.nio.file.StandardOpenOption;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.Executor;
 
-public class SuperBlockIndex {
+public class SuperBlockIndex extends AbstractCloseable {
+
+    public static final String DEFAULT_MAGIC_NUMBER_STRING = "CBI0";
+    public static final MagicNumber DEFAULT_MAGIC_NUMBER = new MagicNumber(DEFAULT_MAGIC_NUMBER_STRING);
 
     private final Logger logger = LoggerFactory.getLogger(this.getClass());
 
-    private ConcurrentUnidirectionalLinkedMap<ObjectKey, ObjectEntry> inMemoryMappings;
+    private final ConcurrentUnidirectionalLinkedMap<ObjectKey, ObjectEntry> inMemoryMappings;
+    private final BackOffPolicy indexPersistenceBackOffPolicy;
 
-    public SuperBlockIndex(Path indexFilePath, boolean create, Executor indexPersistenceThreadPool, int capacity) {
-        inMemoryMappings = new ConcurrentUnidirectionalLinkedMap<>(capacity);
+    private final SuperBlockOutputStream superBlockIndexOut;
 
-        indexPersistenceThreadPool.execute(new IndexPersistenceDaemon());
+    public SuperBlockIndex(Path indexFilePath, int capacity, Executor indexPersistenceThreadPool,
+                           BackOffPolicy indexPersistenceBackOffPolicy) throws IOException {
+        this(Validations.notNull(indexFilePath), Validations.positive(capacity),
+                new IterativeExecutorService(Validations.notNull(indexPersistenceThreadPool)),
+                        indexPersistenceBackOffPolicy);
+    }
+
+    // Visible for Testing
+    SuperBlockIndex(Path indexFilePath, int capacity, IterativeExecutor iterativeExecutor,
+                           BackOffPolicy indexPersistenceBackOffPolicy) throws IOException {
+        this.indexPersistenceBackOffPolicy = Validations.notNull(indexPersistenceBackOffPolicy);
+        if (Files.exists(indexFilePath)) {
+            // load file into memory
+            Map<ObjectKey, ObjectEntry> dataFromFile = new HashMap<>();
+            try (DataInputStream dataIn = new DataInputStream(Files.newInputStream(indexFilePath));
+                 SuperBlockInputStream in = new SuperBlockInputStream(dataIn)) {
+                MagicNumber magicNumber = in.readMagicNumber();
+                if (!DEFAULT_MAGIC_NUMBER.equals(magicNumber)) {
+                    throw new UnsupportedBlockFormatException(magicNumber);
+                }
+                while (true) {
+                    ObjectKey objectKey = in.readObjectKey();
+                    if (objectKey == null) {
+                        break;
+                    }
+                    ObjectEntry objectEntry = new ObjectEntry(in.readFlags(), in.readBlockLocation());
+                    dataFromFile.put(objectKey, objectEntry);
+                }
+            }
+            this.inMemoryMappings = new ConcurrentUnidirectionalLinkedMap<>(dataFromFile, capacity);
+
+            this.superBlockIndexOut = new SuperBlockOutputStream(
+                    new DataOutputStream(Files.newOutputStream(indexFilePath, StandardOpenOption.APPEND)));
+            iterativeExecutor.submit(new IndexPersistenceIteration(superBlockIndexOut));
+        } else {
+            this.inMemoryMappings = new ConcurrentUnidirectionalLinkedMap<>(capacity);
+
+            this.superBlockIndexOut = new SuperBlockOutputStream(
+                    new DataOutputStream(Files.newOutputStream(indexFilePath,
+                            StandardOpenOption.APPEND, StandardOpenOption.CREATE)));
+            superBlockIndexOut.writeMagicHeader(DEFAULT_MAGIC_NUMBER);
+            iterativeExecutor.submit(new IndexPersistenceIteration(superBlockIndexOut));
+        }
     }
 
     public boolean put(ObjectKey objectKey, BlockLocation locationStored, short flags) {
         Validations.notNull(objectKey);
         Validations.notNull(locationStored);
+        ensureNotClosed();
 
-        ObjectEntry indexedEntry = new ObjectEntry(locationStored, flags);
+        ObjectEntry indexedEntry = new ObjectEntry(flags, locationStored);
         return inMemoryMappings.put(objectKey, indexedEntry);
     }
 
     public BlockLocation queryLocation(ObjectKey objectKey) {
         Validations.notNull(objectKey);
+        ensureNotClosed();
 
         ObjectEntry entry = inMemoryMappings.get(objectKey);
         return entry == null ? null : entry.location;
     }
 
-    private class IndexPersistenceDaemon implements Runnable {
+    @Override
+    public void close() throws IOException {
+        super.close();
+        superBlockIndexOut.close();
+    }
+
+    private class IndexPersistenceIteration implements IterativeRunnable<IterationContextValue> {
+
+        private final SuperBlockOutputStream outputStream;
+
+        IndexPersistenceIteration(SuperBlockOutputStream outputStream) {
+            this.outputStream = outputStream;
+        }
 
         @Override
-        public void run() {
-            ObjectKey objectKey;
-            ObjectEntry objectEntry;
+        public IterationContextValue initialValue() {
+            return new IterationContextValue(null, indexPersistenceBackOffPolicy.start());
+        }
 
-            while (true) {
-                try {
-                    ConcurrentUnidirectionalLinkedMap.Entry<ObjectKey, ObjectEntry> next = inMemoryMappings.take();
-                    objectKey = next.getKey();
-                    objectEntry = next.getValue();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    logger.info("The index persistence daemon is stopped because of an interruption");
-                    break;
+        @Override
+        public void run(Context<IterationContextValue> context) {
+            if (isClosed()) {
+                logger.info("The index persistence daemon is stopped because the index was closed.");
+                return;
+            }
+
+            IterationContextValue current = context.current();
+            ConcurrentUnidirectionalLinkedMap.Entry<ObjectKey, ObjectEntry> next = current.next;
+            BackOffPolicy.Context backOffCtx = current.backOffCtx;
+
+            try {
+                if (next == null) {
+                    next = inMemoryMappings.take();
+                } else {
+                    logger.info("Retrying the failed persistence");
                 }
 
-                // TODO write to the index file
+                try {
+                    outputStream.writeObjectKey(next.getKey());
+                    ObjectEntry entry = next.getValue();
+                    outputStream.writeFlags(entry.flags);
+                    outputStream.writeBlockLocation(entry.location);
+                    next = null;
+                    backOffCtx = indexPersistenceBackOffPolicy.start();
+                } catch (IOException e) {
+                    logger.error("Failed to persist the index asynchronously. It will be tried again latter.", e);
+                    indexPersistenceBackOffPolicy.backOff(backOffCtx);
+                }
+
+                context.cont(new IterationContextValue(next, backOffCtx));
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                logger.info("The index persistence daemon is stopped because of an interruption");
             }
         }
     }
@@ -80,9 +172,20 @@ public class SuperBlockIndex {
         final BlockLocation location;
         final short flags;
 
-        ObjectEntry(BlockLocation location, short flags) {
+        ObjectEntry(short flags, BlockLocation location) {
             this.location = location;
             this.flags = flags;
+        }
+    }
+
+    private static class IterationContextValue {
+        ConcurrentUnidirectionalLinkedMap.Entry<ObjectKey, ObjectEntry> next;
+        BackOffPolicy.Context backOffCtx;
+
+        IterationContextValue(ConcurrentUnidirectionalLinkedMap.Entry<ObjectKey, ObjectEntry> next,
+                              BackOffPolicy.Context backOffCtx) {
+            this.next = next;
+            this.backOffCtx = backOffCtx;
         }
     }
 }

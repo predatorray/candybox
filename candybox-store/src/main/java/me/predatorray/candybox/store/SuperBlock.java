@@ -20,9 +20,7 @@ import me.predatorray.candybox.ObjectFlags;
 import me.predatorray.candybox.ObjectKey;
 import me.predatorray.candybox.util.Validations;
 
-import java.io.Closeable;
 import java.io.DataOutputStream;
-import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.MappedByteBuffer;
@@ -34,18 +32,16 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.zip.CRC32;
 
-public class SuperBlock implements Closeable {
+public class SuperBlock extends AbstractCloseable {
 
     public static final String DEFAULT_MAGIC_NUMBER_STRING = "CBX0";
     public static final MagicNumber DEFAULT_MAGIC_NUMBER = new MagicNumber(DEFAULT_MAGIC_NUMBER_STRING);
     // TODO magic footer
 
-    private static final int DEFAULT_BUFFER_SIZE = 2048;
     private static final long MAXIMUM_DATA_SIZE = (1L << 32) - 1L;
 
-    private final DataOutputStream superBlockOutput;
+    private final SuperBlockOutputStream superBlockOutput;
     private final Path superBlockPath;
     private final FileChannel superBlockAppendChannel;
 
@@ -70,7 +66,8 @@ public class SuperBlock implements Closeable {
         this.offset = size();
 
         this.superBlockAppendChannel = FileChannel.open(superBlockPath, options);
-        this.superBlockOutput = new DataOutputStream(Channels.newOutputStream(superBlockAppendChannel));
+        this.superBlockOutput = new SuperBlockOutputStream(
+                new DataOutputStream(Channels.newOutputStream(superBlockAppendChannel)));
     }
 
     private void ensureBlockIsNotCorrupt() throws CorruptBlockException {
@@ -95,37 +92,13 @@ public class SuperBlock implements Closeable {
                 "data size must be within the range [0, " + MAXIMUM_DATA_SIZE + ")");
 
         ensureBlockIsNotCorrupt();
+        ensureNotClosed();
 
         try {
-            superBlockOutput.writeInt(magicNumber.toInteger());
-
-            superBlockOutput.writeShort(objectKey.getSizeAsUnsignedShort());
-            superBlockOutput.write(objectKey.getBinary());
-
-            superBlockOutput.writeShort(flags);
-            superBlockOutput.writeInt((int) dataSize);
-
-            CRC32 crc32 = new CRC32();
-
-            byte[] buffer = new byte[DEFAULT_BUFFER_SIZE];
-            long remaining = dataSize;
-            while (remaining > 0) {
-                int bytesToRead = (int) Math.min(remaining, buffer.length);
-                int len = dataInput.read(buffer, 0, bytesToRead);
-                if (len < 0) {
-                    break;
-                }
-                superBlockOutput.write(buffer, 0, len);
-                crc32.update(buffer, 0, len);
-                remaining -= len;
-            }
-
-            if (remaining > 0) {
-                throw new EOFException(
-                        "the actual data size read from the input stream is less than the dataSize argument");
-            }
-            long value = crc32.getValue();
-            superBlockOutput.writeInt((int) value);
+            superBlockOutput.writeMagicHeader(magicNumber);
+            superBlockOutput.writeObjectKey(objectKey);
+            superBlockOutput.writeFlags(flags);
+            superBlockOutput.writeData(dataInput, dataSize);
             superBlockOutput.flush();
         } catch (IOException e) {
             corrupt = true;
@@ -138,12 +111,14 @@ public class SuperBlock implements Closeable {
     }
 
     public MappedByteBuffer openMappedByteBuffer() throws IOException {
+        ensureNotClosed();
         return superBlockAppendChannel.map(FileChannel.MapMode.READ_ONLY, 0, size());
     }
 
     public List<MappedByteBuffer> openMappedByteBuffer(BlockLocation location) throws IOException {
         Validations.notNull(location);
         ensureBlockIsWithinRange(location);
+        ensureNotClosed();
 
         int bufferSize = (int) ((location.getLength() + Integer.MAX_VALUE - 1L) / Integer.MAX_VALUE);
         ArrayList<MappedByteBuffer> buffers = new ArrayList<>(bufferSize);
@@ -161,6 +136,7 @@ public class SuperBlock implements Closeable {
     public CandyBlock getCandyBlockAt(BlockLocation location) throws IOException {
         Validations.notNull(location);
         ensureBlockIsWithinRange(location);
+        ensureNotClosed();
         return new CandyBlock(superBlockPath, location);
     }
 
@@ -169,6 +145,7 @@ public class SuperBlock implements Closeable {
         Validations.notNull(objectKey);
         Validations.notNull(location);
         ensureBlockIsWithinRange(location);
+        ensureNotClosed();
 
         long position = 6 + objectKey.getSize() + location.getOffset();
         try (FileChannel superBlockWriteChannel = FileChannel.open(superBlockPath, StandardOpenOption.WRITE,
@@ -179,12 +156,14 @@ public class SuperBlock implements Closeable {
     }
 
     public void recover(SuperBlockIndex index) throws IOException {
+        ensureNotClosed();
         this.offset = Files.size(superBlockPath);
         // TODO
         this.corrupt = false;
     }
 
     public long size() throws IOException {
+        ensureNotClosed();
         return Files.size(superBlockPath);
     }
 
@@ -198,6 +177,7 @@ public class SuperBlock implements Closeable {
 
     @Override
     public void close() throws IOException {
+        super.close();
         superBlockOutput.close();
     }
 }
