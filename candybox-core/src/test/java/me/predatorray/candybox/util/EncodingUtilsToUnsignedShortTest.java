@@ -39,6 +39,7 @@ public class EncodingUtilsToUnsignedShortTest {
                 { (short) 0, false, 0 },
                 { (short) 1, false, 1 },
                 { Short.MAX_VALUE, false, (int) Short.MAX_VALUE },
+                { (short) 0, true, (1 << 16) }
         });
     }
 

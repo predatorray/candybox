@@ -50,4 +50,13 @@ public class MagicNumberTest {
         MagicNumber reconstructed = new MagicNumber(magicNumber.toInteger());
         Assert.assertEquals(magicNumber, reconstructed);
     }
+
+    @Test
+    public void magicNumberWithSameTextInterpretationIsEqual() {
+        String textInterpretation = "1234";
+        MagicNumber magicNumber1 = new MagicNumber(textInterpretation);
+        MagicNumber magicNumber2 = new MagicNumber(textInterpretation);
+        Assert.assertEquals(magicNumber1, magicNumber2);
+        Assert.assertEquals(magicNumber1.hashCode(), magicNumber2.hashCode());
+    }
 }

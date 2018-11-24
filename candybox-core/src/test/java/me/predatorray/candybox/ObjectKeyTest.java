@@ -89,4 +89,12 @@ public class ObjectKeyTest {
         String stringKey = "foobar";
         Assert.assertEquals(stringKey, new ObjectKey(stringKey).toString());
     }
+
+    @Test
+    public void testLengthOfObjectKey() throws Exception {
+        String stringKey = "foobar";
+        ObjectKey objectKey = new ObjectKey(stringKey);
+        Assert.assertEquals(stringKey.length(), objectKey.getSize());
+        Assert.assertEquals((short) stringKey.length(), objectKey.getSizeAsUnsignedShort());
+    }
 }

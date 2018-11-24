@@ -19,7 +19,7 @@ package me.predatorray.candybox.store;
 import java.io.Closeable;
 import java.io.IOException;
 
-public class AbstractCloseable implements Closeable {
+public abstract class AbstractCloseable implements Closeable {
 
     private boolean closed = false;
 
