@@ -19,20 +19,23 @@ package me.predatorray.candybox.store;
 import me.predatorray.candybox.ObjectKey;
 import me.predatorray.candybox.store.util.BackOffPolicy;
 import me.predatorray.candybox.store.util.ConcurrentUnidirectionalLinkedMap;
-import me.predatorray.candybox.store.util.IterativeExecutor;
 import me.predatorray.candybox.store.util.IterativeExecutorService;
 import me.predatorray.candybox.store.util.IterativeRunnable;
+import me.predatorray.candybox.util.IOUtils;
 import me.predatorray.candybox.util.Validations;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
+import java.io.EOFException;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.Executor;
 
@@ -48,49 +51,105 @@ public class SuperBlockIndex extends AbstractCloseable {
 
     private final SuperBlockOutputStream superBlockIndexOut;
 
-    public SuperBlockIndex(Path indexFilePath, int capacity, Executor indexPersistenceThreadPool,
-                           BackOffPolicy indexPersistenceBackOffPolicy) throws IOException {
-        this(Validations.notNull(indexFilePath), Validations.positive(capacity),
-                new IterativeExecutorService(Validations.notNull(indexPersistenceThreadPool)),
-                        indexPersistenceBackOffPolicy);
+    public static SuperBlockIndex createSuperBlockIndex(Path indexFilePath, int capacity,
+                                                        Executor indexPersistenceThreadPool,
+                                                        BackOffPolicy indexPersistenceBackOffPolicy)
+            throws IOException {
+        Validations.notNull(indexFilePath);
+        Validations.positive(capacity);
+        Validations.notNull(indexPersistenceThreadPool);
+        Validations.notNull(indexPersistenceBackOffPolicy);
+
+        boolean exists = Files.exists(indexFilePath);
+
+        SuperBlockOutputStream superBlockIndexOut = new SuperBlockOutputStream(
+                new DataOutputStream(Files.newOutputStream(indexFilePath,
+                        StandardOpenOption.APPEND, StandardOpenOption.CREATE)));
+        try {
+            ConcurrentUnidirectionalLinkedMap<ObjectKey, ObjectEntry> inMemoryMappings;
+            if (!exists) {
+                superBlockIndexOut.writeMagicHeader(DEFAULT_MAGIC_NUMBER);
+                inMemoryMappings = new ConcurrentUnidirectionalLinkedMap<>(capacity);
+            } else {
+                // load file into memory
+                Map<ObjectKey, ObjectEntry> dataFromFile = new LinkedHashMap<>();
+                try (DataInputStream dataIn = new DataInputStream(Files.newInputStream(indexFilePath));
+                     SuperBlockInputStream in = new SuperBlockInputStream(dataIn)) {
+                    MagicNumber magicNumber = in.readMagicNumber();
+                    if (!DEFAULT_MAGIC_NUMBER.equals(magicNumber)) {
+                        throw new UnsupportedBlockFormatException(magicNumber);
+                    }
+                    while (true) {
+                        ObjectKey objectKey = in.readObjectKey();
+                        if (objectKey == null) {
+                            break;
+                        }
+                        ObjectEntry objectEntry = new ObjectEntry(in.readFlags(), in.readBlockLocation());
+                        dataFromFile.put(objectKey, objectEntry);
+                    }
+                } catch (EOFException inconsistent) {
+                    // ignored
+                }
+                inMemoryMappings = new ConcurrentUnidirectionalLinkedMap<>(dataFromFile, capacity);
+            }
+
+            SuperBlockIndex superBlockIndex = new SuperBlockIndex(inMemoryMappings,
+                    indexPersistenceBackOffPolicy, superBlockIndexOut);
+            new IterativeExecutorService(Validations.notNull(indexPersistenceThreadPool)).submit(
+                    superBlockIndex.new IndexPersistenceIteration(superBlockIndexOut));
+            return superBlockIndex;
+        } catch (IOException e) {
+            throw IOUtils.addSuppressIfThrown(e, superBlockIndexOut);
+        } catch (RuntimeException e) {
+            throw IOUtils.addSuppressIfThrown(e, superBlockIndexOut);
+        }
     }
 
-    // Visible for Testing
-    SuperBlockIndex(Path indexFilePath, int capacity, IterativeExecutor iterativeExecutor,
-                           BackOffPolicy indexPersistenceBackOffPolicy) throws IOException {
-        this.indexPersistenceBackOffPolicy = Validations.notNull(indexPersistenceBackOffPolicy);
-        if (Files.exists(indexFilePath)) {
-            // load file into memory
-            Map<ObjectKey, ObjectEntry> dataFromFile = new HashMap<>();
-            try (DataInputStream dataIn = new DataInputStream(Files.newInputStream(indexFilePath));
-                 SuperBlockInputStream in = new SuperBlockInputStream(dataIn)) {
-                MagicNumber magicNumber = in.readMagicNumber();
-                if (!DEFAULT_MAGIC_NUMBER.equals(magicNumber)) {
-                    throw new UnsupportedBlockFormatException(magicNumber);
-                }
-                while (true) {
-                    ObjectKey objectKey = in.readObjectKey();
-                    if (objectKey == null) {
+    public static SuperBlockIndex restoreSuperBlockIndex(Path indexFilePath, SuperBlock superBlock, int capacity,
+                                                         Executor indexPersistenceThreadPool,
+                                                         BackOffPolicy indexPersistenceBackOffPolicy)
+            throws IOException {
+        Validations.notNull(superBlock);
+        SuperBlockIndex superBlockIndex = createSuperBlockIndex(indexFilePath, capacity, indexPersistenceThreadPool,
+                indexPersistenceBackOffPolicy);
+
+        try {
+            long startingOffset = superBlockIndex.inMemoryMappings.last()
+                    .map(ConcurrentUnidirectionalLinkedMap.Entry::getValue)
+                    .map(ObjectEntry::getLocation)
+                    .map(loc -> loc.getOffset() + loc.getLength())
+                    .orElse(0L);
+            Iterator<CandyBlock> candyBlockIterator = superBlock.iterateCandyBlocks(startingOffset);
+            while (candyBlockIterator.hasNext()) {
+                CandyBlock next;
+                try {
+                    next = candyBlockIterator.next();
+                } catch (UncheckedIOException e) {
+                    IOException cause = e.getCause();
+                    if (cause instanceof EOFException) {
+                        // eof exception is ignored
                         break;
+                    } else {
+                        throw e;
                     }
-                    ObjectEntry objectEntry = new ObjectEntry(in.readFlags(), in.readBlockLocation());
-                    dataFromFile.put(objectKey, objectEntry);
                 }
+                ObjectEntry objectEntry = new ObjectEntry(next.getFlags(), next.getBlockLocation());
+                superBlockIndex.inMemoryMappings.putSilently(next.getObjectKey(), objectEntry);
             }
-            this.inMemoryMappings = new ConcurrentUnidirectionalLinkedMap<>(dataFromFile, capacity);
-
-            this.superBlockIndexOut = new SuperBlockOutputStream(
-                    new DataOutputStream(Files.newOutputStream(indexFilePath, StandardOpenOption.APPEND)));
-            iterativeExecutor.submit(new IndexPersistenceIteration(superBlockIndexOut));
-        } else {
-            this.inMemoryMappings = new ConcurrentUnidirectionalLinkedMap<>(capacity);
-
-            this.superBlockIndexOut = new SuperBlockOutputStream(
-                    new DataOutputStream(Files.newOutputStream(indexFilePath,
-                            StandardOpenOption.APPEND, StandardOpenOption.CREATE)));
-            superBlockIndexOut.writeMagicHeader(DEFAULT_MAGIC_NUMBER);
-            iterativeExecutor.submit(new IndexPersistenceIteration(superBlockIndexOut));
+        } catch (UncheckedIOException uncheckedIO) {
+            throw IOUtils.addSuppressIfThrown(uncheckedIO.getCause(), superBlockIndex);
+        } catch (RuntimeException e) {
+            throw IOUtils.addSuppressIfThrown(e, superBlockIndex);
         }
+
+        return superBlockIndex;
+    }
+
+    private SuperBlockIndex(ConcurrentUnidirectionalLinkedMap<ObjectKey, ObjectEntry> inMemoryMappings,
+                            BackOffPolicy indexPersistenceBackOffPolicy, SuperBlockOutputStream superBlockIndexOut) {
+        this.inMemoryMappings = inMemoryMappings;
+        this.indexPersistenceBackOffPolicy = indexPersistenceBackOffPolicy;
+        this.superBlockIndexOut = superBlockIndexOut;
     }
 
     public boolean put(ObjectKey objectKey, BlockLocation locationStored, short flags) {
@@ -175,6 +234,10 @@ public class SuperBlockIndex extends AbstractCloseable {
         ObjectEntry(short flags, BlockLocation location) {
             this.location = location;
             this.flags = flags;
+        }
+
+        BlockLocation getLocation() {
+            return location;
         }
     }
 

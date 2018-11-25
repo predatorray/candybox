@@ -64,4 +64,9 @@ public class IOUtils {
         }
         return (short) ((ch1 << 8) + (ch2 << 0));
     }
+
+    public static <T extends Throwable> T addSuppressIfThrown(T nontrivial, Closeable closeable) {
+        Exceptions.executeAndGetException(closeable::close, Exception.class).ifPresent(nontrivial::addSuppressed);
+        return nontrivial;
+    }
 }

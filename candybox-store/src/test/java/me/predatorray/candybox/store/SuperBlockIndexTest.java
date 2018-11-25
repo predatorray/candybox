@@ -20,7 +20,6 @@ import me.predatorray.candybox.ObjectFlags;
 import me.predatorray.candybox.ObjectKey;
 import me.predatorray.candybox.store.testsupport.ManualExecutor;
 import me.predatorray.candybox.store.util.BackOffPolicy;
-import me.predatorray.candybox.store.util.IterativeExecutorService;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
@@ -51,8 +50,7 @@ public class SuperBlockIndexTest {
         File superBlockIndexFile = new File(superBlockIndexFolder, testName.getMethodName() + ".idx");
         this.indexFilePath = superBlockIndexFile.toPath();
         this.executor = new ManualExecutor();
-        sut = new SuperBlockIndex(indexFilePath, 100, new IterativeExecutorService(executor),
-                BackOffPolicy.IMMEDIATE);
+        sut = SuperBlockIndex.createSuperBlockIndex(indexFilePath, 100, executor, BackOffPolicy.IMMEDIATE);
     }
 
     @After
@@ -80,7 +78,7 @@ public class SuperBlockIndexTest {
 
         executor.runNext();
 
-        SuperBlockIndex restoredIndex = new SuperBlockIndex(indexFilePath, 100, new ManualExecutor(),
+        SuperBlockIndex restoredIndex = SuperBlockIndex.createSuperBlockIndex(indexFilePath, 100, new ManualExecutor(),
                 BackOffPolicy.IMMEDIATE);
         BlockLocation locationReturned = restoredIndex.queryLocation(objectKey);
         assertEquals(location, locationReturned);
@@ -99,7 +97,7 @@ public class SuperBlockIndexTest {
 
         executor.runNext();
 
-        SuperBlockIndex restoredIndex = new SuperBlockIndex(indexFilePath, 100, new ManualExecutor(),
+        SuperBlockIndex restoredIndex = SuperBlockIndex.createSuperBlockIndex(indexFilePath, 100, new ManualExecutor(),
                 BackOffPolicy.IMMEDIATE);
         BlockLocation locationReturned = restoredIndex.queryLocation(objectKey);
         assertEquals(location, locationReturned);
@@ -112,8 +110,31 @@ public class SuperBlockIndexTest {
         boolean put = sut.put(objectKey, location, ObjectFlags.NONE);
         assertTrue(put);
 
-        SuperBlockIndex restoredIndex = new SuperBlockIndex(indexFilePath, 100, new ManualExecutor(),
+        SuperBlockIndex restoredIndex = SuperBlockIndex.createSuperBlockIndex(indexFilePath, 100, new ManualExecutor(),
                 BackOffPolicy.IMMEDIATE);
         assertNull(restoredIndex.queryLocation(objectKey));
+    }
+
+    @Test
+    public void staleIndexCanBeRestoredFromSuperBlock() throws Exception {
+        File superBlockFile = temporaryFolder.newFile();
+        final ObjectKey[] objectKeys = new ObjectKey[] {new ObjectKey("a"), new ObjectKey("b")};
+        final byte[][] data = new byte[][] {{1, 2, 3}, {4, 5, 6}};
+
+        try (SuperBlock superBlock = new SuperBlock(superBlockFile.toPath(), true)) {
+            BlockLocation[] locations = new BlockLocation[]{
+                    CandyBlockTest.makeCandy(superBlock, objectKeys[0], data[0]),
+                    CandyBlockTest.makeCandy(superBlock, objectKeys[1], data[1])
+            };
+            sut.put(objectKeys[0], locations[0], ObjectFlags.NONE);
+            executor.runNext(); // only the [0] is stored
+            sut.close();
+
+            try (SuperBlockIndex rebuilt = SuperBlockIndex.restoreSuperBlockIndex(indexFilePath, superBlock, 100,
+                    executor, BackOffPolicy.IMMEDIATE)) {
+                assertEquals(locations[0], rebuilt.queryLocation(objectKeys[0]));
+                assertEquals(locations[1], rebuilt.queryLocation(objectKeys[1]));
+            }
+        }
     }
 }

@@ -23,6 +23,7 @@ import me.predatorray.candybox.util.Validations;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UncheckedIOException;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
@@ -31,6 +32,7 @@ import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 
 public class SuperBlock extends AbstractCloseable {
@@ -110,11 +112,13 @@ public class SuperBlock extends AbstractCloseable {
         return new BlockLocation(offset - candySize, candySize);
     }
 
+    @Deprecated
     public MappedByteBuffer openMappedByteBuffer() throws IOException {
         ensureNotClosed();
         return superBlockAppendChannel.map(FileChannel.MapMode.READ_ONLY, 0, size());
     }
 
+    @Deprecated
     public List<MappedByteBuffer> openMappedByteBuffer(BlockLocation location) throws IOException {
         Validations.notNull(location);
         ensureBlockIsWithinRange(location);
@@ -133,11 +137,20 @@ public class SuperBlock extends AbstractCloseable {
         return buffers;
     }
 
+    public CandyBlock getCandyBlockStartingAt(long startingOffset) throws IOException {
+        return new CandyBlock(superBlockPath, startingOffset);
+    }
+
     public CandyBlock getCandyBlockAt(BlockLocation location) throws IOException {
         Validations.notNull(location);
         ensureBlockIsWithinRange(location);
         ensureNotClosed();
         return new CandyBlock(superBlockPath, location);
+    }
+
+    public Iterator<CandyBlock> iterateCandyBlocks(long startingOffset) {
+        ensureNotClosed();
+        return new CandyBlockIterator(startingOffset);
     }
 
     public void changeFlagsOfCandyBlockAt(ObjectKey objectKey, BlockLocation location, short flags)
@@ -179,5 +192,33 @@ public class SuperBlock extends AbstractCloseable {
     public void close() throws IOException {
         super.close();
         superBlockOutput.close();
+    }
+
+    private class CandyBlockIterator implements Iterator<CandyBlock> {
+
+        private long offset;
+        private final long blockSize;
+
+        CandyBlockIterator(long startingOffset) {
+            this.offset = startingOffset;
+            this.blockSize = SuperBlock.this.offset;
+        }
+
+        @Override
+        public boolean hasNext() {
+            return this.offset < this.blockSize;
+        }
+
+        @Override
+        public CandyBlock next() throws UncheckedIOException {
+            CandyBlock next;
+            try {
+                next = getCandyBlockStartingAt(offset);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+            this.offset = next.getStartingOffsetOfNextBlock();
+            return next;
+        }
     }
 }

@@ -51,12 +51,16 @@ public class CandyBlockTest {
         superBlock.close();
     }
 
-    private BlockLocation makeCandy(ObjectKey objectKey, byte[] data) throws IOException {
+    public static BlockLocation makeCandy(SuperBlock superBlock, ObjectKey objectKey, byte[] data) throws IOException {
         BlockLocation location;
         try (ByteArrayInputStream dataInputStream = new ByteArrayInputStream(data)) {
             location = superBlock.append(objectKey, dataInputStream, data.length);
         }
         return location;
+    }
+
+    private BlockLocation makeCandy(ObjectKey objectKey, byte[] data) throws IOException {
+        return makeCandy(superBlock, objectKey, data);
     }
 
     @Test

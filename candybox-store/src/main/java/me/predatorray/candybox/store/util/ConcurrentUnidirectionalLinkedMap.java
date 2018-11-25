@@ -19,6 +19,7 @@ package me.predatorray.candybox.store.util;
 import me.predatorray.candybox.util.Validations;
 
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicReference;
@@ -35,6 +36,8 @@ public class ConcurrentUnidirectionalLinkedMap<K, V> {
 
     private volatile Entry<K, V> head = null;
     private volatile Entry<K, V> tail = null;
+
+    private volatile Entry<K, V> last = null;
 
     private final ReentrantLock lock = new ReentrantLock();
     private final Condition notEmpty = lock.newCondition();
@@ -74,11 +77,23 @@ public class ConcurrentUnidirectionalLinkedMap<K, V> {
             ++queueSize;
 
             map.put(key, entry);
+            last = entry;
             notEmpty.signalAll();
         } finally {
             lock.unlock();
         }
         return true;
+    }
+
+    public void putSilently(K key, V value) {
+        Entry<K, V> entry = new Entry<>(key, value);
+        lock.lock();
+        try {
+            map.put(key, entry);
+            last = entry;
+        } finally {
+            lock.unlock();
+        }
     }
 
     public V get(K key) {
@@ -104,6 +119,10 @@ public class ConcurrentUnidirectionalLinkedMap<K, V> {
         } finally {
             lock.unlock();
         }
+    }
+
+    public Optional<Entry<K, V>> last() {
+        return Optional.ofNullable(last);
     }
 
     public static class Entry<K, V> {

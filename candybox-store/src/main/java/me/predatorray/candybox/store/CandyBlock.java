@@ -39,7 +39,6 @@ public class CandyBlock implements Closeable {
     public static final int DATA_SIZE_FIXED_LENGTH_IN_BYTES = 4;
 
     private final Path superBlockPath;
-    private final BlockLocation blockLocation;
 
     private final List<? extends ByteBuffer> objectDataMaps;
 
@@ -49,19 +48,27 @@ public class CandyBlock implements Closeable {
     private final long dataSize;
     private final int checksum;
 
+    private final BlockLocation blockLocation;
+
+    CandyBlock(Path superBlockPath, long startOffset) throws IOException {
+        this(superBlockPath, startOffset, Integer.MAX_VALUE);
+    }
+
     CandyBlock(Path superBlockPath, BlockLocation blockLocation) throws IOException {
         this(superBlockPath, blockLocation, Integer.MAX_VALUE);
     }
 
     CandyBlock(Path superBlockPath, BlockLocation blockLocation, int maximumByteBufferSize) throws IOException {
+        this(superBlockPath, blockLocation.getOffset(), maximumByteBufferSize);
+    }
+
+    CandyBlock(Path superBlockPath, long startOffset, int maximumByteBufferSize) throws IOException {
         this.superBlockPath = Validations.notNull(superBlockPath);
-        this.blockLocation = Validations.notNull(blockLocation);
+        Validations.nonnegative(startOffset);
         Validations.positive(maximumByteBufferSize);
 
-        long startOffset = blockLocation.getOffset();
-
         long dataBlockOffset;
-        try (FileChannel dataBlockChannel = FileChannel.open(superBlockPath, StandardOpenOption.READ);) {
+        try (FileChannel dataBlockChannel = FileChannel.open(superBlockPath, StandardOpenOption.READ)) {
             try (InputStream fileChannelIn = Channels.newInputStream(dataBlockChannel.position(startOffset));
                  SuperBlockInputStream input = new SuperBlockInputStream(new DataInputStream(fileChannelIn))) {
                 // magic number
@@ -81,6 +88,7 @@ public class CandyBlock implements Closeable {
                         ObjectKey.OBJECT_KEY_SIZE_FIXED_LENGTH_IN_BYTES + this.objectKey.getSize() +
                         ObjectFlags.FIXED_LENGTH_IN_BYTES + DATA_SIZE_FIXED_LENGTH_IN_BYTES;
                 long checksumOffset = dataBlockOffset + dataSize;
+                this.blockLocation = new BlockLocation(startOffset, checksumOffset + 4 - startOffset);
 
                 try (InputStream fileChecksumIn = Channels.newInputStream(dataBlockChannel.position(checksumOffset));
                      SuperBlockInputStream checksumInput = new SuperBlockInputStream(
@@ -129,6 +137,14 @@ public class CandyBlock implements Closeable {
         return checksum;
     }
 
+    public BlockLocation getBlockLocation() {
+        return blockLocation;
+    }
+
+    public long getStartingOffsetOfNextBlock() {
+        return blockLocation.getOffset() + blockLocation.getLength();
+    }
+
     public List<ByteBuffer> getObjectDataMaps() {
         if (objectDataMaps.isEmpty()) {
             return Collections.emptyList();
@@ -148,6 +164,6 @@ public class CandyBlock implements Closeable {
 
     @Deprecated
     @Override
-    public void close() throws IOException {
+    public void close() {
     }
 }
