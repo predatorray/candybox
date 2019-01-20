@@ -121,7 +121,7 @@ public class SuperBlockIndexTest {
         final ObjectKey[] objectKeys = new ObjectKey[] {new ObjectKey("a"), new ObjectKey("b")};
         final byte[][] data = new byte[][] {{1, 2, 3}, {4, 5, 6}};
 
-        try (SuperBlock superBlock = new SuperBlock(superBlockFile.toPath(), true)) {
+        try (SuperBlock superBlock = SuperBlock.createIfNotExists(superBlockFile.toPath())) {
             BlockLocation[] locations = new BlockLocation[]{
                     CandyBlockTest.makeCandy(superBlock, objectKeys[0], data[0]),
                     CandyBlockTest.makeCandy(superBlock, objectKeys[1], data[1])

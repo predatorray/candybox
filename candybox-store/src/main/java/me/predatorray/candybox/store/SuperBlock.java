@@ -18,58 +18,49 @@ package me.predatorray.candybox.store;
 
 import me.predatorray.candybox.ObjectFlags;
 import me.predatorray.candybox.ObjectKey;
+import me.predatorray.candybox.util.IOUtils;
 import me.predatorray.candybox.util.Validations;
 
-import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.nio.MappedByteBuffer;
-import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
-import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.util.ArrayList;
 import java.util.Iterator;
-import java.util.List;
+import java.util.Optional;
 
 public class SuperBlock extends AbstractCloseable {
 
     public static final String DEFAULT_MAGIC_NUMBER_STRING = "CBX0";
     public static final MagicNumber DEFAULT_MAGIC_NUMBER = new MagicNumber(DEFAULT_MAGIC_NUMBER_STRING);
-    // TODO magic footer
 
     private static final long MAXIMUM_DATA_SIZE = (1L << 32) - 1L;
+    private static final long DATA_SIZE_FIXED_LENGTH_IN_BYTES = Integer.BYTES;
+    private static final long DATA_CHECKSUM_FIXED_LENGTH_IN_BYTES = Integer.BYTES;
 
-    private final SuperBlockOutputStream superBlockOutput;
     private final Path superBlockPath;
-    private final FileChannel superBlockAppendChannel;
+    private final IOUtils.Supplier<SuperBlockOutputStream> superBlockOutputSupplier;
+    private SuperBlockOutputStream superBlockOutput;
 
     private long offset;
     private boolean corrupt = false;
 
-    public SuperBlock(Path superBlockPath, boolean create) throws IOException {
-        this.superBlockPath = Validations.notNull(superBlockPath);
+    public static SuperBlock createIfNotExists(Path superBlockPath) throws IOException {
+        Validations.notNull(superBlockPath);
+        IOUtils.Supplier<SuperBlockOutputStream> superBlockOutputSupplier = () ->
+                SuperBlockOutputStream.createAndAppend(superBlockPath);
+        return new SuperBlock(superBlockPath, superBlockOutputSupplier);
+    }
 
-        OpenOption[] options;
-        if (create) {
-            options = new OpenOption[] {
-                    StandardOpenOption.APPEND,
-                    StandardOpenOption.CREATE
-            };
-        } else {
-            options = new OpenOption[] {
-                    StandardOpenOption.APPEND
-            };
-        }
-
+    SuperBlock(Path superBlockPath,
+               IOUtils.Supplier<SuperBlockOutputStream> superBlockOutputSupplier) throws IOException {
+        this.superBlockPath = superBlockPath;
         this.offset = size();
-
-        this.superBlockAppendChannel = FileChannel.open(superBlockPath, options);
-        this.superBlockOutput = new SuperBlockOutputStream(
-                new DataOutputStream(Channels.newOutputStream(superBlockAppendChannel)));
+        this.superBlockOutputSupplier = superBlockOutputSupplier;
+        this.superBlockOutput = this.superBlockOutputSupplier.get();
     }
 
     private void ensureBlockIsNotCorrupt() throws CorruptBlockException {
@@ -107,34 +98,9 @@ public class SuperBlock extends AbstractCloseable {
             throw e;
         }
 
-        long candySize = objectKey.getSize() + dataSize + 16;
+        long candySize = calculateBlockSize(objectKey, dataSize);
         offset += candySize;
         return new BlockLocation(offset - candySize, candySize);
-    }
-
-    @Deprecated
-    public MappedByteBuffer openMappedByteBuffer() throws IOException {
-        ensureNotClosed();
-        return superBlockAppendChannel.map(FileChannel.MapMode.READ_ONLY, 0, size());
-    }
-
-    @Deprecated
-    public List<MappedByteBuffer> openMappedByteBuffer(BlockLocation location) throws IOException {
-        Validations.notNull(location);
-        ensureBlockIsWithinRange(location);
-        ensureNotClosed();
-
-        int bufferSize = (int) ((location.getLength() + Integer.MAX_VALUE - 1L) / Integer.MAX_VALUE);
-        ArrayList<MappedByteBuffer> buffers = new ArrayList<>(bufferSize);
-        long mapOffset = location.getOffset();
-        long remaining = location.getLength();
-        for (int i = 0; i < bufferSize; i++) {
-            long mapLength = Math.min(remaining, Integer.MAX_VALUE);
-            MappedByteBuffer buffer = superBlockAppendChannel.map(FileChannel.MapMode.READ_ONLY, mapOffset, mapLength);
-            buffers.add(buffer);
-            mapOffset += mapLength;
-        }
-        return buffers;
     }
 
     public CandyBlock getCandyBlockStartingAt(long startingOffset) throws IOException {
@@ -170,8 +136,20 @@ public class SuperBlock extends AbstractCloseable {
 
     public void recover(SuperBlockIndex index) throws IOException {
         ensureNotClosed();
+
+        if (!this.corrupt) {
+            return;
+        }
+
+        IOUtils.closeQuietly(this.superBlockOutput);
+
+        Optional<BlockLocation> lastBlockLocationOpt = index.getLastBlockLocation();
+        IOUtils.truncate(superBlockPath, lastBlockLocationOpt.map(BlockLocation::getNextOffset).orElse(0L));
+
+        // reopen the superBlockOutput again
+        this.superBlockOutput = this.superBlockOutputSupplier.get();
+
         this.offset = Files.size(superBlockPath);
-        // TODO
         this.corrupt = false;
     }
 
@@ -192,6 +170,16 @@ public class SuperBlock extends AbstractCloseable {
     public void close() throws IOException {
         super.close();
         superBlockOutput.close();
+    }
+
+    // Visible for Testing
+    static long calculateBlockSize(ObjectKey objectKey, long dataSize) {
+        return MagicNumber.FIXED_LENGTH_IN_BYTES +
+                ObjectKey.OBJECT_KEY_SIZE_FIXED_LENGTH_IN_BYTES +
+                ObjectFlags.FIXED_LENGTH_IN_BYTES +
+                DATA_SIZE_FIXED_LENGTH_IN_BYTES +
+                DATA_CHECKSUM_FIXED_LENGTH_IN_BYTES +
+                objectKey.getSize() + dataSize;
     }
 
     private class CandyBlockIterator implements Iterator<CandyBlock> {

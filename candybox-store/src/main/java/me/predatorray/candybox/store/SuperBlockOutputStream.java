@@ -18,19 +18,29 @@ package me.predatorray.candybox.store;
 
 import me.predatorray.candybox.ObjectKey;
 import me.predatorray.candybox.store.util.OutputStreamWrapper;
+import me.predatorray.candybox.util.IOUtils;
 
 import java.io.DataOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.zip.CRC32;
 
 public class SuperBlockOutputStream extends OutputStreamWrapper<DataOutputStream> {
 
     private static final int DEFAULT_WRITING_DATA_BUFFER_SIZE = 2048;
 
-    public SuperBlockOutputStream(DataOutputStream outputStream) {
-        super(outputStream);
+    public static SuperBlockOutputStream createAndAppend(Path superBlockPath) throws IOException {
+        return new SuperBlockOutputStream(Files.newOutputStream(superBlockPath,
+                StandardOpenOption.APPEND, StandardOpenOption.CREATE));
+    }
+
+    public SuperBlockOutputStream(OutputStream outputStream) {
+        super(IOUtils.toDataOutputStream(outputStream));
     }
 
     public void writeMagicHeader(MagicNumber magicNumber) throws IOException {

@@ -18,8 +18,13 @@ package me.predatorray.candybox.util;
 
 import java.io.Closeable;
 import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.EOFException;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.channels.FileChannel;
+import java.nio.file.Path;
 
 /**
  * Common IO utilities
@@ -68,5 +73,43 @@ public class IOUtils {
     public static <T extends Throwable> T addSuppressIfThrown(T nontrivial, Closeable closeable) {
         Exceptions.executeAndGetException(closeable::close, Exception.class).ifPresent(nontrivial::addSuppressed);
         return nontrivial;
+    }
+
+    public static void truncate(Path path, long newSize) throws IOException {
+        try (FileChannel channel = new FileOutputStream(path.toFile(), true).getChannel()) {
+            channel.truncate(newSize);
+        }
+    }
+
+    public static void closeQuietly(Closeable closeable) {
+        if (closeable == null) {
+            return;
+        }
+        try {
+            closeable.close();
+        } catch (IOException ignored) {
+            // ignored
+        }
+    }
+
+    public static DataOutputStream toDataOutputStream(OutputStream out) {
+        if (out == null) {
+            return null;
+        }
+        if (out instanceof DataOutputStream) {
+            return (DataOutputStream) out;
+        }
+        return new DataOutputStream(out);
+    }
+
+    @FunctionalInterface
+    public interface Supplier<T> {
+
+        /**
+         * Gets a result.
+         *
+         * @return a result
+         */
+        T get() throws IOException;
     }
 }

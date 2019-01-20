@@ -18,6 +18,7 @@ package me.predatorray.candybox.store;
 
 import me.predatorray.candybox.ObjectFlags;
 import me.predatorray.candybox.ObjectKey;
+import me.predatorray.candybox.store.testsupport.ByteBufferTestSupport;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
@@ -26,13 +27,9 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.EOFException;
 import java.io.File;
 import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.nio.channels.Channels;
-import java.nio.channels.WritableByteChannel;
 import java.util.Arrays;
 import java.util.zip.CRC32;
 
@@ -46,7 +43,7 @@ public class SuperBlockTest {
     @Before
     public void setUpSuperBlock() throws Exception {
         File superBlockFile = temporaryFolder.newFile();
-        sut = new SuperBlock(superBlockFile.toPath(), true);
+        sut = SuperBlock.createIfNotExists(superBlockFile.toPath());
     }
 
     @After
@@ -76,18 +73,7 @@ public class SuperBlockTest {
             Assert.assertEquals((long) expectedData.length, candyBlock.getDataSize());
 
             // data
-            byte[] actualData;
-            try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                 WritableByteChannel baosChannel = Channels.newChannel(baos)) {
-                for (ByteBuffer byteBuffer : candyBlock.getObjectDataMaps()) {
-                    long remaining = byteBuffer.remaining();
-                    while (remaining > 0) {
-                        remaining -= baosChannel.write(byteBuffer);
-                    }
-                }
-                baos.flush();
-                actualData = baos.toByteArray();
-            }
+            byte[] actualData = ByteBufferTestSupport.toByteArray(candyBlock.getObjectDataMaps());
             Assert.assertArrayEquals(expectedData, actualData);
         }
     }
@@ -173,7 +159,7 @@ public class SuperBlockTest {
         final byte[] data = new byte[] { 1, 2, 3 };
         final int dataSize = data.length + 1;
 
-        try (SuperBlock sut = new SuperBlock(superBlockFile.toPath(), true)) {
+        try (SuperBlock sut = SuperBlock.createIfNotExists(superBlockFile.toPath())) {
             try (ByteArrayInputStream dataInputStream = new ByteArrayInputStream(data)) {
                 sut.append(objectKey, dataInputStream, dataSize);
             }

@@ -27,16 +27,15 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.DataInputStream;
-import java.io.DataOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.Executor;
 
 public class SuperBlockIndex extends AbstractCloseable {
@@ -62,9 +61,8 @@ public class SuperBlockIndex extends AbstractCloseable {
 
         boolean exists = Files.exists(indexFilePath);
 
-        SuperBlockOutputStream superBlockIndexOut = new SuperBlockOutputStream(
-                new DataOutputStream(Files.newOutputStream(indexFilePath,
-                        StandardOpenOption.APPEND, StandardOpenOption.CREATE)));
+        SuperBlockOutputStream superBlockIndexOut = SuperBlockOutputStream.createAndAppend(
+                indexFilePath);
         try {
             ConcurrentUnidirectionalLinkedMap<ObjectKey, ObjectEntry> inMemoryMappings;
             if (!exists) {
@@ -117,7 +115,7 @@ public class SuperBlockIndex extends AbstractCloseable {
             long startingOffset = superBlockIndex.inMemoryMappings.last()
                     .map(ConcurrentUnidirectionalLinkedMap.Entry::getValue)
                     .map(ObjectEntry::getLocation)
-                    .map(loc -> loc.getOffset() + loc.getLength())
+                    .map(BlockLocation::getNextOffset)
                     .orElse(0L);
             Iterator<CandyBlock> candyBlockIterator = superBlock.iterateCandyBlocks(startingOffset);
             while (candyBlockIterator.hasNext()) {
@@ -167,6 +165,12 @@ public class SuperBlockIndex extends AbstractCloseable {
 
         ObjectEntry entry = inMemoryMappings.get(objectKey);
         return entry == null ? null : entry.location;
+    }
+
+    public Optional<BlockLocation> getLastBlockLocation() {
+        return inMemoryMappings.last()
+                .map(ConcurrentUnidirectionalLinkedMap.Entry::getValue)
+                .map(ObjectEntry::getLocation);
     }
 
     @Override

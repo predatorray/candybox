@@ -59,6 +59,13 @@ public class BlockLocation {
     }
 
     /**
+     * @return the starting offset of next block, which equals {@code offset + length}
+     */
+    public long getNextOffset() {
+        return offset + length;
+    }
+
+    /**
      * Determine if the location is out of the range of the super-block where it belongs.
      *
      * <p>This method returns {@code true}, if anyone of the conditions below is true:

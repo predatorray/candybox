@@ -142,7 +142,7 @@ public class CandyBlock implements Closeable {
     }
 
     public long getStartingOffsetOfNextBlock() {
-        return blockLocation.getOffset() + blockLocation.getLength();
+        return blockLocation.getNextOffset();
     }
 
     public List<ByteBuffer> getObjectDataMaps() {

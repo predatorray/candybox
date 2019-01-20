@@ -43,7 +43,7 @@ public class CandyBlockTest {
     public void setUpFixtures() throws Exception {
         File superBlockFile = temporaryFolder.newFile();
         superBlockPath = superBlockFile.toPath();
-        superBlock = new SuperBlock(superBlockPath, true);
+        superBlock = SuperBlock.createIfNotExists(superBlockPath);
     }
 
     @After
