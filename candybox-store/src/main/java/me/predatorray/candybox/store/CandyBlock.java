@@ -16,6 +16,7 @@
 
 package me.predatorray.candybox.store;
 
+import me.predatorray.candybox.MagicNumber;
 import me.predatorray.candybox.ObjectFlags;
 import me.predatorray.candybox.ObjectKey;
 import me.predatorray.candybox.util.Validations;

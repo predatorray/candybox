@@ -137,4 +137,19 @@ public class SuperBlockIndexTest {
             }
         }
     }
+
+    @Test
+    public void blockLocationIsRenewedAfterSecondWriting() throws Exception {
+        ObjectKey objectKey = new ObjectKey("foobar");
+        BlockLocation[] locations = new BlockLocation[] {
+                new BlockLocation(100, 200),
+                new BlockLocation(200, 300)
+        };
+        for (BlockLocation location : locations) {
+            assertTrue(sut.put(objectKey, location, ObjectFlags.NONE));
+        }
+
+        BlockLocation locationReturned = sut.queryLocation(objectKey);
+        assertEquals(locations[locations.length - 1], locationReturned);
+    }
 }

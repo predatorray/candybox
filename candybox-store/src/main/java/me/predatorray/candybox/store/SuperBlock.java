@@ -16,6 +16,7 @@
 
 package me.predatorray.candybox.store;
 
+import me.predatorray.candybox.MagicNumber;
 import me.predatorray.candybox.ObjectFlags;
 import me.predatorray.candybox.ObjectKey;
 import me.predatorray.candybox.util.IOUtils;
@@ -76,8 +77,6 @@ public class SuperBlock extends AbstractCloseable {
 
     public BlockLocation append(MagicNumber magicNumber, ObjectKey objectKey, short flags, InputStream dataInput,
                                 long dataSize) throws IOException {
-        // PART          || magic-number | object-key-size | object-key | flags | data-size | data | data-checksum
-        // SIZE IN BYTES || 4            | 2               | var        | 2     | 4         | var  | 4
         Validations.notNull(magicNumber);
         Validations.notNull(objectKey);
         Validations.notNull(dataInput);
@@ -88,6 +87,8 @@ public class SuperBlock extends AbstractCloseable {
         ensureNotClosed();
 
         try {
+            // PART          || magic-number | object-key-size | object-key | flags | data-size | data | data-checksum
+            // SIZE IN BYTES || 4            | 2               | var        | 2     | 4         | var  | 4
             superBlockOutput.writeMagicHeader(magicNumber);
             superBlockOutput.writeObjectKey(objectKey);
             superBlockOutput.writeFlags(flags);

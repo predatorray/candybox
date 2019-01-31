@@ -16,6 +16,8 @@
 
 package me.predatorray.candybox.store;
 
+import me.predatorray.candybox.MagicNumber;
+
 public class UnsupportedBlockFormatException extends CandyBlockIOException {
 
     public UnsupportedBlockFormatException(MagicNumber unsupportedMagicNumber) {

@@ -16,6 +16,7 @@
 
 package me.predatorray.candybox.store;
 
+import me.predatorray.candybox.MagicNumber;
 import me.predatorray.candybox.ObjectKey;
 import me.predatorray.candybox.store.util.BackOffPolicy;
 import me.predatorray.candybox.store.util.ConcurrentUnidirectionalLinkedMap;
@@ -211,6 +212,8 @@ public class SuperBlockIndex extends AbstractCloseable {
                 }
 
                 try {
+                    // PART          || object-key-size | object-key | flags | offset | length
+                    // SIZE IN BYTES || 2               | var        | 2     | 8      | 8
                     outputStream.writeObjectKey(next.getKey());
                     ObjectEntry entry = next.getValue();
                     outputStream.writeFlags(entry.flags);
