@@ -19,6 +19,7 @@ package me.predatorray.candybox.store;
 import me.predatorray.candybox.MagicNumber;
 import me.predatorray.candybox.ObjectFlags;
 import me.predatorray.candybox.ObjectKey;
+import me.predatorray.candybox.store.util.ByteBufferInputStream;
 import me.predatorray.candybox.util.Validations;
 
 import java.io.Closeable;
@@ -34,14 +35,15 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
+import java.util.zip.CRC32;
 
 public class CandyBlock implements Closeable {
 
     public static final int DATA_SIZE_FIXED_LENGTH_IN_BYTES = 4;
 
-    private final Path superBlockPath;
 
-    private final List<? extends ByteBuffer> objectDataMaps;
+    private final List<ByteBuffer> objectDataMaps;
 
     private final MagicNumber magicNumber;
     private final ObjectKey objectKey;
@@ -49,7 +51,28 @@ public class CandyBlock implements Closeable {
     private final long dataSize;
     private final int checksum;
 
-    private final BlockLocation blockLocation;
+    private Path superBlockPath;
+    private BlockLocation blockLocation;
+
+    public CandyBlock(ObjectKey objectKey, List<ByteBuffer> objectDataMaps) {
+        this.superBlockPath = null;
+        this.objectDataMaps = Objects.requireNonNull(objectDataMaps);
+
+        this.magicNumber = SuperBlock.DEFAULT_MAGIC_NUMBER;
+        this.objectKey = objectKey;
+        this.flags = ObjectFlags.NONE;
+
+        this.dataSize = objectDataMaps.stream()
+                .map(ByteBuffer::remaining).mapToLong(Long::valueOf).sum();
+
+        objectDataMaps.forEach(ByteBuffer::mark);
+        CRC32 checksum = new CRC32();
+        objectDataMaps.forEach(checksum::update);
+        this.checksum = (int) checksum.getValue();
+        objectDataMaps.forEach(ByteBuffer::reset);
+
+        this.blockLocation = null;
+    }
 
     CandyBlock(Path superBlockPath, long startOffset) throws IOException {
         this(superBlockPath, startOffset, Integer.MAX_VALUE);
@@ -158,8 +181,16 @@ public class CandyBlock implements Closeable {
         return duplication;
     }
 
+    void store(Path superBlockPath, BlockLocation location) {
+        this.superBlockPath = superBlockPath;
+        this.blockLocation = location;
+    }
+
     @Override
     public String toString() {
+        if (superBlockPath == null) {
+            return "<not persisted candy block>";
+        }
         return superBlockPath + " " + blockLocation;
     }
 

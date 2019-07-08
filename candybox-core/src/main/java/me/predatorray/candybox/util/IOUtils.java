@@ -23,8 +23,10 @@ import java.io.EOFException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.io.UncheckedIOException;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
+import java.util.Collection;
 
 /**
  * Common IO utilities
@@ -55,6 +57,24 @@ public class IOUtils {
         }
         if (throwable != null) {
             throw throwable;
+        }
+    }
+
+    public static void closeSequentially(Collection<? extends Closeable> closeables) throws IOException {
+        IOException rootCause = null;
+        for (Closeable closeable : closeables) {
+            try {
+                closeable.close();
+            } catch (IOException e) {
+                if (rootCause == null) {
+                    rootCause = e;
+                } else {
+                    rootCause.addSuppressed(e);
+                }
+            }
+        }
+        if (rootCause != null) {
+            throw rootCause;
         }
     }
 
@@ -102,6 +122,16 @@ public class IOUtils {
         return new DataOutputStream(out);
     }
 
+    public static <T, R> java.util.function.Function<T, R> unchecked(IOUtils.Function<T, R> ioFunction) {
+        return t -> {
+            try {
+                return ioFunction.apply(t);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        };
+    }
+
     @FunctionalInterface
     public interface Supplier<T> {
 
@@ -111,5 +141,11 @@ public class IOUtils {
          * @return a result
          */
         T get() throws IOException;
+    }
+
+    @FunctionalInterface
+    public interface Function<T, R> {
+
+        R apply(T t) throws IOException;
     }
 }

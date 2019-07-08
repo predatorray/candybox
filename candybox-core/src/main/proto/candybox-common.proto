@@ -1,0 +1,82 @@
+syntax = "proto3";
+
+option java_package = "me.predatorray.candybox.proto";
+option java_outer_classname = "CommonProtos";
+
+package me.predatorray.candybox.proto;
+
+message ObjectKey {
+
+    string value = 1;
+}
+
+message Chunk {
+
+    bytes data = 1;
+}
+
+message Shard {
+
+    string boxName = 1;
+    int32 offset = 2;
+}
+
+message BlockLocation {
+    int64 offset = 1;
+    int64 length = 2;
+}
+
+message ShardInitializeRequest {
+    Shard shard = 1;
+}
+
+message ShardInitializeResponse {
+
+    enum Status {
+        INITIALIZED = 0;
+    }
+    Status status = 1;
+}
+
+message ObjectFetchRequest {
+
+    Shard shard = 1;
+    ObjectKey objectKey = 2;
+}
+
+message ObjectFetchResponse {
+
+    enum Status {
+
+        OK = 0;
+    }
+
+    Status status = 1;
+    Chunk body = 2;
+}
+
+message ObjectAppendRequest {
+
+    Shard shard = 1;
+    ObjectKey objectKey = 2;
+    Chunk body = 3;
+}
+
+message ObjectAppendResponse {
+
+    enum Status {
+
+        APPENDED = 0;
+    }
+    Status status = 1;
+    BlockLocation location = 2;
+}
+
+service ShardService {
+
+    rpc Initialize(ShardInitializeRequest) returns (ShardInitializeResponse);
+
+    rpc Fetch(ObjectFetchRequest) returns (stream ObjectFetchResponse);
+
+    rpc Append(stream ObjectAppendRequest) returns (ObjectAppendResponse);
+}

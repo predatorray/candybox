@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018 the original author or authors.
+ * Copyright (c) 2019 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,25 +16,8 @@
 
 package me.predatorray.candybox.store.util;
 
-public interface BackOffPolicy {
+@FunctionalInterface
+public interface ExceptionalRunnable<T extends Throwable> {
 
-    Context start();
-
-    boolean backOff(Context context) throws InterruptedException;
-
-    interface Context {
-    }
-
-    BackOffPolicy IMMEDIATE = new BackOffPolicy() {
-
-        @Override
-        public Context start() {
-            return null;
-        }
-
-        @Override
-        public boolean backOff(Context context) {
-            return true;
-        }
-    };
+    void run() throws T;
 }

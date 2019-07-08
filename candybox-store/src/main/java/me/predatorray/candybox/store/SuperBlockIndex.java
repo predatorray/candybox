@@ -88,6 +88,7 @@ public class SuperBlockIndex extends AbstractCloseable {
                     }
                 } catch (EOFException inconsistent) {
                     // ignored
+                    // FIXME truncate
                 }
                 inMemoryMappings = new ConcurrentUnidirectionalLinkedMap<>(dataFromFile, capacity);
             }
@@ -134,6 +135,7 @@ public class SuperBlockIndex extends AbstractCloseable {
                 }
                 ObjectEntry objectEntry = new ObjectEntry(next.getFlags(), next.getBlockLocation());
                 superBlockIndex.inMemoryMappings.putSilently(next.getObjectKey(), objectEntry);
+                // FIXME write into index file
             }
         } catch (UncheckedIOException uncheckedIO) {
             throw IOUtils.addSuppressIfThrown(uncheckedIO.getCause(), superBlockIndex);
@@ -158,6 +160,16 @@ public class SuperBlockIndex extends AbstractCloseable {
 
         ObjectEntry indexedEntry = new ObjectEntry(flags, locationStored);
         return inMemoryMappings.put(objectKey, indexedEntry);
+    }
+
+    public void putInterruptibly(ObjectKey objectKey, BlockLocation locationStored, short flags)
+            throws InterruptedException {
+        Validations.notNull(objectKey);
+        Validations.notNull(locationStored);
+        ensureNotClosed();
+
+        ObjectEntry indexedEntry = new ObjectEntry(flags, locationStored);
+        inMemoryMappings.putInterruptibly(objectKey, indexedEntry);
     }
 
     public BlockLocation queryLocation(ObjectKey objectKey) {
@@ -206,7 +218,7 @@ public class SuperBlockIndex extends AbstractCloseable {
 
             try {
                 if (next == null) {
-                    next = inMemoryMappings.take();
+                    next = inMemoryMappings.take(); // FIXME bug
                 } else {
                     logger.info("Retrying the failed persistence");
                 }

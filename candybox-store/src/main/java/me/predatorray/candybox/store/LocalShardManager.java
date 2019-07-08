@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018 the original author or authors.
+ * Copyright (c) 2019 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,27 +14,16 @@
  * limitations under the License.
  */
 
-package me.predatorray.candybox.store.util;
+package me.predatorray.candybox.store;
 
-public interface BackOffPolicy {
+import java.io.Closeable;
+import java.util.Collection;
 
-    Context start();
+public interface LocalShardManager extends Closeable {
 
-    boolean backOff(Context context) throws InterruptedException;
+    LocalShard initialize(String boxName, int offset) throws CandyBlockIOException;
 
-    interface Context {
-    }
+    LocalShard find(String boxName, int offset) throws CandyBlockIOException;
 
-    BackOffPolicy IMMEDIATE = new BackOffPolicy() {
-
-        @Override
-        public Context start() {
-            return null;
-        }
-
-        @Override
-        public boolean backOff(Context context) {
-            return true;
-        }
-    };
+    Collection<? extends LocalShard> findAll() throws CandyBlockIOException;
 }

@@ -29,6 +29,8 @@ import java.util.stream.Collectors;
 
 public class ConcurrentUnidirectionalLinkedMap<K, V> {
 
+    private static final int MAXIMUM_INITIAL_CAPACITY = 128;
+
     private final int queueCapacity;
     private int queueSize = 0;
 
@@ -41,16 +43,17 @@ public class ConcurrentUnidirectionalLinkedMap<K, V> {
 
     private final ReentrantLock lock = new ReentrantLock();
     private final Condition notEmpty = lock.newCondition();
+    private final Condition notFull = lock.newCondition();
 
     public ConcurrentUnidirectionalLinkedMap(int capacity) {
         this.queueCapacity = Validations.positive(capacity);
-        this.map = new ConcurrentHashMap<>(capacity);
+        this.map = new ConcurrentHashMap<>(Math.min(capacity, MAXIMUM_INITIAL_CAPACITY));
     }
 
     public ConcurrentUnidirectionalLinkedMap(Map<K, V> initialData, int capacity) {
         Validations.notNull(initialData);
         this.queueCapacity = Validations.positive(capacity);
-        this.map = new ConcurrentHashMap<>(capacity);
+        this.map = new ConcurrentHashMap<>(Math.min(capacity, MAXIMUM_INITIAL_CAPACITY));
 
         Map<K, Entry<K, V>> initialEntryDataMap = initialData.entrySet().stream()
                 .collect(Collectors.toMap(Map.Entry::getKey, Entry::new));
@@ -85,6 +88,33 @@ public class ConcurrentUnidirectionalLinkedMap<K, V> {
         return true;
     }
 
+    public void putInterruptibly(K key, V value) throws InterruptedException {
+        Entry<K, V> entry = new Entry<>(key, value);
+
+        lock.lock();
+        try {
+            while (queueSize >= queueCapacity) {
+                notFull.await();
+            }
+            if (head == null) {
+                head = entry;
+            }
+
+            if (tail != null) {
+                tail.setNext(entry);
+            }
+            tail = entry;
+
+            ++queueSize;
+
+            map.put(key, entry);
+            last = entry;
+            notEmpty.signalAll();
+        } finally {
+            lock.unlock();
+        }
+    }
+
     public void putSilently(K key, V value) {
         Entry<K, V> entry = new Entry<>(key, value);
         lock.lock();
@@ -115,6 +145,7 @@ public class ConcurrentUnidirectionalLinkedMap<K, V> {
             if (this.head == null) {
                 this.tail = null;
             }
+            notFull.signalAll();
             return taken;
         } finally {
             lock.unlock();

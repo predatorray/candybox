@@ -32,9 +32,10 @@ public class ExponentialSleepBackOffPolicy implements BackOffPolicy {
     }
 
     @Override
-    public void backOff(BackOffPolicy.Context context) throws InterruptedException {
+    public boolean backOff(BackOffPolicy.Context context) throws InterruptedException {
         Context ctx = (Context) context;
         sleep(ctx.getAndIncrementSleepTime());
+        return true;
     }
 
     // Visible for Testing

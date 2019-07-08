@@ -19,18 +19,21 @@ package me.predatorray.candybox.store;
 import me.predatorray.candybox.MagicNumber;
 import me.predatorray.candybox.ObjectFlags;
 import me.predatorray.candybox.ObjectKey;
+import me.predatorray.candybox.store.util.ByteBufferInputStream;
 import me.predatorray.candybox.util.IOUtils;
 import me.predatorray.candybox.util.Validations;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Optional;
 
 public class SuperBlock extends AbstractCloseable {
@@ -70,11 +73,24 @@ public class SuperBlock extends AbstractCloseable {
         }
     }
 
+    public BlockLocation append(CandyBlock candyBlock) throws IOException {
+        List<ByteBuffer> dataMaps = candyBlock.getObjectDataMaps();
+        BlockLocation location;
+        try (ByteBufferInputStream dataIn = new ByteBufferInputStream(dataMaps)) {
+            location = append(candyBlock.getMagicNumber(), candyBlock.getObjectKey(), candyBlock.getFlags(),
+                    dataIn, candyBlock.getDataSize());
+        }
+        candyBlock.store(superBlockPath, location);
+        return location;
+    }
+
+    @Deprecated
     public BlockLocation append(ObjectKey objectKey, InputStream dataInput, long dataSize)
             throws IOException {
         return append(DEFAULT_MAGIC_NUMBER, objectKey, ObjectFlags.NONE, dataInput, dataSize);
     }
 
+    @Deprecated
     public BlockLocation append(MagicNumber magicNumber, ObjectKey objectKey, short flags, InputStream dataInput,
                                 long dataSize) throws IOException {
         Validations.notNull(magicNumber);
@@ -138,10 +154,6 @@ public class SuperBlock extends AbstractCloseable {
     public void recover(SuperBlockIndex index) throws IOException {
         ensureNotClosed();
 
-        if (!this.corrupt) {
-            return;
-        }
-
         IOUtils.closeQuietly(this.superBlockOutput);
 
         Optional<BlockLocation> lastBlockLocationOpt = index.getLastBlockLocation();
@@ -150,13 +162,15 @@ public class SuperBlock extends AbstractCloseable {
         // reopen the superBlockOutput again
         this.superBlockOutput = this.superBlockOutputSupplier.get();
 
+        // TODO truncate
+
         this.offset = Files.size(superBlockPath);
         this.corrupt = false;
     }
 
     public long size() throws IOException {
         ensureNotClosed();
-        return Files.size(superBlockPath);
+        return Files.exists(superBlockPath) ? Files.size(superBlockPath) : 0L;
     }
 
     private void ensureBlockIsWithinRange(BlockLocation location) throws IOException {

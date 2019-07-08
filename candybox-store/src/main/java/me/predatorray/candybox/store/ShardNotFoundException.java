@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018 the original author or authors.
+ * Copyright (c) 2019 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,27 +14,11 @@
  * limitations under the License.
  */
 
-package me.predatorray.candybox.store.util;
+package me.predatorray.candybox.store;
 
-public interface BackOffPolicy {
+public class ShardNotFoundException extends CandyBlockIOException {
 
-    Context start();
-
-    boolean backOff(Context context) throws InterruptedException;
-
-    interface Context {
+    public ShardNotFoundException(String boxName, int offset) {
+        super("The shard " + boxName + "[" + offset + "] is not found.");
     }
-
-    BackOffPolicy IMMEDIATE = new BackOffPolicy() {
-
-        @Override
-        public Context start() {
-            return null;
-        }
-
-        @Override
-        public boolean backOff(Context context) {
-            return true;
-        }
-    };
 }
