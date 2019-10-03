@@ -17,7 +17,10 @@
 package me.predatorray.candybox.store.service;
 
 import com.google.protobuf.UnsafeByteOperations;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import io.grpc.stub.StreamObserver;
+import me.predatorray.candybox.ObjectFlags;
 import me.predatorray.candybox.ObjectKey;
 import me.predatorray.candybox.proto.CommonProtos;
 import me.predatorray.candybox.proto.ShardServiceGrpc;
@@ -37,7 +40,6 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Objects;
-import java.util.function.Consumer;
 
 public class ShardService extends ShardServiceGrpc.ShardServiceImplBase {
 
@@ -77,41 +79,19 @@ public class ShardService extends ShardServiceGrpc.ShardServiceImplBase {
         CommonProtos.ObjectKey objectKeyProto = request.getObjectKey();
         ObjectKey objectKey = new ObjectKey(objectKeyProto.getValue());
 
-        dealWithLocalShard(shardProto, responseObserver, localShardManager, objectKey, localShard -> {
-            try (LocalShard.Snapshot snapshot = localShard.takeSnapshot()) {
-                SuperBlockIndex idx = snapshot.index();
-                BlockLocation location = idx.queryLocation(objectKey);
-                if (location == null) {
-                    GrpcUtils.sendNotFoundError(responseObserver, "Object named " + objectKey + " is not found.", null);
-                    return;
-                }
+        CandyBlock candyBlock = getCandyBlock(localShardManager, shardProto, objectKey);
+        List<ByteBuffer> dataMaps = candyBlock.getObjectDataMaps();
+        for (ByteBuffer dataMap : dataMaps) {
+            CommonProtos.Chunk chunk = CommonProtos.Chunk.newBuilder()
+                .setData(UnsafeByteOperations.unsafeWrap(dataMap))
+                .build();
+            CommonProtos.ObjectFetchResponse response = CommonProtos.ObjectFetchResponse.newBuilder()
+                .setBody(chunk)
+                .build();
+            responseObserver.onNext(response);
+        }
 
-                SuperBlock block = snapshot.block();
-                CandyBlock candyBlock;
-                try {
-                    candyBlock = block.getCandyBlockAt(location);
-                } catch (IOException e) {
-                    String errorMessage = "Fetching candy block at " + location + " for object " + objectKey +
-                            " failed.";
-                    logger.error(errorMessage, e);
-                    GrpcUtils.sendInternalError(responseObserver, errorMessage, e);
-                    return;
-                }
-
-                List<ByteBuffer> dataMaps = candyBlock.getObjectDataMaps();
-                for (ByteBuffer dataMap : dataMaps) {
-                    CommonProtos.Chunk chunk = CommonProtos.Chunk.newBuilder()
-                            .setData(UnsafeByteOperations.unsafeWrap(dataMap))
-                            .build();
-                    CommonProtos.ObjectFetchResponse response = CommonProtos.ObjectFetchResponse.newBuilder()
-                            .setBody(chunk)
-                            .build();
-                    responseObserver.onNext(response);
-                }
-
-                responseObserver.onCompleted();
-            }
-        });
+        responseObserver.onCompleted();
     }
 
     @Override
@@ -120,10 +100,62 @@ public class ShardService extends ShardServiceGrpc.ShardServiceImplBase {
         return new ShardServiceAppendObserver(responseObserver, localShardManager);
     }
 
-    static void dealWithLocalShard(CommonProtos.Shard shardProto, StreamObserver<?> observer,
-                                   LocalShardManager localShardManager,
-                                   ObjectKey objectKey,
-                                   Consumer<LocalShard> consumer) {
+    @Override
+    public void delete(CommonProtos.ObjectDeleteRequest request,
+                       StreamObserver<CommonProtos.ObjectDeleteResponse> responseObserver) {
+        CommonProtos.Shard shardProto = request.getShard();
+        CommonProtos.ObjectKey objectKeyProto = request.getObjectKey();
+        ObjectKey objectKey = new ObjectKey(objectKeyProto.getValue());
+
+        LocalShard localShard = getLocalShard(localShardManager, shardProto);
+
+        try (LocalShard.Snapshot snapshot = localShard.takeSnapshot()) {
+            SuperBlockIndex idx = snapshot.index();
+            BlockLocation location = idx.queryLocation(objectKey);
+            if (location == null) {
+                logger.debug("Object named {} is not found.", objectKey);
+                throw new StatusRuntimeException(Status.NOT_FOUND);
+            }
+
+            SuperBlock block = snapshot.block();
+            CandyBlock candyBlock;
+            try {
+                candyBlock = block.getCandyBlockAt(location);
+            } catch (IOException e) {
+                String errorMessage = "Finding candy block at " + location + " for object " + objectKey +
+                    " failed.";
+                logger.error(errorMessage, e);
+                throw new StatusRuntimeException(Status.INTERNAL);
+            }
+
+            try {
+                candyBlock.setFlags(ObjectFlags.DELETED);
+            } catch (IOException e) {
+                String errorMessage = "Failed to mark the candybox at " +
+                    candyBlock.getBlockLocation() + " as deleted.";
+                logger.error(errorMessage, e);
+                GrpcUtils.sendInternalError(responseObserver, errorMessage, e);
+                return;
+            }
+
+            try {
+                idx.putInterruptibly(objectKey, null, ObjectFlags.DELETED);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                GrpcUtils.sendInternalError(responseObserver, "Failed to mark the candybox index  as deleted "
+                    + "due to an unexpected interruption", e);
+                return;
+            }
+        }
+
+        responseObserver.onNext(CommonProtos.ObjectDeleteResponse.newBuilder()
+            .setStatus(CommonProtos.ObjectDeleteResponse.Status.DELETED)
+            .build());
+        responseObserver.onCompleted();
+    }
+
+    static LocalShard getLocalShard(LocalShardManager localShardManager,
+                                    CommonProtos.Shard shardProto) throws StatusRuntimeException {
         String boxName = shardProto.getBoxName();
         int offset = shardProto.getOffset();
 
@@ -132,19 +164,38 @@ public class ShardService extends ShardServiceGrpc.ShardServiceImplBase {
             localShard = localShardManager.find(boxName, offset);
         } catch (ShardNotFoundException notFound) {
             logger.error(notFound.getMessage(), notFound);
-            GrpcUtils.sendNotFoundError(observer, null, notFound);
-            return;
+            throw new StatusRuntimeException(Status.NOT_FOUND);
         } catch (CandyBlockIOException e) {
-            String errorMessage = "Finding shard " + boxName + "[" + offset + "] for object " + objectKey + " failed.";
+            String errorMessage = "Finding shard " + boxName + "[" + offset + "] failed.";
             logger.error(errorMessage, e);
-            GrpcUtils.sendInternalError(observer, errorMessage, e);
-            return;
+            throw new StatusRuntimeException(Status.INTERNAL);
         }
 
-        try {
-            consumer.accept(localShard);
-        } catch (Exception e) {
-            GrpcUtils.sendInternalError(observer, "unexpected error occurred while dealing with the local shard", e);
+        return localShard;
+    }
+
+    private CandyBlock getCandyBlock(LocalShardManager localShardManager, CommonProtos.Shard shardProto,
+                                     ObjectKey objectKey) throws StatusRuntimeException {
+        LocalShard localShard = getLocalShard(localShardManager, shardProto);
+        try (LocalShard.Snapshot snapshot = localShard.takeSnapshot()) {
+            SuperBlockIndex idx = snapshot.index();
+            BlockLocation location = idx.queryLocation(objectKey);
+            if (location == null) {
+                logger.debug("Object named {} is not found.", objectKey);
+                throw new StatusRuntimeException(Status.NOT_FOUND);
+            }
+
+            SuperBlock block = snapshot.block();
+            CandyBlock candyBlock;
+            try {
+                candyBlock = block.getCandyBlockAt(location);
+            } catch (IOException e) {
+                String errorMessage = "Finding candy block at " + location + " for object " + objectKey +
+                    " failed.";
+                logger.error(errorMessage, e);
+                throw new StatusRuntimeException(Status.INTERNAL);
+            }
+            return candyBlock;
         }
     }
 }

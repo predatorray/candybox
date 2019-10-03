@@ -60,6 +60,18 @@ public class IOUtils {
         }
     }
 
+    /**
+     * Close all the closeable(s) sequentially even IOException occurs while being {@link Closeable#close()}-ed.
+     *
+     * <p>The first IOException will be thrown as the root cause while any others will be suppressed
+     * by using method {@link Throwable#addSuppressed(Throwable)}.
+     *
+     * <p><b>NOTE THAT</b>, only {@link IOException}s will be properly handled. Any other type of exceptions or throwables
+     * will be left uncaught and thrown immediately.
+     *
+     * @param closeables a collection of instances that are closeable
+     * @throws IOException when ny of the instances in the collection throws IOException while being closed
+     */
     public static void closeSequentially(Collection<? extends Closeable> closeables) throws IOException {
         IOException rootCause = null;
         for (Closeable closeable : closeables) {
@@ -138,6 +150,7 @@ public class IOUtils {
         /**
          * Gets a result.
          *
+         * @throws IOException an exception of its type occurs in the supplier
          * @return a result
          */
         T get() throws IOException;

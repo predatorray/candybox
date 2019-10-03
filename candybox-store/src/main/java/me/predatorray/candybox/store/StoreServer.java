@@ -18,6 +18,7 @@ package me.predatorray.candybox.store;
 
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
+import io.grpc.util.TransmitStatusRuntimeExceptionInterceptor;
 import me.predatorray.candybox.store.config.Configuration;
 import me.predatorray.candybox.store.config.DefaultConfiguration;
 import me.predatorray.candybox.store.service.ShardService;
@@ -32,8 +33,9 @@ public class StoreServer {
 
     public StoreServer(int port, ShardService shardService) {
         this.server = ServerBuilder.forPort(port)
-                .addService(shardService)
-                .build();
+            .intercept(TransmitStatusRuntimeExceptionInterceptor.instance())
+            .addService(shardService)
+            .build();
     }
 
     public void start() throws IOException {

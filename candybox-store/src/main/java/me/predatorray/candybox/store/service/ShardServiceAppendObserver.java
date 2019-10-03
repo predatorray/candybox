@@ -56,8 +56,7 @@ class ShardServiceAppendObserver implements StreamObserver<CommonProtos.ObjectAp
         this.objectKey = new ObjectKey(objectKeyProto.getValue());
 
         if (this.localShard == null) {
-            ShardService.dealWithLocalShard(shardProto, responseObserver, localShardManager, objectKey, localShard ->
-                    ShardServiceAppendObserver.this.localShard = localShard);
+            ShardServiceAppendObserver.this.localShard = ShardService.getLocalShard(localShardManager, shardProto);
         }
 
         CommonProtos.Chunk body = request.getBody();

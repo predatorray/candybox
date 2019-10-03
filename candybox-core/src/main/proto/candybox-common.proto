@@ -72,6 +72,21 @@ message ObjectAppendResponse {
     BlockLocation location = 2;
 }
 
+message ObjectDeleteRequest {
+
+    Shard shard = 1;
+    ObjectKey objectKey = 2;
+}
+
+message ObjectDeleteResponse {
+
+    enum Status {
+
+        DELETED = 0;
+    }
+    Status status = 1;
+}
+
 service ShardService {
 
     rpc Initialize(ShardInitializeRequest) returns (ShardInitializeResponse);
@@ -79,4 +94,6 @@ service ShardService {
     rpc Fetch(ObjectFetchRequest) returns (stream ObjectFetchResponse);
 
     rpc Append(stream ObjectAppendRequest) returns (ObjectAppendResponse);
+
+    rpc Delete(ObjectDeleteRequest) returns (ObjectDeleteResponse);
 }

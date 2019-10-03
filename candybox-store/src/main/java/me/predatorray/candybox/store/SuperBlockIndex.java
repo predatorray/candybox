@@ -17,6 +17,7 @@
 package me.predatorray.candybox.store;
 
 import me.predatorray.candybox.MagicNumber;
+import me.predatorray.candybox.ObjectFlags;
 import me.predatorray.candybox.ObjectKey;
 import me.predatorray.candybox.store.util.BackOffPolicy;
 import me.predatorray.candybox.store.util.ConcurrentUnidirectionalLinkedMap;
@@ -165,7 +166,9 @@ public class SuperBlockIndex extends AbstractCloseable {
     public void putInterruptibly(ObjectKey objectKey, BlockLocation locationStored, short flags)
             throws InterruptedException {
         Validations.notNull(objectKey);
-        Validations.notNull(locationStored);
+        if (locationStored == null && !ObjectFlags.isDeleted(flags)) {
+            throw new IllegalArgumentException("A location can only be null if its object is being deleted.");
+        }
         ensureNotClosed();
 
         ObjectEntry indexedEntry = new ObjectEntry(flags, locationStored);
@@ -218,7 +221,7 @@ public class SuperBlockIndex extends AbstractCloseable {
 
             try {
                 if (next == null) {
-                    next = inMemoryMappings.take(); // FIXME bug
+                    next = inMemoryMappings.take();
                 } else {
                     logger.info("Retrying the failed persistence");
                 }

@@ -24,6 +24,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.annotation.concurrent.GuardedBy;
+import javax.annotation.concurrent.ThreadSafe;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.nio.file.Path;
@@ -32,6 +33,7 @@ import java.util.Objects;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
+@ThreadSafe
 public class FsLocalShard implements LocalShard {
 
     public static final String INDEX_FILE_SUFFIX = ".idx";

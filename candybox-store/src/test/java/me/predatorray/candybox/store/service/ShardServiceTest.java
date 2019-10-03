@@ -19,8 +19,14 @@ package me.predatorray.candybox.store.service;
 import com.google.common.collect.Lists;
 import com.google.common.primitives.Bytes;
 import com.google.protobuf.ByteString;
+import io.grpc.ServerInterceptors;
 import io.grpc.stub.StreamObserver;
+import io.grpc.util.TransmitStatusRuntimeExceptionInterceptor;
 import me.predatorray.candybox.proto.CommonProtos;
+import me.predatorray.candybox.proto.CommonProtos.ObjectDeleteRequest;
+import me.predatorray.candybox.proto.CommonProtos.ObjectDeleteResponse;
+import me.predatorray.candybox.proto.CommonProtos.ObjectKey;
+import me.predatorray.candybox.proto.CommonProtos.Shard;
 import me.predatorray.candybox.proto.ShardServiceGrpc;
 import me.predatorray.candybox.store.SingleDataDirLocalShardManager;
 import me.predatorray.candybox.store.config.DefaultConfiguration;
@@ -59,7 +65,8 @@ public class ShardServiceTest extends AbstractGrpcService {
                 return Collections.singletonList(dataDirPath);
             }
         }));
-        grpcServerRule.getServiceRegistry().addService(srv);
+        grpcServerRule.getServiceRegistry().addService(ServerInterceptors.intercept(srv,
+            TransmitStatusRuntimeExceptionInterceptor.instance()));
     }
 
     private ShardServiceGrpc.ShardServiceBlockingStub newBlockingStub() {
@@ -187,5 +194,55 @@ public class ShardServiceTest extends AbstractGrpcService {
                 .map(res -> res.getBody().getData().toByteArray())
                 .toArray(byte[][]::new));
         assertArrayEquals(data, fetchedData);
+    }
+
+    @Test
+    public void initializeAppendDeleteAndFetch() throws Exception {
+        ShardServiceGrpc.ShardServiceStub sut = newStub();
+        ShardServiceGrpc.ShardServiceBlockingStub blockingSut = newBlockingStub();
+        final String boxName = "foobar";
+        final int offset = 0;
+        final String objectKey = "foobar";
+        final byte[] data = new byte[] {1, 2, 3};
+
+        // initialize
+        blockingSut.initialize(
+            CommonProtos.ShardInitializeRequest.newBuilder()
+                .setShard(CommonProtos.Shard.newBuilder().setBoxName(boxName).setOffset(offset))
+                .build());
+
+        // append
+        CompletableStreamObserver<CommonProtos.ObjectAppendResponse> observer = new CompletableStreamObserver<>();
+        StreamObserver<CommonProtos.ObjectAppendRequest> request = sut.append(observer);
+        request.onNext(CommonProtos.ObjectAppendRequest.newBuilder()
+            .setShard(CommonProtos.Shard.newBuilder()
+                .setBoxName(boxName).setOffset(offset))
+            .setObjectKey(CommonProtos.ObjectKey.newBuilder().setValue(objectKey))
+            .setBody(CommonProtos.Chunk.newBuilder().setData(ByteString.copyFrom(data)))
+            .build());
+        request.onCompleted();
+        CompletableFuture<List<CommonProtos.ObjectAppendResponse>> cf = observer.getCompletableFuture();
+        cf.get();
+
+        // delete
+        ObjectDeleteResponse deleteResponse = blockingSut.delete(ObjectDeleteRequest.newBuilder()
+            .setObjectKey(ObjectKey.newBuilder().setValue(objectKey))
+            .setShard(Shard.newBuilder().setBoxName(boxName).setOffset(offset))
+            .build());
+        assertEquals(ObjectDeleteResponse.Status.DELETED, deleteResponse.getStatus());
+
+        // fetch
+        Iterator<CommonProtos.ObjectFetchResponse> fetchResponseIt = blockingSut.fetch(
+            CommonProtos.ObjectFetchRequest.newBuilder()
+                .setShard(CommonProtos.Shard.newBuilder()
+                    .setBoxName(boxName).setOffset(offset))
+                .setObjectKey(CommonProtos.ObjectKey.newBuilder()
+                    .setValue(objectKey))
+                .build());
+        assertNotFoundStatusThrown(() -> {
+            while (fetchResponseIt.hasNext()) {
+                fetchResponseIt.next();
+            }
+        });
     }
 }

@@ -23,6 +23,7 @@ import me.predatorray.candybox.util.EncodingUtils;
 import me.predatorray.candybox.util.IOUtils;
 
 import java.io.DataInputStream;
+import java.io.EOFException;
 import java.io.IOException;
 
 public class SuperBlockInputStream extends InputStreamWrapper<DataInputStream> {
@@ -47,6 +48,19 @@ public class SuperBlockInputStream extends InputStreamWrapper<DataInputStream> {
         byte[] keyInBytes = new byte[keySize];
         getInputStream().readFully(keyInBytes);
         return new ObjectKey(keyInBytes);
+    }
+
+    public int readObjectKeySize() throws IOException {
+        Short sizeOrNone = IOUtils.readShortOrNone(getInputStream());
+        if (sizeOrNone == null) {
+            throw new EOFException();
+        }
+
+        int keySize = EncodingUtils.toUnsignedShort(sizeOrNone, true);
+        if (keySize <= 0) {
+            throw new MalformedBlockException("Non-positive key size: " + keySize);
+        }
+        return keySize;
     }
     
     public MagicNumber readMagicNumber() throws IOException {
