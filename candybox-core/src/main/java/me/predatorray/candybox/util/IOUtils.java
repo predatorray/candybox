@@ -144,6 +144,16 @@ public class IOUtils {
         };
     }
 
+    public static <T> java.util.function.Supplier<T> unchecked(IOUtils.Supplier<T> ioFunction) {
+        return () -> {
+            try {
+                return ioFunction.get();
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        };
+    }
+
     @FunctionalInterface
     public interface Supplier<T> {
 

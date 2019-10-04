@@ -16,6 +16,9 @@
 
 package me.predatorray.candybox.store.config;
 
+import me.predatorray.candybox.store.DataDirectoryAssignmentStrategies;
+import me.predatorray.candybox.store.DataDirectoryAssignmentStrategy;
+import me.predatorray.candybox.store.SingleDataDirLocalShardManager;
 import me.predatorray.candybox.store.util.BackOffPolicy;
 import me.predatorray.candybox.store.util.Base36Codec;
 import me.predatorray.candybox.store.util.ExponentialSleepBackOffPolicy;
@@ -82,6 +85,11 @@ public class DefaultConfiguration implements Configuration {
     @Override
     public BackOffPolicy getSuperBlockRecoveryBackOffPolicy() {
         return new ExponentialSleepBackOffPolicy(1, 1000);
+    }
+
+    @Override
+    public DataDirectoryAssignmentStrategy getDataDirectoryAssignmentStrategy(List<SingleDataDirLocalShardManager> managers) {
+        return DataDirectoryAssignmentStrategies.roundRobin(managers);
     }
 
     @Override

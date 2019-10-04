@@ -16,6 +16,7 @@
 
 package me.predatorray.candybox.util;
 
+import java.util.Collection;
 import java.util.function.Predicate;
 
 /**
@@ -76,6 +77,20 @@ public class Validations {
             throw new IllegalArgumentException("A non-negative number is required: " + n);
         }
         return n;
+    }
+
+    /**
+     * Validate if the collection is not empty, throws {@link IllegalArgumentException} if is or null.
+     * @param collection the collection to be validated
+     * @param <E> collect entity type
+     * @param <T> collection type
+     * @return the collection itself
+     */
+    public static <E, T extends Collection<E>> T notEmpty(T collection) {
+        if (collection == null || collection.isEmpty()) {
+            throw new IllegalArgumentException("The collection is empty or null.");
+        }
+        return collection;
     }
 
     /**

@@ -24,8 +24,6 @@ import me.predatorray.candybox.store.config.DefaultConfiguration;
 import me.predatorray.candybox.store.service.ShardService;
 
 import java.io.IOException;
-import java.nio.file.Path;
-import java.util.List;
 
 public class StoreServer {
 
@@ -52,12 +50,7 @@ public class StoreServer {
 
     public static void main(String[] args) throws Exception {
         try (Configuration configuration = new DefaultConfiguration()) {
-            List<Path> dataPaths = configuration.getDataDirectoryPaths();
-            if (dataPaths.size() != 1) {
-                throw new IllegalArgumentException("Only one data directory is supported by now.");
-            }
-
-            try (SingleDataDirLocalShardManager localShardManager = new SingleDataDirLocalShardManager(configuration)) {
+            try (MultipleDataDirShardManager localShardManager = new MultipleDataDirShardManager(configuration)) {
                 ShardService shardService = new ShardService(localShardManager);
                 StoreServer storeServer = new StoreServer(configuration.getRpcPort(), shardService);
                 storeServer.start();

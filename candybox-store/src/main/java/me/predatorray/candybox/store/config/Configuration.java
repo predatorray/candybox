@@ -16,6 +16,8 @@
 
 package me.predatorray.candybox.store.config;
 
+import me.predatorray.candybox.store.DataDirectoryAssignmentStrategy;
+import me.predatorray.candybox.store.SingleDataDirLocalShardManager;
 import me.predatorray.candybox.store.util.BackOffPolicy;
 import me.predatorray.candybox.store.util.FilenameSafeStringCodec;
 
@@ -41,6 +43,8 @@ public interface Configuration extends Closeable {
     BackOffPolicy getIndexPersistenceBackOffPolicy();
 
     BackOffPolicy getSuperBlockRecoveryBackOffPolicy();
+
+    DataDirectoryAssignmentStrategy getDataDirectoryAssignmentStrategy(List<SingleDataDirLocalShardManager> managers);
 
     // TODO get CRC32 checksum
 }

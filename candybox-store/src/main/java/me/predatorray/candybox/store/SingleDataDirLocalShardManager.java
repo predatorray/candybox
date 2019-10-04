@@ -17,6 +17,7 @@
 package me.predatorray.candybox.store;
 
 import me.predatorray.candybox.store.config.Configuration;
+import me.predatorray.candybox.store.util.DiskSpace;
 import me.predatorray.candybox.store.util.FilenameSafeStringCodec;
 import me.predatorray.candybox.util.IOUtils;
 import me.predatorray.candybox.util.Validations;
@@ -47,9 +48,9 @@ public class SingleDataDirLocalShardManager implements LocalShardManager {
 
     private final ConcurrentMap<ShardLocation, FsLocalShard> shardsByLocation = new ConcurrentHashMap<>();
 
-    public SingleDataDirLocalShardManager(Configuration configuration) {
+    public SingleDataDirLocalShardManager(Path dataDirectoryPath, Configuration configuration) {
         this.configuration = Objects.requireNonNull(configuration, "configuration must not be null");
-        this.dataDirPath = configuration.getDataDirectoryPaths().get(0); // TODO
+        this.dataDirPath = dataDirectoryPath;
         this.filenameCodec = configuration.getFilenameCodec();
     }
 
@@ -96,7 +97,7 @@ public class SingleDataDirLocalShardManager implements LocalShardManager {
 
     private Path getShardPath(String boxName, int offset) {
         String boxFilename = filenameCodec.encode(boxName);
-        return dataDirPath.resolve(boxFilename + "_" + Integer.toString(offset));
+        return dataDirPath.resolve(boxFilename + "_" + offset);
     }
 
     @Override
@@ -128,6 +129,10 @@ public class SingleDataDirLocalShardManager implements LocalShardManager {
         } catch (CandyBlockIOException e) {
             throw new UncheckedCandyBlockIOException(e);
         }
+    }
+
+    public DiskSpace getDiskSpace() {
+        return new DiskSpace(this.dataDirPath);
     }
 
     @Override
@@ -162,5 +167,10 @@ public class SingleDataDirLocalShardManager implements LocalShardManager {
         public int hashCode() {
             return Objects.hash(boxName, offset);
         }
+    }
+
+    @Override
+    public String toString() {
+        return dataDirPath.toString();
     }
 }

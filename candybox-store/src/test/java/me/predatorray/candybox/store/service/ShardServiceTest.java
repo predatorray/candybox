@@ -59,7 +59,7 @@ public class ShardServiceTest extends AbstractGrpcService {
         File dataDir = temporaryFolder.newFolder();
         Path dataDirPath = dataDir.toPath();
 
-        ShardService srv = new ShardService(new SingleDataDirLocalShardManager(new DefaultConfiguration() {
+        ShardService srv = new ShardService(new SingleDataDirLocalShardManager(dataDirPath, new DefaultConfiguration() {
             @Override
             public List<Path> getDataDirectoryPaths() {
                 return Collections.singletonList(dataDirPath);
