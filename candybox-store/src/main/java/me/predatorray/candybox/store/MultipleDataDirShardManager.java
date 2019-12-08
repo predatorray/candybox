@@ -10,6 +10,7 @@ import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import javax.annotation.concurrent.ThreadSafe;
 import me.predatorray.candybox.store.config.Configuration;
 import me.predatorray.candybox.util.IOUtils;
@@ -81,7 +82,7 @@ public class MultipleDataDirShardManager implements LocalShardManager {
   public Collection<? extends LocalShard> findAll() throws CandyBlockIOException {
     try {
       return managers.stream()
-          .flatMap(IOUtils.unchecked(m -> m.findAll().stream()))
+          .flatMap(IOUtils.unchecked((IOUtils.Function<SingleDataDirLocalShardManager, Stream<FsLocalShard>>) m -> m.findAll().stream()))
           .collect(Collectors.toList());
     } catch (UncheckedIOException e) {
       throw (CandyBlockIOException) e.getCause();

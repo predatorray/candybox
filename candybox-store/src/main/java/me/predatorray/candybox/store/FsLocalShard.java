@@ -16,6 +16,12 @@
 
 package me.predatorray.candybox.store;
 
+import com.google.common.annotations.VisibleForTesting;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.util.Comparator;
+import java.util.Optional;
+import java.util.function.Predicate;
 import me.predatorray.candybox.store.config.Configuration;
 import me.predatorray.candybox.store.util.BackOffPolicy;
 import me.predatorray.candybox.store.util.Retry;
@@ -55,13 +61,37 @@ public class FsLocalShard implements LocalShard {
     private final Object appendMonitor = new Object();
 
     @GuardedBy("superBlockAndIndexGenLock")
+    private BigInteger generation;
+    @GuardedBy("superBlockAndIndexGenLock")
     private SuperBlock block;
     @GuardedBy("superBlockAndIndexGenLock")
     private SuperBlockIndex index;
 
     static FsLocalShard restore(Path shardPath, String boxName, int offset,
                                 Configuration configuration) throws IOException {
-        return new FsLocalShard(shardPath, boxName, offset, BigInteger.ZERO, configuration); // TODO get current gen
+        Optional<Path> minBlockPathOpt = Files.list(shardPath)
+            .filter(p -> p.endsWith(BLOCK_FILE_SUFFIX))
+            .min(Comparator.comparing(FsLocalShard::superBlockGeneration));
+
+        BigInteger currentGeneration;
+        if (!minBlockPathOpt.isPresent()) {
+            logger.debug("Since no super block file found with suffix '" + BLOCK_FILE_SUFFIX +
+                "' under the shard directory: {}, ZERO is used as the current generation.", shardPath);
+            currentGeneration = BigInteger.ZERO;
+        } else {
+            Path currentSuperBlockPath = minBlockPathOpt.get();
+            currentGeneration = superBlockGeneration(currentSuperBlockPath);
+            logger.debug("The current super block file ({} th generation) is found on path '{}'.", currentGeneration, currentSuperBlockPath);
+        }
+
+        try {
+            Files.list(shardPath)
+                .filter(new IsBlockOrIndexButNotOfGeneration(currentGeneration))
+                .forEach(IOUtils.unchecked(Files::delete));
+        } catch (UncheckedIOException unchecked) {
+            throw unchecked.getCause();
+        }
+        return new FsLocalShard(shardPath, boxName, offset, currentGeneration, configuration);
     }
 
     FsLocalShard(Path shardPath, String boxName, int offset, BigInteger generation, Configuration configuration)
@@ -69,18 +99,16 @@ public class FsLocalShard implements LocalShard {
         this.shardPath = shardPath;
         this.boxName = boxName;
         this.offset = offset;
+        this.generation = generation;
 
-        String generationFilename = generation.toString();
-        Path idxFilePath = shardPath.resolve(generationFilename + INDEX_FILE_SUFFIX);
-        Path cbxFilePath = shardPath.resolve(generationFilename + BLOCK_FILE_SUFFIX);
+        Path idxFilePath = idxFilePath(shardPath, generation);
+        Path cbxFilePath = cbxFilePath(shardPath, generation);
 
         block = SuperBlock.createIfNotExists(cbxFilePath);
         index = SuperBlockIndex.restoreSuperBlockIndex(idxFilePath, block, configuration.getIndexCapacity(),
                 configuration.getIndexPersistenceThreadPool(), configuration.getIndexPersistenceBackOffPolicy());
 
         this.superBlockRecoveryBackOffPolicy = configuration.getSuperBlockRecoveryBackOffPolicy();
-
-        // TODO find index and block file
     }
 
     @Override
@@ -106,6 +134,11 @@ public class FsLocalShard implements LocalShard {
     @Override
     public SuperBlock block() {
         return block;
+    }
+
+    @VisibleForTesting
+    BigInteger getGeneration() {
+        return generation;
     }
 
     @Override
@@ -147,6 +180,7 @@ public class FsLocalShard implements LocalShard {
                     }
                     callback.onError(e);
                     // TODO: trigger a jvm shutdown or a stop-world self-healing
+                    System.exit(2);
                     return;
                 }
             } finally {
@@ -196,6 +230,7 @@ public class FsLocalShard implements LocalShard {
         Snapshot() {
             superBlockAndIndexGenReadLock.lock();
             try {
+                logger.debug("The {} th generation snapshot is taken.", FsLocalShard.this.generation);
                 this.block = FsLocalShard.this.block;
                 this.index = FsLocalShard.this.index;
             } finally {
@@ -230,6 +265,43 @@ public class FsLocalShard implements LocalShard {
             if (closed) {
                 throw new IllegalStateException("The snapshot has already been closed.");
             }
+        }
+    }
+
+    private static BigInteger superBlockGeneration(Path superBlockPath) {
+        String superBlockFileName = superBlockPath.getFileName().toString();
+        if (!superBlockFileName.endsWith(BLOCK_FILE_SUFFIX)) {
+            throw new IllegalArgumentException("The file name does not end with " + BLOCK_FILE_SUFFIX);
+        }
+        return new BigInteger(superBlockFileName.substring(0, superBlockFileName.length() - BLOCK_FILE_SUFFIX.length()));
+    }
+
+    private static Path idxFilePath(Path shardPath, BigInteger generation) {
+        return shardPath.resolve(generation.toString() + INDEX_FILE_SUFFIX);
+    }
+
+    private static Path cbxFilePath(Path shardPath, BigInteger generation) {
+        return shardPath.resolve(generation.toString() + BLOCK_FILE_SUFFIX);
+    }
+
+    private static class IsBlockOrIndexButNotOfGeneration implements Predicate<Path> {
+
+        private final String generation;
+
+        IsBlockOrIndexButNotOfGeneration(BigInteger generation) {
+            this.generation = generation.toString();
+        }
+
+        @Override
+        public boolean test(Path path) {
+            String fileName = path.getFileName().toString();
+            if (fileName.endsWith(INDEX_FILE_SUFFIX)) {
+                return !generation.equals(fileName.substring(0, fileName.length() - INDEX_FILE_SUFFIX.length()));
+            }
+            if (fileName.endsWith(BLOCK_FILE_SUFFIX)) {
+                return !generation.equals(fileName.substring(0, fileName.length() - BLOCK_FILE_SUFFIX.length()));
+            }
+            return false;
         }
     }
 }

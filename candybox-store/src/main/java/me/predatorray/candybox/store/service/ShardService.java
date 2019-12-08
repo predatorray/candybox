@@ -195,6 +195,10 @@ public class ShardService extends ShardServiceGrpc.ShardServiceImplBase {
                 logger.error(errorMessage, e);
                 throw new StatusRuntimeException(Status.INTERNAL);
             }
+            if (ObjectFlags.isDeleted(candyBlock.getFlags())) {
+                logger.debug("Object named {} is not found due to the candy block returned being marked as deleted.", objectKey);
+                throw new StatusRuntimeException(Status.NOT_FOUND);
+            }
             return candyBlock;
         }
     }

@@ -30,6 +30,8 @@ import java.math.BigInteger;
 import java.util.concurrent.ForkJoinPool;
 
 import static org.junit.Assert.assertArrayEquals;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 public class FsLocalShardTest {
@@ -64,5 +66,30 @@ public class FsLocalShardTest {
             byte[] actualData = ByteBufferTestSupport.toByteArray(candyBlock.getObjectDataMaps());
             assertArrayEquals(data, actualData);
         }
+    }
+
+    @Test
+    public void testMultipleGenerationsFound() throws Exception {
+        final BigInteger firstGen = BigInteger.ZERO;
+        final BigInteger nextGen = firstGen.add(BigInteger.ONE);
+        File shardDir = temporaryFolder.newFolder();
+
+        File firstGenBlockFile = new File(shardDir, firstGen + FsLocalShard.BLOCK_FILE_SUFFIX);
+        File firstGenIdxFile = new File(shardDir, firstGen + FsLocalShard.INDEX_FILE_SUFFIX);
+        assertTrue(firstGenBlockFile.createNewFile());
+        assertTrue(firstGenIdxFile.createNewFile());
+
+        File nextGenBlockFile = new File(shardDir, nextGen + FsLocalShard.BLOCK_FILE_SUFFIX);
+        File nextGenIdxFile = new File(shardDir, nextGen + FsLocalShard.INDEX_FILE_SUFFIX);
+        assertTrue(nextGenBlockFile.createNewFile());
+        assertTrue(nextGenIdxFile.createNewFile());
+
+        FsLocalShard restored = FsLocalShard.restore(shardDir.toPath(), "foobar", 0, new DefaultConfiguration());
+        assertEquals(firstGen, restored.getGeneration());
+
+        assertTrue(firstGenBlockFile.exists());
+        assertTrue(firstGenIdxFile.exists());
+        assertFalse(nextGenBlockFile.exists());
+        assertFalse(nextGenIdxFile.exists());
     }
 }

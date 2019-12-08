@@ -91,7 +91,7 @@ public class SingleDataDirLocalShardManager implements LocalShardManager {
             throw new ShardNotFoundException(boxName, offset);
         }
 
-        return shardsByLocation.computeIfAbsent(shardLocation, IOUtils.unchecked(
+        return shardsByLocation.computeIfAbsent(shardLocation, IOUtils.unchecked((IOUtils.Function<ShardLocation, FsLocalShard>)
                 (it) -> FsLocalShard.restore(shardPath, boxName, offset, configuration)));
     }
 

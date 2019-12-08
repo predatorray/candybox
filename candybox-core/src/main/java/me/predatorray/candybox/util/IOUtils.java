@@ -154,6 +154,16 @@ public class IOUtils {
         };
     }
 
+    public static <T> java.util.function.Consumer<T> unchecked(IOUtils.Consumer<T> ioFunction) {
+        return (t) -> {
+            try {
+                ioFunction.accept(t);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        };
+    }
+
     @FunctionalInterface
     public interface Supplier<T> {
 
@@ -170,5 +180,11 @@ public class IOUtils {
     public interface Function<T, R> {
 
         R apply(T t) throws IOException;
+    }
+
+    @FunctionalInterface
+    public interface Consumer<T> {
+
+        void accept(T t) throws IOException;
     }
 }
