@@ -1,0 +1,6 @@
+target/
+*.class
+*.log
+
+# OS / editor cruft
+.DS_Store

@@ -1,0 +1,124 @@
+package me.predatorray.candybox.protocol;
+
+import java.util.List;
+import java.util.Map;
+
+/**
+ * The typed protocol messages, mapped to/from {@link Frame}s by {@link MessageCodec}. A sealed
+ * hierarchy so the codec's dispatch is exhaustive.
+ *
+ * <p>Phase 2 scaffold: these define the wire contract for the full v1 client API. Large-object
+ * streaming (chunked PUT/GET bodies rather than the inlined {@code data} here) is TODO(phase-2);
+ * the records carry inline bytes for now so small objects round-trip.
+ */
+public sealed interface Message {
+
+    /** The opcode that identifies this message on the wire. */
+    Opcode opcode();
+
+    // ---- Box admin requests ----------------------------------------------------------------
+
+    record CreateBoxRequest(String box) implements Message {
+        public Opcode opcode() {
+            return Opcode.CREATE_BOX;
+        }
+    }
+
+    record DeleteBoxRequest(String box, boolean force) implements Message {
+        public Opcode opcode() {
+            return Opcode.DELETE_BOX;
+        }
+    }
+
+    record ListBoxesRequest() implements Message {
+        public Opcode opcode() {
+            return Opcode.LIST_BOXES;
+        }
+    }
+
+    record HeadBoxRequest(String box) implements Message {
+        public Opcode opcode() {
+            return Opcode.HEAD_BOX;
+        }
+    }
+
+    // ---- Candy requests --------------------------------------------------------------------
+
+    record PutCandyRequest(String box, String key, String contentType,
+                           Map<String, String> userMetadata, String idempotencyToken,
+                           byte[] data) implements Message {
+        public Opcode opcode() {
+            return Opcode.PUT_CANDY;
+        }
+    }
+
+    record GetCandyRequest(String box, String key) implements Message {
+        public Opcode opcode() {
+            return Opcode.GET_CANDY;
+        }
+    }
+
+    record HeadCandyRequest(String box, String key) implements Message {
+        public Opcode opcode() {
+            return Opcode.HEAD_CANDY;
+        }
+    }
+
+    record DeleteCandyRequest(String box, String key) implements Message {
+        public Opcode opcode() {
+            return Opcode.DELETE_CANDY;
+        }
+    }
+
+    record ListCandiesRequest(String box, String prefix, String startAfter, int maxKeys)
+            implements Message {
+        public Opcode opcode() {
+            return Opcode.LIST_CANDIES;
+        }
+    }
+
+    // ---- Responses -------------------------------------------------------------------------
+
+    record OkResponse() implements Message {
+        public Opcode opcode() {
+            return Opcode.RESPONSE_OK;
+        }
+    }
+
+    record ErrorResponse(String errorType, String message) implements Message {
+        public Opcode opcode() {
+            return Opcode.RESPONSE_ERROR;
+        }
+    }
+
+    /** Retriable backpressure signal (write-stall). */
+    record BusyResponse(long retryAfterMillis) implements Message {
+        public Opcode opcode() {
+            return Opcode.RESPONSE_BUSY;
+        }
+    }
+
+    record NotFoundResponse() implements Message {
+        public Opcode opcode() {
+            return Opcode.RESPONSE_NOT_FOUND;
+        }
+    }
+
+    record CandyDataResponse(long contentLength, String contentType,
+                             Map<String, String> userMetadata, int crc32c, byte[] data)
+            implements Message {
+        public Opcode opcode() {
+            return Opcode.RESPONSE_CANDY_DATA;
+        }
+    }
+
+    record ListCandiesResponse(List<ListedCandy> entries, String nextStartAfter) implements Message {
+        public Opcode opcode() {
+            return Opcode.RESPONSE_LIST;
+        }
+    }
+
+    /** One row in a {@link ListCandiesResponse}. */
+    record ListedCandy(String key, long contentLength, long createdAtMillis) {
+    }
+}

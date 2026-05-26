@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>me.predatorray.candybox</groupId>
+        <artifactId>candybox-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>candybox-integration-tests</artifactId>
+    <name>Candybox :: Integration Tests</name>
+    <description>End-to-end tests on embedded BookKeeper (LocalBookKeeper) + in-process ZooKeeper (curator TestingServer). No external services or Docker.</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>me.predatorray.candybox</groupId>
+            <artifactId>candybox-common</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>me.predatorray.candybox</groupId>
+            <artifactId>candybox-bookkeeper</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>me.predatorray.candybox</groupId>
+            <artifactId>candybox-coordination</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>me.predatorray.candybox</groupId>
+            <artifactId>candybox-lsm</artifactId>
+        </dependency>
+
+        <!-- Reuse the shared LedgerStore contract suite against the real BookKeeper-backed store. -->
+        <dependency>
+            <groupId>me.predatorray.candybox</groupId>
+            <artifactId>candybox-bookkeeper</artifactId>
+            <version>${project.version}</version>
+            <type>test-jar</type>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Real backend, exercised only here. Embedded BookKeeper bundles an in-JVM ZooKeeper. -->
+        <dependency>
+            <groupId>org.apache.bookkeeper</groupId>
+            <artifactId>bookkeeper-server</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- The embedded ZooKeeper server (3.9.x) needs Dropwizard metrics-core at runtime, which
+             bookkeeper-server does not pull transitively. Only needed to run the embedded cluster. -->
+        <dependency>
+            <groupId>io.dropwizard.metrics</groupId>
+            <artifactId>metrics-core</artifactId>
+            <version>4.2.25</version>
+            <scope>test</scope>
+        </dependency>
+        <!-- ZooKeeper's snapshot/txnlog uses snappy-java; also not pulled transitively here. -->
+        <dependency>
+            <groupId>org.xerial.snappy</groupId>
+            <artifactId>snappy-java</artifactId>
+            <version>1.1.10.5</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- Integration tests are *IT.java and run under `mvn verify` (failsafe), not `mvn test`.
+                 This keeps `mvn test` fast and dependency-free while still exercising real ledgers in CI. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <skipTests>true</skipTests>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <!-- BookKeeper/ZooKeeper reach into JDK internals (e.g. PageCacheUtil reflects
+                         into java.io.FileDescriptor); open them up on modern JDKs. -->
+                    <argLine>
+                        --add-opens java.base/java.lang=ALL-UNNAMED
+                        --add-opens java.base/java.io=ALL-UNNAMED
+                        --add-opens java.base/java.nio=ALL-UNNAMED
+                        --add-opens java.base/sun.nio.ch=ALL-UNNAMED
+                        --add-opens java.base/java.util=ALL-UNNAMED
+                        --add-opens java.base/java.util.concurrent=ALL-UNNAMED
+                    </argLine>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

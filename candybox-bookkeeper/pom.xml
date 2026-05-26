@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>me.predatorray.candybox</groupId>
+        <artifactId>candybox-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>candybox-bookkeeper</artifactId>
+    <name>Candybox :: BookKeeper SPI</name>
+    <description>Narrow LedgerStore SPI over Apache BookKeeper plus an in-memory fake. The only module that touches the raw BookKeeper client.</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>me.predatorray.candybox</groupId>
+            <artifactId>candybox-common</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.bookkeeper</groupId>
+            <artifactId>bookkeeper-server</artifactId>
+            <!-- Provided at runtime by the server/integration modules; the SPI compiles against it
+                 but the in-memory fake (used by all unit tests) needs none of it. -->
+            <optional>true</optional>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- Publish the shared LedgerStoreContract as a test-jar so candybox-integration-tests can
+                 run the very same suite against the real BookKeeper-backed store. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>test-jar</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
