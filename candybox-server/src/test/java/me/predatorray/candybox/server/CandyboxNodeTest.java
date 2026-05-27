@@ -158,6 +158,49 @@ class CandyboxNodeTest {
         store.close();
     }
 
+    @Test
+    void gcDeletesLedgersOfCompactedInputs() {
+        CandyboxConfig cfg = CandyboxConfig.builder()
+                .memtableFlushThresholdBytes(1)
+                .l0CompactionTrigger(3)
+                .l0StallThreshold(100)
+                .ledgerGcGraceMillis(0) // delete obsolete ledgers immediately
+                .build();
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        try (CandyboxNode node = new CandyboxNode(1, cfg, store, new InMemoryCoordinationService(),
+                new ManualClock(1000))) {
+            node.createBox(BoxName.of("my-box"));
+            RequestHandler handler = node.requestHandler();
+            for (int i = 0; i < 5; i++) {
+                roundTrip(handler, put("my-box", "key-" + i));
+            }
+
+            java.util.Set<Long> inputLedgerIds = new java.util.HashSet<>();
+            for (var table : node.engine(BoxName.of("my-box")).manifestState().level0()) {
+                inputLedgerIds.add(table.ledgerId());
+            }
+            assertThat(inputLedgerIds.size()).isGreaterThanOrEqualTo(3);
+            assertThat(store.listLedgers()).containsAll(inputLedgerIds);
+
+            // Compaction merges L0 into L1 (inputs leave the committed manifest)...
+            node.compactOwnedBoxesOnce();
+            assertThat(node.engine(BoxName.of("my-box")).manifestState().level0()).isEmpty();
+            assertThat(store.listLedgers()).containsAll(inputLedgerIds); // not deleted yet
+
+            // ...then GC physically deletes the obsolete input ledgers.
+            int deleted = node.collectGarbageOnce();
+            assertThat(deleted).isEqualTo(inputLedgerIds.size());
+            assertThat(store.listLedgers()).doesNotContainAnyElementsOf(inputLedgerIds);
+
+            // The data is still readable from the merged L1 table.
+            for (int i = 0; i < 5; i++) {
+                assertThat(roundTrip(handler, new Message.GetCandyRequest("my-box", "key-" + i)))
+                        .isInstanceOf(Message.CandyDataResponse.class);
+            }
+        }
+        store.close();
+    }
+
     private static Message put(String box, String key) {
         return new Message.PutCandyRequest(box, key, null, Map.of(), null,
                 "v".getBytes(StandardCharsets.UTF_8));

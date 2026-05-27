@@ -47,6 +47,7 @@ public final class CandyboxNode implements AutoCloseable {
     private final ScheduledExecutorService leaseHeartbeat;
     private final ScheduledExecutorService compactionWorker;
     private final CompactionService compactionService;
+    private final GarbageCollector garbageCollector;
 
     /** Bounded compaction passes per Box per worker tick, so one Box cannot starve the others. */
     private static final int MAX_COMPACTIONS_PER_TICK = 8;
@@ -74,6 +75,7 @@ public final class CandyboxNode implements AutoCloseable {
         this.clock = clock;
         coordination.registerMember(nodeId, advertisedAddress.getBytes(StandardCharsets.UTF_8));
         this.compactionService = new CompactionService(ledgerStore, config, clock);
+        this.garbageCollector = new GarbageCollector(ledgerStore, config.ledgerGcGraceMillis(), clock);
 
         long renewInterval = config.leaseRenewIntervalMillis();
         if (renewInterval > 0) {
@@ -87,11 +89,17 @@ public final class CandyboxNode implements AutoCloseable {
         long compactionInterval = config.compactionIntervalMillis();
         if (compactionInterval > 0) {
             this.compactionWorker = daemonScheduler("candybox-compaction-" + nodeId);
-            this.compactionWorker.scheduleWithFixedDelay(this::compactOwnedBoxesOnce, compactionInterval,
+            this.compactionWorker.scheduleWithFixedDelay(this::runMaintenance, compactionInterval,
                     compactionInterval, TimeUnit.MILLISECONDS);
         } else {
             this.compactionWorker = null;
         }
+    }
+
+    /** One background maintenance tick: compact owned Boxes, then GC their obsoleted ledgers. */
+    private void runMaintenance() {
+        compactOwnedBoxesOnce();
+        collectGarbageOnce();
     }
 
     private static ScheduledExecutorService daemonScheduler(String name) {
@@ -242,6 +250,29 @@ public final class CandyboxNode implements AutoCloseable {
             }
         }
         return performed;
+    }
+
+    /**
+     * Runs one GC pass over every Box this node owns, deleting SSTable ledgers obsoleted by committed
+     * compactions past the grace period. Package-visible for deterministic tests.
+     *
+     * @return the number of ledgers deleted
+     */
+    int collectGarbageOnce() {
+        int deleted = 0;
+        for (BoxOwnership ownership : boxes.values()) {
+            if (!ownership.isOwner()) {
+                continue;
+            }
+            try {
+                deleted += garbageCollector.collect(ownership.engine());
+            } catch (NotOwnerException lostOwnership) {
+                LOG.info("Skipping GC of a box on node {}: {}", nodeId, lostOwnership.getMessage());
+            } catch (RuntimeException e) {
+                LOG.warn("GC error on node {}", nodeId, e);
+            }
+        }
+        return deleted;
     }
 
     @Override

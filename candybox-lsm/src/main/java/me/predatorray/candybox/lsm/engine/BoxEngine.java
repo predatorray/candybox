@@ -84,6 +84,9 @@ public final class BoxEngine implements AutoCloseable {
     private WriteAheadLog wal;
     private final ConcurrentMap<Long, SSTableReader> readers = new ConcurrentHashMap<>();
 
+    // SSTable ledgers dropped by a committed compaction, awaiting physical deletion by GC: id -> when.
+    private final ConcurrentMap<Long, Long> obsoleteSSTables = new ConcurrentHashMap<>();
+
     // Bounded idempotency cache: token -> already-applied result, so a retried put is a no-op.
     private final Map<String, CandyMetadata> idempotencyCache = Collections.synchronizedMap(
             new LinkedHashMap<>(16, 0.75f, true) {
@@ -348,24 +351,46 @@ public final class BoxEngine implements AutoCloseable {
 
     /**
      * Commits a compaction's manifest edit (swap inputs for output) and refreshes the SSTable readers.
-     * Physical deletion of the obsoleted input ledgers is GC's job (Phase 3).
+     * The removed input ledgers are recorded as obsolete (with the time they left the committed
+     * manifest) for GC to delete after the grace period; physical deletion is GC's job.
      */
     public void applyCompaction(ManifestEdit edit) {
         lock.writeLock().lock();
         try {
-            manifest.apply(edit);
+            manifest.apply(edit); // fencing-gated: throws if this owner has been superseded
             for (SSTableMeta added : edit.addedTables()) {
                 readers.computeIfAbsent(added.ledgerId(), id -> new SSTableReader(ledgerStore, id));
             }
+            long now = clock.currentTimeMillis();
             for (Long removed : edit.removedTableLedgerIds()) {
                 SSTableReader r = readers.remove(removed);
                 if (r != null) {
                     r.close();
                 }
+                obsoleteSSTables.put(removed, now);
             }
         } finally {
             lock.writeLock().unlock();
         }
+    }
+
+    /**
+     * SSTable ledger ids dropped by a committed compaction at or before {@code asOfMillis} and not yet
+     * physically deleted — the GC reclaim set for this Box.
+     */
+    public java.util.List<Long> reclaimableSSTables(long asOfMillis) {
+        java.util.List<Long> ids = new java.util.ArrayList<>();
+        for (Map.Entry<Long, Long> e : obsoleteSSTables.entrySet()) {
+            if (e.getValue() <= asOfMillis) {
+                ids.add(e.getKey());
+            }
+        }
+        return ids;
+    }
+
+    /** Drops a ledger id from the obsolete set once GC has physically deleted it. */
+    public void forgetObsoleteSSTable(long ledgerId) {
+        obsoleteSSTables.remove(ledgerId);
     }
 
     /** A consistent snapshot of the current LSM state (for compaction picking / inspection). */

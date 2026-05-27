@@ -39,3 +39,21 @@ compaction in the background and reclaims obsoleted ledgers.
 - `CandyboxNode` runs a background compaction worker (`compactionIntervalMillis`, `0` disables) over
   owned Boxes via `CompactionService`; `compactOwnedBoxesOnce()` is exposed for deterministic tests.
   A commit by a node that has lost ownership is rejected by the manifest fence and skipped.
+
+## WS2 status (this change)
+
+Reference-counted GC of obsoleted SSTable ledgers:
+- `BoxEngine.applyCompaction` records each removed input ledger (with the time it left the committed
+  manifest) in a pending-deletion set; `reclaimableSSTables(asOf)` / `forgetObsoleteSSTable(id)` expose it.
+- `GarbageCollector.collect(engine)` deletes reclaimable ledgers past `ledgerGcGraceMillis` via
+  `LedgerStore.deleteLedger` (idempotent on already-gone ledgers).
+- `CandyboxNode` owns a `GarbageCollector`; the background worker now compacts then GCs each tick
+  (`runMaintenance`), and `collectGarbageOnce()` is exposed for tests. GC runs only for Boxes this node
+  still owns, so the physical delete is gated on the owner's lease (the inputs are already out of the
+  fenced, committed manifest).
+- New `CandyboxConfig.ledgerGcGraceMillis` (default 5 min).
+
+Known v1 limitation: the pending-deletion set is in-memory, so input ledgers removed by a prior owner
+that crashed before GC leak until an enumeration backstop is added (future). Tests: `CandyboxNodeTest`
+adds a GC pass that deletes compacted input ledgers (verified via `LedgerStore.listLedgers`) while data
+stays readable. `mvn test` and `mvn verify` (22 ITs) pass.

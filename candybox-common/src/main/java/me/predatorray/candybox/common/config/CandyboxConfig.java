@@ -23,6 +23,7 @@ public final class CandyboxConfig {
     private final long compactionIntervalMillis;
     private final long maxClockSkewMillis;
     private final long tombstoneGcGraceMillis;
+    private final long ledgerGcGraceMillis;
     private final int l0CompactionTrigger;
     private final int l0StallThreshold;
 
@@ -39,6 +40,7 @@ public final class CandyboxConfig {
         this.compactionIntervalMillis = b.compactionIntervalMillis;
         this.maxClockSkewMillis = b.maxClockSkewMillis;
         this.tombstoneGcGraceMillis = b.tombstoneGcGraceMillis;
+        this.ledgerGcGraceMillis = b.ledgerGcGraceMillis;
         this.l0CompactionTrigger = b.l0CompactionTrigger;
         this.l0StallThreshold = b.l0StallThreshold;
     }
@@ -102,6 +104,11 @@ public final class CandyboxConfig {
         return tombstoneGcGraceMillis;
     }
 
+    /** Grace period before an obsoleted ledger (compaction input, dead Syrup) is physically deleted. */
+    public long ledgerGcGraceMillis() {
+        return ledgerGcGraceMillis;
+    }
+
     /** Number of L0 SSTables that triggers a compaction. */
     public int l0CompactionTrigger() {
         return l0CompactionTrigger;
@@ -125,6 +132,7 @@ public final class CandyboxConfig {
         private long compactionIntervalMillis = 0L;            // background compaction; 0 disables
         private long maxClockSkewMillis = 300_000L;            // 5 min HLC skew bound
         private long tombstoneGcGraceMillis = 24L * 3600 * 1000; // 24h late-write window
+        private long ledgerGcGraceMillis = 300_000L;           // 5 min before deleting obsolete ledgers
         private int l0CompactionTrigger = 4;
         private int l0StallThreshold = 12;
 
@@ -185,6 +193,11 @@ public final class CandyboxConfig {
 
         public Builder tombstoneGcGraceMillis(long v) {
             this.tombstoneGcGraceMillis = v;
+            return this;
+        }
+
+        public Builder ledgerGcGraceMillis(long v) {
+            this.ledgerGcGraceMillis = v;
             return this;
         }
 
