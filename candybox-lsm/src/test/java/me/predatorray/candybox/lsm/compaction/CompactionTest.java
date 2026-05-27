@@ -117,6 +117,7 @@ class CompactionTest {
     }
 
     private static SSTableMeta meta(long id, int level, long sizeBytes) {
-        return new SSTableMeta(id, level, CandyKey.of("a"), CandyKey.of("z"), 1, sizeBytes);
+        return new SSTableMeta(id, level, CandyKey.of("a"), CandyKey.of("z"), 1, sizeBytes,
+                java.util.Set.of());
     }
 }

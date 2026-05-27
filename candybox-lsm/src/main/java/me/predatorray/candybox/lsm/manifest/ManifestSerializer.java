@@ -70,6 +70,7 @@ public final class ManifestSerializer {
         w.writeBytes(t.maxKey().utf8Bytes());
         w.writeVarLong(t.entryCount());
         w.writeVarLong(t.sizeBytes());
+        writeLongSet(w, t.referencedSyrups());
     }
 
     private static SSTableMeta readTable(BinaryReader r) {
@@ -79,7 +80,8 @@ public final class ManifestSerializer {
         CandyKey maxKey = CandyKey.ofUtf8(r.readBytes());
         long entryCount = r.readVarLong();
         long sizeBytes = r.readVarLong();
-        return new SSTableMeta(ledgerId, level, minKey, maxKey, entryCount, sizeBytes);
+        Set<Long> referencedSyrups = readLongSet(r);
+        return new SSTableMeta(ledgerId, level, minKey, maxKey, entryCount, sizeBytes, referencedSyrups);
     }
 
     private static void writeLongSet(BinaryWriter w, Set<Long> set) {

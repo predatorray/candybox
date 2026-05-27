@@ -65,6 +65,15 @@ public final class ManifestState {
         return liveSyrups;
     }
 
+    /** Syrups currently referenced by some SSTable's locators (union over all tables). */
+    public Set<Long> referencedSyrups() {
+        Set<Long> referenced = new LinkedHashSet<>();
+        for (SSTableMeta t : tables) {
+            referenced.addAll(t.referencedSyrups());
+        }
+        return referenced;
+    }
+
     /** Current WAL ledger id, or {@code -1} if none recorded yet. */
     public long walLedgerId() {
         return walLedgerId;

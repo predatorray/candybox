@@ -201,8 +201,58 @@ class CandyboxNodeTest {
         store.close();
     }
 
+    @Test
+    void gcReclaimsOrphanedSyrupsAfterOverwrite() {
+        CandyboxConfig cfg = CandyboxConfig.builder()
+                .memtableFlushThresholdBytes(1) // each put flushes
+                .syrupRolloverBytes(1)          // each Candy lands in its own Syrup
+                .l0CompactionTrigger(2)
+                .l0StallThreshold(100)
+                .ledgerGcGraceMillis(0)
+                .build();
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        try (CandyboxNode node = new CandyboxNode(1, cfg, store, new InMemoryCoordinationService(),
+                new ManualClock(1000))) {
+            node.createBox(BoxName.of("my-box"));
+            RequestHandler handler = node.requestHandler();
+
+            // Two versions of the same key => two Syrups, two L0 tables.
+            roundTrip(handler, putValue("my-box", "k", "v1"));
+            roundTrip(handler, putValue("my-box", "k", "v2"));
+
+            java.util.Set<Long> liveBefore =
+                    new java.util.HashSet<>(node.engine(BoxName.of("my-box")).manifestState().liveSyrups());
+            assertThat(liveBefore).hasSize(2);
+
+            // Compaction keeps only v2 (S2); the v1 Syrup (S1) becomes unreferenced.
+            node.compactOwnedBoxesOnce();
+            java.util.Set<Long> referenced =
+                    node.engine(BoxName.of("my-box")).manifestState().referencedSyrups();
+            assertThat(referenced).hasSize(1);
+            java.util.Set<Long> orphan = new java.util.HashSet<>(liveBefore);
+            orphan.removeAll(referenced);
+            assertThat(orphan).hasSize(1);
+            assertThat(store.listLedgers()).containsAll(orphan); // not deleted yet
+
+            // GC reclaims the orphaned Syrup; the referenced one survives and data is intact.
+            int deleted = node.collectGarbageOnce();
+            assertThat(deleted).isGreaterThanOrEqualTo(1);
+            assertThat(store.listLedgers()).doesNotContainAnyElementsOf(orphan);
+            assertThat(store.listLedgers()).containsAll(referenced);
+
+            Message get = roundTrip(handler, new Message.GetCandyRequest("my-box", "k"));
+            assertThat(new String(((Message.CandyDataResponse) get).data(), StandardCharsets.UTF_8))
+                    .isEqualTo("v2");
+        }
+        store.close();
+    }
+
     private static Message put(String box, String key) {
+        return putValue(box, key, "v");
+    }
+
+    private static Message putValue(String box, String key, String value) {
         return new Message.PutCandyRequest(box, key, null, Map.of(), null,
-                "v".getBytes(StandardCharsets.UTF_8));
+                value.getBytes(StandardCharsets.UTF_8));
     }
 }

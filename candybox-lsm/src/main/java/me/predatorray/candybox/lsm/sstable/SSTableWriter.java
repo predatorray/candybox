@@ -2,12 +2,15 @@ package me.predatorray.candybox.lsm.sstable;
 
 import java.util.ArrayList;
 import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 import me.predatorray.candybox.bookkeeper.LedgerConfig;
 import me.predatorray.candybox.bookkeeper.LedgerStore;
 import me.predatorray.candybox.bookkeeper.WritableLedger;
 import me.predatorray.candybox.common.CandyKey;
 import me.predatorray.candybox.common.Mutation;
+import me.predatorray.candybox.common.SegmentRef;
 import me.predatorray.candybox.common.bloom.BloomFilter;
 import me.predatorray.candybox.common.serial.BinaryWriter;
 import me.predatorray.candybox.common.serial.MutationSerializer;
@@ -57,10 +60,14 @@ public final class SSTableWriter {
         byte[] maxKey = null;
         long numEntries = 0;
         long sizeBytes = 0;
+        Set<Long> referencedSyrups = new LinkedHashSet<>();
 
         while (sorted.hasNext()) {
             Mutation m = sorted.next();
             byte[] keyBytes = m.key().utf8Bytes();
+            for (SegmentRef seg : m.locator().segments()) {
+                referencedSyrups.add(seg.syrupId());
+            }
             byte[] mb = MutationSerializer.serialize(m);
 
             if (blockBytes > 0 && blockBytes + mb.length + 5 > dataBlockTargetBytes) {
@@ -99,7 +106,7 @@ public final class SSTableWriter {
         ledger.close();
 
         return new SSTableMeta(ledger.ledgerId(), level, CandyKey.ofUtf8(minKey),
-                CandyKey.ofUtf8(maxKey), numEntries, sizeBytes);
+                CandyKey.ofUtf8(maxKey), numEntries, sizeBytes, referencedSyrups);
     }
 
     /** Appends the block as one ledger entry; returns the entry's byte length (0 if empty). */

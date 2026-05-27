@@ -57,3 +57,22 @@ Known v1 limitation: the pending-deletion set is in-memory, so input ledgers rem
 that crashed before GC leak until an enumeration backstop is added (future). Tests: `CandyboxNodeTest`
 adds a GC pass that deletes compacted input ledgers (verified via `LedgerStore.listLedgers`) while data
 stays readable. `mvn test` and `mvn verify` (22 ITs) pass.
+
+## WS3 status (this change)
+
+Orphan-Syrup GC via per-SSTable referenced-Syrup tracking:
+- `SSTableMeta` carries `referencedSyrups` (the writer unions the segment Syrup ids over the run);
+  `ManifestSerializer` round-trips it; `ManifestState.referencedSyrups()` unions over all tables.
+- `BoxEngine` recomputes orphans after each compaction: a live Syrup referenced by no SSTable, the
+  active memtable, or the open write Syrup is recorded (with first-seen time) in a pending set.
+  `reclaimableSyrups(asOf)` / `dropSyrups(ids)` expose it; `dropSyrups` removes them from the live set
+  via a **fencing-gated** manifest edit. Recovery recomputes once so pre-handover orphans aren't leaked.
+- `GarbageCollector.collect` now reclaims orphaned Syrups after obsolete SSTables: drop from the live
+  set (fenced), then whole-ledger-delete (v1 reclaims a Syrup only once every segment in it is dead —
+  no defragmentation).
+
+Tests: `CandyboxNodeTest` adds an overwrite→compact→GC case where the superseded version's Syrup is
+reclaimed (verified via `LedgerStore.listLedgers`) while the live version and data survive. `mvn test`
+and `mvn verify` (22 ITs) pass.
+
+Remaining for Phase 3: **WS4** — WAL GC + a full compaction-and-GC cycle IT on embedded BookKeeper.

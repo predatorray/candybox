@@ -87,6 +87,9 @@ public final class BoxEngine implements AutoCloseable {
     // SSTable ledgers dropped by a committed compaction, awaiting physical deletion by GC: id -> when.
     private final ConcurrentMap<Long, Long> obsoleteSSTables = new ConcurrentHashMap<>();
 
+    // Syrup ledgers no longer referenced by any SSTable/memtable, awaiting GC: id -> first-seen-orphan.
+    private final ConcurrentMap<Long, Long> pendingOrphanSyrups = new ConcurrentHashMap<>();
+
     // Bounded idempotency cache: token -> already-applied result, so a retried put is a no-op.
     private final Map<String, CandyMetadata> idempotencyCache = Collections.synchronizedMap(
             new LinkedHashMap<>(16, 0.75f, true) {
@@ -170,6 +173,14 @@ public final class BoxEngine implements AutoCloseable {
         BoxEngine engine = new BoxEngine(box, config, ledgerStore, hlc, clock, manifest, newWal);
         engine.active = memtable;
         engine.openReadersFor(state);
+        // Catch Syrups already orphaned before this handover (e.g. by a prior owner that crashed
+        // pre-GC) so they are not leaked.
+        engine.lock.writeLock().lock();
+        try {
+            engine.recomputeOrphanSyrupsLocked(clock.currentTimeMillis());
+        } finally {
+            engine.lock.writeLock().unlock();
+        }
         return engine;
     }
 
@@ -369,6 +380,61 @@ public final class BoxEngine implements AutoCloseable {
                 }
                 obsoleteSSTables.put(removed, now);
             }
+            recomputeOrphanSyrupsLocked(now);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Recomputes which live Syrups are no longer referenced by any SSTable, the active memtable, or the
+     * currently open write Syrup, recording newly-orphaned ones with the time first seen. Syrup
+     * references only ever decrease (compaction drops superseded/tombstoned locators), so an orphan
+     * stays an orphan. Called under the write lock after a manifest change.
+     */
+    private void recomputeOrphanSyrupsLocked(long now) {
+        java.util.Set<Long> referenced = new java.util.HashSet<>(manifest.current().referencedSyrups());
+        for (java.util.Iterator<Mutation> it = active.iterator(); it.hasNext(); ) {
+            for (SegmentRef seg : it.next().locator().segments()) {
+                referenced.add(seg.syrupId());
+            }
+        }
+        long openSyrup = syrupManager.currentSyrupId();
+        if (openSyrup >= 0) {
+            referenced.add(openSyrup);
+        }
+        for (Long syrup : manifest.current().liveSyrups()) {
+            if (!referenced.contains(syrup)) {
+                pendingOrphanSyrups.putIfAbsent(syrup, now);
+            }
+        }
+    }
+
+    /** Orphaned Syrup ledger ids first seen at or before {@code asOfMillis} — the GC reclaim set. */
+    public java.util.List<Long> reclaimableSyrups(long asOfMillis) {
+        java.util.List<Long> ids = new java.util.ArrayList<>();
+        for (Map.Entry<Long, Long> e : pendingOrphanSyrups.entrySet()) {
+            if (e.getValue() <= asOfMillis) {
+                ids.add(e.getKey());
+            }
+        }
+        return ids;
+    }
+
+    /**
+     * Drops the given orphaned Syrups from the live set via a fencing-gated manifest edit (so a fenced
+     * owner cannot remove them) and stops tracking them. Call before physically deleting the ledgers.
+     */
+    public void dropSyrups(java.util.Collection<Long> syrupIds) {
+        if (syrupIds.isEmpty()) {
+            return;
+        }
+        lock.writeLock().lock();
+        try {
+            manifest.apply(ManifestEdit.builder()
+                    .removedSyrups(new java.util.LinkedHashSet<>(syrupIds))
+                    .build());
+            syrupIds.forEach(pendingOrphanSyrups::remove);
         } finally {
             lock.writeLock().unlock();
         }

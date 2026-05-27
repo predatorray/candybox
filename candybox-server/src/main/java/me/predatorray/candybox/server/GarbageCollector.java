@@ -46,15 +46,16 @@ public final class GarbageCollector {
      */
     public int collect(BoxEngine engine) {
         long cutoff = clock.currentTimeMillis() - graceMillis;
-        List<Long> reclaimable = engine.reclaimableSSTables(cutoff);
+        int deleted = collectSSTables(engine, cutoff);
+        deleted += collectSyrups(engine, cutoff);
+        return deleted;
+    }
+
+    private int collectSSTables(BoxEngine engine, long cutoff) {
         int deleted = 0;
-        for (long ledgerId : reclaimable) {
-            try {
-                ledgerStore.deleteLedger(ledgerId);
+        for (long ledgerId : engine.reclaimableSSTables(cutoff)) {
+            if (deleteLedger(ledgerId)) {
                 deleted++;
-            } catch (StorageException e) {
-                // Already gone (or transient): forget it either way; a real failure retries next pass.
-                LOG.debug("GC delete of ledger {} did not succeed cleanly: {}", ledgerId, e.getMessage());
             }
             engine.forgetObsoleteSSTable(ledgerId);
         }
@@ -62,5 +63,34 @@ public final class GarbageCollector {
             LOG.debug("GC deleted {} obsolete SSTable ledger(s)", deleted);
         }
         return deleted;
+    }
+
+    private int collectSyrups(BoxEngine engine, long cutoff) {
+        List<Long> orphans = engine.reclaimableSyrups(cutoff);
+        if (orphans.isEmpty()) {
+            return 0;
+        }
+        // Drop them from the live set first via a fencing-gated manifest edit; then delete the ledgers
+        // (a Syrup is removed whole only once every segment in it is dead — v1 has no defragmentation).
+        engine.dropSyrups(orphans);
+        int deleted = 0;
+        for (long syrupId : orphans) {
+            if (deleteLedger(syrupId)) {
+                deleted++;
+            }
+        }
+        LOG.debug("GC deleted {} orphaned Syrup ledger(s)", deleted);
+        return deleted;
+    }
+
+    private boolean deleteLedger(long ledgerId) {
+        try {
+            ledgerStore.deleteLedger(ledgerId);
+            return true;
+        } catch (StorageException e) {
+            // Already gone (or transient): a real failure is retried on a later pass.
+            LOG.debug("GC delete of ledger {} did not succeed cleanly: {}", ledgerId, e.getMessage());
+            return false;
+        }
     }
 }
