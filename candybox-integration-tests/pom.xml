@@ -32,12 +32,32 @@
             <artifactId>candybox-lsm</artifactId>
         </dependency>
 
-        <!-- Reuse the shared LedgerStore contract suite against the real BookKeeper-backed store. -->
+        <!-- Reuse the shared contract suites against the real BookKeeper / ZooKeeper backends. -->
         <dependency>
             <groupId>me.predatorray.candybox</groupId>
             <artifactId>candybox-bookkeeper</artifactId>
             <version>${project.version}</version>
             <type>test-jar</type>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>me.predatorray.candybox</groupId>
+            <artifactId>candybox-coordination</artifactId>
+            <version>${project.version}</version>
+            <type>test-jar</type>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Curator + its test server, to exercise ZooKeeperCoordinationService on embedded ZooKeeper.
+             curator-framework is optional (non-transitive) in candybox-coordination, so declare it here. -->
+        <dependency>
+            <groupId>org.apache.curator</groupId>
+            <artifactId>curator-framework</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.curator</groupId>
+            <artifactId>curator-test</artifactId>
             <scope>test</scope>
         </dependency>
 

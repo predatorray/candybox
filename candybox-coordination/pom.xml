@@ -19,5 +19,32 @@
             <groupId>me.predatorray.candybox</groupId>
             <artifactId>candybox-common</artifactId>
         </dependency>
+        <dependency>
+            <groupId>org.apache.curator</groupId>
+            <artifactId>curator-framework</artifactId>
+            <!-- Needed only by ZooKeeperCoordinationService; the in-memory fake (used by all unit
+                 tests and the LSM engine) needs none of it, so keep it optional/non-transitive.
+                 The ZK impl is exercised against an embedded ZooKeeper in candybox-integration-tests,
+                 keeping `mvn test` fake-only. -->
+            <optional>true</optional>
+        </dependency>
     </dependencies>
+
+    <build>
+        <plugins>
+            <!-- Publish CoordinationServiceContract as a test-jar so candybox-integration-tests can
+                 run the same suite against the real ZooKeeper-backed service. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>test-jar</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
 </project>
