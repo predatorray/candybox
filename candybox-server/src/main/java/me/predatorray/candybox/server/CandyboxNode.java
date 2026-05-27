@@ -1,31 +1,36 @@
 package me.predatorray.candybox.server;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import me.predatorray.candybox.bookkeeper.LedgerStore;
 import me.predatorray.candybox.common.BoxName;
 import me.predatorray.candybox.common.Clock;
 import me.predatorray.candybox.common.SystemClock;
 import me.predatorray.candybox.common.config.CandyboxConfig;
-import me.predatorray.candybox.common.exception.BoxAlreadyExistsException;
 import me.predatorray.candybox.common.exception.BoxNotEmptyException;
 import me.predatorray.candybox.common.exception.BoxNotFoundException;
 import me.predatorray.candybox.coordination.CoordinationService;
+import me.predatorray.candybox.coordination.VersionedValue;
 import me.predatorray.candybox.lsm.engine.BoxEngine;
 import me.predatorray.candybox.protocol.transport.RequestHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * A Candybox storage node. In this run it wires the LSM {@link BoxEngine} behind the protocol handler
- * so the client can drive real put/get/delete/list over a {@link me.predatorray.candybox.protocol.transport.Transport};
- * each Box it owns gets its own engine.
+ * A Candybox storage node. It owns a set of Boxes under fenced ZooKeeper leases (via
+ * {@link BoxOwnership}), serving each from its local {@link BoxEngine}. {@link #createBox} takes
+ * ownership of a brand-new Box; {@link #openBox} takes over an existing Box (the failover/handover
+ * path), recovering its manifest and WAL. A background heartbeat renews the leases.
  *
- * <p>Scaffolded for later phases (see TODOs): ZooKeeper-leased Box ownership and request routing
- * across the cluster (Phase 2), and background compaction/GC workers (Phase 3). For now a node owns
- * every Box created against it and serves it locally.
+ * <p>Still scaffolded for later: request <em>routing</em> across the cluster (a non-owner currently
+ * surfaces {@link me.predatorray.candybox.common.exception.NotOwnerException}; WS5 turns that into a
+ * {@code MOVED} response), and background compaction/GC workers (Phase 3).
  */
 public final class CandyboxNode implements AutoCloseable {
 
@@ -36,7 +41,8 @@ public final class CandyboxNode implements AutoCloseable {
     private final LedgerStore ledgerStore;
     private final CoordinationService coordination;
     private final Clock clock;
-    private final ConcurrentMap<String, BoxEngine> engines = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, BoxOwnership> boxes = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService leaseHeartbeat;
 
     public CandyboxNode(int nodeId, CandyboxConfig config, LedgerStore ledgerStore,
                         CoordinationService coordination) {
@@ -50,58 +56,104 @@ public final class CandyboxNode implements AutoCloseable {
         this.ledgerStore = ledgerStore;
         this.coordination = coordination;
         this.clock = clock;
-        coordination.registerMember(nodeId, ("node-" + nodeId).getBytes(java.nio.charset.StandardCharsets.UTF_8));
-        // TODO(phase-2): acquire per-Box ZK ownership leases and route requests to the owning node.
+        coordination.registerMember(nodeId, ("node-" + nodeId).getBytes(StandardCharsets.UTF_8));
+
+        long interval = config.leaseRenewIntervalMillis();
+        if (interval > 0) {
+            this.leaseHeartbeat = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "candybox-lease-" + nodeId);
+                t.setDaemon(true);
+                return t;
+            });
+            this.leaseHeartbeat.scheduleAtFixedRate(this::renewLeases, interval, interval,
+                    TimeUnit.MILLISECONDS);
+        } else {
+            this.leaseHeartbeat = null;
+        }
     }
 
     public int nodeId() {
         return nodeId;
     }
 
-    /** Creates a Box and its engine on this node. */
+    /** Creates and takes ownership of a brand-new Box on this node. */
     public void createBox(BoxName box) {
-        engines.compute(box.value(), (name, existing) -> {
-            if (existing != null) {
-                throw new BoxAlreadyExistsException(name);
+        boxes.compute(box.value(), (name, existing) -> {
+            if (existing != null && existing.isOwner()) {
+                throw new me.predatorray.candybox.common.exception.BoxAlreadyExistsException(name);
             }
             LOG.info("Creating box {} on node {}", name, nodeId);
-            // TODO(phase-2 WS3): pass the owner's ZK lease fencing token here instead of a constant.
-            return BoxEngine.createNew(box, config, ledgerStore, nodeId, clock, 1L);
+            return BoxOwnership.createNew(box, config, ledgerStore, coordination, nodeId, clock);
         });
     }
 
-    /** Deletes a Box. Requires it to be empty unless {@code force}. */
+    /**
+     * Takes over ownership of an existing Box (failover/handover): acquires the lease, recovers the
+     * manifest + WAL from the current pointer, and advances the pointer.
+     */
+    public void openBox(BoxName box) {
+        boxes.compute(box.value(), (name, existing) -> {
+            if (existing != null && existing.isOwner()) {
+                return existing; // already owned here
+            }
+            LOG.info("Opening (taking over) box {} on node {}", name, nodeId);
+            return BoxOwnership.recover(box, config, ledgerStore, coordination, nodeId, clock);
+        });
+    }
+
+    /** Relinquishes ownership of a Box (releases the lease, closes the engine); does not delete data. */
+    public void releaseBox(BoxName box) {
+        BoxOwnership ownership = boxes.remove(box.value());
+        if (ownership != null) {
+            ownership.close();
+        }
+    }
+
+    /** Deletes a Box. Requires this node to own it and (unless {@code force}) for it to be empty. */
     public void deleteBox(BoxName box, boolean force) {
-        BoxEngine engine = requireEngine(box);
-        if (!force && !engine.listCandies("", null, 1).entries().isEmpty()) {
+        BoxOwnership ownership = require(box);
+        if (!force && !ownership.engine().listCandies("", null, 1).entries().isEmpty()) {
             throw new BoxNotEmptyException(box.value());
         }
-        engines.remove(box.value());
-        engine.close();
+        boxes.remove(box.value());
+        // Drop the manifest pointer (CAS on its version) so the Box no longer exists, then release.
+        ownership.currentPointer().ifPresent(p -> {
+            try {
+                coordination.delete(BoxOwnership.manifestKey(box), p.version());
+            } catch (RuntimeException e) {
+                LOG.warn("Failed to delete manifest pointer for box {}: {}", box, e.getMessage());
+            }
+        });
+        ownership.close();
         // TODO(phase-3): reference-counted GC of the Box's SSTable/Syrup/WAL/manifest ledgers.
     }
 
     public List<String> listBoxes() {
-        List<String> names = new ArrayList<>(engines.keySet());
+        List<String> names = new ArrayList<>(boxes.keySet());
         names.sort(String::compareTo);
         return names;
     }
 
     public boolean boxExists(BoxName box) {
-        return engines.containsKey(box.value());
+        BoxOwnership o = boxes.get(box.value());
+        return o != null && o.isOwner();
     }
 
-    /** Returns the engine for an owned Box, or throws {@link BoxNotFoundException}. */
+    /**
+     * Returns the engine for a Box this node owns. Throws {@link BoxNotFoundException} if this node has
+     * no ownership object for the Box, or {@link me.predatorray.candybox.common.exception.NotOwnerException}
+     * if its lease is no longer valid.
+     */
     public BoxEngine engine(BoxName box) {
-        return requireEngine(box);
+        return require(box).engine();
     }
 
-    private BoxEngine requireEngine(BoxName box) {
-        BoxEngine engine = engines.get(box.value());
-        if (engine == null) {
+    private BoxOwnership require(BoxName box) {
+        BoxOwnership ownership = boxes.get(box.value());
+        if (ownership == null) {
             throw new BoxNotFoundException(box.value());
         }
-        return engine;
+        return ownership;
     }
 
     CandyboxConfig config() {
@@ -113,12 +165,25 @@ public final class CandyboxNode implements AutoCloseable {
         return new NodeRequestHandler(this);
     }
 
+    private void renewLeases() {
+        for (BoxOwnership ownership : boxes.values()) {
+            try {
+                ownership.renew();
+            } catch (RuntimeException e) {
+                LOG.warn("Lease renewal error for a box on node {}", nodeId, e);
+            }
+        }
+    }
+
     @Override
     public void close() {
-        for (BoxEngine engine : engines.values()) {
-            engine.close();
+        if (leaseHeartbeat != null) {
+            leaseHeartbeat.shutdownNow();
         }
-        engines.clear();
+        for (BoxOwnership ownership : boxes.values()) {
+            ownership.close();
+        }
+        boxes.clear();
         coordination.unregisterMember(nodeId);
     }
 }

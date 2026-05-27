@@ -31,6 +31,10 @@
             <groupId>me.predatorray.candybox</groupId>
             <artifactId>candybox-lsm</artifactId>
         </dependency>
+        <dependency>
+            <groupId>me.predatorray.candybox</groupId>
+            <artifactId>candybox-server</artifactId>
+        </dependency>
 
         <!-- Reuse the shared contract suites against the real BookKeeper / ZooKeeper backends. -->
         <dependency>
@@ -107,6 +111,11 @@
                     </execution>
                 </executions>
                 <configuration>
+                    <!-- Fork a fresh JVM per IT class. Embedded BookKeeper clients leak worker/Netty
+                         threads on close ("mainWorkerPool did not shutdown cleanly"); reusing one fork
+                         across all IT classes lets that accumulate and degrades the last classes by
+                         100s+. A clean JVM per class keeps each class fast and isolated. -->
+                    <reuseForks>false</reuseForks>
                     <!-- BookKeeper/ZooKeeper reach into JDK internals (e.g. PageCacheUtil reflects
                          into java.io.FileDescriptor); open them up on modern JDKs. -->
                     <argLine>

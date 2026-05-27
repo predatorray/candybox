@@ -101,3 +101,21 @@ Implemented fencing-token plumbing through the manifest:
 
 New tests: `ManifestTest` covers token round-trip, stale-handover rejection, and stale-edit rejection.
 `mvn test` and `mvn verify` (19 ITs) remain green.
+
+## WS3 status (this change)
+
+Implemented fenced Box ownership + the manifest ZK pointer + handover orchestration:
+- `BoxOwnership` ties a ZK owner lease to a `BoxEngine`: acquire the `boxes/<box>/owner` lease,
+  read/create/CAS the `boxes/<box>/manifest` pointer (`ManifestPointer{ledgerId, ownerToken}`), and
+  `createNew`/`recover` the engine stamped with the lease's fencing token. The lease is the single
+  serialization point; a lost pointer CAS aborts and releases.
+- `CandyboxNode` now owns Boxes through `BoxOwnership`: `createBox` (new), `openBox` (takeover/failover
+  via recover), `releaseBox` (relinquish), `deleteBox` (drops the pointer). A background heartbeat
+  renews leases (`leaseRenewIntervalMillis`, `0` disables); engine access is gated on lease validity,
+  so a non-owner raises `NotOwnerException`. The WS2 constant token is gone — the real lease token flows in.
+- New `CandyboxConfig.leaseRenewIntervalMillis`; new `NotOwnerException`.
+
+Tests: `BoxHandoverTest` (fakes, `ManualClock`) covers lease-expiry takeover, old-owner fencing, the
+advanced pointer, and post-handover LWW. `BoxHandoverIT` exercises the same on **embedded BookKeeper +
+ZooKeeper** (two nodes). Integration uses `reuseForks=false` (a fresh JVM per IT class) to contain
+BookKeeper client thread leaks. `mvn test` and `mvn verify` (20 ITs, ~2 min) pass.

@@ -18,6 +18,7 @@ public final class CandyboxConfig {
     private final long syrupRolloverBytes;
     private final int maxFrameSizeBytes;
     private final long ownershipLeaseTtlMillis;
+    private final long leaseRenewIntervalMillis;
     private final long maxClockSkewMillis;
     private final long tombstoneGcGraceMillis;
     private final int l0CompactionTrigger;
@@ -31,6 +32,7 @@ public final class CandyboxConfig {
         this.syrupRolloverBytes = b.syrupRolloverBytes;
         this.maxFrameSizeBytes = b.maxFrameSizeBytes;
         this.ownershipLeaseTtlMillis = b.ownershipLeaseTtlMillis;
+        this.leaseRenewIntervalMillis = b.leaseRenewIntervalMillis;
         this.maxClockSkewMillis = b.maxClockSkewMillis;
         this.tombstoneGcGraceMillis = b.tombstoneGcGraceMillis;
         this.l0CompactionTrigger = b.l0CompactionTrigger;
@@ -73,6 +75,11 @@ public final class CandyboxConfig {
         return ownershipLeaseTtlMillis;
     }
 
+    /** How often an owner renews its Box lease. {@code 0} disables the background heartbeat. */
+    public long leaseRenewIntervalMillis() {
+        return leaseRenewIntervalMillis;
+    }
+
     public long maxClockSkewMillis() {
         return maxClockSkewMillis;
     }
@@ -99,6 +106,7 @@ public final class CandyboxConfig {
         private long syrupRolloverBytes = 1L << 30;            // 1 GiB
         private int maxFrameSizeBytes = 16 << 20;              // 16 MiB protocol cap
         private long ownershipLeaseTtlMillis = 10_000L;        // 10s lease
+        private long leaseRenewIntervalMillis = 3_000L;        // renew well within the TTL; 0 disables
         private long maxClockSkewMillis = 300_000L;            // 5 min HLC skew bound
         private long tombstoneGcGraceMillis = 24L * 3600 * 1000; // 24h late-write window
         private int l0CompactionTrigger = 4;
@@ -136,6 +144,11 @@ public final class CandyboxConfig {
 
         public Builder ownershipLeaseTtlMillis(long v) {
             this.ownershipLeaseTtlMillis = v;
+            return this;
+        }
+
+        public Builder leaseRenewIntervalMillis(long v) {
+            this.leaseRenewIntervalMillis = v;
             return this;
         }
 
