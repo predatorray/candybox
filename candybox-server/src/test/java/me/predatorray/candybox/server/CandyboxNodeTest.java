@@ -49,6 +49,34 @@ class CandyboxNodeTest {
     }
 
     @Test
+    void handlesHeadCandyListBoxesAndHeadBox() {
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        try (CandyboxNode node = new CandyboxNode(1, CandyboxConfig.defaults(), store,
+                new InMemoryCoordinationService(), new ManualClock(1000))) {
+            node.createBox(BoxName.of("my-box"));
+            RequestHandler handler = node.requestHandler();
+            roundTrip(handler, new Message.PutCandyRequest("my-box", "k", "text/plain",
+                    Map.of("m", "v"), null, "candy".getBytes(StandardCharsets.UTF_8)));
+
+            Message head = roundTrip(handler, new Message.HeadCandyRequest("my-box", "k"));
+            assertThat(head).isInstanceOf(Message.HeadCandyResponse.class);
+            Message.HeadCandyResponse h = (Message.HeadCandyResponse) head;
+            assertThat(h.contentLength()).isEqualTo(5);
+            assertThat(h.userMetadata()).containsEntry("m", "v");
+
+            Message boxes = roundTrip(handler, new Message.ListBoxesRequest());
+            assertThat(boxes).isInstanceOf(Message.ListBoxesResponse.class);
+            assertThat(((Message.ListBoxesResponse) boxes).boxes()).containsExactly("my-box");
+
+            assertThat(roundTrip(handler, new Message.HeadBoxRequest("my-box")))
+                    .isInstanceOf(Message.OkResponse.class);
+            assertThat(roundTrip(handler, new Message.HeadBoxRequest("ghost-box")))
+                    .isInstanceOf(Message.NotFoundResponse.class);
+        }
+        store.close();
+    }
+
+    @Test
     void busyResponseSurfacedUnderWriteStall() {
         CandyboxConfig stall = CandyboxConfig.builder()
                 .memtableFlushThresholdBytes(1)

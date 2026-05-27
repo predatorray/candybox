@@ -68,6 +68,19 @@ public final class MessageCodec {
                 w.writeVarLong(Math.max(0, e.createdAtMillis()));
             }
             writeNullable(w, m.nextStartAfter());
+        } else if (message instanceof Message.HeadCandyResponse m) {
+            w.writeVarLong(m.contentLength());
+            writeNullable(w, m.contentType());
+            writeMetadata(w, m.userMetadata());
+            w.writeInt(m.crc32c());
+            w.writeVarLong(Math.max(0, m.createdAtMillis()));
+        } else if (message instanceof Message.MovedResponse m) {
+            w.writeInt(m.ownerNodeId());
+        } else if (message instanceof Message.ListBoxesResponse m) {
+            w.writeVarInt(m.boxes().size());
+            for (String box : m.boxes()) {
+                w.writeString(box);
+            }
         } else {
             throw new ProtocolException("Unknown message type: " + message.getClass());
         }
@@ -99,9 +112,20 @@ public final class MessageCodec {
             case RESPONSE_CANDY_DATA -> new Message.CandyDataResponse(r.readVarLong(), readNullable(r),
                     readMetadata(r), r.readInt(), r.readBytes());
             case RESPONSE_LIST -> decodeList(r);
-            // RESPONSE_HEAD has no dedicated message yet (TODO(phase-2): add HeadCandyResponse).
-            default -> throw new ProtocolException("No message decoder for opcode " + frame.opcode());
+            case RESPONSE_HEAD -> new Message.HeadCandyResponse(r.readVarLong(), readNullable(r),
+                    readMetadata(r), r.readInt(), r.readVarLong());
+            case RESPONSE_MOVED -> new Message.MovedResponse(r.readInt());
+            case RESPONSE_BOX_LIST -> decodeBoxList(r);
         };
+    }
+
+    private static Message decodeBoxList(BinaryReader r) {
+        int count = r.readVarInt();
+        List<String> boxes = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            boxes.add(r.readString());
+        }
+        return new Message.ListBoxesResponse(boxes);
     }
 
     private static Message decodeList(BinaryReader r) {

@@ -63,4 +63,29 @@ class MessageCodecTest {
         assertThat(out.entries().get(1).key()).isEqualTo("b");
         assertThat(out.nextStartAfter()).isEqualTo("b");
     }
+
+    @Test
+    void headCandyResponseRoundTrips() {
+        Message.HeadCandyResponse resp = new Message.HeadCandyResponse(1234, "image/png",
+                Map.of("k", "v"), 0x55, 9000);
+        Message.HeadCandyResponse out = (Message.HeadCandyResponse) roundTrip(resp);
+        assertThat(out.contentLength()).isEqualTo(1234);
+        assertThat(out.contentType()).isEqualTo("image/png");
+        assertThat(out.userMetadata()).containsEntry("k", "v");
+        assertThat(out.crc32c()).isEqualTo(0x55);
+        assertThat(out.createdAtMillis()).isEqualTo(9000);
+    }
+
+    @Test
+    void movedResponseRoundTrips() {
+        Message.MovedResponse out = (Message.MovedResponse) roundTrip(new Message.MovedResponse(7));
+        assertThat(out.ownerNodeId()).isEqualTo(7);
+    }
+
+    @Test
+    void listBoxesResponseRoundTrips() {
+        Message.ListBoxesResponse out = (Message.ListBoxesResponse) roundTrip(
+                new Message.ListBoxesResponse(List.of("alpha", "beta")));
+        assertThat(out.boxes()).containsExactly("alpha", "beta");
+    }
 }

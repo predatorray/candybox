@@ -75,8 +75,8 @@ final class NodeRequestHandler implements RequestHandler {
         } else if (message instanceof Message.HeadCandyRequest m) {
             BoxEngine engine = node.engine(BoxName.of(m.box()));
             CandyMetadata meta = engine.headCandy(CandyKey.of(m.key()));
-            return new Message.CandyDataResponse(meta.contentLength(), meta.contentType(),
-                    meta.userMetadata(), meta.crc32c(), new byte[0]);
+            return new Message.HeadCandyResponse(meta.contentLength(), meta.contentType(),
+                    meta.userMetadata(), meta.crc32c(), meta.createdAtMillis());
         } else if (message instanceof Message.DeleteCandyRequest m) {
             node.engine(BoxName.of(m.box())).deleteCandy(CandyKey.of(m.key()));
             return new Message.OkResponse();
@@ -89,8 +89,14 @@ final class NodeRequestHandler implements RequestHandler {
                         e.createdAtMillis()));
             }
             return new Message.ListCandiesResponse(entries, result.nextStartAfter());
+        } else if (message instanceof Message.ListBoxesRequest) {
+            // Boxes owned by this node. Cluster-wide listing needs a coordination list op (later).
+            return new Message.ListBoxesResponse(node.listBoxes());
+        } else if (message instanceof Message.HeadBoxRequest m) {
+            return node.boxExists(BoxName.of(m.box()))
+                    ? new Message.OkResponse()
+                    : new Message.NotFoundResponse();
         }
-        // TODO(phase-2): listBoxes / headBox responses.
         return new Message.ErrorResponse("UnsupportedOperation",
                 "Not implemented in this phase: " + message.opcode());
     }

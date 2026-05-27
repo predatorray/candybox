@@ -121,4 +121,26 @@ public sealed interface Message {
     /** One row in a {@link ListCandiesResponse}. */
     record ListedCandy(String key, long contentLength, long createdAtMillis) {
     }
+
+    /** Candy metadata only (the {@code headCandy} response). */
+    record HeadCandyResponse(long contentLength, String contentType,
+                             Map<String, String> userMetadata, int crc32c, long createdAtMillis)
+            implements Message {
+        public Opcode opcode() {
+            return Opcode.RESPONSE_HEAD;
+        }
+    }
+
+    /** Tells the client which node now owns the Box, so it can re-route (Phase 2 routing). */
+    record MovedResponse(int ownerNodeId) implements Message {
+        public Opcode opcode() {
+            return Opcode.RESPONSE_MOVED;
+        }
+    }
+
+    record ListBoxesResponse(List<String> boxes) implements Message {
+        public Opcode opcode() {
+            return Opcode.RESPONSE_BOX_LIST;
+        }
+    }
 }

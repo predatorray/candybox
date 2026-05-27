@@ -13,6 +13,7 @@ import me.predatorray.candybox.common.config.SizeLimits;
 import me.predatorray.candybox.common.exception.BusyException;
 import me.predatorray.candybox.common.exception.CandyNotFoundException;
 import me.predatorray.candybox.common.exception.CandyboxException;
+import me.predatorray.candybox.common.exception.NotOwnerException;
 import me.predatorray.candybox.common.exception.StorageException;
 import me.predatorray.candybox.protocol.Frame;
 import me.predatorray.candybox.protocol.Message;
@@ -94,11 +95,32 @@ public final class CandyboxClient implements AutoCloseable {
     public CandyInfo headCandy(String box, String key) {
         Message response = call(new Message.HeadCandyRequest(BoxName.of(box).value(),
                 CandyKey.of(key).value()));
-        if (response instanceof Message.CandyDataResponse data) {
-            return new CandyInfo(data.contentLength(), data.contentType(), data.userMetadata(),
-                    data.crc32c());
+        if (response instanceof Message.HeadCandyResponse head) {
+            return new CandyInfo(head.contentLength(), head.contentType(), head.userMetadata(),
+                    head.crc32c(), head.createdAtMillis());
         }
         throw mapUnexpected(response, box, key);
+    }
+
+    /** Lists the Boxes known to the contacted node. */
+    public List<String> listBoxes() {
+        Message response = call(new Message.ListBoxesRequest());
+        if (response instanceof Message.ListBoxesResponse boxes) {
+            return boxes.boxes();
+        }
+        throw mapResponse(response);
+    }
+
+    /** Returns whether the Box exists (is owned by the contacted node). */
+    public boolean headBox(String box) {
+        Message response = call(new Message.HeadBoxRequest(BoxName.of(box).value()));
+        if (response instanceof Message.OkResponse) {
+            return true;
+        }
+        if (response instanceof Message.NotFoundResponse) {
+            return false;
+        }
+        throw mapResponse(response);
     }
 
     public void deleteCandy(String box, String key) {
@@ -146,6 +168,10 @@ public final class CandyboxClient implements AutoCloseable {
         if (response instanceof Message.NotFoundResponse) {
             return new CandyboxException("Not found");
         }
+        if (response instanceof Message.MovedResponse moved) {
+            // TODO(phase-2 WS5): re-route to moved.ownerNodeId() via the ClusterRouter and retry.
+            return new NotOwnerException("owned by node " + moved.ownerNodeId());
+        }
         return new CandyboxException("Unexpected response: " + response.opcode());
     }
 
@@ -164,9 +190,9 @@ public final class CandyboxClient implements AutoCloseable {
         }
     }
 
-    /** Metadata returned by {@code headCandy}/{@code getCandy}. */
+    /** Metadata returned by {@code headCandy}. */
     public record CandyInfo(long contentLength, String contentType, Map<String, String> userMetadata,
-                            int crc32c) {
+                            int crc32c, long createdAtMillis) {
     }
 
     /** A page of {@code listCandies} results. */

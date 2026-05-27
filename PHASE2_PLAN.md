@@ -119,3 +119,20 @@ Tests: `BoxHandoverTest` (fakes, `ManualClock`) covers lease-expiry takeover, ol
 advanced pointer, and post-handover LWW. `BoxHandoverIT` exercises the same on **embedded BookKeeper +
 ZooKeeper** (two nodes). Integration uses `reuseForks=false` (a fresh JVM per IT class) to contain
 BookKeeper client thread leaks. `mvn test` and `mvn verify` (20 ITs, ~2 min) pass.
+
+## WS4 status (this change)
+
+Completed the protocol message surface:
+- New opcodes `RESPONSE_HEAD` (now has a message), `RESPONSE_MOVED`, `RESPONSE_BOX_LIST`; new messages
+  `HeadCandyResponse`, `MovedResponse(ownerNodeId)`, `ListBoxesResponse`, all round-tripped by
+  `MessageCodec` (the decode switch is now exhaustive — no fallthrough).
+- `NodeRequestHandler` returns a proper `HeadCandyResponse` for HEAD (was a `CandyDataResponse` with
+  empty bytes), and wires `listBoxes` (boxes owned by the node) and `headBox`.
+- `CandyboxClient` gains `listBoxes()` and `headBox()`, decodes `HeadCandyResponse` into `CandyInfo`
+  (now incl. `createdAtMillis`), and maps a `MovedResponse` to `NotOwnerException` as the WS5 routing hook.
+
+Streaming (D5: chunked PUT/GET) is **deferred to Phase 2.5** — separable and not on the WS5 path.
+
+Tests: `MessageCodecTest` round-trips the three new messages; `CandyboxNodeTest` covers HEAD/listBoxes/
+headBox through the handler; new `CandyboxClientTest` drives the client over `LoopbackTransport`
+(HEAD, listBoxes, MOVED→NotOwner). `mvn test` and `mvn verify` (20 ITs) pass.
