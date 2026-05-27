@@ -19,7 +19,7 @@ BookKeeper**. Each SSTable is a BookKeeper ledger; object bytes live in dedicate
 |---|---|---|
 | 0 | Modules, domain types, serialization, SPIs + in-memory fakes | ✅ implemented & tested |
 | 1 | Single-node core LSM: memtable, WAL, L0 SSTable flush, Syrup chunking, merged read path, LWW + tombstones | ✅ implemented & tested (fakes **and** embedded BookKeeper) |
-| 2 | Server node, ledger-backed manifest + ZK pointer, framed TCP protocol + thin client, routing | 🟡 message types, codec, transports, node/client wiring present; ZK coordination & routing are `TODO(phase-2)` |
+| 2 | Server node, ledger-backed manifest + ZK pointer, framed TCP protocol + thin client, fenced ownership & routing | ✅ implemented & tested (fakes **and** embedded BookKeeper + ZooKeeper). Deferred: chunked-streaming wire path (2.5), automatic failover, cluster-wide listBoxes. See `PHASE2_PLAN.md`. |
 | 3 | Distributed compaction & reference-counted GC | 🟡 compaction core works in-process; distributed scheduling & GC are `TODO(phase-3)` |
 | 4 | Hardening, fault injection, ops docs | ⛔ not started |
 

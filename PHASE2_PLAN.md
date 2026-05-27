@@ -157,4 +157,28 @@ Tests: contract covers the two new reads (fake + embedded ZooKeeper); `ClusterRo
 resolution, MOVED redirect + caching, no-owner, and `callAny`; `BoxHandoverTest` adds a handler
 MOVED-to-owner case. `mvn test` and `mvn verify` (21 ITs) pass.
 
-Remaining for Phase 2: **WS6** — a full client↔cluster handover IT over real TCP, then close-out.
+## WS6 status (this change)
+
+Close-out: a full client↔cluster handover IT over real TCP. `BoxClusterHandoverIT` stands up two
+`CandyboxNode`s, each behind a `TcpTransportServer` on an ephemeral port and registered in membership,
+on embedded BookKeeper + in-process ZooKeeper. A cluster-aware `CandyboxClient` (TCP transport + ZK
+coordination) creates a Box, writes through it, the owner fails over to the second node
+(`releaseBox`/`openBox`), and the next client read is transparently re-routed via `MOVED` to the new
+owner — returning the recovered value. `mvn verify` now runs **22 ITs** (~2.5 min); `mvn test` stays
+fake-only and green.
+
+## Phase 2 — done
+
+WS1–WS6 complete. Candybox is now a real (if minimal) distributed object store: Boxes are owned under
+fenced ZooKeeper leases with a versioned manifest pointer, ownership fails over between nodes with WAL
++ manifest recovery and HLC handover, the framed TCP protocol carries the full v1 surface, and a
+cluster-aware client routes to the owner and re-routes on `MOVED`.
+
+Deferred (documented, non-blocking):
+- **D5 streaming** — chunked multi-frame PUT/GET (objects still inline within the 16 MiB frame cap) → Phase 2.5.
+- **Automatic failover** — a crashed owner's Box is taken over only when some node calls `openBox`;
+  an automatic re-assignment driver (watch lease loss → elect a new owner) is future work.
+- **Cluster-wide `listBoxes`** — returns the contacted node's Boxes; needs a coordination list-children op.
+- **Manifest checkpoint cadence (D6)** — rolls only on handover today; periodic rolling is wired in config but not yet triggered.
+
+Next milestone is **Phase 3** (distributed compaction scheduling + reference-counted GC), per DESIGN.md §8–9.

@@ -35,6 +35,10 @@
             <groupId>me.predatorray.candybox</groupId>
             <artifactId>candybox-server</artifactId>
         </dependency>
+        <dependency>
+            <groupId>me.predatorray.candybox</groupId>
+            <artifactId>candybox-client</artifactId>
+        </dependency>
 
         <!-- Reuse the shared contract suites against the real BookKeeper / ZooKeeper backends. -->
         <dependency>
