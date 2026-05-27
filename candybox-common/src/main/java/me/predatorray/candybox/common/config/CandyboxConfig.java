@@ -20,6 +20,7 @@ public final class CandyboxConfig {
     private final long ownershipLeaseTtlMillis;
     private final long leaseRenewIntervalMillis;
     private final long routerCacheTtlMillis;
+    private final long compactionIntervalMillis;
     private final long maxClockSkewMillis;
     private final long tombstoneGcGraceMillis;
     private final int l0CompactionTrigger;
@@ -35,6 +36,7 @@ public final class CandyboxConfig {
         this.ownershipLeaseTtlMillis = b.ownershipLeaseTtlMillis;
         this.leaseRenewIntervalMillis = b.leaseRenewIntervalMillis;
         this.routerCacheTtlMillis = b.routerCacheTtlMillis;
+        this.compactionIntervalMillis = b.compactionIntervalMillis;
         this.maxClockSkewMillis = b.maxClockSkewMillis;
         this.tombstoneGcGraceMillis = b.tombstoneGcGraceMillis;
         this.l0CompactionTrigger = b.l0CompactionTrigger;
@@ -87,6 +89,11 @@ public final class CandyboxConfig {
         return routerCacheTtlMillis;
     }
 
+    /** How often a node runs background compaction over its owned Boxes. {@code 0} disables it. */
+    public long compactionIntervalMillis() {
+        return compactionIntervalMillis;
+    }
+
     public long maxClockSkewMillis() {
         return maxClockSkewMillis;
     }
@@ -115,6 +122,7 @@ public final class CandyboxConfig {
         private long ownershipLeaseTtlMillis = 10_000L;        // 10s lease
         private long leaseRenewIntervalMillis = 3_000L;        // renew well within the TTL; 0 disables
         private long routerCacheTtlMillis = 5_000L;            // client Box->owner cache TTL
+        private long compactionIntervalMillis = 0L;            // background compaction; 0 disables
         private long maxClockSkewMillis = 300_000L;            // 5 min HLC skew bound
         private long tombstoneGcGraceMillis = 24L * 3600 * 1000; // 24h late-write window
         private int l0CompactionTrigger = 4;
@@ -162,6 +170,11 @@ public final class CandyboxConfig {
 
         public Builder routerCacheTtlMillis(long v) {
             this.routerCacheTtlMillis = v;
+            return this;
+        }
+
+        public Builder compactionIntervalMillis(long v) {
+            this.compactionIntervalMillis = v;
             return this;
         }
 

@@ -60,6 +60,22 @@ class CompactionTest {
     }
 
     @Test
+    void leveledStrategyTriggersOnLevelByteBudget() {
+        // L0 trigger high so only the byte budget matters; L1 budget = 1000 bytes.
+        LeveledCompactionStrategy strategy = new LeveledCompactionStrategy(100, 1000, 10);
+
+        ManifestState underBudget = ManifestState.empty().apply(ManifestEdit.builder()
+                .addedTables(List.of(meta(1, 1, 400), meta(2, 1, 400))).build());
+        assertThat(strategy.pickCompaction(underBudget)).isEmpty();
+
+        ManifestState overBudget = ManifestState.empty().apply(ManifestEdit.builder()
+                .addedTables(List.of(meta(1, 1, 800), meta(2, 1, 800))).build());
+        Optional<CompactionTask> task = strategy.pickCompaction(overBudget);
+        assertThat(task).isPresent();
+        assertThat(task.get().outputLevel()).isEqualTo(2);
+    }
+
+    @Test
     void bottommostCompactionDropsAgedTombstoneButKeepsYoungOne() {
         SSTableMeta a = write(0, List.of(new Mutation(CandyKey.of("a"), put(hlc(1, 0, 1), 1, 5)),
                 new Mutation(CandyKey.of("k"), put(hlc(1, 0, 1), 1, 5))));
@@ -97,6 +113,10 @@ class CompactionTest {
     }
 
     private static SSTableMeta meta(long id, int level) {
-        return new SSTableMeta(id, level, CandyKey.of("a"), CandyKey.of("z"), 1);
+        return meta(id, level, 1024);
+    }
+
+    private static SSTableMeta meta(long id, int level, long sizeBytes) {
+        return new SSTableMeta(id, level, CandyKey.of("a"), CandyKey.of("z"), 1, sizeBytes);
     }
 }

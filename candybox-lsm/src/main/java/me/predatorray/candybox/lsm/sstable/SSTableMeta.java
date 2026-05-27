@@ -4,16 +4,18 @@ import me.predatorray.candybox.common.CandyKey;
 
 /**
  * Manifest-level metadata describing one SSTable ledger: where it lives, its level, the key range it
- * covers, and how many entries it holds. The read path uses the range to skip non-overlapping tables
- * and the compaction strategy uses it to pick work.
+ * covers, how many entries it holds, and its approximate data size. The read path uses the range to
+ * skip non-overlapping tables; the compaction strategy uses the level and size to pick work.
  *
  * @param ledgerId   the SSTable ledger id
  * @param level      LSM level (0 for freshly flushed)
  * @param minKey     smallest CandyKey in the table
  * @param maxKey     largest CandyKey in the table
  * @param entryCount number of mutations (unique keys) in the table
+ * @param sizeBytes  approximate on-ledger data size (sum of data-block bytes), for byte-size scoring
  */
-public record SSTableMeta(long ledgerId, int level, CandyKey minKey, CandyKey maxKey, long entryCount) {
+public record SSTableMeta(long ledgerId, int level, CandyKey minKey, CandyKey maxKey, long entryCount,
+                          long sizeBytes) {
 
     /** Whether this table's key range overlaps {@code [from, to]} (inclusive bounds, nulls = unbounded). */
     public boolean overlaps(CandyKey from, CandyKey to) {

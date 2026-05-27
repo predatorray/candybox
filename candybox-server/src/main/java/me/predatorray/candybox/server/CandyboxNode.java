@@ -15,6 +15,8 @@ import me.predatorray.candybox.common.SystemClock;
 import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.exception.BoxNotEmptyException;
 import me.predatorray.candybox.common.exception.BoxNotFoundException;
+import me.predatorray.candybox.common.exception.FencedException;
+import me.predatorray.candybox.common.exception.NotOwnerException;
 import me.predatorray.candybox.coordination.CoordinationService;
 import me.predatorray.candybox.coordination.VersionedValue;
 import me.predatorray.candybox.lsm.engine.BoxEngine;
@@ -43,6 +45,11 @@ public final class CandyboxNode implements AutoCloseable {
     private final Clock clock;
     private final ConcurrentMap<String, BoxOwnership> boxes = new ConcurrentHashMap<>();
     private final ScheduledExecutorService leaseHeartbeat;
+    private final ScheduledExecutorService compactionWorker;
+    private final CompactionService compactionService;
+
+    /** Bounded compaction passes per Box per worker tick, so one Box cannot starve the others. */
+    private static final int MAX_COMPACTIONS_PER_TICK = 8;
 
     public CandyboxNode(int nodeId, CandyboxConfig config, LedgerStore ledgerStore,
                         CoordinationService coordination) {
@@ -66,19 +73,33 @@ public final class CandyboxNode implements AutoCloseable {
         this.coordination = coordination;
         this.clock = clock;
         coordination.registerMember(nodeId, advertisedAddress.getBytes(StandardCharsets.UTF_8));
+        this.compactionService = new CompactionService(ledgerStore, config, clock);
 
-        long interval = config.leaseRenewIntervalMillis();
-        if (interval > 0) {
-            this.leaseHeartbeat = Executors.newSingleThreadScheduledExecutor(r -> {
-                Thread t = new Thread(r, "candybox-lease-" + nodeId);
-                t.setDaemon(true);
-                return t;
-            });
-            this.leaseHeartbeat.scheduleAtFixedRate(this::renewLeases, interval, interval,
+        long renewInterval = config.leaseRenewIntervalMillis();
+        if (renewInterval > 0) {
+            this.leaseHeartbeat = daemonScheduler("candybox-lease-" + nodeId);
+            this.leaseHeartbeat.scheduleAtFixedRate(this::renewLeases, renewInterval, renewInterval,
                     TimeUnit.MILLISECONDS);
         } else {
             this.leaseHeartbeat = null;
         }
+
+        long compactionInterval = config.compactionIntervalMillis();
+        if (compactionInterval > 0) {
+            this.compactionWorker = daemonScheduler("candybox-compaction-" + nodeId);
+            this.compactionWorker.scheduleWithFixedDelay(this::compactOwnedBoxesOnce, compactionInterval,
+                    compactionInterval, TimeUnit.MILLISECONDS);
+        } else {
+            this.compactionWorker = null;
+        }
+    }
+
+    private static ScheduledExecutorService daemonScheduler(String name) {
+        return Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, name);
+            t.setDaemon(true);
+            return t;
+        });
     }
 
     public int nodeId() {
@@ -190,10 +211,46 @@ public final class CandyboxNode implements AutoCloseable {
         }
     }
 
+    /**
+     * Runs one bounded round of compaction over every Box this node still owns. The commit is gated on
+     * the owner's fencing token by the manifest, so a Box whose ownership was lost mid-round fails the
+     * commit ({@link FencedException}) and is simply skipped — a zombie owner cannot corrupt state.
+     *
+     * <p>Package-visible so tests can drive it deterministically without the background scheduler.
+     *
+     * @return the number of compactions performed across all Boxes
+     */
+    int compactOwnedBoxesOnce() {
+        int performed = 0;
+        for (BoxOwnership ownership : boxes.values()) {
+            if (!ownership.isOwner()) {
+                continue;
+            }
+            try {
+                BoxEngine engine = ownership.engine();
+                for (int pass = 0; pass < MAX_COMPACTIONS_PER_TICK; pass++) {
+                    if (!compactionService.compactOnce(engine)) {
+                        break;
+                    }
+                    performed++;
+                }
+            } catch (FencedException | NotOwnerException lostOwnership) {
+                LOG.info("Stopping compaction of a box on node {}: {}", nodeId,
+                        lostOwnership.getMessage());
+            } catch (RuntimeException e) {
+                LOG.warn("Compaction error on node {}", nodeId, e);
+            }
+        }
+        return performed;
+    }
+
     @Override
     public void close() {
         if (leaseHeartbeat != null) {
             leaseHeartbeat.shutdownNow();
+        }
+        if (compactionWorker != null) {
+            compactionWorker.shutdownNow();
         }
         for (BoxOwnership ownership : boxes.values()) {
             ownership.close();

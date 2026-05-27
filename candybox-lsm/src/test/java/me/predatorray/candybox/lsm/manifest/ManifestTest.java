@@ -19,7 +19,7 @@ class ManifestTest {
     private final LedgerConfig cfg = LedgerConfig.forRole(LedgerRole.MANIFEST);
 
     private static SSTableMeta table(long id, int level) {
-        return new SSTableMeta(id, level, CandyKey.of("a"), CandyKey.of("z"), 10);
+        return new SSTableMeta(id, level, CandyKey.of("a"), CandyKey.of("z"), 10, 1024);
     }
 
     @Test

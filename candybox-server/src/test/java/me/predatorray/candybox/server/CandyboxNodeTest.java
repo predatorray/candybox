@@ -128,6 +128,36 @@ class CandyboxNodeTest {
         store.close();
     }
 
+    @Test
+    void backgroundCompactionWorkerMergesOwnedBoxes() {
+        CandyboxConfig cfg = CandyboxConfig.builder()
+                .memtableFlushThresholdBytes(1) // each put flushes => one L0 table per key
+                .l0CompactionTrigger(3)
+                .l0StallThreshold(100)
+                .build();
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        try (CandyboxNode node = new CandyboxNode(1, cfg, store, new InMemoryCoordinationService(),
+                new ManualClock(1000))) {
+            node.createBox(BoxName.of("my-box"));
+            RequestHandler handler = node.requestHandler();
+            for (int i = 0; i < 5; i++) {
+                roundTrip(handler, put("my-box", "key-" + i));
+            }
+            assertThat(node.engine(BoxName.of("my-box")).manifestState().level0().size())
+                    .isGreaterThanOrEqualTo(3);
+
+            int performed = node.compactOwnedBoxesOnce();
+            assertThat(performed).isGreaterThanOrEqualTo(1);
+            assertThat(node.engine(BoxName.of("my-box")).manifestState().level0()).isEmpty();
+            // Data survives the background compaction.
+            for (int i = 0; i < 5; i++) {
+                Message resp = roundTrip(handler, new Message.GetCandyRequest("my-box", "key-" + i));
+                assertThat(resp).isInstanceOf(Message.CandyDataResponse.class);
+            }
+        }
+        store.close();
+    }
+
     private static Message put(String box, String key) {
         return new Message.PutCandyRequest(box, key, null, Map.of(), null,
                 "v".getBytes(StandardCharsets.UTF_8));

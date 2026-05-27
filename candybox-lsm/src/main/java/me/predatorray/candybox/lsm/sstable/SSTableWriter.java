@@ -56,6 +56,7 @@ public final class SSTableWriter {
         byte[] minKey = null;
         byte[] maxKey = null;
         long numEntries = 0;
+        long sizeBytes = 0;
 
         while (sorted.hasNext()) {
             Mutation m = sorted.next();
@@ -63,7 +64,7 @@ public final class SSTableWriter {
             byte[] mb = MutationSerializer.serialize(m);
 
             if (blockBytes > 0 && blockBytes + mb.length + 5 > dataBlockTargetBytes) {
-                flushBlock(ledger, blockMutations, blockLastKey, indexLastKeys, indexEntryIds);
+                sizeBytes += flushBlock(ledger, blockMutations, blockLastKey, indexLastKeys, indexEntryIds);
                 blockMutations = new ArrayList<>();
                 blockBytes = 0;
             }
@@ -85,7 +86,7 @@ public final class SSTableWriter {
             ledgerStore.deleteLedger(ledger.ledgerId());
             throw new IllegalArgumentException("Refusing to write an empty SSTable");
         }
-        flushBlock(ledger, blockMutations, blockLastKey, indexLastKeys, indexEntryIds);
+        sizeBytes += flushBlock(ledger, blockMutations, blockLastKey, indexLastKeys, indexEntryIds);
 
         BloomFilter bloom = BloomFilter.build(allKeys, bloomBitsPerKey);
         long bloomEntryId = ledger.append(bloom.serialize());
@@ -98,23 +99,26 @@ public final class SSTableWriter {
         ledger.close();
 
         return new SSTableMeta(ledger.ledgerId(), level, CandyKey.ofUtf8(minKey),
-                CandyKey.ofUtf8(maxKey), numEntries);
+                CandyKey.ofUtf8(maxKey), numEntries, sizeBytes);
     }
 
-    private static void flushBlock(WritableLedger ledger, List<byte[]> blockMutations,
-                                   byte[] blockLastKey, List<byte[]> indexLastKeys,
-                                   List<Long> indexEntryIds) {
+    /** Appends the block as one ledger entry; returns the entry's byte length (0 if empty). */
+    private static int flushBlock(WritableLedger ledger, List<byte[]> blockMutations,
+                                  byte[] blockLastKey, List<byte[]> indexLastKeys,
+                                  List<Long> indexEntryIds) {
         if (blockMutations.isEmpty()) {
-            return;
+            return 0;
         }
         BinaryWriter w = new BinaryWriter(256);
         w.writeVarInt(blockMutations.size());
         for (byte[] mb : blockMutations) {
             w.writeBytes(mb);
         }
-        long entryId = ledger.append(w.toByteArray());
+        byte[] block = w.toByteArray();
+        long entryId = ledger.append(block);
         indexLastKeys.add(blockLastKey);
         indexEntryIds.add(entryId);
+        return block.length;
     }
 
     private static byte[] serializeIndex(List<byte[]> lastKeys, List<Long> entryIds) {
