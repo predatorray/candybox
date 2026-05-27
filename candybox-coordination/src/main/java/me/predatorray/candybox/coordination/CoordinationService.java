@@ -62,6 +62,14 @@ public interface CoordinationService extends AutoCloseable {
      */
     Optional<Lease> tryAcquireLease(String resource, int nodeId, long ttlMillis);
 
+    /**
+     * Reads the current valid holder of {@code resource} without acquiring it, for routing.
+     *
+     * @param resource the resource path
+     * @return the holder, or empty if the lease is free/expired/released
+     */
+    Optional<LeaseInfo> leaseHolder(String resource);
+
     // ---- membership -------------------------------------------------------------------------
 
     /** Registers (or refreshes) this node in the cluster with opaque info bytes. */
@@ -72,6 +80,14 @@ public interface CoordinationService extends AutoCloseable {
 
     /** Lists currently registered node ids, ascending. */
     List<Integer> members();
+
+    /**
+     * Returns a registered member's opaque info bytes (e.g. its advertised {@code host:port}).
+     *
+     * @param nodeId the node id
+     * @return the info, or empty if the node is not registered
+     */
+    Optional<byte[]> memberInfo(int nodeId);
 
     @Override
     void close();

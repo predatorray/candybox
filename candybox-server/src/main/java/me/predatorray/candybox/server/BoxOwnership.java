@@ -8,6 +8,7 @@ import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.exception.BoxAlreadyExistsException;
 import me.predatorray.candybox.common.exception.BoxNotFoundException;
 import me.predatorray.candybox.common.exception.NotOwnerException;
+import me.predatorray.candybox.coordination.CandyboxKeys;
 import me.predatorray.candybox.coordination.CasConflictException;
 import me.predatorray.candybox.coordination.CoordinationService;
 import me.predatorray.candybox.coordination.Lease;
@@ -51,11 +52,11 @@ final class BoxOwnership implements AutoCloseable {
     }
 
     static String ownerResource(BoxName box) {
-        return "boxes/" + box.value() + "/owner";
+        return CandyboxKeys.ownerResource(box.value());
     }
 
     static String manifestKey(BoxName box) {
-        return "boxes/" + box.value() + "/manifest";
+        return CandyboxKeys.manifestKey(box.value());
     }
 
     /** Acquires ownership of a brand-new Box (the manifest pointer must not already exist). */

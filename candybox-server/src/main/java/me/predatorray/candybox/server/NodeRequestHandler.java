@@ -3,11 +3,14 @@ package me.predatorray.candybox.server;
 import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import me.predatorray.candybox.common.BoxName;
 import me.predatorray.candybox.common.CandyKey;
+import me.predatorray.candybox.common.exception.BoxNotFoundException;
 import me.predatorray.candybox.common.exception.BusyException;
 import me.predatorray.candybox.common.exception.CandyNotFoundException;
 import me.predatorray.candybox.common.exception.CandyboxException;
+import me.predatorray.candybox.common.exception.NotOwnerException;
 import me.predatorray.candybox.lsm.engine.BoxEngine;
 import me.predatorray.candybox.lsm.engine.CandyMetadata;
 import me.predatorray.candybox.lsm.engine.ListResult;
@@ -39,19 +42,58 @@ final class NodeRequestHandler implements RequestHandler {
 
     @Override
     public Frame handle(Frame request) {
+        Message message;
         try {
-            Message message = codec.decode(request);
+            message = codec.decode(request);
+        } catch (RuntimeException e) {
+            return codec.encode(new Message.ErrorResponse("ProtocolError", safe(e.getMessage())));
+        }
+        try {
             return codec.encode(dispatch(message));
         } catch (BusyException e) {
             return codec.encode(new Message.BusyResponse(100));
-        } catch (CandyNotFoundException | me.predatorray.candybox.common.exception.BoxNotFoundException e) {
+        } catch (CandyNotFoundException e) {
             return codec.encode(new Message.NotFoundResponse());
+        } catch (NotOwnerException | BoxNotFoundException e) {
+            // We don't own this Box. If another node does, tell the client to re-route; else not found.
+            return codec.encode(movedOrNotFound(message));
         } catch (CandyboxException e) {
             return codec.encode(new Message.ErrorResponse(e.getClass().getSimpleName(), safe(e.getMessage())));
         } catch (RuntimeException e) {
             LOG.warn("Unexpected error handling request", e);
             return codec.encode(new Message.ErrorResponse("InternalError", safe(e.getMessage())));
         }
+    }
+
+    private Message movedOrNotFound(Message message) {
+        String box = boxOf(message);
+        if (box != null) {
+            Optional<Integer> owner = node.currentOwner(BoxName.of(box));
+            if (owner.isPresent() && owner.get() != node.nodeId()) {
+                return new Message.MovedResponse(owner.get());
+            }
+        }
+        return new Message.NotFoundResponse();
+    }
+
+    /** The target Box of a Box-routed request, or {@code null} for cluster-wide requests. */
+    private static String boxOf(Message message) {
+        if (message instanceof Message.PutCandyRequest m) {
+            return m.box();
+        } else if (message instanceof Message.GetCandyRequest m) {
+            return m.box();
+        } else if (message instanceof Message.HeadCandyRequest m) {
+            return m.box();
+        } else if (message instanceof Message.DeleteCandyRequest m) {
+            return m.box();
+        } else if (message instanceof Message.ListCandiesRequest m) {
+            return m.box();
+        } else if (message instanceof Message.DeleteBoxRequest m) {
+            return m.box();
+        } else if (message instanceof Message.HeadBoxRequest m) {
+            return m.box();
+        }
+        return null;
     }
 
     private Message dispatch(Message message) {

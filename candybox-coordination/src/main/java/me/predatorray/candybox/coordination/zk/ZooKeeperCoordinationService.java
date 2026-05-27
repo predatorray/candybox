@@ -12,6 +12,7 @@ import me.predatorray.candybox.coordination.CoordinationException;
 import me.predatorray.candybox.coordination.CoordinationService;
 import me.predatorray.candybox.coordination.Lease;
 import me.predatorray.candybox.coordination.LeaseExpiredException;
+import me.predatorray.candybox.coordination.LeaseInfo;
 import me.predatorray.candybox.coordination.VersionedValue;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
@@ -180,6 +181,16 @@ public final class ZooKeeperCoordinationService implements CoordinationService {
         return ok ? Optional.of(new ZkLease(resource, nodeId, token, ttlMillis)) : Optional.empty();
     }
 
+    @Override
+    public Optional<LeaseInfo> leaseHolder(String resource) {
+        LeaseRecord cur = readLease(path(resource), new Stat());
+        long now = clock.currentTimeMillis();
+        if (cur == null || cur.released || now >= cur.expiry) {
+            return Optional.empty();
+        }
+        return Optional.of(new LeaseInfo(cur.owner, cur.token));
+    }
+
     private LeaseRecord readLease(String p, Stat stat) {
         try {
             byte[] data = client.getData().storingStatIn(stat).forPath(p);
@@ -253,6 +264,17 @@ public final class ZooKeeperCoordinationService implements CoordinationService {
             return List.of();
         } catch (Exception e) {
             throw wrap("members", MEMBERS_BASE, e);
+        }
+    }
+
+    @Override
+    public Optional<byte[]> memberInfo(int nodeId) {
+        try {
+            return Optional.of(client.getData().forPath(MEMBERS_BASE + "/" + nodeId));
+        } catch (KeeperException.NoNodeException e) {
+            return Optional.empty();
+        } catch (Exception e) {
+            throw wrap("memberInfo", Integer.toString(nodeId), e);
         }
     }
 

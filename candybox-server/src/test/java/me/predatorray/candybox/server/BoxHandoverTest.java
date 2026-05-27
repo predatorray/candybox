@@ -12,6 +12,8 @@ import me.predatorray.candybox.common.ManualClock;
 import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.exception.NotOwnerException;
 import me.predatorray.candybox.coordination.fake.InMemoryCoordinationService;
+import me.predatorray.candybox.protocol.Message;
+import me.predatorray.candybox.protocol.MessageCodec;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -88,6 +90,37 @@ class BoxHandoverTest {
         } finally {
             nodeA.close();
             nodeB.close();
+            store.close();
+        }
+    }
+
+    @Test
+    void nonOwnerHandlerReturnsMovedToTheOwner() {
+        ManualClock clock = new ManualClock(1_000);
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        CandyboxConfig config = CandyboxConfig.builder().leaseRenewIntervalMillis(0).build();
+        MessageCodec codec = new MessageCodec();
+        BoxName box = BoxName.of("routed-box");
+
+        CandyboxNode owner = new CandyboxNode(1, config, store, coordination, clock);
+        CandyboxNode other = new CandyboxNode(2, config, store, coordination, clock);
+        try {
+            owner.createBox(box);
+
+            // A request for the Box that lands on the non-owner is redirected to the owner (node 1).
+            Message moved = codec.decode(other.requestHandler()
+                    .handle(codec.encode(new Message.GetCandyRequest(box.value(), "k"))));
+            assertThat(moved).isInstanceOf(Message.MovedResponse.class);
+            assertThat(((Message.MovedResponse) moved).ownerNodeId()).isEqualTo(1);
+
+            // A request for a Box that nobody owns is a plain not-found.
+            Message absent = codec.decode(other.requestHandler()
+                    .handle(codec.encode(new Message.GetCandyRequest("absent-box", "k"))));
+            assertThat(absent).isInstanceOf(Message.NotFoundResponse.class);
+        } finally {
+            owner.close();
+            other.close();
             store.close();
         }
     }

@@ -136,3 +136,25 @@ Streaming (D5: chunked PUT/GET) is **deferred to Phase 2.5** — separable and n
 Tests: `MessageCodecTest` round-trips the three new messages; `CandyboxNodeTest` covers HEAD/listBoxes/
 headBox through the handler; new `CandyboxClientTest` drives the client over `LoopbackTransport`
 (HEAD, listBoxes, MOVED→NotOwner). `mvn test` and `mvn verify` (20 ITs) pass.
+
+## WS5 status (this change)
+
+Membership + client-side routing:
+- `CoordinationService` gains `leaseHolder(resource)` → `LeaseInfo{ownerNodeId, fencingToken}` and
+  `memberInfo(nodeId)` → advertised `host:port`; implemented in the fake and the ZooKeeper service and
+  added to the shared contract. Key names moved to `CandyboxKeys` (shared by server and client).
+- `CandyboxNode` registers an advertised `host:port` in membership and exposes `currentOwner(box)`;
+  `NodeRequestHandler` returns `RESPONSE_MOVED(ownerNodeId)` when a Box-routed request lands on a
+  non-owner (and the Box has an owner), else `NOT_FOUND`.
+- New client routing layer: `Router` with `DirectRouter` (single node, existing behaviour) and
+  `ClusterRouter` (resolves Box→owner via the lease, owner→address via membership, re-routes on
+  `MOVED`, caches Box→address with `routerCacheTtlMillis`, one connection per node). `CandyboxClient`
+  gains a cluster constructor `(Transport, CoordinationService, CandyboxConfig)`; `candybox-client`
+  now depends on `candybox-coordination`.
+- New `CandyboxConfig.routerCacheTtlMillis`.
+
+Tests: contract covers the two new reads (fake + embedded ZooKeeper); `ClusterRouterTest` covers
+resolution, MOVED redirect + caching, no-owner, and `callAny`; `BoxHandoverTest` adds a handler
+MOVED-to-owner case. `mvn test` and `mvn verify` (21 ITs) pass.
+
+Remaining for Phase 2: **WS6** — a full client↔cluster handover IT over real TCP, then close-out.

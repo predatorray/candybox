@@ -8,51 +8,60 @@ import java.util.List;
 import java.util.Map;
 import me.predatorray.candybox.common.BoxName;
 import me.predatorray.candybox.common.CandyKey;
+import me.predatorray.candybox.common.SystemClock;
 import me.predatorray.candybox.common.Validation;
+import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.config.SizeLimits;
 import me.predatorray.candybox.common.exception.BusyException;
 import me.predatorray.candybox.common.exception.CandyNotFoundException;
 import me.predatorray.candybox.common.exception.CandyboxException;
 import me.predatorray.candybox.common.exception.NotOwnerException;
 import me.predatorray.candybox.common.exception.StorageException;
-import me.predatorray.candybox.protocol.Frame;
+import me.predatorray.candybox.coordination.CoordinationService;
 import me.predatorray.candybox.protocol.Message;
-import me.predatorray.candybox.protocol.MessageCodec;
-import me.predatorray.candybox.protocol.transport.Connection;
 import me.predatorray.candybox.protocol.transport.Transport;
 
 /**
  * The thin client library: exposes the public Candybox API over the {@link Transport} SPI. It builds
- * typed {@link Message}s, sends them over a {@link Connection}, and maps responses back to results or
- * the Candybox exception hierarchy. Client-side size validation fails fast before a request is sent.
+ * typed {@link Message}s, hands them to a {@link Router}, and maps responses back to results or the
+ * Candybox exception hierarchy. Client-side size validation fails fast before a request is sent.
  *
- * <p>v1 talks to a single node. Multi-node routing via Box assignment (Phase 2) layers on top of this
- * by selecting the connection per request. Large objects are buffered in memory for now; chunked
- * streaming over the wire is TODO(phase-2).
+ * <p>Construct with a {@code host:port} for a single node ({@link DirectRouter}), or with a
+ * {@link CoordinationService} for a cluster ({@link ClusterRouter}, which resolves each Box's owner and
+ * re-routes on {@code MOVED}). Large objects are buffered in memory for now; chunked streaming over the
+ * wire is TODO(phase-2.5).
  */
 public final class CandyboxClient implements AutoCloseable {
 
-    private final Connection connection;
-    private final MessageCodec codec = new MessageCodec();
+    private final Router router;
     private final SizeLimits limits;
 
+    /** Single-node client talking directly to {@code host:port}. */
     public CandyboxClient(Transport transport, String host, int port) {
         this(transport, host, port, SizeLimits.defaults());
     }
 
+    /** Single-node client with explicit size limits. */
     public CandyboxClient(Transport transport, String host, int port, SizeLimits limits) {
-        this.connection = transport.connect(host, port);
+        this.router = new DirectRouter(transport, host, port);
         this.limits = limits;
+    }
+
+    /** Cluster-aware client: routes each request to the owning node via coordination. */
+    public CandyboxClient(Transport transport, CoordinationService coordination, CandyboxConfig config) {
+        this.router = new ClusterRouter(transport, coordination, config.routerCacheTtlMillis(),
+                SystemClock.INSTANCE);
+        this.limits = config.sizeLimits();
     }
 
     // ---- Box admin -------------------------------------------------------------------------
 
     public void createBox(String box) {
-        expectOk(call(new Message.CreateBoxRequest(BoxName.of(box).value())));
+        expectOk(router.callAny(new Message.CreateBoxRequest(BoxName.of(box).value())));
     }
 
     public void deleteBox(String box, boolean force) {
-        expectOk(call(new Message.DeleteBoxRequest(BoxName.of(box).value(), force)));
+        expectOk(router.callBox(box, new Message.DeleteBoxRequest(BoxName.of(box).value(), force)));
     }
 
     // ---- Candy ops -------------------------------------------------------------------------
@@ -63,8 +72,9 @@ public final class CandyboxClient implements AutoCloseable {
         Validation.checkCandyKey(candyKey, limits);
         Validation.checkUserMetadata(userMetadata, limits);
         Validation.checkCandySize(data.length, limits);
-        expectOk(call(new Message.PutCandyRequest(BoxName.of(box).value(), candyKey.value(),
-                contentType, userMetadata == null ? Map.of() : userMetadata, idempotencyToken, data)));
+        expectOk(router.callBox(box, new Message.PutCandyRequest(BoxName.of(box).value(),
+                candyKey.value(), contentType, userMetadata == null ? Map.of() : userMetadata,
+                idempotencyToken, data)));
     }
 
     /** Streaming put (buffers the stream in memory for now — TODO(phase-2): true streaming). */
@@ -74,7 +84,7 @@ public final class CandyboxClient implements AutoCloseable {
     }
 
     public byte[] getCandy(String box, String key) {
-        Message response = call(new Message.GetCandyRequest(BoxName.of(box).value(),
+        Message response = router.callBox(box, new Message.GetCandyRequest(BoxName.of(box).value(),
                 CandyKey.of(key).value()));
         if (response instanceof Message.CandyDataResponse data) {
             return data.data();
@@ -93,7 +103,7 @@ public final class CandyboxClient implements AutoCloseable {
     }
 
     public CandyInfo headCandy(String box, String key) {
-        Message response = call(new Message.HeadCandyRequest(BoxName.of(box).value(),
+        Message response = router.callBox(box, new Message.HeadCandyRequest(BoxName.of(box).value(),
                 CandyKey.of(key).value()));
         if (response instanceof Message.HeadCandyResponse head) {
             return new CandyInfo(head.contentLength(), head.contentType(), head.userMetadata(),
@@ -102,18 +112,23 @@ public final class CandyboxClient implements AutoCloseable {
         throw mapUnexpected(response, box, key);
     }
 
-    /** Lists the Boxes known to the contacted node. */
+    /** Lists the Boxes known to the contacted node. (Cluster-wide listing is a later refinement.) */
     public List<String> listBoxes() {
-        Message response = call(new Message.ListBoxesRequest());
+        Message response = router.callAny(new Message.ListBoxesRequest());
         if (response instanceof Message.ListBoxesResponse boxes) {
             return boxes.boxes();
         }
         throw mapResponse(response);
     }
 
-    /** Returns whether the Box exists (is owned by the contacted node). */
+    /** Returns whether the Box exists (has a current owner). */
     public boolean headBox(String box) {
-        Message response = call(new Message.HeadBoxRequest(BoxName.of(box).value()));
+        Message response;
+        try {
+            response = router.callBox(box, new Message.HeadBoxRequest(BoxName.of(box).value()));
+        } catch (NotOwnerException noOwner) {
+            return false; // no current owner ⇒ not currently a live Box
+        }
         if (response instanceof Message.OkResponse) {
             return true;
         }
@@ -124,12 +139,13 @@ public final class CandyboxClient implements AutoCloseable {
     }
 
     public void deleteCandy(String box, String key) {
-        expectOk(call(new Message.DeleteCandyRequest(BoxName.of(box).value(), CandyKey.of(key).value())));
+        expectOk(router.callBox(box,
+                new Message.DeleteCandyRequest(BoxName.of(box).value(), CandyKey.of(key).value())));
     }
 
     public Listing listCandies(String box, String prefix, String startAfter, int maxKeys) {
-        Message response = call(new Message.ListCandiesRequest(BoxName.of(box).value(), prefix,
-                startAfter, maxKeys));
+        Message response = router.callBox(box, new Message.ListCandiesRequest(BoxName.of(box).value(),
+                prefix, startAfter, maxKeys));
         if (response instanceof Message.ListCandiesResponse list) {
             List<Listing.Entry> entries = new ArrayList<>();
             for (Message.ListedCandy c : list.entries()) {
@@ -142,15 +158,10 @@ public final class CandyboxClient implements AutoCloseable {
 
     @Override
     public void close() {
-        connection.close();
+        router.close();
     }
 
     // ---- internals -------------------------------------------------------------------------
-
-    private Message call(Message request) {
-        Frame responseFrame = connection.call(codec.encode(request));
-        return codec.decode(responseFrame);
-    }
 
     private void expectOk(Message response) {
         if (!(response instanceof Message.OkResponse)) {

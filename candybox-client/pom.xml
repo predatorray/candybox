@@ -23,5 +23,11 @@
             <groupId>me.predatorray.candybox</groupId>
             <artifactId>candybox-protocol</artifactId>
         </dependency>
+        <!-- The cluster-aware router resolves Box owners and member addresses via the coordination SPI.
+             The fake is used in client unit tests; production passes the ZooKeeper-backed service. -->
+        <dependency>
+            <groupId>me.predatorray.candybox</groupId>
+            <artifactId>candybox-coordination</artifactId>
+        </dependency>
     </dependencies>
 </project>

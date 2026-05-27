@@ -19,6 +19,7 @@ public final class CandyboxConfig {
     private final int maxFrameSizeBytes;
     private final long ownershipLeaseTtlMillis;
     private final long leaseRenewIntervalMillis;
+    private final long routerCacheTtlMillis;
     private final long maxClockSkewMillis;
     private final long tombstoneGcGraceMillis;
     private final int l0CompactionTrigger;
@@ -33,6 +34,7 @@ public final class CandyboxConfig {
         this.maxFrameSizeBytes = b.maxFrameSizeBytes;
         this.ownershipLeaseTtlMillis = b.ownershipLeaseTtlMillis;
         this.leaseRenewIntervalMillis = b.leaseRenewIntervalMillis;
+        this.routerCacheTtlMillis = b.routerCacheTtlMillis;
         this.maxClockSkewMillis = b.maxClockSkewMillis;
         this.tombstoneGcGraceMillis = b.tombstoneGcGraceMillis;
         this.l0CompactionTrigger = b.l0CompactionTrigger;
@@ -80,6 +82,11 @@ public final class CandyboxConfig {
         return leaseRenewIntervalMillis;
     }
 
+    /** How long the client caches a Box→owner routing entry before re-resolving. */
+    public long routerCacheTtlMillis() {
+        return routerCacheTtlMillis;
+    }
+
     public long maxClockSkewMillis() {
         return maxClockSkewMillis;
     }
@@ -107,6 +114,7 @@ public final class CandyboxConfig {
         private int maxFrameSizeBytes = 16 << 20;              // 16 MiB protocol cap
         private long ownershipLeaseTtlMillis = 10_000L;        // 10s lease
         private long leaseRenewIntervalMillis = 3_000L;        // renew well within the TTL; 0 disables
+        private long routerCacheTtlMillis = 5_000L;            // client Box->owner cache TTL
         private long maxClockSkewMillis = 300_000L;            // 5 min HLC skew bound
         private long tombstoneGcGraceMillis = 24L * 3600 * 1000; // 24h late-write window
         private int l0CompactionTrigger = 4;
@@ -149,6 +157,11 @@ public final class CandyboxConfig {
 
         public Builder leaseRenewIntervalMillis(long v) {
             this.leaseRenewIntervalMillis = v;
+            return this;
+        }
+
+        public Builder routerCacheTtlMillis(long v) {
+            this.routerCacheTtlMillis = v;
             return this;
         }
 

@@ -126,11 +126,27 @@ public abstract class CoordinationServiceContract {
     }
 
     @Test
-    void membershipRegistersAndLists() {
-        service.registerMember(3, b("host-3"));
-        service.registerMember(1, b("host-1"));
+    void membershipRegistersListsAndExposesInfo() {
+        service.registerMember(3, b("host-3:30"));
+        service.registerMember(1, b("host-1:10"));
         assertThat(service.members()).containsExactly(1, 3);
+        assertThat(service.memberInfo(1).map(String::new)).contains("host-1:10");
+        assertThat(service.memberInfo(2)).isEmpty();
         service.unregisterMember(1);
         assertThat(service.members()).containsExactly(3);
+        assertThat(service.memberInfo(1)).isEmpty();
+    }
+
+    @Test
+    void leaseHolderReportsCurrentOwnerAndClearsOnExpiry() {
+        assertThat(service.leaseHolder("owner")).isEmpty();
+
+        Lease lease = service.tryAcquireLease("owner", 5, 5_000).orElseThrow();
+        LeaseInfo holder = service.leaseHolder("owner").orElseThrow();
+        assertThat(holder.ownerNodeId()).isEqualTo(5);
+        assertThat(holder.fencingToken()).isEqualTo(lease.fencingToken());
+
+        clock.advance(6_000);
+        assertThat(service.leaseHolder("owner")).isEmpty();
     }
 }

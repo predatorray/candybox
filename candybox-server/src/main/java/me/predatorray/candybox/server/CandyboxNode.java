@@ -51,12 +51,21 @@ public final class CandyboxNode implements AutoCloseable {
 
     public CandyboxNode(int nodeId, CandyboxConfig config, LedgerStore ledgerStore,
                         CoordinationService coordination, Clock clock) {
+        this(nodeId, config, ledgerStore, coordination, clock, "node-" + nodeId);
+    }
+
+    /**
+     * @param advertisedAddress this node's reachable {@code host:port}, published to membership so
+     *                          clients can route to it. (Non-routable placeholder for in-JVM tests.)
+     */
+    public CandyboxNode(int nodeId, CandyboxConfig config, LedgerStore ledgerStore,
+                        CoordinationService coordination, Clock clock, String advertisedAddress) {
         this.nodeId = nodeId;
         this.config = config;
         this.ledgerStore = ledgerStore;
         this.coordination = coordination;
         this.clock = clock;
-        coordination.registerMember(nodeId, ("node-" + nodeId).getBytes(StandardCharsets.UTF_8));
+        coordination.registerMember(nodeId, advertisedAddress.getBytes(StandardCharsets.UTF_8));
 
         long interval = config.leaseRenewIntervalMillis();
         if (interval > 0) {
@@ -137,6 +146,12 @@ public final class CandyboxNode implements AutoCloseable {
     public boolean boxExists(BoxName box) {
         BoxOwnership o = boxes.get(box.value());
         return o != null && o.isOwner();
+    }
+
+    /** The node id currently owning {@code box} (from the coordination lease), if any. */
+    public java.util.Optional<Integer> currentOwner(BoxName box) {
+        return coordination.leaseHolder(BoxOwnership.ownerResource(box))
+                .map(me.predatorray.candybox.coordination.LeaseInfo::ownerNodeId);
     }
 
     /**

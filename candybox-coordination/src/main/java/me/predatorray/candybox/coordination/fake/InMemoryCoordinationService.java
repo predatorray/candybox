@@ -11,6 +11,7 @@ import me.predatorray.candybox.coordination.CasConflictException;
 import me.predatorray.candybox.coordination.CoordinationService;
 import me.predatorray.candybox.coordination.Lease;
 import me.predatorray.candybox.coordination.LeaseExpiredException;
+import me.predatorray.candybox.coordination.LeaseInfo;
 import me.predatorray.candybox.coordination.VersionedValue;
 
 /**
@@ -104,6 +105,16 @@ public final class InMemoryCoordinationService implements CoordinationService {
         return Optional.of(new LeaseHandle(fresh));
     }
 
+    @Override
+    public synchronized Optional<LeaseInfo> leaseHolder(String resource) {
+        LeaseState st = leases.get(resource);
+        long now = clock.currentTimeMillis();
+        if (st == null || st.released || now >= st.expiry) {
+            return Optional.empty();
+        }
+        return Optional.of(new LeaseInfo(st.ownerNodeId, st.token));
+    }
+
     // ---- membership ------------------------------------------------------------------------
 
     @Override
@@ -124,6 +135,12 @@ public final class InMemoryCoordinationService implements CoordinationService {
         }
         ids.sort(Integer::compareTo);
         return ids;
+    }
+
+    @Override
+    public Optional<byte[]> memberInfo(int nodeId) {
+        byte[] info = members.get(Integer.toString(nodeId));
+        return info == null ? Optional.empty() : Optional.of(info.clone());
     }
 
     @Override
