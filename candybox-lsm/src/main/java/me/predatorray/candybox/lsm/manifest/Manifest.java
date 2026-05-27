@@ -14,55 +14,82 @@ import me.predatorray.candybox.lsm.sstable.SSTableMeta;
  * before the in-memory state advances, so the two never diverge and a fenced owner cannot mutate
  * committed state.
  *
+ * <p>Fencing is enforced at two levels (defense in depth): BookKeeper recover-open is the hard fence
+ * on the ledger, and the manifest additionally tracks the highest **owner fencing token** it has
+ * committed and rejects any edit (or handover) whose token regresses below it.
+ *
  * <p>{@link #createNew} boots a brand-new Box; {@link #recover} performs the handover sequence —
- * recover-open and replay the prior manifest ledger, then open a fresh ledger seeded with a
- * self-contained checkpoint of the recovered state.
+ * recover-open and replay the prior manifest ledger, reject the handover if this owner's token is
+ * stale, then open a fresh ledger seeded with a checkpoint of the recovered state.
  */
 public final class Manifest implements AutoCloseable {
 
     private final ManifestLog log;
+    private final long ownerFencingToken;
     private volatile ManifestState state;
+    private long maxToken;
 
-    private Manifest(ManifestLog log, ManifestState state) {
+    private Manifest(ManifestLog log, ManifestState state, long ownerFencingToken, long maxToken) {
         this.log = log;
         this.state = state;
+        this.ownerFencingToken = ownerFencingToken;
+        this.maxToken = maxToken;
     }
 
     /** Creates a manifest for a new Box, backed by a fresh empty manifest ledger. */
-    public static Manifest createNew(LedgerStore store, LedgerConfig manifestConfig) {
-        return new Manifest(ManifestLog.create(store, manifestConfig), ManifestState.empty());
+    public static Manifest createNew(LedgerStore store, LedgerConfig manifestConfig,
+                                     long ownerFencingToken) {
+        return new Manifest(ManifestLog.create(store, manifestConfig), ManifestState.empty(),
+                ownerFencingToken, ownerFencingToken);
     }
 
     /**
      * Recovers a Box's manifest on ownership handover: fences and replays the prior ledger, then opens
      * a fresh ledger seeded with a checkpoint of the recovered state.
      *
-     * @param store              the ledger store
-     * @param manifestConfig     config for the fresh manifest ledger
-     * @param priorManifestLedgerId the previous owner's manifest ledger id
-     * @return the recovered manifest, ready for writes on the fresh ledger
+     * @param ownerFencingToken      the recovering owner's fencing token; must not be below the highest
+     *                               token already committed, otherwise the handover is stale
+     * @throws FencedException if {@code ownerFencingToken} regresses below the recovered max token
      */
     public static Manifest recover(LedgerStore store, LedgerConfig manifestConfig,
-                                   long priorManifestLedgerId) {
+                                   long priorManifestLedgerId, long ownerFencingToken) {
         ReadableLedger prior = store.recoverOpen(priorManifestLedgerId);
         ManifestState recovered = ManifestState.empty();
+        long maxReplayedToken = 0;
         try {
             for (ManifestEdit edit : ManifestLog.replay(prior)) {
                 recovered = recovered.apply(edit);
+                maxReplayedToken = Math.max(maxReplayedToken, edit.ownerFencingToken());
             }
         } finally {
             prior.close();
         }
+        if (ownerFencingToken < maxReplayedToken) {
+            throw new FencedException("Stale handover: owner token " + ownerFencingToken
+                    + " is below the committed max token " + maxReplayedToken);
+        }
 
         ManifestLog fresh = ManifestLog.create(store, manifestConfig);
-        fresh.append(checkpoint(recovered));
-        return new Manifest(fresh, recovered);
+        fresh.append(checkpoint(recovered).withOwnerFencingToken(ownerFencingToken));
+        return new Manifest(fresh, recovered, ownerFencingToken, ownerFencingToken);
     }
 
-    /** Appends an edit durably and advances the in-memory state. */
+    /**
+     * Appends an edit durably and advances the in-memory state. The edit is stamped with the authoring
+     * token (its own if set, else this owner's); a token below the highest committed token is rejected.
+     *
+     * @throws FencedException if the edit's token regresses, or this owner's ledger has been fenced
+     */
     public synchronized void apply(ManifestEdit edit) {
-        log.append(edit); // throws FencedException if this owner has been fenced
-        state = state.apply(edit);
+        long token = edit.ownerFencingToken() == 0 ? ownerFencingToken : edit.ownerFencingToken();
+        if (token < maxToken) {
+            throw new FencedException("Rejecting manifest edit with fencing token " + token
+                    + " below committed max " + maxToken);
+        }
+        ManifestEdit stamped = edit.withOwnerFencingToken(token);
+        log.append(stamped); // hard fence: throws FencedException if this ledger was recover-opened
+        state = state.apply(stamped);
+        maxToken = Math.max(maxToken, token);
     }
 
     /** The current LSM state snapshot. */
@@ -73,6 +100,11 @@ public final class Manifest implements AutoCloseable {
     /** The id of the manifest ledger this owner is writing to. */
     public long ledgerId() {
         return log.ledgerId();
+    }
+
+    /** This owner's fencing token. */
+    public long ownerFencingToken() {
+        return ownerFencingToken;
     }
 
     @Override

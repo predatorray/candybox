@@ -65,7 +65,8 @@ public final class CandyboxNode implements AutoCloseable {
                 throw new BoxAlreadyExistsException(name);
             }
             LOG.info("Creating box {} on node {}", name, nodeId);
-            return BoxEngine.createNew(box, config, ledgerStore, nodeId, clock);
+            // TODO(phase-2 WS3): pass the owner's ZK lease fencing token here instead of a constant.
+            return BoxEngine.createNew(box, config, ledgerStore, nodeId, clock, 1L);
         });
     }
 

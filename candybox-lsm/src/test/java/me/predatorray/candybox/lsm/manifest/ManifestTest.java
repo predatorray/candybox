@@ -23,8 +23,8 @@ class ManifestTest {
     }
 
     @Test
-    void applyAdvancesInMemoryState() {
-        Manifest m = Manifest.createNew(store, cfg);
+    void applyAdvancesInMemoryStateAndStampsOwnerToken() {
+        Manifest m = Manifest.createNew(store, cfg, 1L);
         m.apply(ManifestEdit.flush(table(100, 0), Set.of(7L, 8L), 42L));
 
         assertThat(m.current().level0()).extracting(SSTableMeta::ledgerId).containsExactly(100L);
@@ -33,21 +33,21 @@ class ManifestTest {
     }
 
     @Test
-    void editsSerializeAndReplayRoundTrip() {
+    void editsSerializeAndReplayRoundTripIncludingToken() {
         ManifestEdit edit = new ManifestEdit(List.of(table(1, 0), table(2, 1)),
-                Set.of(99L), Set.of(7L), Set.of(8L), 5L);
+                Set.of(99L), Set.of(7L), Set.of(8L), 5L, 3L);
         byte[] bytes = ManifestSerializer.serialize(edit);
         assertThat(ManifestSerializer.deserialize(bytes)).isEqualTo(edit);
     }
 
     @Test
     void recoverReplaysPriorManifestIntoFreshLedger() {
-        Manifest a = Manifest.createNew(store, cfg);
+        Manifest a = Manifest.createNew(store, cfg, 1L);
         a.apply(ManifestEdit.flush(table(100, 0), Set.of(7L), 9L));
         a.apply(ManifestEdit.builder().addedTables(List.of(table(101, 0))).build());
         long priorLedger = a.ledgerId();
 
-        Manifest b = Manifest.recover(store, cfg, priorLedger);
+        Manifest b = Manifest.recover(store, cfg, priorLedger, 2L);
         assertThat(b.current().tables()).extracting(SSTableMeta::ledgerId)
                 .containsExactlyInAnyOrder(100L, 101L);
         assertThat(b.current().walLedgerId()).isEqualTo(9L);
@@ -58,7 +58,7 @@ class ManifestTest {
 
     @Test
     void fencedOwnerCannotCommitFurtherEdits() {
-        Manifest owner = Manifest.createNew(store, cfg);
+        Manifest owner = Manifest.createNew(store, cfg, 1L);
         owner.apply(ManifestEdit.flush(table(100, 0), Set.of(), 9L));
 
         // A new owner recover-opens (fences) the manifest ledger.
@@ -66,6 +66,26 @@ class ManifestTest {
 
         assertThatThrownBy(() -> owner.apply(ManifestEdit.builder()
                 .addedTables(List.of(table(200, 0))).build()))
+                .isInstanceOf(FencedException.class);
+    }
+
+    @Test
+    void recoverRejectsAStaleOwnerToken() {
+        Manifest a = Manifest.createNew(store, cfg, 5L);
+        a.apply(ManifestEdit.flush(table(100, 0), Set.of(), 9L));
+        long priorLedger = a.ledgerId();
+
+        // A node whose lease token (3) is below the committed max (5) must not take over.
+        assertThatThrownBy(() -> Manifest.recover(store, cfg, priorLedger, 3L))
+                .isInstanceOf(FencedException.class);
+    }
+
+    @Test
+    void applyRejectsAnEditCarryingAStaleToken() {
+        Manifest owner = Manifest.createNew(store, cfg, 5L);
+        // An edit explicitly authored with a lower token (e.g. a zombie compactor) is rejected.
+        assertThatThrownBy(() -> owner.apply(ManifestEdit.builder()
+                .addedTables(List.of(table(100, 0))).ownerFencingToken(4L).build()))
                 .isInstanceOf(FencedException.class);
     }
 }

@@ -61,7 +61,7 @@ class Phase1EngineIT {
     void putGetDeleteListOnRealLedgers() {
         BoxName box = BoxName.of("it-box");
         try (BoxEngine engine = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1,
-                SystemClock.INSTANCE)) {
+                SystemClock.INSTANCE, 1L)) {
             engine.putCandy(CandyKey.of("a/1"), bytes("one"), "text/plain", Map.of("k", "v"), null);
             engine.putCandy(CandyKey.of("a/2"), bytes("two"), null, Map.of(), null);
             engine.putCandy(CandyKey.of("b/1"), bytes("three"), null, Map.of(), null);
@@ -93,7 +93,7 @@ class Phase1EngineIT {
         new Random(7).nextBytes(big);
 
         BoxName box = BoxName.of("big-box");
-        try (BoxEngine engine = BoxEngine.createNew(box, config, store, 1, SystemClock.INSTANCE)) {
+        try (BoxEngine engine = BoxEngine.createNew(box, config, store, 1, SystemClock.INSTANCE, 1L)) {
             engine.putCandy(CandyKey.of("large"), big, "application/octet-stream", Map.of(), null);
             assertThat(engine.getCandy(CandyKey.of("large"))).isEqualTo(big);
 
@@ -107,14 +107,14 @@ class Phase1EngineIT {
         BoxName box = BoxName.of("recover-box");
         long manifestLedgerId;
         BoxEngine ownerA = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1,
-                SystemClock.INSTANCE);
+                SystemClock.INSTANCE, 1L);
         ownerA.putCandy(CandyKey.of("k1"), bytes("v1"), null, Map.of(), null);
         ownerA.putCandy(CandyKey.of("k2"), bytes("v2"), null, Map.of(), null);
         // Deliberately do NOT flush or close: simulate a crash with data only in the WAL.
         manifestLedgerId = ownerA.manifestLedgerId();
 
         try (BoxEngine ownerB = BoxEngine.recover(box, CandyboxConfig.defaults(), store, 2,
-                SystemClock.INSTANCE, manifestLedgerId)) {
+                SystemClock.INSTANCE, manifestLedgerId, 2L)) {
             assertThat(ownerB.getCandy(CandyKey.of("k1"))).isEqualTo(bytes("v1"));
             assertThat(ownerB.getCandy(CandyKey.of("k2"))).isEqualTo(bytes("v2"));
         }

@@ -39,6 +39,7 @@ public final class ManifestSerializer {
             w.writeBoolean(true);
             w.writeVarLong(edit.newWalLedgerId());
         }
+        w.writeVarLong(edit.ownerFencingToken());
         return w.toByteArray();
     }
 
@@ -57,7 +58,9 @@ public final class ManifestSerializer {
         Set<Long> addedSyrups = readLongSet(r);
         Set<Long> removedSyrups = readLongSet(r);
         Long newWal = r.readBoolean() ? r.readVarLong() : null;
-        return new ManifestEdit(tables, removedTables, addedSyrups, removedSyrups, newWal);
+        long ownerFencingToken = r.readVarLong();
+        return new ManifestEdit(tables, removedTables, addedSyrups, removedSyrups, newWal,
+                ownerFencingToken);
     }
 
     private static void writeTable(BinaryWriter w, SSTableMeta t) {

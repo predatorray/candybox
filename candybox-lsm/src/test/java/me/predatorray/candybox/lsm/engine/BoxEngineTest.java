@@ -36,7 +36,7 @@ class BoxEngineTest {
 
     @Test
     void putGetDeleteSurvivesFlush() {
-        engine = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1, new ManualClock(1000));
+        engine = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1, new ManualClock(1000), 1L);
 
         engine.putCandy(CandyKey.of("fruit/apple"), bytes("red"), "text/plain",
                 Map.of("color", "red"), null);
@@ -62,7 +62,7 @@ class BoxEngineTest {
 
     @Test
     void overwriteReturnsLatestValueAcrossLevels() {
-        engine = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1, new ManualClock(1000));
+        engine = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1, new ManualClock(1000), 1L);
         engine.putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
         engine.flush(); // v1 now in an SSTable
         engine.putCandy(CandyKey.of("k"), bytes("v2"), null, Map.of(), null); // v2 in the memtable
@@ -71,7 +71,7 @@ class BoxEngineTest {
 
     @Test
     void listCandiesHonoursPrefixStartAfterAndPaging() {
-        engine = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1, new ManualClock(1000));
+        engine = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1, new ManualClock(1000), 1L);
         engine.putCandy(CandyKey.of("a/1"), bytes("x"), null, Map.of(), null);
         engine.putCandy(CandyKey.of("a/2"), bytes("x"), null, Map.of(), null);
         engine.putCandy(CandyKey.of("a/3"), bytes("x"), null, Map.of(), null);
@@ -91,7 +91,7 @@ class BoxEngineTest {
 
     @Test
     void idempotencyTokenDedupesRetriedPut() {
-        engine = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1, new ManualClock(1000));
+        engine = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1, new ManualClock(1000), 1L);
         CandyMetadata first = engine.putCandy(CandyKey.of("k"), bytes("payload"), null, Map.of(), "tok-1");
         CandyMetadata retry = engine.putCandy(CandyKey.of("k"), bytes("payload"), null, Map.of(), "tok-1");
 
@@ -106,7 +106,7 @@ class BoxEngineTest {
                 .l0CompactionTrigger(1)
                 .l0StallThreshold(2)
                 .build();
-        engine = BoxEngine.createNew(box, stallConfig, store, 1, new ManualClock(1000));
+        engine = BoxEngine.createNew(box, stallConfig, store, 1, new ManualClock(1000), 1L);
 
         engine.putCandy(CandyKey.of("k1"), bytes("a"), null, Map.of(), null); // L0 -> 1
         engine.putCandy(CandyKey.of("k2"), bytes("a"), null, Map.of(), null); // L0 -> 2
@@ -118,14 +118,15 @@ class BoxEngineTest {
     void handoverWithRegressedClockDoesNotLoseLatestWrite() {
         // Owner A runs with a wall clock far in the future.
         ManualClock clockA = new ManualClock(10_000);
-        BoxEngine ownerA = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1, clockA);
+        BoxEngine ownerA = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1, clockA, 1L);
         CandyMetadata v1 = ownerA.putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
 
         long manifestLedgerId = ownerA.manifestLedgerId();
 
         // Owner B takes over with a badly regressed wall clock.
         ManualClock clockB = new ManualClock(100);
-        engine = BoxEngine.recover(box, CandyboxConfig.defaults(), store, 2, clockB, manifestLedgerId);
+        // Owner B takes over with a strictly higher fencing token than A (1).
+        engine = BoxEngine.recover(box, CandyboxConfig.defaults(), store, 2, clockB, manifestLedgerId, 2L);
 
         CandyMetadata v2 = engine.putCandy(CandyKey.of("k"), bytes("v2"), null, Map.of(), null);
 

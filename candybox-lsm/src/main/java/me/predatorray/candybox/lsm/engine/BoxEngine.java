@@ -107,12 +107,16 @@ public final class BoxEngine implements AutoCloseable {
         this.syrupReader = new SyrupReader(ledgerStore);
     }
 
-    /** Boots a brand-new Box: fresh manifest and WAL, empty memtable. */
+    /**
+     * Boots a brand-new Box: fresh manifest and WAL, empty memtable.
+     *
+     * @param fencingToken this owner's lease fencing token, stamped into every manifest edit
+     */
     public static BoxEngine createNew(BoxName box, CandyboxConfig config, LedgerStore ledgerStore,
-                                      int nodeId, Clock clock) {
+                                      int nodeId, Clock clock, long fencingToken) {
         HybridLogicalClock hlc = new HybridLogicalClock(nodeId, clock, config.maxClockSkewMillis());
         Manifest manifest = Manifest.createNew(ledgerStore, roleConfig(config, ledgerStore, box,
-                LedgerRole.MANIFEST));
+                LedgerRole.MANIFEST), fencingToken);
         WriteAheadLog wal = WriteAheadLog.create(ledgerStore, roleConfig(config, ledgerStore, box,
                 LedgerRole.WAL));
         // Record the initial WAL id so a future owner can always find and fence it.
@@ -126,12 +130,15 @@ public final class BoxEngine implements AutoCloseable {
      * recorded so a regressed wall clock cannot stamp a newer write with a lower timestamp.
      *
      * @param priorManifestLedgerId the prior owner's manifest ledger id
+     * @param fencingToken          this owner's lease fencing token; a stale (lower) token is rejected
      */
     public static BoxEngine recover(BoxName box, CandyboxConfig config, LedgerStore ledgerStore,
-                                    int nodeId, Clock clock, long priorManifestLedgerId) {
+                                    int nodeId, Clock clock, long priorManifestLedgerId,
+                                    long fencingToken) {
         HybridLogicalClock hlc = new HybridLogicalClock(nodeId, clock, config.maxClockSkewMillis());
         Manifest manifest = Manifest.recover(ledgerStore,
-                roleConfig(config, ledgerStore, box, LedgerRole.MANIFEST), priorManifestLedgerId);
+                roleConfig(config, ledgerStore, box, LedgerRole.MANIFEST), priorManifestLedgerId,
+                fencingToken);
         ManifestState state = manifest.current();
 
         Memtable memtable = new Memtable();

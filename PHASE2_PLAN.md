@@ -87,3 +87,17 @@ Implemented:
 
 `curator-framework` is an **optional** compile dependency of `candybox-coordination` (the fake needs
 nothing); modules that want the ZK impl declare Curator themselves.
+
+## WS2 status (this change)
+
+Implemented fencing-token plumbing through the manifest:
+- `ManifestEdit` carries `long ownerFencingToken` (serialized; left `0` by callers and stamped at apply).
+- `Manifest` tracks `maxToken`; `apply` resolves the edit's token (its own if set, else the owner's),
+  **rejects a regression with `FencedException`**, then appends (BK recover-open remains the hard fence).
+- `Manifest.recover(..., ownerFencingToken)` **rejects a stale handover** (owner token below the
+  recovered max) and seeds `maxToken`/the checkpoint with the new owner's token.
+- `BoxEngine.createNew/recover` take a `long fencingToken` and thread it to the manifest; the engine
+  stays coordination-free (D7). `CandyboxNode` passes a constant token for now (`// TODO(phase-2 WS3)`).
+
+New tests: `ManifestTest` covers token round-trip, stale-handover rejection, and stale-edit rejection.
+`mvn test` and `mvn verify` (19 ITs) remain green.
