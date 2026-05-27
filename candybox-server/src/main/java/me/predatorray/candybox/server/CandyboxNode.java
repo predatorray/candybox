@@ -224,11 +224,11 @@ public final class CandyboxNode implements AutoCloseable {
      * the owner's fencing token by the manifest, so a Box whose ownership was lost mid-round fails the
      * commit ({@link FencedException}) and is simply skipped — a zombie owner cannot corrupt state.
      *
-     * <p>Package-visible so tests can drive it deterministically without the background scheduler.
+     * <p>Exposed so it can be driven manually (tests, operational triggers) without the scheduler.
      *
      * @return the number of compactions performed across all Boxes
      */
-    int compactOwnedBoxesOnce() {
+    public int compactOwnedBoxesOnce() {
         int performed = 0;
         for (BoxOwnership ownership : boxes.values()) {
             if (!ownership.isOwner()) {
@@ -254,11 +254,11 @@ public final class CandyboxNode implements AutoCloseable {
 
     /**
      * Runs one GC pass over every Box this node owns, deleting SSTable ledgers obsoleted by committed
-     * compactions past the grace period. Package-visible for deterministic tests.
+     * compactions past the grace period. Exposed for manual/operational triggering.
      *
      * @return the number of ledgers deleted
      */
-    int collectGarbageOnce() {
+    public int collectGarbageOnce() {
         int deleted = 0;
         for (BoxOwnership ownership : boxes.values()) {
             if (!ownership.isOwner()) {

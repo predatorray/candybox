@@ -90,6 +90,9 @@ public final class BoxEngine implements AutoCloseable {
     // Syrup ledgers no longer referenced by any SSTable/memtable, awaiting GC: id -> first-seen-orphan.
     private final ConcurrentMap<Long, Long> pendingOrphanSyrups = new ConcurrentHashMap<>();
 
+    // WAL ledgers rotated out at flush (data now durable in an SSTable), awaiting GC: id -> when.
+    private final ConcurrentMap<Long, Long> obsoleteWals = new ConcurrentHashMap<>();
+
     // Bounded idempotency cache: token -> already-applied result, so a retried put is a no-op.
     private final Map<String, CandyMetadata> idempotencyCache = Collections.synchronizedMap(
             new LinkedHashMap<>(16, 0.75f, true) {
@@ -459,6 +462,22 @@ public final class BoxEngine implements AutoCloseable {
         obsoleteSSTables.remove(ledgerId);
     }
 
+    /** WAL ledger ids rotated out at or before {@code asOfMillis} and not yet deleted. */
+    public java.util.List<Long> reclaimableWals(long asOfMillis) {
+        java.util.List<Long> ids = new java.util.ArrayList<>();
+        for (Map.Entry<Long, Long> e : obsoleteWals.entrySet()) {
+            if (e.getValue() <= asOfMillis) {
+                ids.add(e.getKey());
+            }
+        }
+        return ids;
+    }
+
+    /** Drops a WAL ledger id from the obsolete set once GC has physically deleted it. */
+    public void forgetObsoleteWal(long ledgerId) {
+        obsoleteWals.remove(ledgerId);
+    }
+
     /** A consistent snapshot of the current LSM state (for compaction picking / inspection). */
     public ManifestState manifestState() {
         return manifest.current();
@@ -554,11 +573,15 @@ public final class BoxEngine implements AutoCloseable {
         SSTableMeta table = sstableWriter.write(ledgerConfig(LedgerRole.SSTABLE), 0, flushing.iterator());
 
         WriteAheadLog newWal = WriteAheadLog.create(ledgerStore, ledgerConfig(LedgerRole.WAL));
+        long obsoleteWalId = wal.ledgerId();
         manifest.apply(ManifestEdit.flush(table, syrups, newWal.ledgerId()));
         wal.close();
         wal = newWal;
         active = new Memtable();
 
+        // The rotated WAL's mutations are now durable in the SSTable and the manifest points at the
+        // new WAL, so the old one is no longer a recovery source and may be GC'd.
+        obsoleteWals.put(obsoleteWalId, clock.currentTimeMillis());
         readers.put(table.ledgerId(), new SSTableReader(ledgerStore, table.ledgerId()));
         LOG.debug("Flushed memtable of box {} to SSTable ledger {} ({} entries)", box,
                 table.ledgerId(), table.entryCount());

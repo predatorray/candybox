@@ -11,18 +11,22 @@ import org.slf4j.LoggerFactory;
 /**
  * Reference-counted garbage collection of obsoleted ledgers.
  *
- * <p>WS2 reclaims <b>SSTable</b> ledgers that a committed compaction removed from the manifest: the
- * engine records each removed ledger (with the time it left the committed manifest), and after a grace
- * period (Pulsar-style — leaving a margin for in-flight readers / continuation tokens) the
- * {@link GarbageCollector} physically deletes it via {@link LedgerStore#deleteLedger(long)}.
+ * <p>Three reclaim sources, each after a grace period (Pulsar-style — a margin for in-flight readers /
+ * continuation tokens), via {@link LedgerStore#deleteLedger(long)}:
+ * <ul>
+ *   <li><b>SSTables</b> removed from the manifest by a committed compaction;</li>
+ *   <li><b>Syrups</b> no longer referenced by any SSTable, the memtable, or the open write Syrup
+ *       (dropped from the live set first via a fencing-gated manifest edit, then whole-ledger-deleted —
+ *       v1 reclaims a Syrup only once every segment in it is dead; no defragmentation);</li>
+ *   <li><b>WAL</b> ledgers rotated out at flush, whose mutations are now durable in an SSTable.</li>
+ * </ul>
  *
  * <p>Safety: this runs only for a Box this node still owns (the caller checks ownership), so the
- * physical delete is effectively gated on the owner's fencing token. The removed ledgers are already
- * out of the committed manifest (the compaction commit passed the manifest fence), so no live reader
- * resolves them. Deletes are idempotent: a missing ledger is treated as already gone.
+ * physical delete is effectively gated on the owner's fencing token, and the reclaimed ledgers are
+ * already out of the committed manifest. Deletes are idempotent: a missing ledger is treated as gone.
  *
- * <p>TODO(phase-3 WS3/WS4): orphaned-Syrup reclamation (per-SSTable referenced-Syrup tracking) and WAL
- * GC. v1 reclaims a Syrup only once every segment in it is dead (whole-ledger delete; no defrag).
+ * <p>TODO(phase-3+): an enumeration backstop so ledgers orphaned by a prior owner that crashed before
+ * GC are eventually reclaimed (the pending sets are in-memory today).
  */
 public final class GarbageCollector {
 
@@ -48,6 +52,21 @@ public final class GarbageCollector {
         long cutoff = clock.currentTimeMillis() - graceMillis;
         int deleted = collectSSTables(engine, cutoff);
         deleted += collectSyrups(engine, cutoff);
+        deleted += collectWals(engine, cutoff);
+        return deleted;
+    }
+
+    private int collectWals(BoxEngine engine, long cutoff) {
+        int deleted = 0;
+        for (long ledgerId : engine.reclaimableWals(cutoff)) {
+            if (deleteLedger(ledgerId)) {
+                deleted++;
+            }
+            engine.forgetObsoleteWal(ledgerId);
+        }
+        if (deleted > 0) {
+            LOG.debug("GC deleted {} rotated WAL ledger(s)", deleted);
+        }
         return deleted;
     }
 

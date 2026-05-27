@@ -76,3 +76,33 @@ reclaimed (verified via `LedgerStore.listLedgers`) while the live version and da
 and `mvn verify` (22 ITs) pass.
 
 Remaining for Phase 3: **WS4** — WAL GC + a full compaction-and-GC cycle IT on embedded BookKeeper.
+
+## WS4 status (this change)
+
+WAL GC + a full cycle on real backends:
+- `BoxEngine` records each WAL ledger rotated out at flush (its mutations are now durable in the new
+  SSTable and the manifest points at the fresh WAL) as obsolete; `reclaimableWals(asOf)` /
+  `forgetObsoleteWal(id)` expose it.
+- `GarbageCollector.collect` now reclaims SSTables, orphaned Syrups, **and** rotated WAL ledgers.
+- `CandyboxNode.compactOwnedBoxesOnce()` / `collectGarbageOnce()` are now public (manual/operational triggers).
+
+Tests: `CandyboxNodeTest` adds a WAL-GC pass (two flushes ⇒ two rotated WALs reclaimed, no compaction);
+new `CompactionGcCycleIT` runs the whole cycle on embedded BookKeeper + ZooKeeper — write + overwrite,
+compact, GC — asserting the cluster's ledger count drops and all live data is still readable. `mvn test`
+and `mvn verify` (23 ITs) pass.
+
+## Phase 3 — done
+
+WS1–WS4 complete. Compaction runs as an owner-driven background worker with LevelDB-style byte-size
+scoring and a fencing-gated commit; reference-counted GC reclaims obsolete SSTable ledgers, orphaned
+Syrups (whole-ledger, once every segment is dead), and rotated WAL ledgers — all by the owner against
+the committed manifest, after a grace period, validated end-to-end on embedded BookKeeper.
+
+Deferred (documented):
+- **Distributed compaction offload** — a non-owner produces the output SSTable under a ZK task lease;
+  v1 has the owner produce + commit (single-owner-per-Box already serializes manifest writes).
+- **GC enumeration backstop** — the pending-deletion/orphan sets are in-memory, so ledgers orphaned by
+  a prior owner that crashed pre-GC leak until a `LedgerStore`-enumeration backstop is added.
+- **Syrup defragmentation** — v1 reclaims a Syrup only once every segment in it is dead.
+
+Next milestone is **Phase 4** (hardening: failure/recovery paths, backpressure, fault-injection, ops docs).

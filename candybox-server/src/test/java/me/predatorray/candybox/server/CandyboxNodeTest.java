@@ -187,9 +187,9 @@ class CandyboxNodeTest {
             assertThat(node.engine(BoxName.of("my-box")).manifestState().level0()).isEmpty();
             assertThat(store.listLedgers()).containsAll(inputLedgerIds); // not deleted yet
 
-            // ...then GC physically deletes the obsolete input ledgers.
+            // ...then GC physically deletes the obsolete input ledgers (plus rotated WALs).
             int deleted = node.collectGarbageOnce();
-            assertThat(deleted).isEqualTo(inputLedgerIds.size());
+            assertThat(deleted).isGreaterThanOrEqualTo(inputLedgerIds.size());
             assertThat(store.listLedgers()).doesNotContainAnyElementsOf(inputLedgerIds);
 
             // The data is still readable from the merged L1 table.
@@ -243,6 +243,31 @@ class CandyboxNodeTest {
             Message get = roundTrip(handler, new Message.GetCandyRequest("my-box", "k"));
             assertThat(new String(((Message.CandyDataResponse) get).data(), StandardCharsets.UTF_8))
                     .isEqualTo("v2");
+        }
+        store.close();
+    }
+
+    @Test
+    void gcDeletesRotatedWalLedgers() {
+        CandyboxConfig cfg = CandyboxConfig.builder()
+                .memtableFlushThresholdBytes(1) // each put flushes => rotates the WAL
+                .l0CompactionTrigger(100)       // no compaction, so only WALs are reclaimable
+                .l0StallThreshold(200)
+                .ledgerGcGraceMillis(0)
+                .build();
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        try (CandyboxNode node = new CandyboxNode(1, cfg, store, new InMemoryCoordinationService(),
+                new ManualClock(1000))) {
+            node.createBox(BoxName.of("my-box"));
+            RequestHandler handler = node.requestHandler();
+            roundTrip(handler, put("my-box", "a")); // flush => WAL_0 rotated out
+            roundTrip(handler, put("my-box", "b")); // flush => WAL_1 rotated out
+
+            // No compaction and all Candies live, so only the two rotated WALs are reclaimable.
+            assertThat(node.collectGarbageOnce()).isEqualTo(2);
+            // Data still readable from the L0 tables.
+            assertThat(roundTrip(handler, new Message.GetCandyRequest("my-box", "a")))
+                    .isInstanceOf(Message.CandyDataResponse.class);
         }
         store.close();
     }
