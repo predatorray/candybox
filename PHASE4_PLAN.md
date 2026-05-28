@@ -35,3 +35,24 @@ documents how to run and reason about it.
 - a zombie owner (fenced by a new owner's recovery) cannot `flush`/commit — `FencedException`;
 - write-stall returns `BUSY`, and after a compaction reduces L0 writes resume;
 - a retried `putCandy` with the same idempotency token writes no second Syrup (no orphan on retry).
+
+## WS2 status (this change)
+
+While prototyping a real-bookie fault-injection IT against `LocalBookKeeper.removeBookie/addBookie`, a
+genuine hardening bug surfaced: **`SyrupManager` could get permanently wedged** if BookKeeper sealed the
+open Syrup ledger underneath it (which happens after sufficient bookie loss). Every subsequent write
+re-appended to the same dead ledger and failed with `FencedException` forever.
+
+Fix: on an append failure, the manager **abandons** the current Syrup (clears its handle + byte
+counter) so the next write rolls to a fresh ledger. Already-written Candies in the abandoned Syrup
+stay readable and referenced; the in-flight Candy's partial chunks are left as orphans for GC.
+
+Tested deterministically on the fake (`SyrupTest.recoversWhenOpenSyrupIsSealedUnderneath`):
+recover-open the open Syrup → the next write fails (`FencedException`) → a retry rolls to a fresh Syrup
+and succeeds → the previously-written Candy is still readable from the (now sealed) old Syrup.
+
+The real-bookie IT itself proved **flaky and pathologically slow on this embedded setup** (BookKeeper
+read failover after `removeBookie` depends on watcher-propagation timing; the test JVM teardown after
+bookie churn hung for tens of minutes). Decision: **drop the flaky IT** — deterministic fault-injection
+coverage lives on the fakes (WS1 + this WS), and a real multi-bookie chaos harness (Jepsen-style) is
+documented as future work. `mvn test` and `mvn verify` (23 ITs) pass.

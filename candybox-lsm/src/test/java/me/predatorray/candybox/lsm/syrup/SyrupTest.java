@@ -69,4 +69,32 @@ class SyrupTest {
                 .isInstanceOf(StorageException.class)
                 .hasMessageContaining("CRC mismatch");
     }
+
+    @Test
+    void recoversWhenOpenSyrupIsSealedUnderneath() {
+        // Models BookKeeper sealing the open Syrup after bookie loss: the next append fails, but the
+        // writer must abandon the dead ledger and roll to a fresh one on retry rather than wedge.
+        SyrupManager writer = new SyrupManager(store, CandyboxConfig.defaults(),
+                LedgerConfig.forRole(LedgerRole.SYRUP));
+        try {
+            SyrupWriteResult first = writer.writeCandy(new ByteArrayInputStream("v1".getBytes()));
+            long sealedSyrup = writer.currentSyrupId();
+
+            // Another actor recover-opens (fences/seals) the open Syrup.
+            store.recoverOpen(sealedSyrup);
+
+            // The in-flight write to the sealed ledger fails...
+            assertThatThrownBy(() -> writer.writeCandy(new ByteArrayInputStream("v2".getBytes())))
+                    .isInstanceOf(me.predatorray.candybox.common.exception.FencedException.class);
+
+            // ...but the writer recovered: a retry rolls to a fresh Syrup and succeeds.
+            SyrupWriteResult retry = writer.writeCandy(new ByteArrayInputStream("v2".getBytes()));
+            assertThat(writer.currentSyrupId()).isNotEqualTo(sealedSyrup);
+            assertThat(new SyrupReader(store).readAll(retry.segments(), 2)).isEqualTo("v2".getBytes());
+            // The Candy written before the seal is still readable from the (now sealed) old Syrup.
+            assertThat(new SyrupReader(store).readAll(first.segments(), 2)).isEqualTo("v1".getBytes());
+        } finally {
+            writer.close();
+        }
+    }
 }

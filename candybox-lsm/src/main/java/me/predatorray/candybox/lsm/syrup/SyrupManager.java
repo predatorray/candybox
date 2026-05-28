@@ -82,7 +82,7 @@ public final class SyrupManager implements AutoCloseable {
                 entry[3] = (byte) crc;
                 System.arraycopy(buf, 0, entry, CHUNK_HEADER_BYTES, n);
 
-                long entryId = currentSyrup.append(entry);
+                long entryId = appendOrAbandon(entry);
                 if (segFirst == -1) {
                     segFirst = entryId;
                 }
@@ -100,6 +100,23 @@ public final class SyrupManager implements AutoCloseable {
             segments.add(new SegmentRef(segSyrupId, segFirst, segLast));
         }
         return new SyrupWriteResult(segments, total, whole.value());
+    }
+
+    /**
+     * Appends a chunk to the current Syrup. If the append fails — e.g. BookKeeper sealed/fenced the
+     * ledger after bookie loss — the current Syrup is abandoned (for writes) so the next write rolls to
+     * a fresh ledger instead of being permanently stuck on a dead one. The exception is rethrown so the
+     * in-progress put fails; its partial chunks are left as orphans for GC. Already-written Candies in
+     * the abandoned Syrup remain readable and referenced.
+     */
+    private long appendOrAbandon(byte[] entry) {
+        try {
+            return currentSyrup.append(entry);
+        } catch (RuntimeException e) {
+            currentSyrup = null;
+            bytesInCurrentSyrup = 0;
+            throw e;
+        }
     }
 
     private void rollIfNeeded(int entryLength) {
