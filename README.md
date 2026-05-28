@@ -21,7 +21,7 @@ BookKeeper**. Each SSTable is a BookKeeper ledger; object bytes live in dedicate
 | 1 | Single-node core LSM: memtable, WAL, L0 SSTable flush, Syrup chunking, merged read path, LWW + tombstones | ✅ implemented & tested (fakes **and** embedded BookKeeper) |
 | 2 | Server node, ledger-backed manifest + ZK pointer, framed TCP protocol + thin client, fenced ownership & routing | ✅ implemented & tested (fakes **and** embedded BookKeeper + ZooKeeper). Deferred: chunked-streaming wire path (2.5), automatic failover, cluster-wide listBoxes. See `PHASE2_PLAN.md`. |
 | 3 | Distributed compaction & reference-counted GC | ✅ implemented & tested (fakes **and** embedded BookKeeper). Owner-driven background compaction (byte-size leveled scoring, fencing-gated commit); GC of obsolete SSTables, orphaned Syrups, rotated WALs. Deferred: distributed compaction offload, GC enumeration backstop, Syrup defrag. See `PHASE3_PLAN.md`. |
-| 4 | Hardening, fault injection, ops docs | ⛔ not started |
+| 4 | Hardening, fault injection, ops docs | ✅ implemented & tested. Engine-level fault-injection (ack-quorum loss/recovery, fencing, backpressure→compact→resume, idempotent retry); a sealed-Syrup writer-wedge bug found & fixed; operational counters (`BoxEngineStats`); `OPERATIONS.md`. Deferred: real multi-bookie chaos harness, metrics exporter. See `PHASE4_PLAN.md`. |
 
 ## Requirements
 

@@ -56,3 +56,27 @@ read failover after `removeBookie` depends on watcher-propagation timing; the te
 bookie churn hung for tens of minutes). Decision: **drop the flaky IT** — deterministic fault-injection
 coverage lives on the fakes (WS1 + this WS), and a real multi-bookie chaos harness (Jepsen-style) is
 documented as future work. `mvn test` and `mvn verify` (23 ITs) pass.
+
+## WS3 status (this change)
+
+Lightweight observability: `BoxEngine` keeps cumulative counters (puts, deletes, gets, heads, lists,
+flushes, compactions, stall rejections) and exposes a `BoxEngineStats` snapshot via `stats()`. No
+metrics framework — just in-process counters for logging / an ops endpoint. Tested by
+`BoxEngineStatsTest`.
+
+## WS4 status (this change)
+
+`OPERATIONS.md`: topology, the full `CandyboxConfig` tuning reference with defaults, the
+consistency/backpressure model, a failure-modes & recovery table, GC behaviour, observability, and the
+consolidated known-limitations / deferred-work list. README status table updated.
+
+## Phase 4 — done
+
+WS1–WS4 complete. Failure paths are exercised deterministically on the adversarial fakes (ack-quorum
+loss + recovery, zombie-owner fencing, backpressure→compact→resume, idempotent-retry-no-orphan); a real
+hardening bug (writer wedged on a sealed Syrup) was found and fixed; the engine exposes operational
+counters; and operations are documented.
+
+Deferred (documented in OPERATIONS.md): wire-streaming for large objects, automatic failover,
+cluster-wide listBoxes, distributed compaction offload, a GC enumeration backstop, Syrup
+defragmentation, a metrics exporter, and a real multi-bookie chaos harness.

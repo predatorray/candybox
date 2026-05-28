@@ -16,6 +16,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import me.predatorray.candybox.bookkeeper.LedgerConfig;
 import me.predatorray.candybox.bookkeeper.LedgerStore;
@@ -92,6 +93,16 @@ public final class BoxEngine implements AutoCloseable {
 
     // WAL ledgers rotated out at flush (data now durable in an SSTable), awaiting GC: id -> when.
     private final ConcurrentMap<Long, Long> obsoleteWals = new ConcurrentHashMap<>();
+
+    // Lightweight operational counters (snapshotted via stats()).
+    private final AtomicLong putCount = new AtomicLong();
+    private final AtomicLong deleteCount = new AtomicLong();
+    private final AtomicLong getCount = new AtomicLong();
+    private final AtomicLong headCount = new AtomicLong();
+    private final AtomicLong listCount = new AtomicLong();
+    private final AtomicLong flushCount = new AtomicLong();
+    private final AtomicLong compactionCount = new AtomicLong();
+    private final AtomicLong stallRejectionCount = new AtomicLong();
 
     // Bounded idempotency cache: token -> already-applied result, so a retried put is a no-op.
     private final Map<String, CandyMetadata> idempotencyCache = Collections.synchronizedMap(
@@ -242,6 +253,7 @@ public final class BoxEngine implements AutoCloseable {
             if (idempotencyToken != null) {
                 idempotencyCache.put(idempotencyToken, result);
             }
+            putCount.incrementAndGet();
             return result;
         } finally {
             lock.writeLock().unlock();
@@ -265,6 +277,7 @@ public final class BoxEngine implements AutoCloseable {
             wal.append(mutation);
             active.put(mutation);
             maybeFlushLocked();
+            deleteCount.incrementAndGet();
         } finally {
             lock.writeLock().unlock();
         }
@@ -276,6 +289,7 @@ public final class BoxEngine implements AutoCloseable {
     public CandyMetadata headCandy(CandyKey key) {
         CandyLocator locator = resolveLive(key)
                 .orElseThrow(() -> new CandyNotFoundException(box.value(), key.value()));
+        headCount.incrementAndGet();
         return CandyMetadata.from(locator);
     }
 
@@ -306,6 +320,7 @@ public final class BoxEngine implements AutoCloseable {
         if (wholeCrc.value() != locator.crc32c()) {
             throw new StorageException("Whole-object CRC mismatch for box=" + box + " key=" + key);
         }
+        getCount.incrementAndGet();
         return CandyMetadata.from(locator);
     }
 
@@ -355,6 +370,7 @@ public final class BoxEngine implements AutoCloseable {
                 CandyLocator loc = m.locator();
                 entries.add(new ListResult.ListEntry(m.key(), loc.contentLength(), loc.createdAtMillis()));
             }
+            listCount.incrementAndGet();
             return new ListResult(entries, next);
         } finally {
             lock.readLock().unlock();
@@ -384,6 +400,7 @@ public final class BoxEngine implements AutoCloseable {
                 obsoleteSSTables.put(removed, now);
             }
             recomputeOrphanSyrupsLocked(now);
+            compactionCount.incrementAndGet();
         } finally {
             lock.writeLock().unlock();
         }
@@ -483,6 +500,12 @@ public final class BoxEngine implements AutoCloseable {
         return manifest.current();
     }
 
+    /** A snapshot of this engine's cumulative operational counters. */
+    public BoxEngineStats stats() {
+        return new BoxEngineStats(putCount.get(), deleteCount.get(), getCount.get(), headCount.get(),
+                listCount.get(), flushCount.get(), compactionCount.get(), stallRejectionCount.get());
+    }
+
     @Override
     public void close() {
         lock.writeLock().lock();
@@ -504,6 +527,7 @@ public final class BoxEngine implements AutoCloseable {
     private void rejectIfStalled() {
         int l0 = manifest.current().level0().size();
         if (l0 >= config.l0StallThreshold()) {
+            stallRejectionCount.incrementAndGet();
             throw new BusyException("Box " + box + " is write-stalled: " + l0 + " L0 SSTables");
         }
     }
@@ -583,6 +607,7 @@ public final class BoxEngine implements AutoCloseable {
         // new WAL, so the old one is no longer a recovery source and may be GC'd.
         obsoleteWals.put(obsoleteWalId, clock.currentTimeMillis());
         readers.put(table.ledgerId(), new SSTableReader(ledgerStore, table.ledgerId()));
+        flushCount.incrementAndGet();
         LOG.debug("Flushed memtable of box {} to SSTable ledger {} ({} entries)", box,
                 table.ledgerId(), table.entryCount());
     }

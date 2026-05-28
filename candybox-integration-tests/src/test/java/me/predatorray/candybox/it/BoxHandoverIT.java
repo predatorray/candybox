@@ -52,18 +52,19 @@ class BoxHandoverIT {
         CandyboxConfig config = CandyboxConfig.builder().leaseRenewIntervalMillis(0).build();
         BoxName box = BoxName.of("handover-box");
 
-        BookKeeperLedgerStore storeA = new BookKeeperLedgerStore(bookKeeper.clientConfiguration(),
+        try (BookKeeperLedgerStore storeA = new BookKeeperLedgerStore(
+                bookKeeper.clientConfiguration(),
                 bytes("candybox"));
-        BookKeeperLedgerStore storeB = new BookKeeperLedgerStore(bookKeeper.clientConfiguration(),
-                bytes("candybox"));
-        ZooKeeperCoordinationService coordA =
-                new ZooKeeperCoordinationService(zookeeper.getConnectString(), SystemClock.INSTANCE);
-        ZooKeeperCoordinationService coordB =
-                new ZooKeeperCoordinationService(zookeeper.getConnectString(), SystemClock.INSTANCE);
-
-        CandyboxNode nodeA = new CandyboxNode(1, config, storeA, coordA, SystemClock.INSTANCE);
-        CandyboxNode nodeB = new CandyboxNode(2, config, storeB, coordB, SystemClock.INSTANCE);
-        try {
+             BookKeeperLedgerStore storeB = new BookKeeperLedgerStore(
+                     bookKeeper.clientConfiguration(),
+                     bytes("candybox"));
+             ZooKeeperCoordinationService coordA =
+                     new ZooKeeperCoordinationService(zookeeper.getConnectString(), SystemClock.INSTANCE);
+             ZooKeeperCoordinationService coordB =
+                     new ZooKeeperCoordinationService(zookeeper.getConnectString(), SystemClock.INSTANCE);
+             CandyboxNode nodeA = new CandyboxNode(1, config, storeA, coordA, SystemClock.INSTANCE);
+             CandyboxNode nodeB = new CandyboxNode(2, config, storeB, coordB, SystemClock.INSTANCE)
+        ) {
             nodeA.createBox(box);
             nodeA.engine(box).putCandy(CandyKey.of("k"), bytes("v1"), "text/plain", Map.of(), null);
 
@@ -73,13 +74,6 @@ class BoxHandoverIT {
             // B takes over: acquires the lease, recovers the manifest + WAL, advances the pointer.
             nodeB.openBox(box);
             assertThat(nodeB.engine(box).getCandy(CandyKey.of("k"))).isEqualTo(bytes("v1"));
-        } finally {
-            nodeA.close();
-            nodeB.close();
-            coordA.close();
-            coordB.close();
-            storeA.close();
-            storeB.close();
         }
     }
 }
