@@ -38,119 +38,41 @@ per bucket keeps reads and writes consistent during failover.
 
 ## Quick start
 
-Candybox stores its data in **Apache BookKeeper** and coordinates ownership through **ZooKeeper**, so
-those have to be running before a node starts.
-
 ### With Docker Compose (recommended)
 
-The fastest way to get a real cluster on your laptop is the bundled
-[`docker-compose.yml`](docker-compose.yml). It uses the published
-[`zetaplusae/candybox`](https://hub.docker.com/r/zetaplusae/candybox) image and brings up
-**ZooKeeper + 3 BookKeeper bookies + 3 Candybox nodes** — enough bookies for the default `3/3/2`
-replication quorum — wired together with health-gated startup ordering. The only requirement is
-Docker (with the Compose plugin).
+The bundled [`docker-compose.yml`](docker-compose.yml) starts the full stack — ZooKeeper, 3
+BookKeeper bookies, and 3 Candybox nodes — using the published
+[`zetaplusae/candybox`](https://hub.docker.com/r/zetaplusae/candybox) image. Store and read an
+object with the bundled `cli` service:
 
 ```bash
-# Pull the images and start the whole cluster.
 docker compose up -d
-
-# Watch it come up; node 1 is reachable on the host at 9709 (client) and 9710 (health).
-docker compose ps
-curl -s localhost:9710/healthz    # -> ok
-curl -s localhost:9710/readyz     # -> ready
-curl -s localhost:9710/metrics    # Prometheus counters
-```
-
-Store and read an object with the `candybox` client. The image is **dual-mode** — the same image
-runs either the storage node or the CLI — so the compose file ships a `cli` service for exactly
-this. It is not started by `up`; run it on demand with `docker compose run`:
-
-```bash
 docker compose run --rm cli create-box photos
 echo 'hello candybox' | docker compose run --rm -T cli put photos hello.txt
-docker compose run --rm cli get  photos hello.txt   # -> hello candybox
-docker compose run --rm cli list photos
-docker compose run --rm cli help                    # full command list
+docker compose run --rm cli get photos hello.txt   # -> hello candybox
 ```
 
-(`-T` disables the TTY so stdin can be piped into `put`.) The `cli` service points the client at
-`candybox-1:9709` over the internal network; a request to any node is routed to the box's owner.
-
-Tear it down with `docker compose down` (add `-v` to also wipe the ZooKeeper/BookKeeper volumes).
-
-> **Notes.** Nodes 2 and 3 are published on host ports `9719/9720` and `9729/9730` so all three are
-> reachable from the host. Per-node settings (`CANDYBOX_NODE_ID`, `CANDYBOX_ADVERTISED`, heap, …) are
-> passed as `CANDYBOX_*` environment variables — see [Configuration](#configuration). Both
-> `zetaplusae/candybox` and `apache/bookkeeper` ship `linux/amd64` only, so on Apple Silicon / arm64
-> hosts those containers run under emulation (slower to start, but functional). To run a node image
-> built from your local checkout instead of the published one, set `image:` to your own tag and add
-> `build: .` to a node service.
-
-### From a binary distribution
-
-If you would rather run a node directly on the host, start ZooKeeper and some bookies yourself. The
-simplest option is BookKeeper's bundled local mode, which starts an in-process ZooKeeper plus some
-bookies in one command:
-
-```bash
-# 1. Start ZooKeeper + 3 bookies (download the Apache BookKeeper 4.17 binary distribution first).
-bookkeeper-4.17.1/bin/bookkeeper localbookie 3
-```
-
-Then build and unpack a Candybox distribution:
-
-```bash
-# 2. Build the distribution archive.
-mvn -q -DskipTests package
-tar xzf candybox-dist/target/candybox-*.tar.gz
-cd candybox-*/
-
-# 3. Create a config from the example and point it at ZooKeeper.
-cp conf/candybox.properties.example conf/candybox.properties
-#   In conf/candybox.properties set at least:
-#     node.id=1
-#     zookeeper.connect=127.0.0.1:2181
-
-# 4. Start the node (runs in the foreground; Ctrl-C / SIGTERM stops it gracefully).
-bin/candybox-server
-```
-
-The node listens for clients on `9709` and serves health/metrics on `9710`:
-
-```bash
-curl -s localhost:9710/healthz    # -> ok
-curl -s localhost:9710/readyz     # -> ready
-curl -s localhost:9710/metrics    # Prometheus counters
-```
-
-### Single bookie (smallest possible setup)
-
-By default each ledger is replicated across **3 bookies**, so the cluster needs at least three. To
-run against a **single bookie** for local development, lower the quorum in `candybox.properties`:
-
-```properties
-quorum.wal=1/1/1
-quorum.manifest=1/1/1
-quorum.sstable=1/1/1
-quorum.syrup=1/1/1
-```
-
-(The three numbers are *ensemble / write-quorum / ack-quorum*; `1/1/1` means "one copy, no
-replication" — fine for a laptop, not for production.)
+Tear it down with `docker compose down` (add `-v` to also wipe the data volumes).
 
 ## Storing and retrieving objects
 
-`bin/candybox` is a command-line client. It talks to one node over TCP, defaulting to
-`127.0.0.1:9709` (override with `-s host:port` or the `CANDYBOX_SERVER` environment variable):
+The `zetaplusae/candybox` image is dual-mode: passing `candybox <args>` runs the command-line client
+instead of a storage node. Point it at a node with `CANDYBOX_SERVER` (or `-s host:port`); to reach
+the cluster from [Quick start](#with-docker-compose-recommended), join its Compose network
+(`candybox_default` by default) and mount a directory to exchange files. An alias keeps the commands
+readable:
 
 ```bash
-bin/candybox create-box photos
-bin/candybox put  photos cat.jpg ./cat.jpg --content-type image/jpeg
-bin/candybox get  photos cat.jpg ./out.jpg
-bin/candybox head photos cat.jpg            # size, content-type, checksum, metadata
-bin/candybox list photos                    # keys in the box
-bin/candybox list-boxes
-bin/candybox help                           # full command list
+alias candybox='docker run --rm -i --network candybox_default \
+  -e CANDYBOX_SERVER=candybox-1:9709 -v "$PWD:/data" -w /data zetaplusae/candybox candybox'
+
+candybox create-box photos
+candybox put  photos cat.jpg cat.jpg --content-type image/jpeg
+candybox get  photos cat.jpg out.jpg
+candybox head photos cat.jpg            # size, content-type, checksum, metadata
+candybox list photos                    # keys in the box
+candybox list-boxes
+candybox help                           # full command list
 ```
 
 `put` reads from a file or, if you omit the path, from standard input; `get` writes to a file or to
