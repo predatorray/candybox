@@ -1,8 +1,9 @@
 # Candybox
 
-![License](https://img.shields.io/github/license/predatorray/candybox)
-![Build](https://img.shields.io/github/actions/workflow/status/predatorray/candybox/ci.yml?branch=main)
-![Docker](https://img.shields.io/github/actions/workflow/status/predatorray/candybox/docker-publish.yml?branch=main&label=docker)
+[![License](https://img.shields.io/github/license/predatorray/candybox)][LICENSE]
+[![Docker Version](https://img.shields.io/docker/v/zetaplusae/candybox?label=docker)][DOCKER_HUB]
+[![Build](https://img.shields.io/github/actions/workflow/status/predatorray/candybox/ci.yml?branch=main)][GITHUB_WORKFLOW_CI]
+[![Docker](https://img.shields.io/github/actions/workflow/status/predatorray/candybox/docker-publish.yml?branch=main&label=deploy)][GITHUB_WORKFLOW_DOCKER]
 
 Candybox is a **distributed, S3-like object store**. You create *buckets* and store *objects* in
 them through a small TCP API or a command-line client; Candybox keeps those objects durable and
@@ -220,3 +221,9 @@ hard fencing/handover scenarios. No mocking frameworks are used anywhere.
 | `candybox-client` | The thin client library and the `candybox` command-line tool. |
 | `candybox-dist` | Packages the runnable distribution (`bin/ lib/ conf/`) and the Docker/Kubernetes assets. |
 | `candybox-integration-tests` | End-to-end tests on embedded BookKeeper + ZooKeeper. |
+
+
+[LICENSE]: https://github.com/predatorray/candybox/blob/main/LICENSE
+[DOCKER_HUB]: https://hub.docker.com/r/zetaplusae/candybox
+[GITHUB_WORKFLOW_CI]: https://github.com/predatorray/candybox/actions/workflows/ci.yml
+[GITHUB_WORKFLOW_DOCKER]: https://github.com/predatorray/candybox/actions/workflows/docker-publish.yml
