@@ -116,6 +116,40 @@ name, and liveness/readiness probes hit the health endpoint.
 
 Candybox blends three well-known designs:
 
+```mermaid
+flowchart TB
+    client([Client])
+
+    subgraph owner["Box owner (single, fenced node)"]
+        direction TB
+        wal[Write-ahead log]
+        memtable[Memtable]
+        sst[SSTables<br/>sorted, immutable]
+        compaction([Compaction])
+    end
+
+    lease[(ZooKeeper lease<br/>+ fencing token)]
+    syrup[(Syrups<br/>object data ledgers)]
+
+    client -- "write object" --> owner
+    owner -- "object bytes" --> syrup
+    syrup -- "CandyLocator pointer" --> wal
+    wal --> memtable
+    memtable -- "flush when full" --> sst
+    sst --> compaction
+    compaction --> sst
+
+    client -- "read object" --> memtable
+    memtable -. "merge, newest wins" .- sst
+    sst -- "pointer" --> syrup
+    syrup -- "object bytes" --> client
+
+    owner -. "every state change carries token" .-> lease
+
+    classDef store fill:#fff3cd,stroke:#d4a017;
+    class lease,syrup store;
+```
+
 - **A LevelDB-style LSM tree** for the index. Writes land in an in-memory *memtable* fronted by a
   write-ahead log; when it fills, it is flushed to an immutable, sorted **SSTable** and later merged
   into larger ones by background **compaction**. Reads merge the memtable and SSTables, newest wins.
