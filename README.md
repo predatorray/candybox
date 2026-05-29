@@ -1,11 +1,26 @@
-# Candybox
+<div align="center">
+    <img src="https://raw.githubusercontent.com/predatorray/candybox/assets/logo.svg" alt="Candybox" height="120" />
+    <h1>Candybox</h1>
+    <h3><em>Distributed Object Store</em></h3>
+</div>
 
-[![License](https://img.shields.io/github/license/predatorray/candybox)][LICENSE]
-[![Docker Version](https://img.shields.io/docker/v/zetaplusae/candybox?label=docker)][DOCKER_HUB]
-[![Build](https://img.shields.io/github/actions/workflow/status/predatorray/candybox/ci.yml?branch=main)][GITHUB_WORKFLOW_CI]
-[![Docker](https://img.shields.io/github/actions/workflow/status/predatorray/candybox/docker-publish.yml?branch=main&label=deploy)][GITHUB_WORKFLOW_DOCKER]
+<p align="center">
+    <i>LSM tree</i> built on Apache BookKeeper
+</p>
 
-Candybox is a **distributed, S3-like object store**. You create *buckets* and store *objects* in
+<p align="center">
+  <a href="https://hub.docker.com/r/zetaplusae/candybox"><img alt="Docker Hub" src="https://img.shields.io/badge/dockerhub-available-2496ED?logo=docker&logoColor=white"></a>
+  <a href="https://github.com/predatorray/candybox/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/predatorray/candybox"></a>
+  <br>
+  <a href="https://github.com/predatorray/candybox/actions/workflows/ci.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/predatorray/candybox/ci.yml?branch=main"></a>
+  <a href="https://github.com/predatorray/candybox/actions/workflows/docker-publish.yml"><img alt="Docker" src="https://img.shields.io/github/actions/workflow/status/predatorray/candybox/docker-publish.yml?branch=main&label=deploy"></a>
+</p>
+
+---
+
+Candybox is a **distributed, S3-like object store** written in Java.
+
+You create *buckets* and store *objects* in
 them through a small TCP API or a command-line client; Candybox keeps those objects durable and
 replicated across a cluster.
 
@@ -13,8 +28,13 @@ Under the hood it is a **distributed LSM tree built on [Apache BookKeeper](https
 object data and index live in BookKeeper's replicated, append-only ledgers, and a single fenced owner
 per bucket keeps reads and writes consistent during failover.
 
-> **Vocabulary.** A **Box** is a bucket, a **Candy** is an object, a **CandyKey** is an object key,
-> and a **Syrup** is a data ledger that holds object bytes. (Candy in a box — that's the whole theme.)
+> **Vocabulary**
+>
+> A **Box** is a bucket, <br>
+> a **Candy** is an object, <br>
+> a **CandyKey** is an object key, <br>
+> and a **Syrup** is a data ledger that holds object bytes. <br>
+> <i>(Candy in a box — that's the whole theme.)</i>
 
 ## Quick start
 
@@ -221,9 +241,3 @@ hard fencing/handover scenarios. No mocking frameworks are used anywhere.
 | `candybox-client` | The thin client library and the `candybox` command-line tool. |
 | `candybox-dist` | Packages the runnable distribution (`bin/ lib/ conf/`) and the Docker/Kubernetes assets. |
 | `candybox-integration-tests` | End-to-end tests on embedded BookKeeper + ZooKeeper. |
-
-
-[LICENSE]: https://github.com/predatorray/candybox/blob/main/LICENSE
-[DOCKER_HUB]: https://hub.docker.com/r/zetaplusae/candybox
-[GITHUB_WORKFLOW_CI]: https://github.com/predatorray/candybox/actions/workflows/ci.yml
-[GITHUB_WORKFLOW_DOCKER]: https://github.com/predatorray/candybox/actions/workflows/docker-publish.yml
