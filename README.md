@@ -1,5 +1,9 @@
 # Candybox
 
+![License](https://img.shields.io/github/license/predatorray/candybox)
+![Build](https://img.shields.io/github/actions/workflow/status/predatorray/candybox/ci.yml?branch=main)
+![Docker](https://img.shields.io/github/actions/workflow/status/predatorray/candybox/docker-publish.yml?branch=main&label=docker)
+
 Candybox is a **distributed, S3-like object store**. You create *buckets* and store *objects* in
 them through a small TCP API or a command-line client; Candybox keeps those objects durable and
 replicated across a cluster.
