@@ -1,0 +1,79 @@
+#
+# Candybox storage node configuration.
+#
+# Copy to candybox.properties and edit. Every key below can be overridden by an environment
+# variable named CANDYBOX_<KEY> with dots replaced by underscores, upper-cased, e.g.
+#   server.bind          -> CANDYBOX_SERVER_BIND
+#   zookeeper.connect    -> CANDYBOX_ZOOKEEPER_CONNECT
+# Environment variables WIN over values in this file (12-factor: same image, per-pod overrides).
+#
+
+# ---------------------------------------------------------------------------
+# Node identity
+# ---------------------------------------------------------------------------
+
+# Cluster-unique integer node id. If omitted, it is taken from CANDYBOX_NODE_ID, else from the
+# trailing numeric ordinal of $HOSTNAME (so a StatefulSet pod "candybox-2" becomes node 2).
+# node.id=1
+
+# The host:port other nodes/clients use to reach this node (published to membership for routing).
+# Defaults to the bind address, which is rarely correct in a cluster — set this to the routable
+# address (e.g. the pod's stable DNS name). The CANDYBOX_ADVERTISED env var also sets it.
+# server.advertised=candybox-0.candybox.default.svc.cluster.local:9709
+
+# ---------------------------------------------------------------------------
+# Listeners
+# ---------------------------------------------------------------------------
+
+# TCP listen address for client traffic (host:port). Use 0.0.0.0 to bind all interfaces.
+server.bind=0.0.0.0:9709
+
+# HTTP port for /healthz, /readyz and /metrics (Prometheus). Wire k8s probes here.
+health.port=9710
+
+# ---------------------------------------------------------------------------
+# External coordination & storage (ZooKeeper / BookKeeper)
+# ---------------------------------------------------------------------------
+
+# REQUIRED. ZooKeeper connect string shared by BookKeeper metadata and Candybox coordination.
+zookeeper.connect=127.0.0.1:2181
+
+# Override only if BookKeeper's metadata service lives elsewhere. Defaults to
+# zk://${zookeeper.connect}/ledgers.
+# bookkeeper.metadataServiceUri=zk://127.0.0.1:2181/ledgers
+
+# Override only if Candybox coordination (leases / CAS pointers) lives on a different ensemble.
+# Defaults to ${zookeeper.connect}.
+# coordination.connect=127.0.0.1:2181
+
+# BookKeeper ledger password (must match across the cluster).
+ledger.password=candybox
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+# Log directory (relative to the install root unless absolute); consumed by conf/logback.xml.
+log.dir=./logs
+
+# Reserved for future node-local state. Today all object/tree data lives in BookKeeper ledgers, so
+# nothing is written here yet; it is parsed and exposed for forward compatibility.
+data.dir=./data
+
+# ---------------------------------------------------------------------------
+# Engine tuning (optional — omit to keep documented defaults; see DESIGN.md §13)
+# ---------------------------------------------------------------------------
+
+# memtable.flush.threshold.bytes=4194304
+# syrup.rollover.bytes=1073741824
+# max.frame.size.bytes=16777216
+# bloom.bits.per.key=10
+# ownership.lease.ttl.millis=10000
+# lease.renew.interval.millis=3000
+# router.cache.ttl.millis=5000
+# compaction.interval.millis=0
+# max.clock.skew.millis=300000
+# tombstone.gc.grace.millis=86400000
+# ledger.gc.grace.millis=300000
+# l0.compaction.trigger=4
+# l0.stall.threshold=12

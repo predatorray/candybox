@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<assembly xmlns="http://maven.apache.org/ASSEMBLY/2.1.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/ASSEMBLY/2.1.0 http://maven.apache.org/xsd/assembly-2.1.0.xsd">
+    <id>dist</id>
+
+    <formats>
+        <format>tar.gz</format>
+        <format>zip</format>
+    </formats>
+
+    <includeBaseDirectory>true</includeBaseDirectory>
+    <baseDirectory>candybox-${project.version}</baseDirectory>
+
+    <!-- All runtime jars (server + BookKeeper + Curator/ZooKeeper + logging + transitives) into lib/. -->
+    <dependencySets>
+        <dependencySet>
+            <outputDirectory>lib</outputDirectory>
+            <useProjectArtifact>false</useProjectArtifact>
+            <scope>runtime</scope>
+        </dependencySet>
+    </dependencySets>
+
+    <fileSets>
+        <!-- Executable launch scripts. -->
+        <fileSet>
+            <directory>src/bin</directory>
+            <outputDirectory>bin</outputDirectory>
+            <fileMode>0755</fileMode>
+            <excludes>
+                <exclude>test/**</exclude>
+            </excludes>
+        </fileSet>
+        <!-- Bats tests for the scripts (kept in the dist for operators to run locally). -->
+        <fileSet>
+            <directory>src/bin/test</directory>
+            <outputDirectory>bin/test</outputDirectory>
+            <fileMode>0644</fileMode>
+        </fileSet>
+        <!-- Example configuration. -->
+        <fileSet>
+            <directory>src/conf</directory>
+            <outputDirectory>conf</outputDirectory>
+            <fileMode>0644</fileMode>
+        </fileSet>
+        <!-- Top-level docs. -->
+        <fileSet>
+            <directory>${project.basedir}/..</directory>
+            <outputDirectory></outputDirectory>
+            <includes>
+                <include>README.md</include>
+                <include>DESIGN.md</include>
+                <include>OPERATIONS.md</include>
+                <include>LICENSE</include>
+            </includes>
+            <fileMode>0644</fileMode>
+        </fileSet>
+        <!-- An empty logs/ directory so the default log.dir exists in a fresh install. -->
+        <fileSet>
+            <directory>src/logs</directory>
+            <outputDirectory>logs</outputDirectory>
+            <fileMode>0644</fileMode>
+        </fileSet>
+    </fileSets>
+</assembly>

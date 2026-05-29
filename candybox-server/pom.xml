@@ -35,5 +35,19 @@
             <groupId>me.predatorray.candybox</groupId>
             <artifactId>candybox-protocol</artifactId>
         </dependency>
+
+        <!-- Runtime backends for the composition root (CandyboxServer). candybox-bookkeeper /
+             candybox-coordination mark these `optional` so they stay off the LSM engine's classpath;
+             the server is where they are actually provided. Server CODE still references only the
+             candybox SPI impls (BookKeeperLedgerStore.create, ZooKeeperCoordinationService), never the
+             raw clients directly. -->
+        <dependency>
+            <groupId>org.apache.bookkeeper</groupId>
+            <artifactId>bookkeeper-server</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.curator</groupId>
+            <artifactId>curator-framework</artifactId>
+        </dependency>
     </dependencies>
 </project>

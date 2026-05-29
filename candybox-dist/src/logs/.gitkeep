@@ -1,0 +1,1 @@
+Candybox writes runtime logs here by default (see conf/logback.xml).

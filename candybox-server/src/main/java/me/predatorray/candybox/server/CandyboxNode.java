@@ -172,6 +172,28 @@ public final class CandyboxNode implements AutoCloseable {
         return names;
     }
 
+    /**
+     * A point-in-time snapshot of {@link me.predatorray.candybox.lsm.engine.BoxEngineStats} for every
+     * Box this node currently owns, keyed by Box name. Used by the health/metrics endpoint; a Box that
+     * has just lost ownership is simply omitted rather than failing the whole snapshot.
+     */
+    public java.util.Map<String, me.predatorray.candybox.lsm.engine.BoxEngineStats> ownedBoxStats() {
+        java.util.Map<String, me.predatorray.candybox.lsm.engine.BoxEngineStats> out =
+                new java.util.TreeMap<>();
+        for (java.util.Map.Entry<String, BoxOwnership> e : boxes.entrySet()) {
+            BoxOwnership ownership = e.getValue();
+            if (!ownership.isOwner()) {
+                continue;
+            }
+            try {
+                out.put(e.getKey(), ownership.engine().stats());
+            } catch (RuntimeException ignore) {
+                // Ownership lost between the check and the read; drop this Box from the snapshot.
+            }
+        }
+        return out;
+    }
+
     public boolean boxExists(BoxName box) {
         BoxOwnership o = boxes.get(box.value());
         return o != null && o.isOwner();

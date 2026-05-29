@@ -53,6 +53,19 @@ public final class BookKeeperLedgerStore implements LedgerStore {
      * @param clientConfiguration BK client config (ZooKeeper connect string, etc.)
      * @param password            ledger password (may be empty)
      */
+    /**
+     * Builds a store from a BookKeeper {@code metadataServiceUri} (e.g. {@code zk://host:2181/ledgers}),
+     * constructing and owning the BookKeeper client. This keeps the raw BookKeeper
+     * {@link ClientConfiguration} entirely inside this module — callers (the server's composition root)
+     * need only a connect-string URI, preserving the "only this module touches the raw BK client"
+     * invariant.
+     */
+    public static BookKeeperLedgerStore create(String metadataServiceUri, byte[] password) {
+        ClientConfiguration conf = new ClientConfiguration();
+        conf.setMetadataServiceUri(metadataServiceUri);
+        return new BookKeeperLedgerStore(conf, password);
+    }
+
     public BookKeeperLedgerStore(ClientConfiguration clientConfiguration, byte[] password) {
         this.clientConfiguration = clientConfiguration;
         this.password = password.clone();

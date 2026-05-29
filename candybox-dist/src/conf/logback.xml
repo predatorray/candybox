@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Candybox logging configuration.
+
+  By default logs go to the console (stdout) so a container orchestrator can collect them; this is
+  the cloud-native default. To also write rolling files on disk, uncomment the FILE appender below
+  and add it as an <appender-ref> to the root logger. ${CANDYBOX_LOG_DIR} is exported by
+  bin/candybox-env.sh.
+-->
+<configuration>
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!--
+    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${CANDYBOX_LOG_DIR:-logs}/candybox.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+            <fileNamePattern>${CANDYBOX_LOG_DIR:-logs}/candybox.%d{yyyy-MM-dd}.log.gz</fileNamePattern>
+            <maxHistory>14</maxHistory>
+        </rollingPolicy>
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+    -->
+
+    <!-- BookKeeper / ZooKeeper / Curator are chatty at INFO; keep them at WARN. -->
+    <logger name="org.apache.bookkeeper" level="WARN"/>
+    <logger name="org.apache.zookeeper" level="WARN"/>
+    <logger name="org.apache.curator" level="WARN"/>
+
+    <root level="INFO">
+        <appender-ref ref="STDOUT"/>
+        <!-- <appender-ref ref="FILE"/> -->
+    </root>
+</configuration>

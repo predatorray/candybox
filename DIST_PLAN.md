@@ -1,5 +1,10 @@
 # DIST_PLAN — `candybox-dist` distribution & runnable node
 
+> **Status: implemented.** All five workstreams below are complete; `mvn test` (incl. the bats
+> script tests) and `mvn verify` (embedded BookKeeper + ZooKeeper) are green, and the assembled
+> `.tar.gz`/`.zip` boots through config loading + logging from the bundled `lib/`.
+
+
 Goal: package Candybox as a self-contained `.tar.gz`/`.zip` distribution
 (`bin/ lib/ conf/ logs/`) with a real process entrypoint, file+env configuration,
 graceful shutdown, health/metrics endpoints, and cloud-native deployment artifacts

@@ -56,6 +56,28 @@ mvn -pl candybox-lsm test
 mvn -pl candybox-integration-tests verify   # embedded-BookKeeper end-to-end
 ```
 
+## Running a node
+
+`candybox-dist` packages a self-contained distribution. Build it, then unpack and launch:
+
+```bash
+mvn -q -DskipTests package
+tar xzf candybox-dist/target/candybox-*.tar.gz && cd candybox-*/
+cp conf/candybox.properties.example conf/candybox.properties   # then edit endpoints
+bin/candybox-server                                            # foreground; Ctrl-C / SIGTERM = graceful stop
+```
+
+The node reads `conf/candybox.properties`; every key is overridable by a `CANDYBOX_*` environment
+variable (e.g. `CANDYBOX_ZOOKEEPER_CONNECT`), which wins over the file. It needs an external
+ZooKeeper ensemble (shared by BookKeeper metadata and Candybox coordination) and BookKeeper bookies.
+`node.id` defaults to the trailing ordinal of `$HOSTNAME` (so a StatefulSet pod `candybox-2` is node
+`2`). The process serves client traffic on `server.bind` (default `9709`) and exposes
+`/healthz`, `/readyz` and Prometheus `/metrics` on `health.port` (default `9710`).
+
+For containers, `conf/k8s/` has a `Dockerfile` (built from the tarball) and a `StatefulSet` +
+headless `Service` with liveness/readiness probes. The `bin/` launch scripts have `bats` tests under
+`bin/test/` (run automatically by `mvn test` when `bats` is installed, skipped otherwise).
+
 ## Module map
 
 | Module | Responsibility |
@@ -68,6 +90,7 @@ mvn -pl candybox-integration-tests verify   # embedded-BookKeeper end-to-end
 | `candybox-server` | Storage node wiring the engine behind the protocol; compaction service; GC scaffold. |
 | `candybox-client` | Thin client over the `Transport` SPI. |
 | `candybox-integration-tests` | End-to-end tests on embedded BookKeeper + in-JVM ZooKeeper. |
+| `candybox-dist` | Packages a runnable distribution (`bin/ lib/ conf/ logs/`) as `.tar.gz`/`.zip`, bundling the server, its runtime backends, and a logging binding. Holds the launch scripts, config examples, and Docker/k8s manifests. |
 
 ## Testing philosophy
 

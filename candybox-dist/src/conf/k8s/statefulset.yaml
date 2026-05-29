@@ -1,0 +1,91 @@
+# Candybox storage cluster as a StatefulSet.
+#
+# Stable pod identities (candybox-0, candybox-1, ...) give each node a deterministic node.id (the
+# pod-name ordinal) and a stable DNS name advertised to membership. Adjust replicas, image,
+# resources and the ZooKeeper endpoint for your environment.
+#
+# Assumes a ZooKeeper ensemble (shared by BookKeeper metadata and Candybox coordination) is
+# reachable at the address in CANDYBOX_ZOOKEEPER_CONNECT, and that BookKeeper bookies are running
+# against the same ensemble.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: candybox
+  labels:
+    app: candybox
+spec:
+  clusterIP: None          # headless: gives each pod a stable DNS A record
+  selector:
+    app: candybox
+  ports:
+    - name: client
+      port: 9709
+    - name: health
+      port: 9710
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: candybox
+spec:
+  serviceName: candybox
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: candybox
+  template:
+    metadata:
+      labels:
+        app: candybox
+    spec:
+      terminationGracePeriodSeconds: 30   # allow graceful lease release on SIGTERM
+      containers:
+        - name: candybox
+          image: candybox:0.1.0
+          ports:
+            - name: client
+              containerPort: 9709
+            - name: health
+              containerPort: 9710
+          env:
+            # node.id is derived from the pod-name ordinal (candybox-2 -> 2) via $HOSTNAME.
+            # Advertise the pod's stable headless-Service DNS name so clients can route to it.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: CANDYBOX_ADVERTISED
+              value: "$(POD_NAME).candybox:9709"
+            - name: CANDYBOX_ZOOKEEPER_CONNECT
+              value: "zookeeper:2181"
+            - name: CANDYBOX_SERVER_BIND
+              value: "0.0.0.0:9709"
+            - name: CANDYBOX_HEALTH_PORT
+              value: "9710"
+            - name: CANDYBOX_HEAP_OPTS
+              value: "-Xms1g -Xmx1g"
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /opt/candybox/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi

@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>me.predatorray.candybox</groupId>
+        <artifactId>candybox-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>candybox-dist</artifactId>
+    <packaging>pom</packaging>
+    <name>Candybox :: Distribution</name>
+    <description>Assembles a runnable distribution (bin/ lib/ conf/ logs/) as .tar.gz and .zip, bundling
+        the server, its runtime backends (BookKeeper, Curator/ZooKeeper) and a logging binding.</description>
+
+    <properties>
+        <!-- Default so the exec-plugin <skip> resolves to a boolean when -DskipTests is not passed. -->
+        <skipTests>false</skipTests>
+    </properties>
+
+    <dependencies>
+        <!-- Pulls the full runtime classpath into lib/: the server plus its transitive BookKeeper and
+             Curator/ZooKeeper clients. -->
+        <dependency>
+            <groupId>me.predatorray.candybox</groupId>
+            <artifactId>candybox-server</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>me.predatorray.candybox</groupId>
+            <artifactId>candybox-client</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <!-- The single production SLF4J binding (tests elsewhere use slf4j-simple). -->
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>candybox-${project.version}</finalName>
+        <plugins>
+            <!-- Run the bin/ script tests (bats) during `test`; a clean no-op when bats is absent. -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>3.2.0</version>
+                <executions>
+                    <execution>
+                        <id>bats-script-tests</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>exec</goal>
+                        </goals>
+                        <configuration>
+                            <skip>${skipTests}</skip>
+                            <executable>bash</executable>
+                            <arguments>
+                                <argument>${project.basedir}/src/bin/test/run-bats.sh</argument>
+                            </arguments>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-assembly-plugin</artifactId>
+                <version>${assembly.plugin.version}</version>
+                <configuration>
+                    <appendAssemblyId>false</appendAssemblyId>
+                    <descriptors>
+                        <descriptor>src/assembly/dist.xml</descriptor>
+                    </descriptors>
+                    <tarLongFileMode>posix</tarLongFileMode>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>make-distribution</id>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>single</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
