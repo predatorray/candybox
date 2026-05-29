@@ -77,3 +77,14 @@ data.dir=./data
 # ledger.gc.grace.millis=300000
 # l0.compaction.trigger=4
 # l0.stall.threshold=12
+
+# ---------------------------------------------------------------------------
+# BookKeeper quorum per ledger role: "E/Qw/Qa" (ensemble / write quorum / ack quorum).
+# Defaults are E=3 (so the cluster needs at least 3 bookies). For a SINGLE-BOOKIE dev box,
+# override all four roles to 1/1/1:
+# ---------------------------------------------------------------------------
+
+# quorum.wal=1/1/1
+# quorum.manifest=1/1/1
+# quorum.sstable=1/1/1
+# quorum.syrup=1/1/1

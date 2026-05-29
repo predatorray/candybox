@@ -94,6 +94,34 @@ class ServerConfigTest {
     }
 
     @Test
+    void parsesPerRoleQuorumOverrides() {
+        ServerConfig cfg = ServerConfig.fromProperties(
+                props("zookeeper.connect", "zk:2181", "node.id", "1",
+                        "quorum.wal", "1/1/1",
+                        "quorum.syrup", "3/2/1"),
+                Map.of());
+
+        var wal = cfg.tuning().quorum(me.predatorray.candybox.common.config.LedgerRole.WAL);
+        assertThat(wal.ensembleSize()).isEqualTo(1);
+        assertThat(wal.writeQuorum()).isEqualTo(1);
+        assertThat(wal.ackQuorum()).isEqualTo(1);
+        var syrup = cfg.tuning().quorum(me.predatorray.candybox.common.config.LedgerRole.SYRUP);
+        assertThat(syrup.ensembleSize()).isEqualTo(3);
+        assertThat(syrup.ackQuorum()).isEqualTo(1);
+        // Roles left unset keep their documented defaults (SSTABLE 3/2/2).
+        var sstable = cfg.tuning().quorum(me.predatorray.candybox.common.config.LedgerRole.SSTABLE);
+        assertThat(sstable.ensembleSize()).isEqualTo(3);
+    }
+
+    @Test
+    void rejectsMalformedQuorumOverride() {
+        assertThatThrownBy(() -> ServerConfig.fromProperties(
+                props("zookeeper.connect", "zk:2181", "node.id", "1", "quorum.wal", "1/1"), Map.of()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("quorum.wal");
+    }
+
+    @Test
     void rendersPrometheusMetricsWithBoxAndNodeLabels() {
         String text = HealthServer.renderMetrics(3, Map.of("alpha",
                 new me.predatorray.candybox.lsm.engine.BoxEngineStats(5, 1, 9, 2, 0, 1, 0, 0)));

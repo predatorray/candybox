@@ -12,6 +12,8 @@ import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import me.predatorray.candybox.common.config.CandyboxConfig;
+import me.predatorray.candybox.common.config.LedgerRole;
+import me.predatorray.candybox.common.config.QuorumConfig;
 
 /**
  * Runtime, deployment-facing configuration for a {@link CandyboxServer} process: endpoints, ports,
@@ -242,7 +244,32 @@ public final class ServerConfig {
             applyInt("max.frame.size.bytes", b::maxFrameSizeBytes);
             applyInt("l0.compaction.trigger", b::l0CompactionTrigger);
             applyInt("l0.stall.threshold", b::l0StallThreshold);
+            // Per-role BookKeeper quorum overrides, "E/Qw/Qa" (e.g. 1/1/1 for a single-bookie dev box).
+            applyQuorum("quorum.wal", LedgerRole.WAL, b);
+            applyQuorum("quorum.manifest", LedgerRole.MANIFEST, b);
+            applyQuorum("quorum.sstable", LedgerRole.SSTABLE, b);
+            applyQuorum("quorum.syrup", LedgerRole.SYRUP, b);
             return b.build();
+        }
+
+        private void applyQuorum(String key, LedgerRole role, CandyboxConfig.Builder b) {
+            get(key).ifPresent(v -> b.quorum(role, parseQuorum(key, v)));
+        }
+
+        /** Parses an {@code "E/Qw/Qa"} triple (e.g. {@code "3/2/2"}) into a {@link QuorumConfig}. */
+        private static QuorumConfig parseQuorum(String key, String value) {
+            String[] parts = value.split("/");
+            if (parts.length != 3) {
+                throw new IllegalArgumentException(
+                        "Config key '" + key + "' must be E/Qw/Qa (e.g. 3/2/2), got: " + value);
+            }
+            try {
+                return new QuorumConfig(Integer.parseInt(parts[0].trim()),
+                        Integer.parseInt(parts[1].trim()), Integer.parseInt(parts[2].trim()));
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException(
+                        "Config key '" + key + "' has non-numeric quorum components: " + value, e);
+            }
         }
 
         private void applyLong(String key, Function<Long, ?> setter) {

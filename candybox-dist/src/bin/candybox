@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+#
+# Candybox command-line client. Talks to a single node over TCP.
+#
+# Usage: candybox [-s host:port] <command> [args]
+#   e.g. candybox create-box photos
+#        candybox put photos cat.jpg ./cat.jpg --content-type image/jpeg
+#        candybox get photos cat.jpg ./out.jpg
+#        candybox list photos
+# Run `candybox help` for the full command list. Server defaults to 127.0.0.1:9709
+# (override with -s/--server or the CANDYBOX_SERVER env var).
+#
+# Set CANDYBOX_DRY_RUN=1 to print the resolved java command instead of executing it.
+#
+set -euo pipefail
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=candybox-env.sh
+source "$BIN_DIR/candybox-env.sh"
+
+CMD=("$JAVA" "${CANDYBOX_JVM_OPTS[@]}" -cp "$CLASSPATH"
+     me.predatorray.candybox.client.CandyboxCli "$@")
+
+if [[ -n "${CANDYBOX_DRY_RUN:-}" ]]; then
+  printf '%s ' "${CMD[@]}"
+  printf '\n'
+  exit 0
+fi
+
+exec "${CMD[@]}"

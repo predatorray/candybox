@@ -74,6 +74,31 @@ ZooKeeper ensemble (shared by BookKeeper metadata and Candybox coordination) and
 `2`). The process serves client traffic on `server.bind` (default `9709`) and exposes
 `/healthz`, `/readyz` and Prometheus `/metrics` on `health.port` (default `9710`).
 
+**External services first.** Candybox bundles the BookKeeper/ZooKeeper *client* libraries but does
+not start them. Bring up ZooKeeper and BookKeeper before the node. The default ledger quorum is
+`E=3`, so the cluster needs **at least 3 bookies**. The quickest dev cluster is BookKeeper's bundled
+local mode — `bookkeeper localbookie 3` runs an in-process ZooKeeper (`127.0.0.1:2181`) plus 3
+bookies in one JVM. For a **single bookie**, drop the quorum to `1/1/1` in `candybox.properties`:
+
+```properties
+quorum.wal=1/1/1
+quorum.manifest=1/1/1
+quorum.sstable=1/1/1
+quorum.syrup=1/1/1
+```
+
+**Client CLI.** `bin/candybox` talks to a node over TCP (defaults to `127.0.0.1:9709`; override with
+`-s host:port` or `CANDYBOX_SERVER`):
+
+```bash
+bin/candybox create-box photos
+bin/candybox put photos cat.jpg ./cat.jpg --content-type image/jpeg
+bin/candybox get photos cat.jpg ./out.jpg
+bin/candybox list photos
+bin/candybox list-boxes
+bin/candybox help              # full command list
+```
+
 For containers, `conf/k8s/` has a `Dockerfile` (built from the tarball) and a `StatefulSet` +
 headless `Service` with liveness/readiness probes. The `bin/` launch scripts have `bats` tests under
 `bin/test/` (run automatically by `mvn test` when `bats` is installed, skipped otherwise).
