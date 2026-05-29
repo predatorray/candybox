@@ -103,8 +103,10 @@ See `conf/candybox.properties.example` for the full, commented list, and
 
 ## Running on Kubernetes
 
-The distribution ships container assets under `conf/k8s/`: a `Dockerfile` that builds an image from
-the release tarball, and a `StatefulSet` + headless `Service` manifest. The StatefulSet gives each
+A multi-stage `Dockerfile` at the repo root builds a node image straight from source
+(`docker build -t candybox:latest .`); it is laid out so Docker Hub's automated builds work with no
+extra configuration. A `StatefulSet` + headless `Service` manifest lives under `examples/kubernetes/`
+(also bundled into the distribution tarball under `examples/`). The StatefulSet gives each
 pod a stable identity, so `node.id` and the advertised address derive automatically from the pod
 name, and liveness/readiness probes hit the health endpoint.
 

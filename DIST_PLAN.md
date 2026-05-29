@@ -61,8 +61,8 @@ graceful shutdown, health/metrics endpoints, and cloud-native deployment artifac
 - `bin/test/*.bats`: classpath resolves, refuses to start without config, `--add-opens` present, env overrides honored. Guarded so absence of `bats` is a no-op.
 
 ### WS4 — Cloud-native artifacts
-- `conf/k8s/Dockerfile` (build from tarball, foreground entrypoint).
-- `conf/k8s/statefulset.yaml` + headless `service.yaml` (stable ids → clean nodeId/advertised derivation; probes hit `health.port`).
+- root `Dockerfile` (multi-stage build from source, foreground entrypoint; Docker Hub friendly).
+- `examples/kubernetes/statefulset.yaml` (StatefulSet + headless Service; stable ids → clean nodeId/advertised derivation; probes hit `health.port`).
 
 ### WS5 — Wiring & docs
 - Root `pom.xml`: add `candybox-dist` to `<modules>` and logback to `<dependencyManagement>`.

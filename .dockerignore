@@ -1,0 +1,17 @@
+# Keep the build context small and the build hermetic: build artifacts and local cruft are
+# rebuilt inside the image, never copied in.
+target/
+**/target/
+*.class
+*.log
+
+# VCS / IDE / OS
+.git/
+.github/
+.idea/
+*.iml
+.DS_Store
+
+# Docker assets themselves
+Dockerfile
+.dockerignore

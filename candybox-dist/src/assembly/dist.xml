@@ -55,6 +55,13 @@
             </includes>
             <fileMode>0644</fileMode>
         </fileSet>
+        <!-- Deployment examples (k8s manifests) kept at the repo root; bundled so operators get
+             them in the tarball too. -->
+        <fileSet>
+            <directory>${project.basedir}/../examples</directory>
+            <outputDirectory>examples</outputDirectory>
+            <fileMode>0644</fileMode>
+        </fileSet>
         <!-- An empty logs/ directory so the default log.dir exists in a fresh install. -->
         <fileSet>
             <directory>src/logs</directory>
