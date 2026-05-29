@@ -59,6 +59,10 @@ COPY --from=build --chown=candybox:candybox /opt/candybox /opt/candybox
 RUN mkdir -p /opt/candybox/data /opt/candybox/logs \
  && chown candybox:candybox /opt/candybox/data /opt/candybox/logs
 
+# Dual-purpose entrypoint: the same image runs the storage node or the `candybox` client CLI.
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
+
 ENV CANDYBOX_HOME=/opt/candybox \
     CANDYBOX_CONF_DIR=/opt/candybox/conf \
     CANDYBOX_LOG_DIR=/opt/candybox/logs \
@@ -70,5 +74,7 @@ WORKDIR /opt/candybox
 # Client (TCP) and health/metrics (HTTP).
 EXPOSE 9709 9710
 
-# Foreground process; Kubernetes/Docker delivers SIGTERM for graceful lease release.
-ENTRYPOINT ["candybox-server"]
+# Default to the storage node (foreground; Docker/Kubernetes delivers SIGTERM for graceful lease
+# release). Pass `candybox <args…>` to use the same image as the client CLI instead.
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["server"]

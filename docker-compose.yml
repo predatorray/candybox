@@ -1,0 +1,196 @@
+# A full local Candybox cluster: 1 ZooKeeper + 3 BookKeeper bookies + 3 Candybox nodes.
+#
+# ZooKeeper is shared by BookKeeper's metadata and Candybox's coordination; the three bookies
+# satisfy Candybox's default 3/3/2 replication quorum, so no quorum overrides are needed. The
+# Candybox nodes use the published zetaplusae/candybox image from Docker Hub.
+#
+# Quick start:
+#   docker compose up -d                  # pull images + start the whole cluster
+#   docker compose exec candybox-1 candybox create-box photos
+#   echo hi | docker compose exec -T candybox-1 candybox put photos hello.txt
+#   docker compose exec candybox-1 candybox list photos
+#   curl -s localhost:9710/readyz         # -> ready  (node 1's health port)
+#
+# Tear down (keep data):  docker compose down
+# Tear down + wipe data:  docker compose down -v
+#
+# Note: both zetaplusae/candybox and apache/bookkeeper publish linux/amd64 only, so on Apple Silicon
+# / other arm64 hosts these containers run under emulation (slower to start, but functional) — hence
+# the pinned platforms.
+
+name: candybox
+
+# ---- shared bookie definition -------------------------------------------------------------
+x-bookie: &bookie
+  image: apache/bookkeeper:4.17.1
+  platform: linux/amd64
+  restart: on-failure
+  depends_on:
+    zookeeper:
+      condition: service_healthy
+    # Cluster metadata must exist in ZooKeeper before any bookie starts (the bookie does not
+    # create it on its own); bk-init does that once.
+    bk-init:
+      condition: service_completed_successfully
+  environment: &bookie-env
+    BK_zkServers: zookeeper:2181
+    # Use the same ledger metadata path Candybox derives by default: zk://<zk>/ledgers.
+    BK_metadataServiceUri: zk://zookeeper:2181/ledgers
+    BK_zkLedgersRootPath: /ledgers
+    # Each bookie must advertise a hostname the Candybox containers can reach (not 127.0.0.1),
+    # so BK_advertisedAddress is overridden per service below.
+    BK_httpServerEnabled: "true"
+  healthcheck:
+    test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8080/heartbeat || exit 1"]
+    interval: 10s
+    timeout: 5s
+    retries: 18
+    start_period: 30s
+
+# ---- shared candybox node definition ------------------------------------------------------
+x-candybox: &candybox
+  image: zetaplusae/candybox:latest
+  platform: linux/amd64
+  restart: on-failure
+  # The server requires a config FILE to exist; point it at the shipped example and let the
+  # CANDYBOX_* environment variables override individual keys (env wins over the file).
+  command: ["/opt/candybox/conf/candybox.properties.example"]
+  depends_on:
+    bookie1:
+      condition: service_healthy
+    bookie2:
+      condition: service_healthy
+    bookie3:
+      condition: service_healthy
+
+services:
+  zookeeper:
+    image: zookeeper:3.9
+    restart: on-failure
+    environment:
+      ZOO_STANDALONE_ENABLED: "true"
+      # Allow the 4-letter-word commands the healthcheck (ruok) relies on.
+      ZOO_4LW_COMMANDS_WHITELIST: srvr,ruok,stat,mntr
+    ports:
+      - "2181:2181"
+    volumes:
+      - zk-data:/data
+      - zk-datalog:/datalog
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # One-shot: initialize the BookKeeper cluster metadata (the /ledgers layout) in ZooKeeper.
+  # Idempotent — on a restart where the metadata already exists, initnewcluster fails and we
+  # fall back to a no-op identity check so the bookies are still allowed to start.
+  bk-init:
+    image: apache/bookkeeper:4.17.1
+    platform: linux/amd64
+    restart: "no"
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      BK_zkServers: zookeeper:2181
+      BK_metadataServiceUri: zk://zookeeper:2181/ledgers
+      BK_zkLedgersRootPath: /ledgers
+    working_dir: /opt/bookkeeper
+    # Bypass the image entrypoint (it word-splits compound commands) and instead apply the BK_*
+    # env into the config ourselves, then init. initnewcluster is a no-op error if the cluster
+    # already exists (e.g. on a restart with persisted volumes), so we tolerate that and confirm
+    # the cluster is there with whatisinstanceid.
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        python3 scripts/apply-config-from-env.py conf/bk_server.conf
+        bin/bookkeeper shell initnewcluster || bin/bookkeeper shell whatisinstanceid
+
+  bookie1:
+    <<: *bookie
+    hostname: bookie1
+    environment:
+      <<: *bookie-env
+      BK_advertisedAddress: bookie1
+    volumes:
+      - bk1-data:/data/bookkeeper
+
+  bookie2:
+    <<: *bookie
+    hostname: bookie2
+    environment:
+      <<: *bookie-env
+      BK_advertisedAddress: bookie2
+    volumes:
+      - bk2-data:/data/bookkeeper
+
+  bookie3:
+    <<: *bookie
+    hostname: bookie3
+    environment:
+      <<: *bookie-env
+      BK_advertisedAddress: bookie3
+    volumes:
+      - bk3-data:/data/bookkeeper
+
+  candybox-1:
+    <<: *candybox
+    hostname: candybox-1
+    environment:
+      CANDYBOX_NODE_ID: "1"
+      CANDYBOX_ZOOKEEPER_CONNECT: zookeeper:2181
+      CANDYBOX_ADVERTISED: candybox-1:9709
+      CANDYBOX_HEAP_OPTS: "-Xms256m -Xmx512m"
+    ports:
+      - "9709:9709"   # client (TCP)
+      - "9710:9710"   # health/metrics (HTTP)
+
+  candybox-2:
+    <<: *candybox
+    hostname: candybox-2
+    environment:
+      CANDYBOX_NODE_ID: "2"
+      CANDYBOX_ZOOKEEPER_CONNECT: zookeeper:2181
+      CANDYBOX_ADVERTISED: candybox-2:9709
+      CANDYBOX_HEAP_OPTS: "-Xms256m -Xmx512m"
+    ports:
+      - "9719:9709"
+      - "9720:9710"
+
+  candybox-3:
+    <<: *candybox
+    hostname: candybox-3
+    environment:
+      CANDYBOX_NODE_ID: "3"
+      CANDYBOX_ZOOKEEPER_CONNECT: zookeeper:2181
+      CANDYBOX_ADVERTISED: candybox-3:9709
+      CANDYBOX_HEAP_OPTS: "-Xms256m -Xmx512m"
+    ports:
+      - "9729:9709"
+      - "9730:9710"
+
+  # Convenience client. The same image doubles as the `candybox` CLI; this service points it at
+  # the cluster (over the internal network) and is only run on demand, never started by `up`:
+  #
+  #   docker compose run --rm cli list-boxes
+  #   docker compose run --rm cli create-box photos
+  #   echo 'hello candybox' | docker compose run --rm -T cli put photos hello.txt
+  #   docker compose run --rm cli get photos hello.txt
+  #
+  # (-T disables the TTY so stdin can be piped into `put`.)
+  cli:
+    image: zetaplusae/candybox:latest
+    platform: linux/amd64
+    profiles: ["cli"]   # excluded from `docker compose up`; only `docker compose run cli …` uses it
+    entrypoint: ["candybox"]
+    environment:
+      CANDYBOX_SERVER: candybox-1:9709
+
+volumes:
+  zk-data:
+  zk-datalog:
+  bk1-data:
+  bk2-data:
+  bk3-data:

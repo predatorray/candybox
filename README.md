@@ -18,8 +18,58 @@ per bucket keeps reads and writes consistent during failover.
 ## Quick start
 
 Candybox stores its data in **Apache BookKeeper** and coordinates ownership through **ZooKeeper**, so
-those need to be running first. The fastest way to get a local environment is BookKeeper's bundled
-local mode, which starts an in-process ZooKeeper plus some bookies in one command:
+those have to be running before a node starts.
+
+### With Docker Compose (recommended)
+
+The fastest way to get a real cluster on your laptop is the bundled
+[`docker-compose.yml`](docker-compose.yml). It uses the published
+[`zetaplusae/candybox`](https://hub.docker.com/r/zetaplusae/candybox) image and brings up
+**ZooKeeper + 3 BookKeeper bookies + 3 Candybox nodes** — enough bookies for the default `3/3/2`
+replication quorum — wired together with health-gated startup ordering. The only requirement is
+Docker (with the Compose plugin).
+
+```bash
+# Pull the images and start the whole cluster.
+docker compose up -d
+
+# Watch it come up; node 1 is reachable on the host at 9709 (client) and 9710 (health).
+docker compose ps
+curl -s localhost:9710/healthz    # -> ok
+curl -s localhost:9710/readyz     # -> ready
+curl -s localhost:9710/metrics    # Prometheus counters
+```
+
+Store and read an object with the `candybox` client. The image is **dual-mode** — the same image
+runs either the storage node or the CLI — so the compose file ships a `cli` service for exactly
+this. It is not started by `up`; run it on demand with `docker compose run`:
+
+```bash
+docker compose run --rm cli create-box photos
+echo 'hello candybox' | docker compose run --rm -T cli put photos hello.txt
+docker compose run --rm cli get  photos hello.txt   # -> hello candybox
+docker compose run --rm cli list photos
+docker compose run --rm cli help                    # full command list
+```
+
+(`-T` disables the TTY so stdin can be piped into `put`.) The `cli` service points the client at
+`candybox-1:9709` over the internal network; a request to any node is routed to the box's owner.
+
+Tear it down with `docker compose down` (add `-v` to also wipe the ZooKeeper/BookKeeper volumes).
+
+> **Notes.** Nodes 2 and 3 are published on host ports `9719/9720` and `9729/9730` so all three are
+> reachable from the host. Per-node settings (`CANDYBOX_NODE_ID`, `CANDYBOX_ADVERTISED`, heap, …) are
+> passed as `CANDYBOX_*` environment variables — see [Configuration](#configuration). Both
+> `zetaplusae/candybox` and `apache/bookkeeper` ship `linux/amd64` only, so on Apple Silicon / arm64
+> hosts those containers run under emulation (slower to start, but functional). To run a node image
+> built from your local checkout instead of the published one, set `image:` to your own tag and add
+> `build: .` to a node service.
+
+### From a binary distribution
+
+If you would rather run a node directly on the host, start ZooKeeper and some bookies yourself. The
+simplest option is BookKeeper's bundled local mode, which starts an in-process ZooKeeper plus some
+bookies in one command:
 
 ```bash
 # 1. Start ZooKeeper + 3 bookies (download the Apache BookKeeper 4.17 binary distribution first).
@@ -109,7 +159,12 @@ See `conf/candybox.properties.example` for the full, commented list, and
 
 A multi-stage `Dockerfile` at the repo root builds a node image straight from source
 (`docker build -t candybox:latest .`); it is laid out so Docker Hub's automated builds work with no
-extra configuration. A `StatefulSet` + headless `Service` manifest lives under `examples/kubernetes/`
+extra configuration. The image is **dual-mode**: it defaults to the storage node, but
+`docker run … <image> candybox <args…>` runs the bundled client CLI instead (honoring
+`CANDYBOX_SERVER`/`-s`), so the one image serves as both server and client. For a self-contained
+local cluster (ZooKeeper + bookies + nodes) use the
+[`docker-compose.yml`](docker-compose.yml) described under [Quick start](#with-docker-compose-recommended).
+A `StatefulSet` + headless `Service` manifest lives under `examples/kubernetes/`
 (also bundled into the distribution tarball under `examples/`). The StatefulSet gives each
 pod a stable identity, so `node.id` and the advertised address derive automatically from the pod
 name, and liveness/readiness probes hit the health endpoint.
