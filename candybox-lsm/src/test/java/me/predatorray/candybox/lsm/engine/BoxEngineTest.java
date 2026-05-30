@@ -13,6 +13,7 @@ import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.exception.BusyException;
 import me.predatorray.candybox.common.exception.CandyNotFoundException;
 import me.predatorray.candybox.common.exception.FencedException;
+import me.predatorray.candybox.common.exception.ValidationException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -123,6 +124,65 @@ class BoxEngineTest {
                 ScanQuery.reverse("a/", null, null, CandyKey.of(page1.nextStartAfter()), 100));
         assertThat(page2.entries()).extracting(e -> e.key().value()).containsExactly("a/2", "a/1");
         assertThat(page2.isTruncated()).isFalse();
+    }
+
+    @Test
+    void copyCandyReusesSegmentsWithoutWritingNewSyrup() {
+        engine = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1, new ManualClock(1000), 1L);
+        engine.putCandy(CandyKey.of("src"), bytes("payload"), "text/plain", Map.of("k", "v"), null);
+        engine.flush(); // src now lives in an SSTable referencing one Syrup
+        int syrupsBefore = engine.manifestState().referencedSyrups().size();
+
+        engine.copyCandy(CandyKey.of("src"), CandyKey.of("dst"), null);
+
+        // Both keys resolve to identical bytes and CRC; the source is still live.
+        assertThat(engine.getCandy(CandyKey.of("dst"))).isEqualTo(bytes("payload"));
+        assertThat(engine.getCandy(CandyKey.of("src"))).isEqualTo(bytes("payload"));
+        assertThat(engine.headCandy(CandyKey.of("dst")).crc32c())
+                .isEqualTo(engine.headCandy(CandyKey.of("src")).crc32c());
+
+        // Zero-copy: no new Syrup ledger was written for the copy.
+        engine.flush();
+        assertThat(engine.manifestState().referencedSyrups()).hasSize(syrupsBefore);
+    }
+
+    @Test
+    void renameCandyMovesKeyAtomicallyAndSurvivesFlush() {
+        engine = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1, new ManualClock(1000), 1L);
+        engine.putCandy(CandyKey.of("old"), bytes("payload"), null, Map.of(), null);
+
+        engine.renameCandy(CandyKey.of("old"), CandyKey.of("new"), null);
+        assertThat(engine.getCandy(CandyKey.of("new"))).isEqualTo(bytes("payload"));
+        assertThatThrownBy(() -> engine.getCandy(CandyKey.of("old")))
+                .isInstanceOf(CandyNotFoundException.class);
+
+        // Survives a flush to the SSTable path.
+        engine.flush();
+        assertThat(engine.getCandy(CandyKey.of("new"))).isEqualTo(bytes("payload"));
+        assertThatThrownBy(() -> engine.getCandy(CandyKey.of("old")))
+                .isInstanceOf(CandyNotFoundException.class);
+    }
+
+    @Test
+    void renameIsIdempotentUnderRetryToken() {
+        engine = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1, new ManualClock(1000), 1L);
+        engine.putCandy(CandyKey.of("old"), bytes("payload"), null, Map.of(), null);
+
+        CandyMetadata first = engine.renameCandy(CandyKey.of("old"), CandyKey.of("new"), "tok-1");
+        // The retry must not throw CandyNotFound (source already gone) — the token replays the result.
+        CandyMetadata retry = engine.renameCandy(CandyKey.of("old"), CandyKey.of("new"), "tok-1");
+        assertThat(retry.hlc()).isEqualTo(first.hlc());
+    }
+
+    @Test
+    void copyRejectsIdenticalKeysAndMissingSource() {
+        engine = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1, new ManualClock(1000), 1L);
+        engine.putCandy(CandyKey.of("k"), bytes("v"), null, Map.of(), null);
+
+        assertThatThrownBy(() -> engine.copyCandy(CandyKey.of("k"), CandyKey.of("k"), null))
+                .isInstanceOf(ValidationException.class);
+        assertThatThrownBy(() -> engine.renameCandy(CandyKey.of("absent"), CandyKey.of("x"), null))
+                .isInstanceOf(CandyNotFoundException.class);
     }
 
     @Test

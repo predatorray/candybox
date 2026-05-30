@@ -70,6 +70,20 @@ public sealed interface Message {
         }
     }
 
+    record CopyCandyRequest(String box, String srcKey, String dstKey, String idempotencyToken)
+            implements Message {
+        public Opcode opcode() {
+            return Opcode.COPY_CANDY;
+        }
+    }
+
+    record RenameCandyRequest(String box, String srcKey, String dstKey, String idempotencyToken)
+            implements Message {
+        public Opcode opcode() {
+            return Opcode.RENAME_CANDY;
+        }
+    }
+
     record ListCandiesRequest(String box, String prefix, String startAfter, int maxKeys,
                               String startKey, String endKey, boolean reverse) implements Message {
         public Opcode opcode() {

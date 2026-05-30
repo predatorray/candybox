@@ -88,6 +88,10 @@ final class NodeRequestHandler implements RequestHandler {
             return m.box();
         } else if (message instanceof Message.DeleteCandyRequest m) {
             return m.box();
+        } else if (message instanceof Message.CopyCandyRequest m) {
+            return m.box();
+        } else if (message instanceof Message.RenameCandyRequest m) {
+            return m.box();
         } else if (message instanceof Message.ListCandiesRequest m) {
             return m.box();
         } else if (message instanceof Message.DeleteBoxRequest m) {
@@ -124,6 +128,16 @@ final class NodeRequestHandler implements RequestHandler {
         } else if (message instanceof Message.DeleteCandyRequest m) {
             node.engine(BoxName.of(m.box())).deleteCandy(CandyKey.of(m.key()));
             return new Message.OkResponse();
+        } else if (message instanceof Message.CopyCandyRequest m) {
+            CandyMetadata meta = node.engine(BoxName.of(m.box())).copyCandy(CandyKey.of(m.srcKey()),
+                    CandyKey.of(m.dstKey()), m.idempotencyToken());
+            return new Message.HeadCandyResponse(meta.contentLength(), meta.contentType(),
+                    meta.userMetadata(), meta.crc32c(), meta.createdAtMillis());
+        } else if (message instanceof Message.RenameCandyRequest m) {
+            CandyMetadata meta = node.engine(BoxName.of(m.box())).renameCandy(CandyKey.of(m.srcKey()),
+                    CandyKey.of(m.dstKey()), m.idempotencyToken());
+            return new Message.HeadCandyResponse(meta.contentLength(), meta.contentType(),
+                    meta.userMetadata(), meta.crc32c(), meta.createdAtMillis());
         } else if (message instanceof Message.ListCandiesRequest m) {
             BoxEngine engine = node.engine(BoxName.of(m.box()));
             ListResult result = engine.scanCandies(toScanQuery(m));
