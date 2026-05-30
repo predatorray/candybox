@@ -5,9 +5,14 @@ on **Apache BookKeeper** ledgers. This document captures the architecture, on-le
 (with their version bytes), size limits, the compaction model, the manifest/GC design, the local
 decisions made (with rationale), and the deliberate v1 simplifications.
 
-It is written against the implementation in this repository: **Phase 0 and Phase 1 are implemented and
-tested; Phases 2–4 are scaffolded** with interfaces, message types, working cores where cheap, and
-`// TODO(phase-N)` markers.
+It is written against the implementation in this repository: **Phases 0–4 are implemented and
+tested** — the LSM engine, ZooKeeper-backed coordination, fenced Box ownership/handover, the framed
+TCP protocol with cluster membership + client-side routing, multi-level leveled compaction, and
+reference-counted GC all run, with the storage node, CLI, and a packaged distribution (Docker /
+Kubernetes) on top. A handful of deliberate v1 simplifications remain (true on-the-wire streaming,
+distributed cross-node compaction scheduling, watch-based coordination, a GC enumeration backstop);
+they are called out inline and collected in §12–§13, and a few are still marked `// TODO(phase-N)` in
+code.
 
 ## 1. Domain glossary
 
@@ -29,12 +34,13 @@ an in-memory fake, so the whole engine is testable without BookKeeper, ZooKeeper
 ```
 candybox-common         Domain types, versioned serialization, HLC, config, CRC32C, bloom filter.
 candybox-bookkeeper     LedgerStore SPI + in-memory fake + real BookKeeper impl. (only module touching raw BK)
-candybox-coordination   Coordination SPI (membership, leases w/ fencing tokens, CAS kv) + in-memory fake + ZK scaffold.
+candybox-coordination   Coordination SPI (membership, leases w/ fencing tokens, CAS kv) + in-memory fake + real ZooKeeper impl.
 candybox-lsm            Memtable, WAL, SSTable, Syrup chunking, manifest, merge/read path, compaction. Depends only on the two SPIs.
 candybox-protocol       Framed TCP codec + message types + Transport SPI (TCP impl + loopback fake).
-candybox-server         Storage node: wires LSM behind the protocol; compaction service; GC scaffold.
-candybox-client         Thin client over Transport.
-candybox-integration-tests  Embedded BookKeeper (LocalBookKeeper, bundles in-JVM ZooKeeper) end-to-end tests.
+candybox-server         Storage node: wires LSM behind the protocol; fenced Box ownership + handover; background compaction + GC workers; health/metrics; runnable entrypoint.
+candybox-client         Thin client over Transport, cluster-aware router, and the `candybox` command-line tool.
+candybox-dist           Packages the runnable distribution (`bin/ lib/ conf/`) + the Docker/Kubernetes assets.
+candybox-integration-tests  Embedded BookKeeper (LocalBookKeeper, bundles in-JVM ZooKeeper) end-to-end + contract ITs.
 ```
 
 Dependency rule: `candybox-lsm` depends **only** on the two SPIs (`bookkeeper`, `coordination`) and
@@ -150,15 +156,15 @@ optional range-tombstone block, and a table may be *range-only* (zero data block
 `minKey/maxKey` bound its point keys; range tombstones can reach beyond them, so the read path
 consults range tombstones across all tables rather than pruning by point range.
 
-## 6. Read / write / merge path (Phase 1)
+## 6. Read / write / merge path
 
 - **put**: validate → stream bytes into Syrups (`SyrupManager`) → stamp HLC → build `CandyLocator` →
   append to WAL → apply to memtable (LWW). Auto-flush when the memtable exceeds its byte threshold.
 - **delete**: stamp HLC → write a DELETE tombstone the same way.
 - **flush**: seal the memtable into a new L0 SSTable, record referenced Syrups + the rotated WAL id in
   one `ManifestEdit`, open a reader for the new table.
-- **get/head**: resolve the key to the highest-HLC locator across the memtable and overlapping L0
-  SSTables (range + bloom pre-filter); a point tombstone, a covering **range tombstone** newer than
+- **get/head**: resolve the key to the highest-HLC locator across the memtable and the overlapping
+  SSTables at every level (range + bloom pre-filter); a point tombstone, a covering **range tombstone** newer than
   that locator, or absence ⇒ `CandyNotFound`. `getCandy` then streams bytes from Syrups and validates
   the whole-object crc.
 - **list / scan**: a `MergingIterator` over the memtable + SSTables (LWW, tombstones suppressed),
@@ -174,9 +180,10 @@ consults range tombstones across all tables rather than pruning by point range.
   atomically under the single owner's write lock (same Box only). Because GC is reference-counted by
   Syrup id, several keys may share one segment set safely.
 
-Phase 1 keeps an **L0-only** merged read path (honest scope); the multi-level structure lands with
-compaction. Under write-stall (too many L0 SSTables, `l0StallThreshold`) writes return a retriable
-`BUSY`.
+The merged read path spans **all levels** (L0 plus the compaction-produced L1+); within a level keys
+are non-overlapping, while L0 tables may overlap, so L0 is consulted table-by-table. Under
+write-stall (too many L0 SSTables, `l0StallThreshold`) writes return a retriable `BUSY`, the
+dedicated `RESPONSE_BUSY` opcode.
 
 ## 7. Manifest, fencing & ownership
 
@@ -189,21 +196,33 @@ lock-step (append durably, then advance state). Handover (`Manifest.recover`):
 3. open a **fresh** manifest ledger (a sealed BK ledger can't be appended) and seed it with a
    self-contained checkpoint of the recovered state.
 
-In production the ZK pointer to the current manifest ledger is advanced with a **compare-and-set on
-the expected ZK version** (never a blind set), and every state-mutating append carries the owner's
-**fencing token** (ZK lease version). A zombie former owner's appends fail because its ledger was
-recover-open-fenced — see `ManifestTest.fencedOwnerCannotCommitFurtherEdits`. The `CoordinationService`
-fake models lease expiry, supersession, and CAS conflicts so these tests are not vacuous
-(`InMemoryCoordinationServiceTest`).
+The ZK pointer to the current manifest ledger is advanced with a **compare-and-set on the expected
+ZK version** (never a blind set), and every state-mutating append carries the owner's **fencing
+token** (the lease version). A zombie former owner's appends fail because its ledger was
+recover-open-fenced — see `ManifestTest.fencedOwnerCannotCommitFurtherEdits`. The pointer and lease
+live in the `CoordinationService` SPI: an in-memory fake that models lease expiry, supersession, and
+CAS conflicts (so these tests are not vacuous — `InMemoryCoordinationServiceTest`), and the real
+`ZooKeeperCoordinationService`. Both run the shared `CoordinationServiceContract` (as a
+`*ContractTest` against the fake and a `*ContractIT` against a live ZooKeeper), so the fast tests are
+a faithful stand-in. `BoxOwnership` (server) ties the lease, fencing token, and manifest pointer
+together; `CandyboxNode.createBox`/`openBox` are the take-ownership and failover/handover entry
+points, with a background heartbeat renewing leases within the TTL.
 
 ## 8. Compaction model
 
 `CompactionStrategy` is a pluggable SPI (Cassandra-style) with **LevelDB-style leveled compaction** as
-the default (`LeveledCompactionStrategy`): L0 reaching the trigger count merges all L0 (+ overlapping
-L1) into L1; a level L≥1 over its table budget merges a table (+ overlapping L+1) into L+1. The
-`Compactor` opens the inputs, merges by LWW, writes the output SSTable, and returns the `ManifestEdit`
-to commit. `CompactionService` (server) runs one step end-to-end today; distributed scheduling via ZK
-task claims/leases and the fencing-gated commit are **TODO(phase-3)**.
+the default (`LeveledCompactionStrategy`): L0 is scored by **file count** — reaching the trigger
+count merges all L0 (+ overlapping L1) into L1 — while each level L≥1 has a **byte budget**
+(`levelBaseBytes × levelMultiplier^(L-1)`, defaults 10 MiB × 10); the level most over budget has one
+table (+ overlapping L+1) merged into L+1. The `Compactor` opens the inputs, merges by LWW, writes
+the output SSTable, and returns the `ManifestEdit` to commit. `CompactionService` (server) runs one
+step end-to-end; `CandyboxNode` drives it on a background worker (`compactionIntervalMillis`), running
+a **bounded** number of passes per owned Box per tick so one Box can't starve the others, then a GC
+pass (§9). The commit is **fencing-gated** by the manifest, so a Box whose ownership was lost
+mid-round fails its commit (`FencedException`) and is skipped — a zombie owner cannot corrupt state.
+Distributed *cross-node* scheduling (claiming work via ZK task leases so compaction can run off the
+owner) is still **TODO(phase-3)**; today each owner compacts its own Boxes in-process. Covered by
+`CompactionTest` and the end-to-end `CompactionGcCycleIT`.
 
 **Tombstone-drop rule** (LevelDB + late-write window): a DELETE is dropped only when the compaction is
 at the **bottommost** level holding overlapping data **and** the tombstone is older than the configured
@@ -212,27 +231,41 @@ governs **range tombstones**: the compactor collects them from all inputs and ca
 into the output, except an aged one at the bottommost level — which is dropped together with the
 (necessarily older) point locators it covers, so nothing is resurrected. Covered by `CompactionTest`.
 
-## 9. Garbage collection (design; Phase 3)
+## 9. Garbage collection (`GarbageCollector`, server)
 
 Reference-counted GC of obsoleted ledgers, run **only by the Box's manifest owner against a committed
 manifest snapshot** (never a stale tail), gated on the owner's fencing token, after a grace period
-(Pulsar-style):
+(`ledgerGcGraceMillis`, Pulsar-style — a margin for in-flight readers / continuation tokens). Three
+reclaim sources, each whole-ledger-deleted via `LedgerStore.deleteLedger` (idempotent — a missing
+ledger is treated as already gone), driven on the same background worker as compaction (§8):
 
-- (a) deletion edit + physical delete are fenced;
+- **SSTables** removed from the manifest by a committed compaction;
+- **Syrups** no longer referenced by any SSTable, the memtable, or the open write Syrup — dropped from
+  the live set first via a fencing-gated manifest edit, then deleted;
+- **WAL** ledgers rotated out at flush, whose mutations are now durable in an SSTable.
+
+The detailed rules:
+
+- (a) the live-set-drop edit + the physical delete are fenced;
 - (b) a tombstone may be dropped only under the bottommost + time-bound rule (§8);
-- (c) orphaned-Syrup GC is driven by a **pending-orphan list** recorded at supersede/dedupe time (a
-  retried or conflicting put knows its losing segments immediately); a full live-locator scan is only
-  a backstop;
+- (c) orphaned-Syrup GC is driven by per-SSTable referenced-Syrup tracking plus a **pending-orphan
+  list** recorded at supersede/dedupe time (a retried or conflicting put knows its losing segments
+  immediately); the pending sets are in-memory today, so an **enumeration backstop** for ledgers
+  orphaned by a *prior* owner that crashed before GC is still **TODO(phase-3+)**;
 - (d) **v1 Syrup reclamation policy**: because BookKeeper deletes whole ledgers only, a single live
   Candy pins an otherwise-dead Syrup. **v1 documents and accepts this** — a Syrup is reclaimed only
   once *every* segment in it is dead. Syrup defragmentation (copying survivors into a fresh Syrup) is
-  deferred. See `GarbageCollector` (scaffold).
+  deferred;
 - (e) **shared segments from copy/rename**: orphan detection counts Syrup references by actual
   `SegmentRef`s across the manifest's SSTables and the memtable, so several keys pointing at one
   segment set (a `copyCandy`, or the in-flight state of a `renameCandy`) keep that Syrup live until
   *all* of them are gone — no per-key refcount table is needed. A range tombstone holds no segments,
   so a Candy it shadows is reclaimed only once compaction drops the covered point locator (as with a
   point delete).
+
+The full compaction-then-GC cycle is covered end-to-end by `CompactionGcCycleIT`. One gap: deleting a
+Box drops its manifest pointer but does not yet reclaim that Box's SSTable/Syrup/WAL/manifest ledgers
+(**TODO(phase-3)**).
 
 ## 10. Size limits (configurable; enforced at client and node)
 
@@ -259,13 +292,19 @@ Per-role BK quorum (E/Qw/Qa) defaults: **WAL 3/3/2, Manifest 3/3/2, SSTable 3/2/
 | WAL granularity | Per-Box | Matches single-owner-per-Box; simplest correct recovery unit. |
 | Memtable structure | `ConcurrentSkipListMap`, LWW merge | Sorted, lock-free reads during the flush scan. |
 | Manifest checkpoint | On handover (fresh ledger seeded with full-state checkpoint) | Bounds replay; aligns with "can't append a sealed ledger". |
+| Memtable flush threshold | 4 MiB | Bounds WAL replay and L0 table size. |
 | Syrup rollover | 1 GiB | Bounds per-ledger size; large objects span multiple Syrups. |
+| L0 compaction trigger / stall | 4 tables / 12 tables | Trigger starts compaction; stall returns `BUSY` (must be ≥ trigger). |
+| Leveled level base / multiplier | 10 MiB / 10× | LevelDB-style growing per-level byte budgets for L≥1. |
 | HLC logical width / skew bound | 32-bit logical; 5-min skew rejection | Overflow needs ~2.1e9 events/ms; bound stops a wild clock dragging us forward. |
-| Ownership lease TTL / fencing token | 10 s; monotonic per-resource counter (ZK version) | Short enough for quick failover; strictly increasing tokens fence zombies. |
+| Ownership lease TTL / renew / fencing token | 10 s TTL; 3 s renew; monotonic per-resource counter (ZK version) | Short TTL for quick failover; renew well inside it; strictly increasing tokens fence zombies. |
+| Compaction + GC worker interval | configurable; 0 disables | Background maintenance cadence on the owner. |
 | Tombstone-GC time bound | 24 h | Covers in-flight late writes before a delete is reclaimable. |
-| Continuation token | `lastKey` (+ advisory manifest-version, Phase 2) | `lastKey` alone resumes a range scan; version stays advisory so GC isn't blocked. |
+| Ledger-GC grace | 5 min | Margin for in-flight readers / continuation tokens before a physical delete. |
+| Client router cache TTL | 5 s | How long the client caches a Box→owner mapping before re-resolving. |
+| Continuation token | `lastKey` | `lastKey` alone resumes a range/reverse scan, exclusive in the scan direction. |
 | LWW tiebreaker | `nodeId` (locked) | Deterministic, coordination-free. |
-| TCP opcodes | incl. dedicated `RESPONSE_BUSY` | Backpressure is a first-class, retriable signal. |
+| TCP opcodes | incl. dedicated `RESPONSE_BUSY` and `RESPONSE_MOVED` | Backpressure and re-routing are first-class signals. |
 
 ## 12. Deliberate v1 simplifications (escape hatches)
 
@@ -280,11 +319,31 @@ Per-role BK quorum (E/Qw/Qa) defaults: **WAL 3/3/2, Manifest 3/3/2, SSTable 3/2/
 - **No Syrup defragmentation, no multipart upload** — see §9(d); large-object streaming over the wire
   and resumable writes are future work (client currently buffers).
 
-## 13. Open questions / future work
+## 13. What's done vs. remaining
 
-- Phase 2: ZooKeeper-backed coordination (`ZooKeeperCoordinationService`), the manifest ZK pointer with
-  versioned CAS, cluster membership + Box assignment/routing, full server wiring, and chunked
-  PUT/GET bodies on the wire (today the protocol inlines bytes for small objects).
-- Phase 3: distributed compaction scheduling (ZK task claims/leases, fenced commit) and the GC engine.
-- Phase 4: fault-injection/hardening, broader recovery paths, operational docs.
-- Reading flushed data from any replica (read scaling) once ownership/routing exists.
+**Implemented (Phases 0–4):** the LSM engine (memtable/WAL/SSTable/Syrup, merged multi-level read
+path, range tombstones, zero-copy copy/rename); ZooKeeper-backed coordination
+(`ZooKeeperCoordinationService`) with the manifest ZK pointer under versioned CAS and fenced
+ownership/handover; cluster membership + client-side routing over the framed TCP protocol
+(`RESPONSE_MOVED`); multi-level leveled compaction on a background worker; reference-counted GC of
+SSTable/Syrup/WAL ledgers; the storage node with health/metrics, the `candybox` CLI, and a packaged
+distribution (Docker image + Compose + Kubernetes manifests). Fault-injection / failure-path
+hardening and operational docs (`OPERATIONS.md`) landed in Phase 4.
+
+**Remaining future work:**
+
+- **True on-the-wire streaming.** The protocol still inlines a Candy's bytes in one framed message and
+  the client buffers a stream in memory; chunked PUT/GET bodies and resumable/multipart upload are
+  future work (`TODO(phase-2)` in `Message`/`CandyboxClient`).
+- **Distributed cross-node compaction scheduling.** Compaction runs in-process on each Box's owner;
+  claiming work via ZK task leases so it can run off the owner is `TODO(phase-3)` (the *commit* is
+  already fencing-gated).
+- **Watch-based coordination.** The `CoordinationService` callers poll today; ZK watches to avoid
+  polling are `TODO(phase-2)`.
+- **GC enumeration backstop + Box-delete reclamation.** Pending-orphan sets are in-memory, so ledgers
+  orphaned by a prior owner that crashed before GC, and the ledgers of a deleted Box, are not yet
+  reclaimed (§9, `TODO(phase-3)`).
+- **Read scaling.** Sealed SSTables/Syrups are immutable and replicated, so any node *could* serve
+  reads of flushed data; only unflushed-memtable read-your-writes needs the owner. Serving reads off
+  the owner is not built in v1.
+- **Syrup defragmentation and small-object inlining** — see §9(d) and §12.
