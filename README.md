@@ -14,6 +14,7 @@
   <br>
   <a href="https://github.com/predatorray/candybox/actions/workflows/ci.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/predatorray/candybox/ci.yml?branch=main"></a>
   <a href="https://github.com/predatorray/candybox/actions/workflows/docker-publish.yml"><img alt="Docker" src="https://img.shields.io/github/actions/workflow/status/predatorray/candybox/docker-publish.yml?branch=main&label=deploy"></a>
+  <a href="https://codecov.io/github/predatorray/candybox" ><img src="https://codecov.io/github/predatorray/candybox/graph/badge.svg?token=L1FZZY3569"/></a>
 </p>
 
 ---
