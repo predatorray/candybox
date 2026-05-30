@@ -132,7 +132,37 @@ A `StatefulSet` + headless `Service` manifest lives under `examples/kubernetes/`
 pod a stable identity, so `node.id` and the advertised address derive automatically from the pod
 name, and liveness/readiness probes hit the health endpoint.
 
-## How it works (high level)
+## Architecture
+
+Candybox is layered top to bottom: an S3-like object API sits on a per-Box LSM engine, which talks to
+two narrow SPIs, which in turn run on Apache BookKeeper (durable ledgers) and ZooKeeper
+(coordination/metadata).
+
+```
+┌────────────────────────────────────────────────────────────┐
+│  Client API — S3-like object store: Boxes of Candy         │
+├────────────────────────────────────────────────────────────┤
+│  LSM engine  (candybox-lsm)                                │
+│  WAL → Memtable → SSTables → Manifest                      │
+│  Compaction · GC · HLC · single fenced owner               │
+├──────────────────────────────┬─────────────────────────────┤
+│  LedgerStore SPI             │  Coordination SPI           │
+│  (candybox-bookkeeper)       │  (candybox-coordination)    │
+│  ledger roles: WAL,          │  fencing tokens,            │
+│  SSTable, Syrup, manifest    │  manifest pointer CAS       │
+├──────────────────────────────┼─────────────────────────────┤
+│  Apache BookKeeper           │  ZooKeeper                  │
+│  (durable ledgers)           │  (metadata / CAS)           │
+└──────────────────────────────┴─────────────────────────────┘
+```
+
+`candybox-common` (shared records, `BinaryWriter`/`BinaryReader` serialization, HLC, config) underpins
+every layer. Object bytes never enter the LSM tree: candy lives in Syrups and the tree holds only
+`CandyLocator` pointers. The protocol/server/client modules (see [Project layout](#project-layout))
+wrap the engine behind the wire API; the dashed arrow in the data-flow diagram below shows how the
+fenced owner gates every state change.
+
+### How it works
 
 Candybox blends three well-known designs:
 
