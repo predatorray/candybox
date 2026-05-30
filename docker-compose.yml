@@ -171,6 +171,37 @@ services:
       - "9729:9709"
       - "9730:9710"
 
+  # Anonymous, path-style S3-compatible HTTP gateway. Stateless client of the cluster; reachable on
+  # the host at :9711 (S3) and :9712 (health). Used by the ceph/s3-tests harness in
+  # compat/s3-tests/. Runs the shipped example config with CANDYBOX_* env overrides applied.
+  s3-gateway:
+    image: zetaplusae/candybox:latest
+    platform: linux/amd64
+    restart: on-failure
+    command: ["candybox-s3-gateway", "/opt/candybox/conf/candybox-s3-gateway.properties.example"]
+    depends_on:
+      candybox-1:
+        condition: service_started
+      candybox-2:
+        condition: service_started
+      candybox-3:
+        condition: service_started
+    environment:
+      CANDYBOX_ZOOKEEPER_CONNECT: zookeeper:2181
+      CANDYBOX_S3_BIND: 0.0.0.0:9711
+      CANDYBOX_HEALTH_PORT: "9712"
+      CANDYBOX_HEAP_OPTS: "-Xms256m -Xmx512m"
+    ports:
+      - "9711:9711"   # S3 HTTP API
+      - "9712:9712"   # health/metrics (HTTP)
+    # The JRE image ships no curl/wget; probe the readiness port with bash's /dev/tcp instead.
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9712 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 20s
+
   # Convenience client. The same image doubles as the `candybox` CLI; this service points it at
   # the cluster (over the internal network) and is only run on demand, never started by `up`:
   #

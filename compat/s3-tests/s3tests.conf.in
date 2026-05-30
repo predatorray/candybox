@@ -1,0 +1,64 @@
+# ceph/s3-tests configuration template for the Candybox S3 gateway.
+#
+# run.sh renders this into .work/s3tests.conf, substituting __HOST__ / __PORT__ from $S3_ENDPOINT.
+#
+# Notes specific to Candybox:
+#  * The gateway is ANONYMOUS: it accepts and ignores the Authorization header. The credentials
+#    below are therefore arbitrary placeholders -- every "account" maps to the same anonymous
+#    namespace. Multi-user / ACL / tenant-isolation tests cannot pass and are not in the allowlist.
+#  * __HOST__ should be an IP literal (e.g. 127.0.0.1), not a DNS name. boto3 falls back to
+#    path-style addressing when the host is an IP, which is the only addressing the gateway speaks.
+#  * Plain HTTP only -- TLS is expected to terminate at a load balancer in production.
+
+[DEFAULT]
+host = __HOST__
+port = __PORT__
+is_secure = False
+ssl_verify = False
+
+[fixtures]
+bucket prefix = candybox-{random}-
+iam name prefix = s3-tests-
+iam path prefix = /s3-tests/
+
+[s3 main]
+display_name = candybox-main
+user_id = candybox-main
+email = main@candybox.test
+api_name = default
+access_key = candybox
+secret_key = candybox
+
+[s3 alt]
+display_name = candybox-alt
+user_id = candybox-alt
+email = alt@candybox.test
+access_key = candyalt
+secret_key = candyalt
+
+[s3 tenant]
+display_name = candybox-tenant
+user_id = candybox-tenant
+email = tenant@candybox.test
+access_key = candytenant
+secret_key = candytenant
+tenant = candytenant
+
+[iam]
+email = iam@candybox.test
+access_key = candyiam
+secret_key = candyiam
+display_name = candybox-iam
+user_id = candybox-iam
+
+[iam root]
+access_key = candyroot
+secret_key = candyroot
+user_id = RGW11111111111111111
+email = root@candybox.test
+
+[iam alt root]
+access_key = candyaltroot
+secret_key = candyaltroot
+user_id = RGW22222222222222222
+email = altroot@candybox.test

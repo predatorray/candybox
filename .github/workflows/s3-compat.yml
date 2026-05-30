@@ -1,0 +1,158 @@
+name: S3 compatibility
+
+# Runs the ceph/s3-tests gate against a from-source build of the S3 gateway on EVERY PR and every
+# push to main -- regardless of which module changed -- because a change anywhere (LSM, BookKeeper
+# SPI, client, protocol) can break the gateway end-to-end. No `paths:` filter, deliberately.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Manual trigger to (re)calibrate the allowlist on a native amd64 runner and download the result.
+  workflow_dispatch:
+    inputs:
+      calibrate:
+        description: 'Run --calibrate and upload allowlist.txt as an artifact (does not gate).'
+        type: boolean
+        default: false
+
+concurrency:
+  group: s3-compat-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  s3-tests:
+    name: ceph/s3-tests gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write   # to post the pass/fail comment
+    env:
+      COMPOSE_FILE: compat/s3-tests/docker-compose.ci.yml
+      S3_ENDPOINT: http://127.0.0.1:9711
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build the candybox image from THIS checkout (not Docker Hub) so the gate tests current code.
+      - name: Build candybox:ci from source
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: candybox:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # `up -d` honours depends_on conditions (bookies healthy -> node healthy -> gateway), so
+      # ordering is correct; the preflight step below confirms end-to-end readiness. (We avoid
+      # `--wait` because the one-shot bk-init exits 0, which `--wait` misreads as a failure.)
+      - name: Start slimmed stack
+        run: docker compose up -d --no-build
+
+      # Drive a real PUT bucket through the gateway until the full path (gateway -> node -> bookies)
+      # answers, so the suite never races a not-yet-serving cluster.
+      - name: Wait for the gateway to serve
+        run: |
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$S3_ENDPOINT/ci-preflight" || true)
+            if [ "$code" = "200" ]; then
+              curl -s -o /dev/null -X DELETE "$S3_ENDPOINT/ci-preflight" || true
+              echo "gateway is serving (PUT bucket -> $code)"; exit 0
+            fi
+            echo "attempt $i: PUT bucket -> ${code:-no-response}; retrying"; sleep 5
+          done
+          echo "gateway did not become ready in time"; exit 1
+
+      # Provisional (uncalibrated) seed allowlist -> report only; a real one -> gate. Detected by the
+      # marker the seed file carries, which `run.sh --calibrate` strips when it rewrites the file.
+      - name: Decide mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.calibrate }}" = "true" ]; then
+            echo "mode=calibrate" >> "$GITHUB_OUTPUT"
+          elif grep -q "PROVISIONAL SEED" compat/s3-tests/allowlist.txt; then
+            echo "mode=report" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=gate" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run ceph/s3-tests
+        id: run
+        run: |
+          set -o pipefail
+          mode="${{ steps.mode.outputs.mode }}"
+          rc=0
+          case "$mode" in
+            calibrate) compat/s3-tests/run.sh --calibrate 2>&1 | tee gate.log ;;
+            gate)      compat/s3-tests/run.sh            2>&1 | tee gate.log || rc=$? ;;
+            report)    compat/s3-tests/run.sh --all      2>&1 | tee gate.log ;;
+          esac
+
+          summary=$(grep -E '^=+ .*(passed|failed|error|no tests ran)' gate.log | tail -1 | sed 's/=//g; s/^ *//; s/ *$//')
+          [ -z "$summary" ] && summary="(no pytest summary captured)"
+
+          {
+            case "$mode" in
+              gate)      [ "$rc" = "0" ] && echo "### ✅ S3 compatibility gate passed" || echo "### ❌ S3 compatibility gate FAILED" ;;
+              report)    echo "### ℹ️ S3 compatibility report (allowlist is the provisional seed — not gating)" ;;
+              calibrate) echo "### 🔧 S3 compatibility calibration run" ;;
+            esac
+            echo ""
+            echo "- mode: \`$mode\`"
+            echo "- result: \`$summary\`"
+            if grep -qE ' FAILED' gate.log; then
+              echo ""
+              echo "<details><summary>Failed tests</summary>"
+              echo ""
+              echo '```'
+              grep -E ' FAILED' gate.log | awk '{print $1}' | sort -u
+              echo '```'
+              echo "</details>"
+            fi
+            if [ "$mode" = "report" ]; then
+              echo ""
+              echo "> Calibrate to turn this into a gate: run the **S3 compatibility** workflow with \`calibrate=true\` (or \`compat/s3-tests/run.sh --calibrate\` locally), then commit \`compat/s3-tests/allowlist.txt\`."
+            fi
+          } | tee summary.md >> "$GITHUB_STEP_SUMMARY"
+
+          exit $rc
+
+      - name: Upload calibrated allowlist
+        if: ${{ steps.mode.outputs.mode == 'calibrate' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: allowlist.txt
+          path: compat/s3-tests/allowlist.txt
+
+      - name: Comment results on PR
+        if: ${{ always() && github.event_name == 'pull_request' && hashFiles('summary.md') != '' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- s3-compat -->';
+            const body = marker + '\n' + fs.readFileSync('summary.md', 'utf8');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Dump container logs on failure
+        if: ${{ failure() }}
+        run: docker compose logs --no-color --tail 200
+
+      - name: Tear down
+        if: ${{ always() }}
+        run: docker compose down -v

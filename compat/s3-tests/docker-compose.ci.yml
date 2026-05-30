@@ -1,0 +1,138 @@
+# Slimmed Candybox stack for the ceph/s3-tests compatibility gate: 1 ZooKeeper + 3 BookKeeper
+# bookies + 1 Candybox node + the S3 gateway. Three bookies are the minimum for the default 3/3/2
+# replication quorum; a single node is enough for the gateway to route to. The candybox image is
+# BUILT FROM THE LOCAL SOURCE (this checkout), never pulled, so it tests the code under review.
+#
+# Used by .github/workflows/s3-compat.yml and runnable locally -- see compat/s3-tests/README.md.
+#
+#   docker compose -f compat/s3-tests/docker-compose.ci.yml build      # build candybox:ci from source
+#   docker compose -f compat/s3-tests/docker-compose.ci.yml up -d --wait
+#   compat/s3-tests/run.sh --calibrate     # or: run.sh  (gate)
+#   docker compose -f compat/s3-tests/docker-compose.ci.yml down -v
+#
+# No `platform:` pins: on the amd64 CI runner everything is native; on an arm64 laptop the
+# candybox image builds native arm64 (fast) and only the upstream amd64-only images emulate.
+
+name: candybox-s3-compat
+
+x-bookie: &bookie
+  image: apache/bookkeeper:4.17.1
+  restart: on-failure
+  depends_on:
+    zookeeper:
+      condition: service_healthy
+    bk-init:
+      condition: service_completed_successfully
+  environment: &bookie-env
+    BK_zkServers: zookeeper:2181
+    BK_metadataServiceUri: zk://zookeeper:2181/ledgers
+    BK_zkLedgersRootPath: /ledgers
+    BK_httpServerEnabled: "true"
+  healthcheck:
+    test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8080/heartbeat || exit 1"]
+    interval: 5s
+    timeout: 5s
+    retries: 24
+    start_period: 20s
+
+services:
+  zookeeper:
+    image: zookeeper:3.9
+    restart: on-failure
+    environment:
+      ZOO_STANDALONE_ENABLED: "true"
+      ZOO_4LW_COMMANDS_WHITELIST: srvr,ruok,stat,mntr
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 5s
+
+  bk-init:
+    image: apache/bookkeeper:4.17.1
+    restart: "no"
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      BK_zkServers: zookeeper:2181
+      BK_metadataServiceUri: zk://zookeeper:2181/ledgers
+      BK_zkLedgersRootPath: /ledgers
+    working_dir: /opt/bookkeeper
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        python3 scripts/apply-config-from-env.py conf/bk_server.conf
+        bin/bookkeeper shell initnewcluster || bin/bookkeeper shell whatisinstanceid
+
+  bookie1:
+    <<: *bookie
+    hostname: bookie1
+    environment:
+      <<: *bookie-env
+      BK_advertisedAddress: bookie1
+
+  bookie2:
+    <<: *bookie
+    hostname: bookie2
+    environment:
+      <<: *bookie-env
+      BK_advertisedAddress: bookie2
+
+  bookie3:
+    <<: *bookie
+    hostname: bookie3
+    environment:
+      <<: *bookie-env
+      BK_advertisedAddress: bookie3
+
+  # The single storage node. Built from source; the same image serves the gateway below.
+  candybox-1:
+    image: candybox:ci
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    restart: on-failure
+    command: ["/opt/candybox/conf/candybox.properties.example"]
+    depends_on:
+      bookie1:
+        condition: service_healthy
+      bookie2:
+        condition: service_healthy
+      bookie3:
+        condition: service_healthy
+    environment:
+      CANDYBOX_NODE_ID: "1"
+      CANDYBOX_ZOOKEEPER_CONNECT: zookeeper:2181
+      CANDYBOX_ADVERTISED: candybox-1:9709
+      CANDYBOX_HEAP_OPTS: "-Xms256m -Xmx512m"
+    # The client (TCP) port being open means the node has bound and is serving.
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9709 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 15s
+
+  s3-gateway:
+    image: candybox:ci
+    restart: on-failure
+    command: ["candybox-s3-gateway", "/opt/candybox/conf/candybox-s3-gateway.properties.example"]
+    depends_on:
+      candybox-1:
+        condition: service_healthy
+    environment:
+      CANDYBOX_ZOOKEEPER_CONNECT: zookeeper:2181
+      CANDYBOX_S3_BIND: 0.0.0.0:9711
+      CANDYBOX_HEALTH_PORT: "9712"
+      CANDYBOX_HEAP_OPTS: "-Xms256m -Xmx512m"
+    ports:
+      - "9711:9711"   # S3 HTTP API
+      - "9712:9712"   # health/metrics
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9712 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 15s
