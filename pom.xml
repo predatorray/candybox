@@ -11,6 +11,7 @@
 
     <name>Candybox</name>
     <description>A distributed, S3-like object store whose storage engine is a distributed LSM tree built on Apache BookKeeper.</description>
+    <inceptionYear>2026</inceptionYear>
 
     <modules>
         <module>candybox-common</module>
@@ -43,6 +44,7 @@
         <compiler.plugin.version>3.13.0</compiler.plugin.version>
         <jar.plugin.version>3.4.1</jar.plugin.version>
         <assembly.plugin.version>3.7.1</assembly.plugin.version>
+        <license.plugin.version>4.6</license.plugin.version>
     </properties>
 
     <dependencyManagement>
@@ -179,7 +181,45 @@
                     <artifactId>maven-jar-plugin</artifactId>
                     <version>${jar.plugin.version}</version>
                 </plugin>
+                <plugin>
+                    <groupId>com.mycila</groupId>
+                    <artifactId>license-maven-plugin</artifactId>
+                    <version>${license.plugin.version}</version>
+                </plugin>
             </plugins>
         </pluginManagement>
+
+        <plugins>
+            <plugin>
+                <groupId>com.mycila</groupId>
+                <artifactId>license-maven-plugin</artifactId>
+                <configuration>
+                    <licenseSets>
+                        <licenseSet>
+                            <header>${maven.multiModuleProjectDirectory}/etc/license-header.txt</header>
+                            <includes>
+                                <include>src/main/java/**/*.java</include>
+                                <include>src/test/java/**/*.java</include>
+                            </includes>
+                        </licenseSet>
+                    </licenseSets>
+                    <properties>
+                        <project.inceptionYear>${project.inceptionYear}</project.inceptionYear>
+                    </properties>
+                    <mapping>
+                        <java>SLASHSTAR_STYLE</java>
+                    </mapping>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>license-check</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>check</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
     </build>
 </project>
