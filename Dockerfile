@@ -27,6 +27,7 @@ COPY candybox-lsm/pom.xml               candybox-lsm/
 COPY candybox-protocol/pom.xml          candybox-protocol/
 COPY candybox-server/pom.xml            candybox-server/
 COPY candybox-client/pom.xml            candybox-client/
+COPY candybox-s3-gateway/pom.xml        candybox-s3-gateway/
 COPY candybox-integration-tests/pom.xml candybox-integration-tests/
 COPY candybox-dist/pom.xml              candybox-dist/
 RUN --mount=type=cache,target=/root/.m2 \
