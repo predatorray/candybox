@@ -116,6 +116,7 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
                 }
             }
             case LIST_OBJECTS -> listObjects(ctx, request, parts.bucket(), decoder, requestId);
+            case LIST_OBJECT_VERSIONS -> listObjectVersions(ctx, request, parts.bucket(), decoder, requestId);
             case DELETE_OBJECTS -> deleteObjects(ctx, request, parts.bucket(), requestId);
             case GET_BUCKET_LOCATION -> sendXml(ctx, request, HttpResponseStatus.OK,
                     S3Xml.locationConstraint(config.region()), requestId);
@@ -229,17 +230,73 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
     private void listObjects(ChannelHandlerContext ctx, FullHttpRequest request, String bucket,
                              QueryStringDecoder decoder, String requestId) {
         Map<String, List<String>> q = decoder.parameters();
+        // ListObjectsV2 is selected by list-type=2; without it this is the V1 ListObjects API, whose
+        // pagination cursor is the (plain, non-opaque) `marker` rather than V2's continuation-token.
+        boolean v2 = "2".equals(first(q, "list-type", null));
         String prefix = first(q, "prefix", "");
         String delimiter = first(q, "delimiter", null);
         int maxKeys = clampMaxKeys(first(q, "max-keys", null));
+
         String continuationToken = first(q, "continuation-token", null);
         String startAfterParam = first(q, "start-after", null);
-        String startAfter = continuationToken != null ? decodeToken(continuationToken) : startAfterParam;
+        String marker = first(q, "marker", null);
+        String startAfter = v2
+                ? (continuationToken != null ? decodeToken(continuationToken) : startAfterParam)
+                : marker;
 
         Listing listing = store.listCandies(bucket, prefix, startAfter, maxKeys);
-
         List<S3Xml.Content> contents = new ArrayList<>();
         Set<String> commonPrefixes = new LinkedHashSet<>();
+        rollUp(listing, prefix, delimiter, contents, commonPrefixes);
+
+        String xml;
+        if (v2) {
+            String nextToken = listing.isTruncated() ? encodeToken(listing.nextStartAfter()) : null;
+            xml = S3Xml.listBucketV2(bucket, prefix, delimiter, maxKeys, contents,
+                    new ArrayList<>(commonPrefixes), continuationToken, nextToken, startAfterParam);
+        } else {
+            // S3 only returns NextMarker when a delimiter is in play; otherwise the client resumes from
+            // the last returned key. Our resume cursor is exactly that last key, so the two agree.
+            String nextMarker = (listing.isTruncated() && delimiter != null) ? listing.nextStartAfter() : null;
+            xml = S3Xml.listBucketV1(bucket, prefix, delimiter, maxKeys, contents,
+                    new ArrayList<>(commonPrefixes), marker, nextMarker, listing.isTruncated());
+        }
+        sendXml(ctx, request, HttpResponseStatus.OK, xml, requestId);
+    }
+
+    /**
+     * ListObjectVersions for the unversioned store: lists each object as its sole latest version. The
+     * store has no version dimension, so this reuses {@code listCandies} and pages by {@code key-marker}
+     * (the {@code version-id-marker} is irrelevant). Mainly here so version-aware clients — e.g. the
+     * s3-tests cleanup, which drains a bucket via {@code list_object_versions} — work against us.
+     */
+    private void listObjectVersions(ChannelHandlerContext ctx, FullHttpRequest request, String bucket,
+                                    QueryStringDecoder decoder, String requestId) {
+        Map<String, List<String>> q = decoder.parameters();
+        String prefix = first(q, "prefix", "");
+        String delimiter = first(q, "delimiter", null);
+        int maxKeys = clampMaxKeys(first(q, "max-keys", null));
+        String keyMarker = first(q, "key-marker", null);
+
+        Listing listing = store.listCandies(bucket, prefix, keyMarker, maxKeys);
+        List<S3Xml.Content> versions = new ArrayList<>();
+        Set<String> commonPrefixes = new LinkedHashSet<>();
+        rollUp(listing, prefix, delimiter, versions, commonPrefixes);
+
+        String nextKeyMarker = listing.isTruncated() ? listing.nextStartAfter() : null;
+        String xml = S3Xml.listVersions(bucket, prefix, delimiter, maxKeys, versions,
+                new ArrayList<>(commonPrefixes), keyMarker, nextKeyMarker);
+        sendXml(ctx, request, HttpResponseStatus.OK, xml, requestId);
+    }
+
+    /**
+     * Folds a {@link Listing} page into object rows and synthesized common prefixes: a key whose first
+     * {@code delimiter} occurrence after {@code prefix} rolls it up into a {@code CommonPrefixes} entry,
+     * otherwise it becomes a content/version row. List entries carry no ETag (the listing API returns no
+     * CRC32C; a HEAD on the key yields the deterministic ETag).
+     */
+    private static void rollUp(Listing listing, String prefix, String delimiter,
+                               List<S3Xml.Content> rows, Set<String> commonPrefixes) {
         for (Listing.Entry e : listing.entries()) {
             String key = e.key();
             if (delimiter != null) {
@@ -250,14 +307,8 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
                     continue;
                 }
             }
-            // The listing API returns no CRC32C, so list entries carry no ETag in v1 (clients tolerate
-            // its absence). A HEAD on the individual key returns the deterministic ETag.
-            contents.add(new S3Xml.Content(key, e.contentLength(), e.createdAtMillis(), null));
+            rows.add(new S3Xml.Content(key, e.contentLength(), e.createdAtMillis(), null));
         }
-        String nextToken = listing.isTruncated() ? encodeToken(listing.nextStartAfter()) : null;
-        String xml = S3Xml.listBucket(bucket, prefix, delimiter, maxKeys, contents,
-                new ArrayList<>(commonPrefixes), continuationToken, nextToken, startAfterParam);
-        sendXml(ctx, request, HttpResponseStatus.OK, xml, requestId);
     }
 
     private void deleteObjects(ChannelHandlerContext ctx, FullHttpRequest request, String bucket,

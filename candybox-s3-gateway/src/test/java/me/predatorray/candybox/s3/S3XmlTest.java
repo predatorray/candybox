@@ -39,27 +39,64 @@ class S3XmlTest {
     }
 
     @Test
-    void listBucketTruncationAndContents() {
-        String xml = S3Xml.listBucket("photos", "a/", "/", 1000,
+    void listBucketV2TruncationAndContents() {
+        String xml = S3Xml.listBucketV2("photos", "a/", "/", 1000,
                 List.of(new S3Xml.Content("a/cat.jpg", 42, 0L, null)),
                 List.of("a/sub/"), null, "TOKEN", null);
         assertThat(xml).contains("<Key>a/cat.jpg</Key>")
                 .contains("<Size>42</Size>")
                 .contains("<CommonPrefixes><Prefix>a/sub/</Prefix></CommonPrefixes>")
+                .contains("<KeyCount>2</KeyCount>")
                 .contains("<IsTruncated>true</IsTruncated>")
                 .contains("<NextContinuationToken>TOKEN</NextContinuationToken>");
     }
 
     @Test
     void notTruncatedWhenNoNextToken() {
-        String xml = S3Xml.listBucket("photos", "", null, 1000, List.of(), List.of(), null, null, null);
+        String xml = S3Xml.listBucketV2("photos", "", null, 1000, List.of(), List.of(), null, null, null);
         assertThat(xml).contains("<IsTruncated>false</IsTruncated>")
                 .doesNotContain("NextContinuationToken");
     }
 
     @Test
+    void listBucketV1EchoesMarkerAndNextMarker() {
+        String xml = S3Xml.listBucketV1("photos", "a/", "/", 1000,
+                List.of(new S3Xml.Content("a/cat.jpg", 42, 0L, null)),
+                List.of("a/sub/"), "a/aardvark", "a/sub/", true);
+        assertThat(xml).contains("<Marker>a/aardvark</Marker>")
+                .contains("<NextMarker>a/sub/</NextMarker>")
+                .contains("<IsTruncated>true</IsTruncated>")
+                .contains("<Key>a/cat.jpg</Key>")
+                // V1 has no KeyCount / V2 cursor fields.
+                .doesNotContain("KeyCount")
+                .doesNotContain("ContinuationToken");
+    }
+
+    @Test
+    void listBucketV1NoNextMarkerWhenNotTruncated() {
+        String xml = S3Xml.listBucketV1("photos", "", null, 1000,
+                List.of(new S3Xml.Content("k", 1, 0L, null)), List.of(), null, null, false);
+        assertThat(xml).contains("<Marker></Marker>")
+                .contains("<IsTruncated>false</IsTruncated>")
+                .doesNotContain("NextMarker");
+    }
+
+    @Test
+    void listVersionsSurfacesNullVersionIds() {
+        String xml = S3Xml.listVersions("photos", "", null, 1000,
+                List.of(new S3Xml.Content("hello.txt", 5, 0L, null)), List.of(), null, "hello.txt");
+        assertThat(xml).contains("<ListVersionsResult")
+                .contains("<Version>")
+                .contains("<Key>hello.txt</Key>")
+                .contains("<VersionId>null</VersionId>")
+                .contains("<IsLatest>true</IsLatest>")
+                .contains("<NextKeyMarker>hello.txt</NextKeyMarker>")
+                .contains("<IsTruncated>true</IsTruncated>");
+    }
+
+    @Test
     void escapesSpecialCharactersInKeys() {
-        String xml = S3Xml.listBucket("photos", "", null, 1000,
+        String xml = S3Xml.listBucketV2("photos", "", null, 1000,
                 List.of(new S3Xml.Content("a & b <c>.jpg", 1, 0L, null)), List.of(), null, null, null);
         assertThat(xml).contains("a &amp; b &lt;c&gt;.jpg").doesNotContain("a & b <c>");
     }

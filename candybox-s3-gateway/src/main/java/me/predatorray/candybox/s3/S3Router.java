@@ -33,6 +33,7 @@ final class S3Router {
         DELETE_BUCKET,
         HEAD_BUCKET,
         LIST_OBJECTS,
+        LIST_OBJECT_VERSIONS,
         DELETE_OBJECTS,
         GET_BUCKET_LOCATION,
         GET_BUCKET_VERSIONING,
@@ -84,6 +85,9 @@ final class S3Router {
                 }
                 if (queries.contains("acl")) {
                     yield S3Action.GET_BUCKET_ACL;
+                }
+                if (queries.contains("versions")) {
+                    yield S3Action.LIST_OBJECT_VERSIONS;
                 }
                 yield S3Action.LIST_OBJECTS;
             }

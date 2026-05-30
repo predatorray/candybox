@@ -47,6 +47,8 @@ class S3RouterTest {
                 .isEqualTo(S3Action.GET_BUCKET_VERSIONING);
         assertThat(S3Router.route("GET", "photos", null, Set.of("acl")))
                 .isEqualTo(S3Action.GET_BUCKET_ACL);
+        assertThat(S3Router.route("GET", "photos", null, Set.of("versions")))
+                .isEqualTo(S3Action.LIST_OBJECT_VERSIONS);
     }
 
     @Test
