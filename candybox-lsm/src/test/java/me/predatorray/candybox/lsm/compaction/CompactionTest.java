@@ -13,6 +13,7 @@ import me.predatorray.candybox.common.CandyKey;
 import me.predatorray.candybox.common.CandyLocator;
 import me.predatorray.candybox.common.ManualClock;
 import me.predatorray.candybox.common.Mutation;
+import me.predatorray.candybox.common.RangeTombstone;
 import me.predatorray.candybox.common.config.LedgerRole;
 import me.predatorray.candybox.lsm.manifest.ManifestEdit;
 import me.predatorray.candybox.lsm.manifest.ManifestState;
@@ -31,6 +32,10 @@ class CompactionTest {
         return writer.write(cfg, level, sorted.iterator());
     }
 
+    private SSTableMeta write(int level, List<Mutation> sorted, List<RangeTombstone> rangeTombstones) {
+        return writer.write(cfg, level, sorted.iterator(), rangeTombstones);
+    }
+
     private List<String> keysOf(SSTableMeta meta) {
         List<String> keys = new ArrayList<>();
         try (SSTableReader r = new SSTableReader(store, meta.ledgerId())) {
@@ -40,6 +45,12 @@ class CompactionTest {
             }
         }
         return keys;
+    }
+
+    private List<RangeTombstone> rangeTombstonesOf(SSTableMeta meta) {
+        try (SSTableReader r = new SSTableReader(store, meta.ledgerId())) {
+            return r.rangeTombstones();
+        }
     }
 
     @Test
@@ -110,6 +121,49 @@ class CompactionTest {
         Compactor c = new Compactor(store, writer, cfg, 100, new ManualClock(1_000_000));
         SSTableMeta out = c.compact(new CompactionTask(List.of(a, b), 1, false)).output().orElseThrow();
         assertThat(keysOf(out)).containsExactly("k");
+    }
+
+    @Test
+    void nonBottommostCompactionCarriesRangeTombstoneAndKeepsCoveredPoint() {
+        SSTableMeta a = write(0, List.of(new Mutation(CandyKey.of("c"), put(hlc(1, 0, 1), 1, 5))));
+        SSTableMeta b = write(0, List.of(),
+                List.of(new RangeTombstone(CandyKey.of("b"), CandyKey.of("d"), hlc(5, 0, 1))));
+
+        // Ancient range tombstone, but non-bottommost: nothing may be dropped.
+        Compactor c = new Compactor(store, writer, cfg, 100, new ManualClock(1_000_000));
+        SSTableMeta out = c.compact(new CompactionTask(List.of(a, b), 1, false)).output().orElseThrow();
+
+        assertThat(keysOf(out)).containsExactly("c");          // covered point preserved
+        assertThat(rangeTombstonesOf(out)).hasSize(1);         // range tombstone carried forward
+    }
+
+    @Test
+    void bottommostCompactionDropsAgedRangeTombstoneAndItsCoveredPoints() {
+        SSTableMeta a = write(0, List.of(new Mutation(CandyKey.of("c"), put(hlc(1, 0, 1), 1, 5)),
+                new Mutation(CandyKey.of("z"), put(hlc(1, 0, 1), 1, 5))));
+        // Range tombstone HLC physical=1000; now=1_000_000, grace=100 => aged.
+        SSTableMeta b = write(0, List.of(),
+                List.of(new RangeTombstone(CandyKey.of("b"), CandyKey.of("d"), hlc(1000, 0, 1))));
+
+        Compactor aged = new Compactor(store, writer, cfg, 100, new ManualClock(1_000_000));
+        SSTableMeta out = aged.compact(new CompactionTask(List.of(a, b), 1, true)).output().orElseThrow();
+
+        assertThat(keysOf(out)).containsExactly("z");          // "c" covered+aged => dropped
+        assertThat(rangeTombstonesOf(out)).isEmpty();          // aged range tombstone dropped
+    }
+
+    @Test
+    void bottommostCompactionKeepsYoungRangeTombstoneAndCoveredPoint() {
+        SSTableMeta a = write(0, List.of(new Mutation(CandyKey.of("c"), put(hlc(1, 0, 1), 1, 5))));
+        // Range tombstone HLC physical=1000; now=1050, grace=100 => too young to drop.
+        SSTableMeta b = write(0, List.of(),
+                List.of(new RangeTombstone(CandyKey.of("b"), CandyKey.of("d"), hlc(1000, 0, 1))));
+
+        Compactor young = new Compactor(store, writer, cfg, 100, new ManualClock(1050));
+        SSTableMeta out = young.compact(new CompactionTask(List.of(a, b), 1, true)).output().orElseThrow();
+
+        assertThat(keysOf(out)).containsExactly("c");          // covered point preserved (young)
+        assertThat(rangeTombstonesOf(out)).hasSize(1);         // carried forward
     }
 
     private static SSTableMeta meta(long id, int level) {
