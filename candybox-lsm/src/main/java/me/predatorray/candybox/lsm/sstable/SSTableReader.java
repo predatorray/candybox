@@ -9,11 +9,14 @@ import me.predatorray.candybox.bookkeeper.LedgerStore;
 import me.predatorray.candybox.bookkeeper.ReadableLedger;
 import me.predatorray.candybox.common.CandyKey;
 import me.predatorray.candybox.common.CandyLocator;
+import me.predatorray.candybox.common.Hlc;
 import me.predatorray.candybox.common.Mutation;
+import me.predatorray.candybox.common.RangeTombstone;
 import me.predatorray.candybox.common.bloom.BloomFilter;
 import me.predatorray.candybox.common.exception.SerializationException;
 import me.predatorray.candybox.common.serial.BinaryReader;
 import me.predatorray.candybox.common.serial.MutationSerializer;
+import me.predatorray.candybox.common.serial.RangeTombstoneSerializer;
 import me.predatorray.candybox.common.util.Bytes;
 
 /**
@@ -32,6 +35,7 @@ public final class SSTableReader implements AutoCloseable {
     private final CandyKey minKey;
     private final CandyKey maxKey;
     private final long entryCount;
+    private final List<RangeTombstone> rangeTombstones;
 
     public SSTableReader(LedgerStore store, long ledgerId) {
         this.ledger = store.openLedger(ledgerId);
@@ -53,6 +57,19 @@ public final class SSTableReader implements AutoCloseable {
             blockLastKeys[i] = idx.readBytes();
             blockEntryIds[i] = idx.readVarLong();
         }
+
+        this.rangeTombstones = footer.rangeDelEntryId < 0 ? List.of()
+                : parseRangeTombstones(ledger.read(footer.rangeDelEntryId).data());
+    }
+
+    private static List<RangeTombstone> parseRangeTombstones(byte[] data) {
+        BinaryReader r = new BinaryReader(data);
+        int count = r.readVarInt();
+        List<RangeTombstone> out = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            out.add(RangeTombstoneSerializer.deserialize(r.readBytes()));
+        }
+        return out;
     }
 
     public CandyKey minKey() {
@@ -65,6 +82,25 @@ public final class SSTableReader implements AutoCloseable {
 
     public long entryCount() {
         return entryCount;
+    }
+
+    /** The range tombstones persisted in this table (empty for a v1 table or one with none). */
+    public List<RangeTombstone> rangeTombstones() {
+        return rangeTombstones;
+    }
+
+    /**
+     * The highest HLC among this table's range tombstones covering {@code key}, or {@code null} if
+     * none cover it. A point locator at {@code key} is shadowed iff its HLC is older than this value.
+     */
+    public Hlc maxRangeTombstoneCovering(CandyKey key) {
+        Hlc max = null;
+        for (RangeTombstone rt : rangeTombstones) {
+            if (rt.covers(key) && (max == null || rt.hlc().isAfter(max))) {
+                max = rt.hlc();
+            }
+        }
+        return max;
     }
 
     /**
@@ -247,7 +283,8 @@ public final class SSTableReader implements AutoCloseable {
             throw new SerializationException("Bad SSTable footer magic in ledger " + ledgerId);
         }
         int version = r.readByte();
-        if (version != SSTableFormat.FORMAT_VERSION) {
+        if (version != SSTableFormat.FORMAT_VERSION
+                && version != SSTableFormat.FORMAT_VERSION_NO_RANGE_DEL) {
             throw new SerializationException("Unsupported SSTable format version " + version);
         }
         Footer f = new Footer();
@@ -257,6 +294,9 @@ public final class SSTableReader implements AutoCloseable {
         f.numEntries = r.readVarLong();
         f.minKey = r.readBytes();
         f.maxKey = r.readBytes();
+        // v2+ adds an optional range-del block; v1 footers end after maxKey.
+        f.rangeDelEntryId = version >= SSTableFormat.FORMAT_VERSION && r.readBoolean()
+                ? r.readVarLong() : -1;
         return f;
     }
 
@@ -267,5 +307,6 @@ public final class SSTableReader implements AutoCloseable {
         long numEntries;
         byte[] minKey;
         byte[] maxKey;
+        long rangeDelEntryId = -1;
     }
 }

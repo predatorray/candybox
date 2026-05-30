@@ -84,6 +84,18 @@ public sealed interface Message {
         }
     }
 
+    /**
+     * Deletes a key range with a single range tombstone. Exactly one of: a {@code prefix}, or a
+     * {@code [startKey, endKey)} window (either bound nullable). {@code prefix} non-null selects the
+     * prefix form.
+     */
+    record DeleteRangeRequest(String box, String prefix, String startKey, String endKey)
+            implements Message {
+        public Opcode opcode() {
+            return Opcode.DELETE_RANGE;
+        }
+    }
+
     record ListCandiesRequest(String box, String prefix, String startAfter, int maxKeys,
                               String startKey, String endKey, boolean reverse) implements Message {
         public Opcode opcode() {

@@ -50,6 +50,11 @@ public final class MessageCodec {
             w.writeString(m.srcKey());
             w.writeString(m.dstKey());
             writeNullable(w, m.idempotencyToken());
+        } else if (message instanceof Message.DeleteRangeRequest m) {
+            w.writeString(m.box());
+            writeNullable(w, m.prefix());
+            writeNullable(w, m.startKey());
+            writeNullable(w, m.endKey());
         } else if (message instanceof Message.ListCandiesRequest m) {
             w.writeString(m.box());
             writeNullable(w, m.prefix());
@@ -120,6 +125,8 @@ public final class MessageCodec {
                     r.readString(), readNullable(r));
             case RENAME_CANDY -> new Message.RenameCandyRequest(r.readString(), r.readString(),
                     r.readString(), readNullable(r));
+            case DELETE_RANGE -> new Message.DeleteRangeRequest(r.readString(), readNullable(r),
+                    readNullable(r), readNullable(r));
             case LIST_CANDIES -> new Message.ListCandiesRequest(r.readString(), readNullable(r),
                     readNullable(r), r.readInt(), readNullable(r), readNullable(r), r.readBoolean());
             case RESPONSE_OK -> new Message.OkResponse();

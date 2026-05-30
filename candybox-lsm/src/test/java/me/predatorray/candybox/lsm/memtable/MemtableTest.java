@@ -7,7 +7,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.ArrayList;
 import java.util.List;
+import me.predatorray.candybox.common.CandyKey;
 import me.predatorray.candybox.common.Mutation;
+import me.predatorray.candybox.common.RangeTombstone;
 import org.junit.jupiter.api.Test;
 
 class MemtableTest {
@@ -73,6 +75,19 @@ class MemtableTest {
             bounded.add(bit.next().key().value());
         }
         assertThat(bounded).containsExactly("banana", "apple"); // <= start, descending
+    }
+
+    @Test
+    void rangeTombstoneCoveringReportsHighestHlc() {
+        Memtable m = new Memtable();
+        m.delete(new RangeTombstone(CandyKey.of("b"), CandyKey.of("e"), hlc(10, 0, 1)));
+        m.delete(new RangeTombstone(CandyKey.of("a"), CandyKey.of("c"), hlc(20, 0, 1))); // overlaps at b
+
+        assertThat(m.maxRangeTombstoneCovering(CandyKey.of("a"))).isEqualTo(hlc(20, 0, 1));
+        assertThat(m.maxRangeTombstoneCovering(CandyKey.of("b"))).isEqualTo(hlc(20, 0, 1)); // higher wins
+        assertThat(m.maxRangeTombstoneCovering(CandyKey.of("d"))).isEqualTo(hlc(10, 0, 1));
+        assertThat(m.maxRangeTombstoneCovering(CandyKey.of("z"))).isNull(); // uncovered
+        assertThat(m.isEmpty()).isFalse(); // range tombstones count toward flush
     }
 
     @Test

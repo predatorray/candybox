@@ -17,6 +17,7 @@ public enum Opcode {
     LIST_CANDIES(14),
     COPY_CANDY(15),
     RENAME_CANDY(16),
+    DELETE_RANGE(17),
 
     RESPONSE_OK(20),
     RESPONSE_ERROR(21),

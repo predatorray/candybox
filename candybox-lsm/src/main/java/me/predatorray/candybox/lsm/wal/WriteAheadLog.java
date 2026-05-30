@@ -9,7 +9,7 @@ import me.predatorray.candybox.bookkeeper.ReadableLedger;
 import me.predatorray.candybox.bookkeeper.WritableLedger;
 import me.predatorray.candybox.common.Hlc;
 import me.predatorray.candybox.common.Mutation;
-import me.predatorray.candybox.common.serial.MutationSerializer;
+import me.predatorray.candybox.common.RangeTombstone;
 
 /**
  * The write-ahead log: every mutation is appended here (and ack-quorum durable) before the memtable
@@ -35,9 +35,19 @@ public final class WriteAheadLog implements AutoCloseable {
         return new WriteAheadLog(store.createLedger(config));
     }
 
-    /** Appends a mutation, blocking until ack-quorum durable. */
+    /** Appends a point mutation, blocking until ack-quorum durable. */
     public long append(Mutation mutation) {
-        return ledger.append(MutationSerializer.serialize(mutation));
+        return append(WalEntry.of(mutation));
+    }
+
+    /** Appends a range tombstone ({@code deleteRange}), blocking until ack-quorum durable. */
+    public long append(RangeTombstone tombstone) {
+        return append(WalEntry.of(tombstone));
+    }
+
+    /** Appends a WAL entry of either kind, blocking until ack-quorum durable. */
+    public long append(WalEntry entry) {
+        return ledger.append(WalEntrySerializer.serialize(entry));
     }
 
     public long ledgerId() {
@@ -50,33 +60,34 @@ public final class WriteAheadLog implements AutoCloseable {
     }
 
     /**
-     * Reads every entry of a WAL ledger back into mutations, also reporting the maximum HLC seen — the
-     * value the recovering owner must advance its clock beyond.
+     * Reads every entry of a WAL ledger back into {@link WalEntry}s, also reporting the maximum HLC
+     * seen across both point mutations and range tombstones — the value the recovering owner must
+     * advance its clock beyond before stamping anything new.
      *
      * @param ledger a readable WAL ledger (typically the result of {@code recoverOpen})
      */
     public static ReplayResult replay(ReadableLedger ledger) {
-        List<Mutation> mutations = new ArrayList<>();
+        List<WalEntry> entries = new ArrayList<>();
         Hlc maxHlc = Hlc.MIN;
         long lac = ledger.lastAddConfirmed();
         if (lac >= 0) {
             for (LedgerEntry entry : ledger.readRange(0, lac)) {
-                Mutation m = MutationSerializer.deserialize(entry.data());
-                mutations.add(m);
-                if (m.hlc().isAfter(maxHlc)) {
-                    maxHlc = m.hlc();
+                WalEntry e = WalEntrySerializer.deserialize(entry.data());
+                entries.add(e);
+                if (e.hlc().isAfter(maxHlc)) {
+                    maxHlc = e.hlc();
                 }
             }
         }
-        return new ReplayResult(mutations, maxHlc);
+        return new ReplayResult(entries, maxHlc);
     }
 
     /**
      * The outcome of a WAL replay.
      *
-     * @param mutations the mutations in append order
-     * @param maxHlc    the highest HLC recorded ({@link Hlc#MIN} if the WAL was empty)
+     * @param entries the WAL entries in append order (point mutations and range tombstones)
+     * @param maxHlc  the highest HLC recorded ({@link Hlc#MIN} if the WAL was empty)
      */
-    public record ReplayResult(List<Mutation> mutations, Hlc maxHlc) {
+    public record ReplayResult(List<WalEntry> entries, Hlc maxHlc) {
     }
 }

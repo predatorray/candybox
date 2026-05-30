@@ -170,6 +170,25 @@ public final class CandyboxClient implements AutoCloseable {
         throw mapUnexpected(response, box, srcKey);
     }
 
+    /**
+     * Deletes every Candy whose key starts with {@code prefix} using a single server-side range
+     * tombstone (O(1), not a list-then-delete). An empty/null prefix deletes the whole Box's contents.
+     */
+    public void deleteRangeByPrefix(String box, String prefix) {
+        expectOk(router.callBox(box,
+                new Message.DeleteRangeRequest(BoxName.of(box).value(), prefix == null ? "" : prefix,
+                        null, null)));
+    }
+
+    /**
+     * Deletes every Candy whose key falls in {@code [startKey, endKey)} (either bound nullable) using a
+     * single server-side range tombstone.
+     */
+    public void deleteRange(String box, String startKey, String endKey) {
+        expectOk(router.callBox(box,
+                new Message.DeleteRangeRequest(BoxName.of(box).value(), null, startKey, endKey)));
+    }
+
     public Listing listCandies(String box, String prefix, String startAfter, int maxKeys) {
         return listCandies(box, new Message.ListCandiesRequest(BoxName.of(box).value(), prefix,
                 startAfter, maxKeys));

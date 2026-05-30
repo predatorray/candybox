@@ -92,6 +92,8 @@ final class NodeRequestHandler implements RequestHandler {
             return m.box();
         } else if (message instanceof Message.RenameCandyRequest m) {
             return m.box();
+        } else if (message instanceof Message.DeleteRangeRequest m) {
+            return m.box();
         } else if (message instanceof Message.ListCandiesRequest m) {
             return m.box();
         } else if (message instanceof Message.DeleteBoxRequest m) {
@@ -138,6 +140,16 @@ final class NodeRequestHandler implements RequestHandler {
                     CandyKey.of(m.dstKey()), m.idempotencyToken());
             return new Message.HeadCandyResponse(meta.contentLength(), meta.contentType(),
                     meta.userMetadata(), meta.crc32c(), meta.createdAtMillis());
+        } else if (message instanceof Message.DeleteRangeRequest m) {
+            BoxEngine engine = node.engine(BoxName.of(m.box()));
+            if (m.prefix() != null) {
+                engine.deleteRangeByPrefix(m.prefix());
+            } else {
+                CandyKey start = m.startKey() == null ? null : CandyKey.of(m.startKey());
+                CandyKey end = m.endKey() == null ? null : CandyKey.of(m.endKey());
+                engine.deleteRange(start, end);
+            }
+            return new Message.OkResponse();
         } else if (message instanceof Message.ListCandiesRequest m) {
             BoxEngine engine = node.engine(BoxName.of(m.box()));
             ListResult result = engine.scanCandies(toScanQuery(m));
