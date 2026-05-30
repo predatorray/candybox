@@ -1,0 +1,30 @@
+# Candybox S3 gateway configuration (example).
+#
+# The gateway is an anonymous, path-style, S3-compatible HTTP front-end that translates S3 requests
+# onto the Candybox cluster. It is stateless and is intended to run behind an HTTP(S) load balancer
+# (which terminates TLS); the gateway itself listens on plain HTTP.
+#
+# Every key below can be overridden by an environment variable named CANDYBOX_<KEY> (dots and dashes
+# become underscores, upper-cased); the environment value wins. e.g. CANDYBOX_S3_BIND, CANDYBOX_ZOOKEEPER_CONNECT.
+
+# Address the S3 HTTP listener binds to (plain HTTP, behind the load balancer).
+s3.bind=0.0.0.0:9711
+
+# ZooKeeper connect string of the Candybox cluster (used for owner routing). REQUIRED.
+zookeeper.connect=127.0.0.1:2181
+
+# Region echoed in ?location and related responses.
+s3.region=us-east-1
+
+# Reject single PUTs larger than this many bytes (no multipart upload in v1). Note: the practical
+# ceiling is ~2 GiB because the request is buffered in full. Default: 5368709120 (5 GiB, capped to ~2 GiB).
+# s3.max-object-bytes=5368709120
+
+# Size of the blocking worker pool that issues Candybox client calls. Default: 2 x CPU cores (min 4).
+# s3.worker-threads=8
+
+# Box->owner resolution cache TTL (ms). Default: 5000.
+# s3.router-cache-ttl-ms=5000
+
+# HTTP port for /healthz, /readyz, /metrics. Default: 9712.
+# health.port=9712

@@ -34,6 +34,12 @@
             <artifactId>candybox-client</artifactId>
             <version>${project.version}</version>
         </dependency>
+        <!-- The S3 gateway and its Netty runtime, so lib/ can launch it via bin/candybox-s3-gateway. -->
+        <dependency>
+            <groupId>me.predatorray.candybox</groupId>
+            <artifactId>candybox-s3-gateway</artifactId>
+            <version>${project.version}</version>
+        </dependency>
         <!-- The single production SLF4J binding (tests elsewhere use slf4j-simple). -->
         <dependency>
             <groupId>ch.qos.logback</groupId>

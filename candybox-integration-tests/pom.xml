@@ -45,6 +45,12 @@
             <groupId>me.predatorray.candybox</groupId>
             <artifactId>candybox-client</artifactId>
         </dependency>
+        <!-- The S3 gateway, exercised end-to-end over a real node (pulls Netty transitively). -->
+        <dependency>
+            <groupId>me.predatorray.candybox</groupId>
+            <artifactId>candybox-s3-gateway</artifactId>
+            <scope>test</scope>
+        </dependency>
 
         <!-- Reuse the shared contract suites against the real BookKeeper / ZooKeeper backends. -->
         <dependency>
