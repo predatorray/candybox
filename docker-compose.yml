@@ -195,8 +195,9 @@ services:
       - "9711:9711"   # S3 HTTP API
       - "9712:9712"   # health/metrics (HTTP)
     # The JRE image ships no curl/wget; probe the readiness port with bash's /dev/tcp instead.
+    # /bin/sh is dash (no /dev/tcp), so invoke bash explicitly.
     healthcheck:
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9712 || exit 1"]
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/9712"]
       interval: 10s
       timeout: 5s
       retries: 18

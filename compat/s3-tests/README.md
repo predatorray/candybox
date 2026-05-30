@@ -75,7 +75,7 @@ docker compose -f compat/s3-tests/docker-compose.ci.yml down -v
 | `S3_ENDPOINT` | `http://127.0.0.1:9711`                       | Gateway base URL. Use an **IP** host, not `localhost`, so boto3 stays path-style. |
 | `S3TESTS_REF` | `master`                                      | `ceph/s3-tests` ref to pin. Calibration records the resolved SHA in the allowlist header. |
 | `S3TESTS_REPO`| `https://github.com/ceph/s3-tests.git`        | Clone URL.                               |
-| `TEST_PATH`   | `s3tests_boto3/functional/test_s3.py`         | Suite path to run.                       |
+| `TEST_PATH`   | `s3tests/functional/test_s3.py`         | Suite path to run.                       |
 | `PYTEST_ARGS` | _(empty)_                                     | Extra args appended to pytest.           |
 
 ## The allowlist as a contract
