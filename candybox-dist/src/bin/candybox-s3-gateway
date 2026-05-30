@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+#
+# Starts the Candybox S3 gateway in the FOREGROUND (logs to stdout, no daemonization) so a process
+# supervisor or container orchestrator owns its lifecycle. SIGTERM/Ctrl-C triggers a graceful
+# shutdown. The gateway is stateless and is meant to sit behind an HTTP(S) load balancer.
+#
+# Usage: candybox-s3-gateway [path/to/candybox-s3-gateway.properties]
+#   Defaults to $CANDYBOX_CONF_DIR/candybox-s3-gateway.properties.
+#
+# Set CANDYBOX_DRY_RUN=1 to print the resolved java command instead of executing it.
+#
+set -euo pipefail
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=candybox-env.sh
+source "$BIN_DIR/candybox-env.sh"
+
+CONFIG_FILE="${1:-$CANDYBOX_CONF_DIR/candybox-s3-gateway.properties}"
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  echo "ERROR: configuration file not found: $CONFIG_FILE" >&2
+  echo "Copy $CANDYBOX_CONF_DIR/candybox-s3-gateway.properties.example to" >&2
+  echo "candybox-s3-gateway.properties and edit it, or pass a config path as the first argument." >&2
+  exit 1
+fi
+
+mkdir -p "$CANDYBOX_LOG_DIR"
+
+CMD=("$JAVA" "${CANDYBOX_JVM_OPTS[@]}" -cp "$CLASSPATH"
+     me.predatorray.candybox.s3.S3GatewayMain "$CONFIG_FILE")
+
+if [[ -n "${CANDYBOX_DRY_RUN:-}" ]]; then
+  printf '%s ' "${CMD[@]}"
+  printf '\n'
+  exit 0
+fi
+
+exec "${CMD[@]}"

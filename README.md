@@ -246,5 +246,6 @@ hard fencing/handover scenarios. No mocking frameworks are used anywhere.
 | `candybox-protocol` | The framed TCP wire protocol and transport. |
 | `candybox-server` | The storage node: wires the engine behind the protocol, plus the runnable entrypoint, health/metrics, and ownership. |
 | `candybox-client` | The thin client library and the `candybox` command-line tool. |
+| `candybox-s3-gateway` | An anonymous, path-style, S3-compatible HTTP gateway (Netty) that translates the S3 REST/XML API onto the client. Stateless; runs behind an HTTP(S) load balancer. See `S3_GATEWAY_PLAN.md`. |
 | `candybox-dist` | Packages the runnable distribution (`bin/ lib/ conf/`) and the Docker/Kubernetes assets. |
 | `candybox-integration-tests` | End-to-end tests on embedded BookKeeper + ZooKeeper. |
