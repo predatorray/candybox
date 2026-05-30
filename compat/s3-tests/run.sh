@@ -21,7 +21,7 @@
 #   S3_ENDPOINT   gateway base URL                (default: http://127.0.0.1:9711)
 #   S3TESTS_REF   ceph/s3-tests git ref to pin    (default: master; calibrate records the SHA)
 #   S3TESTS_REPO  clone URL                        (default: https://github.com/ceph/s3-tests.git)
-#   TEST_PATH     suite path under the checkout    (default: s3tests_boto3/functional/test_s3.py)
+#   TEST_PATH     suite path under the checkout    (default: s3tests/functional/test_s3.py)
 #   PYTEST_ARGS   extra args appended to pytest    (default: empty)
 #
 set -euo pipefail
@@ -36,7 +36,7 @@ ALLOWLIST="$HERE/allowlist.txt"
 S3_ENDPOINT="${S3_ENDPOINT:-http://127.0.0.1:9711}"
 S3TESTS_REF="${S3TESTS_REF:-master}"
 S3TESTS_REPO="${S3TESTS_REPO:-https://github.com/ceph/s3-tests.git}"
-TEST_PATH="${TEST_PATH:-s3tests_boto3/functional/test_s3.py}"
+TEST_PATH="${TEST_PATH:-s3tests/functional/test_s3.py}"
 PYTEST_ARGS="${PYTEST_ARGS:-}"
 
 MODE="allowlist"

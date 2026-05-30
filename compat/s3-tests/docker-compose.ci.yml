@@ -107,9 +107,10 @@ services:
       CANDYBOX_ZOOKEEPER_CONNECT: zookeeper:2181
       CANDYBOX_ADVERTISED: candybox-1:9709
       CANDYBOX_HEAP_OPTS: "-Xms256m -Xmx512m"
-    # The client (TCP) port being open means the node has bound and is serving.
+    # The client (TCP) port being open means the node has bound and is serving. Use bash explicitly:
+    # /dev/tcp is a bash builtin and the image's /bin/sh is dash, which does not support it.
     healthcheck:
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9709 || exit 1"]
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/9709"]
       interval: 5s
       timeout: 5s
       retries: 24
@@ -131,7 +132,7 @@ services:
       - "9711:9711"   # S3 HTTP API
       - "9712:9712"   # health/metrics
     healthcheck:
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9712 || exit 1"]
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/9712"]
       interval: 5s
       timeout: 5s
       retries: 24
