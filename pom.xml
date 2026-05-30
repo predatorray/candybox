@@ -45,6 +45,7 @@
         <jar.plugin.version>3.4.1</jar.plugin.version>
         <assembly.plugin.version>3.7.1</assembly.plugin.version>
         <license.plugin.version>4.6</license.plugin.version>
+        <jacoco.plugin.version>0.8.12</jacoco.plugin.version>
     </properties>
 
     <dependencyManagement>
@@ -186,10 +187,54 @@
                     <artifactId>license-maven-plugin</artifactId>
                     <version>${license.plugin.version}</version>
                 </plugin>
+                <plugin>
+                    <groupId>org.jacoco</groupId>
+                    <artifactId>jacoco-maven-plugin</artifactId>
+                    <version>${jacoco.plugin.version}</version>
+                </plugin>
             </plugins>
         </pluginManagement>
 
         <plugins>
+            <!-- Code coverage. prepare-agent instruments the surefire (unit) JVM and writes
+                 target/jacoco.exec; prepare-agent-integration instruments the failsafe (IT) forks
+                 and writes target/jacoco-it.exec. Both set the `argLine` property: surefire/failsafe
+                 pick it up automatically, except the integration-tests module which hardcodes an
+                 argLine and must reference @{argLine} (see that module's pom). Per-module HTML reports
+                 land in target/site/jacoco (unit) and target/site/jacoco-it (IT); the cross-module
+                 aggregate is produced by candybox-integration-tests via report-aggregate. -->
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>jacoco-prepare-agent</id>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>jacoco-report</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>jacoco-prepare-agent-integration</id>
+                        <goals>
+                            <goal>prepare-agent-integration</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>jacoco-report-integration</id>
+                        <phase>post-integration-test</phase>
+                        <goals>
+                            <goal>report-integration</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
             <plugin>
                 <groupId>com.mycila</groupId>
                 <artifactId>license-maven-plugin</artifactId>

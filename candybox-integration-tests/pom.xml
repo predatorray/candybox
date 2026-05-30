@@ -31,6 +31,12 @@
             <groupId>me.predatorray.candybox</groupId>
             <artifactId>candybox-lsm</artifactId>
         </dependency>
+        <!-- Transitive via server/client, but declared directly so report-aggregate (which only
+             walks this module's direct dependencies) includes candybox-protocol in the coverage report. -->
+        <dependency>
+            <groupId>me.predatorray.candybox</groupId>
+            <artifactId>candybox-protocol</artifactId>
+        </dependency>
         <dependency>
             <groupId>me.predatorray.candybox</groupId>
             <artifactId>candybox-server</artifactId>
@@ -121,8 +127,11 @@
                          100s+. A clean JVM per class keeps each class fast and isolated. -->
                     <reuseForks>false</reuseForks>
                     <!-- BookKeeper/ZooKeeper reach into JDK internals (e.g. PageCacheUtil reflects
-                         into java.io.FileDescriptor); open them up on modern JDKs. -->
+                         into java.io.FileDescriptor); open them up on modern JDKs.
+                         @{argLine} carries the JaCoCo integration agent injected by
+                         prepare-agent-integration; it must lead so the IT forks record coverage. -->
                     <argLine>
+                        @{argLine}
                         --add-opens java.base/java.lang=ALL-UNNAMED
                         --add-opens java.base/java.io=ALL-UNNAMED
                         --add-opens java.base/java.nio=ALL-UNNAMED
@@ -131,6 +140,26 @@
                         --add-opens java.base/java.util.concurrent=ALL-UNNAMED
                     </argLine>
                 </configuration>
+            </plugin>
+            <!-- Aggregate coverage across the whole reactor. This module depends (directly or via
+                 candybox-server) on every production module, so report-aggregate merges each module's
+                 jacoco.exec (unit) and jacoco-it.exec (IT) into one HTML report under
+                 target/site/jacoco-aggregate. Bound to verify so it runs after the IT phase. -->
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>jacoco-aggregate-report</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>report-aggregate</goal>
+                        </goals>
+                        <configuration>
+                            <outputDirectory>${project.build.directory}/site/jacoco-aggregate</outputDirectory>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>
