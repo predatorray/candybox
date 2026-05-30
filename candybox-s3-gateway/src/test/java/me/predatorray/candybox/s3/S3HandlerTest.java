@@ -157,6 +157,49 @@ class S3HandlerTest {
     }
 
     @Test
+    void listObjectsV1HonoursMarker() {
+        put("/photos");
+        for (String k : new String[]{"k1", "k2", "k3"}) {
+            put("/photos/" + k, "v".getBytes(StandardCharsets.UTF_8), null);
+        }
+        // No list-type=2 -> V1 ListObjects: the cursor is `marker` and the response echoes <Marker>,
+        // not a continuation token.
+        Response first = get("/photos?max-keys=2");
+        assertThat(first.body).contains("<Key>k1</Key>").contains("<Key>k2</Key>")
+                .doesNotContain("<Key>k3</Key>")
+                .contains("<IsTruncated>true</IsTruncated>")
+                .contains("<Marker></Marker>")
+                .doesNotContain("ContinuationToken");
+
+        Response second = get("/photos?max-keys=2&marker=k2");
+        assertThat(second.body).contains("<Key>k3</Key>")
+                .doesNotContain("<Key>k1</Key>").doesNotContain("<Key>k2</Key>");
+    }
+
+    @Test
+    void listObjectVersionsListsAndPaginatesByKeyMarker() {
+        put("/photos");
+        put("/photos/a.txt", "1".getBytes(StandardCharsets.UTF_8), null);
+        put("/photos/b.txt", "2".getBytes(StandardCharsets.UTF_8), null);
+
+        Response all = get("/photos?versions");
+        assertThat(all.status).isEqualTo(200);
+        assertThat(all.body).contains("<ListVersionsResult")
+                .contains("<Key>a.txt</Key>").contains("<Key>b.txt</Key>")
+                .contains("<VersionId>null</VersionId>")
+                .contains("<IsLatest>true</IsLatest>")
+                .contains("<IsTruncated>false</IsTruncated>");
+
+        // key-marker pagination lets a version-aware client drain the bucket key by key.
+        Response page = get("/photos?versions&max-keys=1");
+        assertThat(page.body).contains("<Key>a.txt</Key>").doesNotContain("<Key>b.txt</Key>")
+                .contains("<IsTruncated>true</IsTruncated>")
+                .contains("<NextKeyMarker>a.txt</NextKeyMarker>");
+        Response next = get("/photos?versions&max-keys=1&key-marker=a.txt");
+        assertThat(next.body).contains("<Key>b.txt</Key>").doesNotContain("<Key>a.txt</Key>");
+    }
+
+    @Test
     void batchDeleteObjects() {
         put("/photos");
         put("/photos/a.txt", "1".getBytes(StandardCharsets.UTF_8), null);

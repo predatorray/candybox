@@ -81,10 +81,10 @@ final class S3Xml {
     }
 
     /** ListObjectsV2 result. {@code nextContinuationToken} non-null iff truncated. */
-    static String listBucket(String bucket, String prefix, String delimiter, int maxKeys,
-                             List<Content> contents, List<String> commonPrefixes,
-                             String continuationToken, String nextContinuationToken,
-                             String startAfter) {
+    static String listBucketV2(String bucket, String prefix, String delimiter, int maxKeys,
+                               List<Content> contents, List<String> commonPrefixes,
+                               String continuationToken, String nextContinuationToken,
+                               String startAfter) {
         return doc(w -> {
             root(w, "ListBucketResult");
             el(w, "Name", bucket);
@@ -105,9 +105,71 @@ final class S3Xml {
             if (truncated) {
                 el(w, "NextContinuationToken", nextContinuationToken);
             }
-            for (Content c : contents) {
-                w.writeStartElement("Contents");
+            writeContents(w, contents);
+            writeCommonPrefixes(w, commonPrefixes);
+            w.writeEndElement();
+        });
+    }
+
+    /**
+     * ListObjects (V1) result. Differs from V2 only in its pagination cursor: it echoes {@code <Marker>}
+     * and, when a delimiter rolls keys up (matching S3, which omits {@code NextMarker} otherwise),
+     * emits {@code <NextMarker>}; flat listings page from the last returned key. No {@code KeyCount}
+     * (that element is V2-only).
+     */
+    static String listBucketV1(String bucket, String prefix, String delimiter, int maxKeys,
+                               List<Content> contents, List<String> commonPrefixes,
+                               String marker, String nextMarker, boolean truncated) {
+        return doc(w -> {
+            root(w, "ListBucketResult");
+            el(w, "Name", bucket);
+            el(w, "Prefix", prefix == null ? "" : prefix);
+            el(w, "Marker", marker == null ? "" : marker);
+            if (nextMarker != null) {
+                el(w, "NextMarker", nextMarker);
+            }
+            if (delimiter != null) {
+                el(w, "Delimiter", delimiter);
+            }
+            el(w, "MaxKeys", Integer.toString(maxKeys));
+            el(w, "IsTruncated", Boolean.toString(truncated));
+            writeContents(w, contents);
+            writeCommonPrefixes(w, commonPrefixes);
+            w.writeEndElement();
+        });
+    }
+
+    /**
+     * ListObjectVersions result for the unversioned store: every object surfaces as a single latest
+     * {@code <Version>} carrying the literal {@code null} version id (S3's convention for an object in
+     * an unversioned bucket), so version-aware clients — notably the s3-tests cleanup, which enumerates
+     * a bucket via {@code list_object_versions} before deleting — can drain it. Paginated by key-marker;
+     * the version-id marker is always empty since there is only one version per key.
+     */
+    static String listVersions(String bucket, String prefix, String delimiter, int maxKeys,
+                               List<Content> versions, List<String> commonPrefixes,
+                               String keyMarker, String nextKeyMarker) {
+        return doc(w -> {
+            root(w, "ListVersionsResult");
+            el(w, "Name", bucket);
+            el(w, "Prefix", prefix == null ? "" : prefix);
+            el(w, "KeyMarker", keyMarker == null ? "" : keyMarker);
+            el(w, "VersionIdMarker", "");
+            boolean truncated = nextKeyMarker != null;
+            if (truncated) {
+                el(w, "NextKeyMarker", nextKeyMarker);
+                el(w, "NextVersionIdMarker", "");
+            }
+            if (delimiter != null) {
+                el(w, "Delimiter", delimiter);
+            }
+            el(w, "MaxKeys", Integer.toString(maxKeys));
+            el(w, "IsTruncated", Boolean.toString(truncated));
+            for (Content c : versions) {
+                w.writeStartElement("Version");
                 el(w, "Key", c.key());
+                el(w, "VersionId", "null");
+                el(w, "IsLatest", "true");
                 el(w, "LastModified", ISO8601.format(Instant.ofEpochMilli(c.lastModifiedMillis())));
                 if (c.etag() != null) {
                     el(w, "ETag", '"' + c.etag() + '"');
@@ -116,11 +178,7 @@ final class S3Xml {
                 el(w, "StorageClass", "STANDARD");
                 w.writeEndElement();
             }
-            for (String cp : commonPrefixes) {
-                w.writeStartElement("CommonPrefixes");
-                el(w, "Prefix", cp);
-                w.writeEndElement();
-            }
+            writeCommonPrefixes(w, commonPrefixes);
             w.writeEndElement();
         });
     }
@@ -197,6 +255,31 @@ final class S3Xml {
     }
 
     // ---- internals -------------------------------------------------------------------------
+
+    /** Writes the {@code <Contents>} rows shared by the V1 and V2 listing results. */
+    private static void writeContents(XMLStreamWriter w, List<Content> contents) throws XMLStreamException {
+        for (Content c : contents) {
+            w.writeStartElement("Contents");
+            el(w, "Key", c.key());
+            el(w, "LastModified", ISO8601.format(Instant.ofEpochMilli(c.lastModifiedMillis())));
+            if (c.etag() != null) {
+                el(w, "ETag", '"' + c.etag() + '"');
+            }
+            el(w, "Size", Long.toString(c.size()));
+            el(w, "StorageClass", "STANDARD");
+            w.writeEndElement();
+        }
+    }
+
+    /** Writes the {@code <CommonPrefixes>} rollup shared by every listing result. */
+    private static void writeCommonPrefixes(XMLStreamWriter w, List<String> commonPrefixes)
+            throws XMLStreamException {
+        for (String cp : commonPrefixes) {
+            w.writeStartElement("CommonPrefixes");
+            el(w, "Prefix", cp);
+            w.writeEndElement();
+        }
+    }
 
     /** Opens a document root element in the S3 default namespace. */
     private static void root(XMLStreamWriter w, String name) throws XMLStreamException {
