@@ -66,6 +66,16 @@ public final class Memtable {
         return mutationIterator(map.tailMap(startInclusive, true));
     }
 
+    /** Iterates all entries in descending key order. */
+    public Iterator<Mutation> descendingIterator() {
+        return mutationIterator(map.descendingMap());
+    }
+
+    /** Iterates entries with key {@code <= startInclusive} in descending order. */
+    public Iterator<Mutation> descendingIterator(CandyKey startInclusive) {
+        return mutationIterator(map.headMap(startInclusive, true).descendingMap());
+    }
+
     private static Iterator<Mutation> mutationIterator(Map<CandyKey, CandyLocator> view) {
         Iterator<Map.Entry<CandyKey, CandyLocator>> it = view.entrySet().iterator();
         return new Iterator<>() {

@@ -103,6 +103,22 @@ public final class SSTableReader implements AutoCloseable {
         return new ScanIterator(startBlock, start);
     }
 
+    /**
+     * Returns an iterator over mutations with key {@code <= start} (or all if {@code start} is null),
+     * in descending key order.
+     */
+    public Iterator<Mutation> scanReverse(CandyKey start) {
+        int startBlock = start == null ? blockLastKeys.length - 1 : findBlock(start.utf8Bytes());
+        if (startBlock < 0) {
+            // start is beyond the table's last key: begin at the final block.
+            startBlock = blockLastKeys.length - 1;
+        }
+        if (startBlock < 0) {
+            return List.<Mutation>of().iterator(); // empty table
+        }
+        return new ReverseScanIterator(startBlock, start);
+    }
+
     @Override
     public void close() {
         ledger.close();
@@ -176,6 +192,51 @@ public final class SSTableReader implements AutoCloseable {
                 throw new NoSuchElementException();
             }
             return block.get(posInBlock++);
+        }
+    }
+
+    private final class ReverseScanIterator implements Iterator<Mutation> {
+        private int blockIndex;
+        private List<Mutation> block;
+        private int posInBlock;
+        private final CandyKey start;
+        private boolean startPositioned;
+
+        ReverseScanIterator(int startBlock, CandyKey start) {
+            this.blockIndex = startBlock;
+            this.start = start;
+            loadBlock();
+        }
+
+        private void loadBlock() {
+            block = blockIndex >= 0 ? readBlock(blockIndex) : List.of();
+            posInBlock = block.size() - 1;
+            if (!startPositioned && start != null) {
+                while (posInBlock >= 0 && block.get(posInBlock).key().compareTo(start) > 0) {
+                    posInBlock--;
+                }
+                startPositioned = true;
+            }
+        }
+
+        @Override
+        public boolean hasNext() {
+            while (posInBlock < 0) {
+                blockIndex--;
+                if (blockIndex < 0) {
+                    return false;
+                }
+                loadBlock();
+            }
+            return true;
+        }
+
+        @Override
+        public Mutation next() {
+            if (!hasNext()) {
+                throw new NoSuchElementException();
+            }
+            return block.get(posInBlock--);
         }
     }
 

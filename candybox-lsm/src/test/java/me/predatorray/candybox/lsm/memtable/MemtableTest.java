@@ -54,6 +54,28 @@ class MemtableTest {
     }
 
     @Test
+    void descendingIteratorWalksKeysInReverse() {
+        Memtable m = new Memtable();
+        m.put(putMutation("banana", hlc(1, 0, 1)));
+        m.put(putMutation("apple", hlc(1, 0, 1)));
+        m.put(putMutation("cherry", hlc(1, 0, 1)));
+
+        List<String> all = new ArrayList<>();
+        var it = m.descendingIterator();
+        while (it.hasNext()) {
+            all.add(it.next().key().value());
+        }
+        assertThat(all).containsExactly("cherry", "banana", "apple");
+
+        List<String> bounded = new ArrayList<>();
+        var bit = m.descendingIterator(me.predatorray.candybox.common.CandyKey.of("banana"));
+        while (bit.hasNext()) {
+            bounded.add(bit.next().key().value());
+        }
+        assertThat(bounded).containsExactly("banana", "apple"); // <= start, descending
+    }
+
+    @Test
     void tombstoneIsStoredAndResolvableByReader() {
         Memtable m = new Memtable();
         m.put(putMutation("k", hlc(1, 0, 1)));

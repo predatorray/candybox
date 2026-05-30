@@ -57,6 +57,47 @@ class SSTableTest {
     }
 
     @Test
+    void reverseScanReturnsDescendingTailFromStartKey() {
+        SSTableMeta meta = writeKeys(100); // tiny blocks: reverse must walk across blocks
+        try (SSTableReader reader = new SSTableReader(store, meta.ledgerId())) {
+            List<String> keys = new ArrayList<>();
+            var it = reader.scanReverse(CandyKey.of("key-00002"));
+            while (it.hasNext()) {
+                keys.add(it.next().key().value());
+            }
+            assertThat(keys).containsExactly("key-00002", "key-00001", "key-00000");
+        }
+    }
+
+    @Test
+    void reverseFullScanReturnsEverythingDescending() {
+        SSTableMeta meta = writeKeys(50);
+        try (SSTableReader reader = new SSTableReader(store, meta.ledgerId())) {
+            List<String> keys = new ArrayList<>();
+            var it = reader.scanReverse(null);
+            while (it.hasNext()) {
+                keys.add(it.next().key().value());
+            }
+            assertThat(keys).hasSize(50);
+            assertThat(keys.get(0)).isEqualTo("key-00049");
+            assertThat(keys.get(49)).isEqualTo("key-00000");
+            for (int i = 1; i < keys.size(); i++) {
+                assertThat(keys.get(i).compareTo(keys.get(i - 1))).isLessThan(0);
+            }
+        }
+    }
+
+    @Test
+    void reverseScanFromKeyBeyondMaxStartsAtLast() {
+        SSTableMeta meta = writeKeys(10);
+        try (SSTableReader reader = new SSTableReader(store, meta.ledgerId())) {
+            var it = reader.scanReverse(CandyKey.of("zzz")); // beyond the table's max key
+            assertThat(it.hasNext()).isTrue();
+            assertThat(it.next().key().value()).isEqualTo("key-00009");
+        }
+    }
+
+    @Test
     void fullScanReturnsEverythingInOrder() {
         SSTableMeta meta = writeKeys(50);
         try (SSTableReader reader = new SSTableReader(store, meta.ledgerId())) {
