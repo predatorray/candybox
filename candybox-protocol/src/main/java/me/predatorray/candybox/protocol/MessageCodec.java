@@ -40,6 +40,16 @@ public final class MessageCodec {
             writeBoxKey(w, m.box(), m.key());
         } else if (message instanceof Message.DeleteCandyRequest m) {
             writeBoxKey(w, m.box(), m.key());
+        } else if (message instanceof Message.CopyCandyRequest m) {
+            w.writeString(m.box());
+            w.writeString(m.srcKey());
+            w.writeString(m.dstKey());
+            writeNullable(w, m.idempotencyToken());
+        } else if (message instanceof Message.RenameCandyRequest m) {
+            w.writeString(m.box());
+            w.writeString(m.srcKey());
+            w.writeString(m.dstKey());
+            writeNullable(w, m.idempotencyToken());
         } else if (message instanceof Message.ListCandiesRequest m) {
             w.writeString(m.box());
             writeNullable(w, m.prefix());
@@ -106,6 +116,10 @@ public final class MessageCodec {
             case GET_CANDY -> new Message.GetCandyRequest(r.readString(), r.readString());
             case HEAD_CANDY -> new Message.HeadCandyRequest(r.readString(), r.readString());
             case DELETE_CANDY -> new Message.DeleteCandyRequest(r.readString(), r.readString());
+            case COPY_CANDY -> new Message.CopyCandyRequest(r.readString(), r.readString(),
+                    r.readString(), readNullable(r));
+            case RENAME_CANDY -> new Message.RenameCandyRequest(r.readString(), r.readString(),
+                    r.readString(), readNullable(r));
             case LIST_CANDIES -> new Message.ListCandiesRequest(r.readString(), readNullable(r),
                     readNullable(r), r.readInt(), readNullable(r), readNullable(r), r.readBoolean());
             case RESPONSE_OK -> new Message.OkResponse();

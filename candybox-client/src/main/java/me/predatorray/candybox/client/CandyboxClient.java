@@ -143,6 +143,33 @@ public final class CandyboxClient implements AutoCloseable {
                 new Message.DeleteCandyRequest(BoxName.of(box).value(), CandyKey.of(key).value())));
     }
 
+    /**
+     * Zero-copy server-side copy of {@code srcKey} to {@code dstKey} within the same Box: the new key
+     * reuses the source's stored bytes (no data is transferred). Returns the destination's metadata.
+     */
+    public CandyInfo copyCandy(String box, String srcKey, String dstKey, String idempotencyToken) {
+        return copyOrRename(box, srcKey, new Message.CopyCandyRequest(BoxName.of(box).value(),
+                CandyKey.of(srcKey).value(), CandyKey.of(dstKey).value(), idempotencyToken));
+    }
+
+    /**
+     * Zero-copy server-side rename/move of {@code srcKey} to {@code dstKey} within the same Box: the
+     * bytes never move; the source key is atomically removed. Returns the destination's metadata.
+     */
+    public CandyInfo renameCandy(String box, String srcKey, String dstKey, String idempotencyToken) {
+        return copyOrRename(box, srcKey, new Message.RenameCandyRequest(BoxName.of(box).value(),
+                CandyKey.of(srcKey).value(), CandyKey.of(dstKey).value(), idempotencyToken));
+    }
+
+    private CandyInfo copyOrRename(String box, String srcKey, Message request) {
+        Message response = router.callBox(box, request);
+        if (response instanceof Message.HeadCandyResponse head) {
+            return new CandyInfo(head.contentLength(), head.contentType(), head.userMetadata(),
+                    head.crc32c(), head.createdAtMillis());
+        }
+        throw mapUnexpected(response, box, srcKey);
+    }
+
     public Listing listCandies(String box, String prefix, String startAfter, int maxKeys) {
         return listCandies(box, new Message.ListCandiesRequest(BoxName.of(box).value(), prefix,
                 startAfter, maxKeys));

@@ -37,6 +37,7 @@ import me.predatorray.candybox.common.config.LedgerRole;
 import me.predatorray.candybox.common.exception.BusyException;
 import me.predatorray.candybox.common.exception.CandyNotFoundException;
 import me.predatorray.candybox.common.exception.StorageException;
+import me.predatorray.candybox.common.exception.ValidationException;
 import me.predatorray.candybox.lsm.manifest.Manifest;
 import me.predatorray.candybox.lsm.manifest.ManifestEdit;
 import me.predatorray.candybox.lsm.manifest.ManifestState;
@@ -278,6 +279,80 @@ public final class BoxEngine implements AutoCloseable {
             active.put(mutation);
             maybeFlushLocked();
             deleteCount.incrementAndGet();
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Server-side, zero-copy copy: writes a fresh PUT at {@code dst} that points at the <em>same</em>
+     * Syrup segments as the live Candy at {@code src} — no Candy bytes are read or rewritten. Both keys
+     * then resolve to identical content (and share the same whole-object CRC). Same-Box only.
+     *
+     * @throws CandyNotFoundException if there is no live Candy at {@code src}
+     */
+    public CandyMetadata copyCandy(CandyKey src, CandyKey dst, String idempotencyToken) {
+        return copyOrRename(src, dst, idempotencyToken, false);
+    }
+
+    /**
+     * Server-side, zero-copy rename/move: like {@link #copyCandy} but also writes a DELETE tombstone at
+     * {@code src}, atomically (the single owner serializes both into the WAL and memtable under one
+     * write lock). The Candy's bytes never move; only locator pointers are rewritten. Same-Box only.
+     *
+     * @throws CandyNotFoundException if there is no live Candy at {@code src}
+     */
+    public CandyMetadata renameCandy(CandyKey src, CandyKey dst, String idempotencyToken) {
+        return copyOrRename(src, dst, idempotencyToken, true);
+    }
+
+    private CandyMetadata copyOrRename(CandyKey src, CandyKey dst, String idempotencyToken,
+                                       boolean tombstoneSource) {
+        Validation.checkCandyKey(src, config.sizeLimits());
+        Validation.checkCandyKey(dst, config.sizeLimits());
+        if (src.equals(dst)) {
+            throw new ValidationException("source and destination keys must differ");
+        }
+        if (idempotencyToken != null) {
+            CandyMetadata cached = idempotencyCache.get(idempotencyToken);
+            if (cached != null) {
+                return cached;
+            }
+        }
+        lock.writeLock().lock();
+        try {
+            rejectIfStalled();
+            CandyLocator source = resolveLiveLocked(src)
+                    .orElseThrow(() -> new CandyNotFoundException(box.value(), src.value()));
+
+            // The destination locator reuses the source's Syrup segments and CRC verbatim — zero copy.
+            Hlc stamp = hlc.tick();
+            CandyLocator dstLocator = new CandyLocator(stamp, LocatorType.PUT, source.contentLength(),
+                    source.chunkSize(), source.contentType(), source.userMetadata(), source.crc32c(),
+                    clock.currentTimeMillis(), source.segments());
+            Mutation dstMutation = new Mutation(dst, dstLocator);
+            wal.append(dstMutation);
+
+            Mutation tombstone = null;
+            if (tombstoneSource) {
+                tombstone = new Mutation(src,
+                        CandyLocator.tombstone(hlc.tick(), clock.currentTimeMillis()));
+                wal.append(tombstone);
+            }
+            // Apply to the memtable only after both are durable in the WAL (atomic to readers).
+            active.put(dstMutation);
+            if (tombstone != null) {
+                active.put(tombstone);
+                deleteCount.incrementAndGet();
+            }
+            maybeFlushLocked();
+
+            CandyMetadata result = CandyMetadata.from(dstLocator);
+            if (idempotencyToken != null) {
+                idempotencyCache.put(idempotencyToken, result);
+            }
+            putCount.incrementAndGet();
+            return result;
         } finally {
             lock.writeLock().unlock();
         }
@@ -564,23 +639,28 @@ public final class BoxEngine implements AutoCloseable {
     private Optional<CandyLocator> resolveLive(CandyKey key) {
         lock.readLock().lock();
         try {
-            CandyLocator best = active.get(key).orElse(null);
-            for (SSTableReader reader : readers.values()) {
-                if (reader.minKey().compareTo(key) <= 0 && reader.maxKey().compareTo(key) >= 0) {
-                    Optional<CandyLocator> candidate = reader.get(key);
-                    if (candidate.isPresent()
-                            && (best == null || candidate.get().hlc().isAfter(best.hlc()))) {
-                        best = candidate.get();
-                    }
-                }
-            }
-            if (best == null || best.isTombstone()) {
-                return Optional.empty();
-            }
-            return Optional.of(best);
+            return resolveLiveLocked(key);
         } finally {
             lock.readLock().unlock();
         }
+    }
+
+    /** Resolves a key to its live locator; caller must hold the read or write lock. */
+    private Optional<CandyLocator> resolveLiveLocked(CandyKey key) {
+        CandyLocator best = active.get(key).orElse(null);
+        for (SSTableReader reader : readers.values()) {
+            if (reader.minKey().compareTo(key) <= 0 && reader.maxKey().compareTo(key) >= 0) {
+                Optional<CandyLocator> candidate = reader.get(key);
+                if (candidate.isPresent()
+                        && (best == null || candidate.get().hlc().isAfter(best.hlc()))) {
+                    best = candidate.get();
+                }
+            }
+        }
+        if (best == null || best.isTombstone()) {
+            return Optional.empty();
+        }
+        return Optional.of(best);
     }
 
     /**
