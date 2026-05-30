@@ -29,6 +29,7 @@ import me.predatorray.candybox.common.Hlc;
 import me.predatorray.candybox.common.HybridLogicalClock;
 import me.predatorray.candybox.common.LocatorType;
 import me.predatorray.candybox.common.Mutation;
+import me.predatorray.candybox.common.RangeTombstone;
 import me.predatorray.candybox.common.SegmentRef;
 import me.predatorray.candybox.common.Validation;
 import me.predatorray.candybox.common.checksum.Crc32c;
@@ -48,6 +49,7 @@ import me.predatorray.candybox.lsm.sstable.SSTableWriter;
 import me.predatorray.candybox.lsm.syrup.SyrupManager;
 import me.predatorray.candybox.lsm.syrup.SyrupReader;
 import me.predatorray.candybox.lsm.syrup.SyrupWriteResult;
+import me.predatorray.candybox.lsm.wal.WalEntry;
 import me.predatorray.candybox.lsm.wal.WriteAheadLog;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -173,8 +175,12 @@ public final class BoxEngine implements AutoCloseable {
             } finally {
                 priorWal.close();
             }
-            for (Mutation m : replay.mutations()) {
-                memtable.put(m);
+            for (WalEntry e : replay.entries()) {
+                if (e instanceof WalEntry.PointMutation pm) {
+                    memtable.put(pm.mutation());
+                } else if (e instanceof WalEntry.RangeDelete rd) {
+                    memtable.delete(rd.tombstone());
+                }
             }
             // The current WAL always holds the most recent mutations (it is rotated on flush), so its
             // max HLC dominates the flushed SSTables — observing it suffices for LWW correctness.
@@ -358,6 +364,46 @@ public final class BoxEngine implements AutoCloseable {
         }
     }
 
+    /**
+     * Deletes every live Candy whose key falls in {@code [startInclusive, endExclusive)} with a single
+     * O(1) range tombstone — no per-key scan or write. Either bound may be null (null start = from the
+     * beginning of the keyspace, null end = to the end). Keys written later (with a higher HLC) are not
+     * affected. The shadowed Candies' bytes are reclaimed lazily at compaction (DESIGN §8,§9).
+     */
+    public void deleteRange(CandyKey startInclusive, CandyKey endExclusive) {
+        if (startInclusive != null) {
+            Validation.checkCandyKey(startInclusive, config.sizeLimits());
+        }
+        if (endExclusive != null) {
+            Validation.checkCandyKey(endExclusive, config.sizeLimits());
+        }
+        lock.writeLock().lock();
+        try {
+            rejectIfStalled();
+            RangeTombstone tombstone = new RangeTombstone(startInclusive, endExclusive, hlc.tick());
+            wal.append(tombstone);
+            active.delete(tombstone);
+            maybeFlushLocked();
+            deleteCount.incrementAndGet();
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Deletes every live Candy whose key starts with {@code prefix} via a single range tombstone over
+     * {@code [prefix, prefixSuccessor)}. An empty prefix deletes the whole Box.
+     */
+    public void deleteRangeByPrefix(String prefix) {
+        if (prefix == null || prefix.isEmpty()) {
+            deleteRange(null, null);
+            return;
+        }
+        CandyKey start = CandyKey.of(prefix);
+        byte[] successor = me.predatorray.candybox.common.util.Bytes.prefixSuccessor(start.utf8Bytes());
+        deleteRange(start, successor == null ? null : CandyKey.ofUtf8(successor));
+    }
+
     // ---- reads -----------------------------------------------------------------------------
 
     /** Returns metadata for a live Candy, or throws {@link CandyNotFoundException}. */
@@ -441,11 +487,15 @@ public final class BoxEngine implements AutoCloseable {
             CandyKey cursor = query.cursorExclusive();
 
             Iterator<Mutation> merged = mergedView(lower, upper, cursor, query.direction());
+            List<RangeTombstone> rangeTombstones = gatherRangeTombstonesLocked();
             List<ListResult.ListEntry> entries = new ArrayList<>();
             String next = null;
             while (merged.hasNext()) {
                 Mutation m = merged.next();
                 CandyKey key = m.key();
+                if (isShadowedByRange(rangeTombstones, key, m.hlc())) {
+                    continue; // a newer range tombstone deletes this key
+                }
                 if (cursor != null) {
                     int c = key.compareTo(cursor);
                     if (forward ? c <= 0 : c >= 0) {
@@ -660,7 +710,48 @@ public final class BoxEngine implements AutoCloseable {
         if (best == null || best.isTombstone()) {
             return Optional.empty();
         }
+        // A range tombstone newer than the best point locator shadows the key (range delete).
+        Hlc deleteFloor = maxRangeTombstoneCoveringLocked(key);
+        if (deleteFloor != null && deleteFloor.isAfter(best.hlc())) {
+            return Optional.empty();
+        }
         return Optional.of(best);
+    }
+
+    /**
+     * The highest HLC among range tombstones covering {@code key} across the memtable and every open
+     * SSTable. Range tombstones can extend beyond a table's point-key range, so this consults all
+     * readers (they are few; tombstones merge away at compaction). Caller holds the lock.
+     */
+    private Hlc maxRangeTombstoneCoveringLocked(CandyKey key) {
+        Hlc max = active.maxRangeTombstoneCovering(key);
+        for (SSTableReader reader : readers.values()) {
+            Hlc h = reader.maxRangeTombstoneCovering(key);
+            if (h != null && (max == null || h.isAfter(max))) {
+                max = h;
+            }
+        }
+        return max;
+    }
+
+    /** The union of range tombstones across the memtable and all open SSTables. Caller holds the lock. */
+    private List<RangeTombstone> gatherRangeTombstonesLocked() {
+        List<RangeTombstone> all = new ArrayList<>(active.rangeTombstones());
+        for (SSTableReader reader : readers.values()) {
+            all.addAll(reader.rangeTombstones());
+        }
+        return all;
+    }
+
+    /** Whether a range tombstone newer than {@code keyHlc} covers {@code key} (so it is deleted). */
+    private static boolean isShadowedByRange(List<RangeTombstone> rangeTombstones, CandyKey key,
+                                             Hlc keyHlc) {
+        for (RangeTombstone rt : rangeTombstones) {
+            if (rt.hlc().isAfter(keyHlc) && rt.covers(key)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -757,7 +848,8 @@ public final class BoxEngine implements AutoCloseable {
             }
         }
 
-        SSTableMeta table = sstableWriter.write(ledgerConfig(LedgerRole.SSTABLE), 0, flushing.iterator());
+        SSTableMeta table = sstableWriter.write(ledgerConfig(LedgerRole.SSTABLE), 0,
+                flushing.iterator(), flushing.rangeTombstones());
 
         WriteAheadLog newWal = WriteAheadLog.create(ledgerStore, ledgerConfig(LedgerRole.WAL));
         long obsoleteWalId = wal.ledgerId();

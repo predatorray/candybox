@@ -1,6 +1,7 @@
 package me.predatorray.candybox.lsm.sstable;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -10,10 +11,12 @@ import me.predatorray.candybox.bookkeeper.LedgerStore;
 import me.predatorray.candybox.bookkeeper.WritableLedger;
 import me.predatorray.candybox.common.CandyKey;
 import me.predatorray.candybox.common.Mutation;
+import me.predatorray.candybox.common.RangeTombstone;
 import me.predatorray.candybox.common.SegmentRef;
 import me.predatorray.candybox.common.bloom.BloomFilter;
 import me.predatorray.candybox.common.serial.BinaryWriter;
 import me.predatorray.candybox.common.serial.MutationSerializer;
+import me.predatorray.candybox.common.serial.RangeTombstoneSerializer;
 
 /**
  * Writes a sorted run of mutations into a new SSTable ledger in the {@link SSTableFormat} layout, then
@@ -36,16 +39,24 @@ public final class SSTableWriter {
         this.dataBlockTargetBytes = dataBlockTargetBytes;
     }
 
-    /**
-     * Writes all mutations from {@code sorted} into a fresh SSTable ledger.
-     *
-     * @param config quorum/metadata for the SSTable ledger
-     * @param level  the LSM level this table belongs to
-     * @param sorted ascending-key, unique-key mutations
-     * @return metadata for the sealed table
-     * @throws IllegalArgumentException if the iterator is empty
-     */
+    /** Writes a run with no range tombstones (a plain point-only SSTable). */
     public SSTableMeta write(LedgerConfig config, int level, Iterator<Mutation> sorted) {
+        return write(config, level, sorted, List.of());
+    }
+
+    /**
+     * Writes all mutations from {@code sorted}, plus any {@code rangeTombstones}, into a fresh SSTable
+     * ledger. The table may be range-only (an empty {@code sorted} with non-empty tombstones).
+     *
+     * @param config          quorum/metadata for the SSTable ledger
+     * @param level           the LSM level this table belongs to
+     * @param sorted          ascending-key, unique-key mutations
+     * @param rangeTombstones range tombstones to persist alongside the points (may be empty)
+     * @return metadata for the sealed table
+     * @throws IllegalArgumentException if there are neither mutations nor range tombstones
+     */
+    public SSTableMeta write(LedgerConfig config, int level, Iterator<Mutation> sorted,
+                             Collection<RangeTombstone> rangeTombstones) {
         WritableLedger ledger = ledgerStore.createLedger(config);
 
         List<byte[]> indexLastKeys = new ArrayList<>();
@@ -88,7 +99,7 @@ public final class SSTableWriter {
             numEntries++;
         }
 
-        if (numEntries == 0) {
+        if (numEntries == 0 && rangeTombstones.isEmpty()) {
             ledger.close();
             ledgerStore.deleteLedger(ledger.ledgerId());
             throw new IllegalArgumentException("Refusing to write an empty SSTable");
@@ -100,13 +111,48 @@ public final class SSTableWriter {
 
         long indexEntryId = ledger.append(serializeIndex(indexLastKeys, indexEntryIds));
 
+        long rangeDelEntryId = -1;
+        if (!rangeTombstones.isEmpty()) {
+            rangeDelEntryId = ledger.append(serializeRangeTombstones(rangeTombstones));
+        }
+
+        // A range-only table still needs concrete min/max keys for the manifest; they bound no point
+        // data (the read path consults range tombstones across all tables, never via these keys).
+        if (numEntries == 0) {
+            byte[] rep = representativeKey(rangeTombstones);
+            minKey = rep;
+            maxKey = rep;
+        }
+
         int numDataBlocks = indexEntryIds.size();
-        ledger.append(serializeFooter(bloomEntryId, indexEntryId, numDataBlocks, numEntries, minKey,
-                maxKey));
+        ledger.append(serializeFooter(bloomEntryId, indexEntryId, rangeDelEntryId, numDataBlocks,
+                numEntries, minKey, maxKey));
         ledger.close();
 
         return new SSTableMeta(ledger.ledgerId(), level, CandyKey.ofUtf8(minKey),
                 CandyKey.ofUtf8(maxKey), numEntries, sizeBytes, referencedSyrups);
+    }
+
+    private static byte[] serializeRangeTombstones(Collection<RangeTombstone> tombstones) {
+        BinaryWriter w = new BinaryWriter(64);
+        w.writeVarInt(tombstones.size());
+        for (RangeTombstone rt : tombstones) {
+            w.writeBytes(RangeTombstoneSerializer.serialize(rt));
+        }
+        return w.toByteArray();
+    }
+
+    /** A concrete key for a range-only table's metadata: any bound present, else a 0x00 sentinel. */
+    private static byte[] representativeKey(Collection<RangeTombstone> tombstones) {
+        for (RangeTombstone rt : tombstones) {
+            if (rt.startInclusive() != null) {
+                return rt.startInclusive().utf8Bytes();
+            }
+            if (rt.endExclusive() != null) {
+                return rt.endExclusive().utf8Bytes();
+            }
+        }
+        return new byte[] {0};
     }
 
     /** Appends the block as one ledger entry; returns the entry's byte length (0 if empty). */
@@ -138,9 +184,10 @@ public final class SSTableWriter {
         return w.toByteArray();
     }
 
-    private static byte[] serializeFooter(long bloomEntryId, long indexEntryId, int numDataBlocks,
-                                          long numEntries, byte[] minKey, byte[] maxKey) {
-        return new BinaryWriter(64)
+    private static byte[] serializeFooter(long bloomEntryId, long indexEntryId, long rangeDelEntryId,
+                                          int numDataBlocks, long numEntries, byte[] minKey,
+                                          byte[] maxKey) {
+        BinaryWriter w = new BinaryWriter(64)
                 .writeInt(SSTableFormat.FOOTER_MAGIC)
                 .writeByte(SSTableFormat.FORMAT_VERSION)
                 .writeVarLong(bloomEntryId)
@@ -148,7 +195,14 @@ public final class SSTableWriter {
                 .writeVarInt(numDataBlocks)
                 .writeVarLong(numEntries)
                 .writeBytes(minKey)
-                .writeBytes(maxKey)
-                .toByteArray();
+                .writeBytes(maxKey);
+        // v2 trailer: presence flag + range-del block entry id.
+        if (rangeDelEntryId >= 0) {
+            w.writeBoolean(true);
+            w.writeVarLong(rangeDelEntryId);
+        } else {
+            w.writeBoolean(false);
+        }
+        return w.toByteArray();
     }
 }

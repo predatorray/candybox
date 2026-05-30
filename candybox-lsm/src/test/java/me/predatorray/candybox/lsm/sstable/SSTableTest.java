@@ -9,7 +9,9 @@ import java.util.List;
 import me.predatorray.candybox.bookkeeper.LedgerConfig;
 import me.predatorray.candybox.bookkeeper.fake.InMemoryLedgerStore;
 import me.predatorray.candybox.common.CandyKey;
+import me.predatorray.candybox.common.Hlc;
 import me.predatorray.candybox.common.Mutation;
+import me.predatorray.candybox.common.RangeTombstone;
 import me.predatorray.candybox.common.config.LedgerRole;
 import org.junit.jupiter.api.Test;
 
@@ -94,6 +96,41 @@ class SSTableTest {
             var it = reader.scanReverse(CandyKey.of("zzz")); // beyond the table's max key
             assertThat(it.hasNext()).isTrue();
             assertThat(it.next().key().value()).isEqualTo("key-00009");
+        }
+    }
+
+    @Test
+    void persistsAndReadsBackRangeTombstones() {
+        List<Mutation> sorted = List.of(putMutation("a", hlc(1, 0, 1)), putMutation("z", hlc(2, 0, 1)));
+        List<RangeTombstone> rts = List.of(
+                new RangeTombstone(CandyKey.of("b"), CandyKey.of("e"), hlc(10, 0, 1)));
+        SSTableMeta meta = new SSTableWriter(store, 10, 256)
+                .write(config, 0, sorted.iterator(), rts);
+
+        try (SSTableReader reader = new SSTableReader(store, meta.ledgerId())) {
+            assertThat(reader.rangeTombstones()).hasSize(1);
+            assertThat(reader.maxRangeTombstoneCovering(CandyKey.of("c"))).isEqualTo(hlc(10, 0, 1));
+            assertThat(reader.maxRangeTombstoneCovering(CandyKey.of("e"))).isNull(); // end exclusive
+            // Point data is still readable alongside the tombstones.
+            assertThat(reader.get(CandyKey.of("a"))).isPresent();
+            assertThat(reader.get(CandyKey.of("z"))).isPresent();
+        }
+    }
+
+    @Test
+    void writesRangeOnlyTableWithNoPointData() {
+        List<RangeTombstone> rts = List.of(
+                new RangeTombstone(CandyKey.of("m"), null, new Hlc(5, 0, 1))); // unbounded end
+        SSTableMeta meta = new SSTableWriter(store, 10, 256)
+                .write(config, 0, List.<Mutation>of().iterator(), rts);
+
+        assertThat(meta.entryCount()).isZero();
+        try (SSTableReader reader = new SSTableReader(store, meta.ledgerId())) {
+            assertThat(reader.rangeTombstones()).hasSize(1);
+            assertThat(reader.maxRangeTombstoneCovering(CandyKey.of("zzz"))).isEqualTo(new Hlc(5, 0, 1));
+            assertThat(reader.get(CandyKey.of("anything"))).isEmpty(); // no point data
+            assertThat(reader.scan(null).hasNext()).isFalse();
+            assertThat(reader.scanReverse(null).hasNext()).isFalse();
         }
     }
 

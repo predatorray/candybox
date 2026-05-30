@@ -1,14 +1,18 @@
 package me.predatorray.candybox.lsm.memtable;
 
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentNavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
 import me.predatorray.candybox.common.CandyKey;
 import me.predatorray.candybox.common.CandyLocator;
+import me.predatorray.candybox.common.Hlc;
 import me.predatorray.candybox.common.Mutation;
+import me.predatorray.candybox.common.RangeTombstone;
 
 /**
  * The in-memory write buffer: a sorted map of CandyKey to its current {@link CandyLocator}, holding
@@ -22,6 +26,8 @@ import me.predatorray.candybox.common.Mutation;
 public final class Memtable {
 
     private final ConcurrentNavigableMap<CandyKey, CandyLocator> map = new ConcurrentSkipListMap<>();
+    // Range tombstones accumulated by deleteRange; small in number, scanned per lookup (DESIGN §6).
+    private final List<RangeTombstone> rangeTombstones = new CopyOnWriteArrayList<>();
     private final AtomicLong approximateBytes = new AtomicLong(0);
 
     /**
@@ -43,6 +49,31 @@ public final class Memtable {
         return Optional.ofNullable(map.get(key));
     }
 
+    /** Records a range tombstone ({@code deleteRange}). It shadows older keys in its interval. */
+    public void delete(RangeTombstone tombstone) {
+        rangeTombstones.add(tombstone);
+        approximateBytes.addAndGet(estimateSize(tombstone));
+    }
+
+    /**
+     * The highest HLC among range tombstones covering {@code key}, or {@code null} if none cover it.
+     * A point locator at {@code key} is shadowed iff its HLC is older than this value.
+     */
+    public Hlc maxRangeTombstoneCovering(CandyKey key) {
+        Hlc max = null;
+        for (RangeTombstone rt : rangeTombstones) {
+            if (rt.covers(key) && (max == null || rt.hlc().isAfter(max))) {
+                max = rt.hlc();
+            }
+        }
+        return max;
+    }
+
+    /** A snapshot of the range tombstones held here (used by flush). */
+    public List<RangeTombstone> rangeTombstones() {
+        return List.copyOf(rangeTombstones);
+    }
+
     /** Rough heap footprint, used to decide when to flush. Overestimates after overwrites. */
     public long approximateSizeBytes() {
         return approximateBytes.get();
@@ -52,8 +83,9 @@ public final class Memtable {
         return map.size();
     }
 
+    /** Whether the memtable holds nothing to flush — neither point entries nor range tombstones. */
     public boolean isEmpty() {
-        return map.isEmpty();
+        return map.isEmpty() && rangeTombstones.isEmpty();
     }
 
     /** Iterates all entries in ascending key order as mutations (used by flush and merge). */
@@ -90,6 +122,17 @@ public final class Memtable {
                 return new Mutation(e.getKey(), e.getValue());
             }
         };
+    }
+
+    private static long estimateSize(RangeTombstone tombstone) {
+        long size = 48L; // fixed overhead + HLC
+        if (tombstone.startInclusive() != null) {
+            size += tombstone.startInclusive().byteLength();
+        }
+        if (tombstone.endExclusive() != null) {
+            size += tombstone.endExclusive().byteLength();
+        }
+        return size;
     }
 
     private static long estimateSize(CandyKey key, CandyLocator locator) {

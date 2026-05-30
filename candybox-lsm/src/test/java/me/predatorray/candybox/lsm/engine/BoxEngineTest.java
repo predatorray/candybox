@@ -211,6 +211,80 @@ class BoxEngineTest {
     }
 
     @Test
+    void deleteRangeShadowsWindowAcrossLevelsAndSurvivesFlush() {
+        engine = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1, new ManualClock(1000), 1L);
+        for (String k : new String[] {"a", "b", "c", "d"}) {
+            engine.putCandy(CandyKey.of(k), bytes("x"), null, Map.of(), null);
+        }
+        engine.flush(); // all four live in an SSTable
+
+        engine.deleteRange(CandyKey.of("b"), CandyKey.of("d")); // deletes b, c; d is exclusive
+
+        assertThat(engine.getCandy(CandyKey.of("a"))).isEqualTo(bytes("x"));
+        assertThat(engine.getCandy(CandyKey.of("d"))).isEqualTo(bytes("x"));
+        assertThatThrownBy(() -> engine.getCandy(CandyKey.of("b")))
+                .isInstanceOf(CandyNotFoundException.class);
+        assertThatThrownBy(() -> engine.headCandy(CandyKey.of("c")))
+                .isInstanceOf(CandyNotFoundException.class);
+        assertThat(engine.listCandies(null, null, 100).entries())
+                .extracting(e -> e.key().value()).containsExactly("a", "d");
+
+        // Flush the range tombstone into an SSTable; the deletion must persist through the merge path.
+        engine.flush();
+        assertThatThrownBy(() -> engine.getCandy(CandyKey.of("b")))
+                .isInstanceOf(CandyNotFoundException.class);
+        assertThat(engine.getCandy(CandyKey.of("a"))).isEqualTo(bytes("x"));
+        assertThat(engine.listCandies(null, null, 100).entries())
+                .extracting(e -> e.key().value()).containsExactly("a", "d");
+    }
+
+    @Test
+    void writeAfterDeleteRangeResurrectsKey() {
+        engine = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1, new ManualClock(1000), 1L);
+        engine.putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
+
+        engine.deleteRange(CandyKey.of("k"), CandyKey.of("l")); // covers "k"
+        assertThatThrownBy(() -> engine.getCandy(CandyKey.of("k")))
+                .isInstanceOf(CandyNotFoundException.class);
+
+        // A later PUT carries a higher HLC than the range tombstone, so the key comes back.
+        engine.putCandy(CandyKey.of("k"), bytes("v2"), null, Map.of(), null);
+        assertThat(engine.getCandy(CandyKey.of("k"))).isEqualTo(bytes("v2"));
+    }
+
+    @Test
+    void deleteRangeByPrefixDeletesOnlyThatPrefix() {
+        engine = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1, new ManualClock(1000), 1L);
+        engine.putCandy(CandyKey.of("logs/1"), bytes("x"), null, Map.of(), null);
+        engine.putCandy(CandyKey.of("logs/2"), bytes("x"), null, Map.of(), null);
+        engine.putCandy(CandyKey.of("logz"), bytes("x"), null, Map.of(), null); // just past "logs/"
+
+        engine.deleteRangeByPrefix("logs/");
+        assertThat(engine.listCandies(null, null, 100).entries())
+                .extracting(e -> e.key().value()).containsExactly("logz");
+    }
+
+    @Test
+    void deleteRangeSurvivesHandoverWithRegressedClock() {
+        ManualClock clockA = new ManualClock(10_000);
+        BoxEngine ownerA = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1, clockA, 1L);
+        ownerA.putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
+        ownerA.deleteRange(CandyKey.of("k"), CandyKey.of("l")); // high-HLC range delete covering "k"
+        long manifestLedgerId = ownerA.manifestLedgerId();
+        ownerA.close();
+
+        // New owner with a badly regressed wall clock must still observe the range delete's HLC.
+        ManualClock clockB = new ManualClock(100);
+        engine = BoxEngine.recover(box, CandyboxConfig.defaults(), store, 2, clockB, manifestLedgerId, 2L);
+        assertThatThrownBy(() -> engine.getCandy(CandyKey.of("k")))
+                .isInstanceOf(CandyNotFoundException.class);
+
+        // A fresh write on B must out-rank the replayed range delete and resurrect the key.
+        engine.putCandy(CandyKey.of("k"), bytes("v2"), null, Map.of(), null);
+        assertThat(engine.getCandy(CandyKey.of("k"))).isEqualTo(bytes("v2"));
+    }
+
+    @Test
     void handoverWithRegressedClockDoesNotLoseLatestWrite() {
         // Owner A runs with a wall clock far in the future.
         ManualClock clockA = new ManualClock(10_000);

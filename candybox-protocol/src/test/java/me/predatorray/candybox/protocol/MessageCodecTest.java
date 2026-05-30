@@ -40,6 +40,42 @@ class MessageCodecTest {
     }
 
     @Test
+    void copyRenameAndDeleteRangeRequestsRoundTrip() {
+        Message.CopyCandyRequest copy = (Message.CopyCandyRequest) roundTrip(
+                new Message.CopyCandyRequest("box", "src", "dst", "idem"));
+        assertThat(copy.srcKey()).isEqualTo("src");
+        assertThat(copy.dstKey()).isEqualTo("dst");
+        assertThat(copy.idempotencyToken()).isEqualTo("idem");
+
+        Message.RenameCandyRequest rename = (Message.RenameCandyRequest) roundTrip(
+                new Message.RenameCandyRequest("box", "a", "b", null));
+        assertThat(rename.dstKey()).isEqualTo("b");
+        assertThat(rename.idempotencyToken()).isNull();
+
+        Message.DeleteRangeRequest byPrefix = (Message.DeleteRangeRequest) roundTrip(
+                new Message.DeleteRangeRequest("box", "logs/", null, null));
+        assertThat(byPrefix.prefix()).isEqualTo("logs/");
+        assertThat(byPrefix.startKey()).isNull();
+
+        Message.DeleteRangeRequest byWindow = (Message.DeleteRangeRequest) roundTrip(
+                new Message.DeleteRangeRequest("box", null, "b", "e"));
+        assertThat(byWindow.prefix()).isNull();
+        assertThat(byWindow.startKey()).isEqualTo("b");
+        assertThat(byWindow.endKey()).isEqualTo("e");
+    }
+
+    @Test
+    void listCandiesRequestRoundTripsRangeAndDirection() {
+        Message.ListCandiesRequest req = new Message.ListCandiesRequest("box", "p/", "p/cursor", 50,
+                "p/a", "p/z", true);
+        Message.ListCandiesRequest out = (Message.ListCandiesRequest) roundTrip(req);
+        assertThat(out.startKey()).isEqualTo("p/a");
+        assertThat(out.endKey()).isEqualTo("p/z");
+        assertThat(out.reverse()).isTrue();
+        assertThat(out.startAfter()).isEqualTo("p/cursor");
+    }
+
+    @Test
     void responsesRoundTrip() {
         assertThat(roundTrip(new Message.OkResponse())).isInstanceOf(Message.OkResponse.class);
         assertThat(roundTrip(new Message.NotFoundResponse())).isInstanceOf(Message.NotFoundResponse.class);
