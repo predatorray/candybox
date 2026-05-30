@@ -49,3 +49,13 @@ jobs:
 
       - name: Run integration tests
         run: mvn -B -ntp verify
+
+      # mvn verify runs the full reactor (unit + IT phases), so the aggregate report already
+      # merges unit (jacoco.exec) and IT (jacoco-it.exec) coverage across every module.
+      - name: Upload coverage to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: candybox-integration-tests/target/site/jacoco-aggregate/jacoco.xml
+          fail_ci_if_error: false
