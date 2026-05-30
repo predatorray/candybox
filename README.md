@@ -42,7 +42,7 @@ per bucket keeps reads and writes consistent during failover.
 ### With Docker Compose (recommended)
 
 The bundled [`docker-compose.yml`](docker-compose.yml) starts the full stack — ZooKeeper, 3
-BookKeeper bookies, and 3 Candybox nodes — using the published
+BookKeeper bookies, 3 Candybox nodes, and the S3 gateway (on `:9711`) — using the published
 [`zetaplusae/candybox`](https://hub.docker.com/r/zetaplusae/candybox) image. Store and read an
 object with the bundled `cli` service:
 
@@ -54,6 +54,11 @@ docker compose run --rm cli get photos hello.txt   # -> hello candybox
 ```
 
 Tear it down with `docker compose down` (add `-v` to also wipe the data volumes).
+
+The gateway's S3 compatibility is verified against the industry-standard
+[`ceph/s3-tests`](https://github.com/ceph/s3-tests) suite — see
+[`compat/s3-tests/`](compat/s3-tests/) (`compat/s3-tests/run.sh --calibrate` against the running
+gateway).
 
 ## Storing and retrieving objects
 

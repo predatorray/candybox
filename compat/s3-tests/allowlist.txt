@@ -1,0 +1,28 @@
+# Compatibility allowlist for the Candybox S3 gateway -- ceph/s3-tests.
+#
+# *** PROVISIONAL SEED -- not yet calibrated against a running gateway. ***
+# Replace this file with a real, suite-pinned list by running:
+#     compat/s3-tests/run.sh --calibrate
+#
+# These are the boto3 functional tests we EXPECT the v1 gateway to satisfy, given that it is
+# anonymous + path-style and supports: bucket create/head/delete, ListObjectsV2-style listing
+# (prefix / delimiter / max-keys / continuation-token), object PUT/GET/HEAD/DELETE, multi-object
+# delete, x-amz-meta-* user metadata, and the deterministic CRC32C ETag.
+#
+# Deliberately NOT here (unsupported in v1 -- see S3_GATEWAY_PLAN.md / DESIGN.md): versioning,
+# multipart upload, ACLs / bucket policy, Range and conditional (If-Match/If-None-Match) GETs,
+# tagging, lifecycle, CORS, SSE, and anything that asserts per-user auth or ownership.
+#
+# Node IDs are relative to TEST_PATH (default s3tests_boto3/functional/test_s3.py).
+
+s3tests_boto3/functional/test_s3.py::test_bucket_list_empty
+s3tests_boto3/functional/test_s3.py::test_bucket_list_many
+s3tests_boto3/functional/test_s3.py::test_bucket_list_delimiter_basic
+s3tests_boto3/functional/test_s3.py::test_bucket_list_prefix_basic
+s3tests_boto3/functional/test_s3.py::test_bucket_list_maxkeys_one
+s3tests_boto3/functional/test_s3.py::test_bucket_create_delete
+s3tests_boto3/functional/test_s3.py::test_object_write_read_update_read_delete
+s3tests_boto3/functional/test_s3.py::test_object_write_check_etag
+s3tests_boto3/functional/test_s3.py::test_object_head_zero_bytes
+s3tests_boto3/functional/test_s3.py::test_object_read_not_exist
+s3tests_boto3/functional/test_s3.py::test_multi_object_delete
