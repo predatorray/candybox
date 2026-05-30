@@ -45,6 +45,9 @@ public final class MessageCodec {
             writeNullable(w, m.prefix());
             writeNullable(w, m.startAfter());
             w.writeInt(m.maxKeys());
+            writeNullable(w, m.startKey());
+            writeNullable(w, m.endKey());
+            w.writeBoolean(m.reverse());
         } else if (message instanceof Message.OkResponse) {
             // no body
         } else if (message instanceof Message.ErrorResponse m) {
@@ -104,7 +107,7 @@ public final class MessageCodec {
             case HEAD_CANDY -> new Message.HeadCandyRequest(r.readString(), r.readString());
             case DELETE_CANDY -> new Message.DeleteCandyRequest(r.readString(), r.readString());
             case LIST_CANDIES -> new Message.ListCandiesRequest(r.readString(), readNullable(r),
-                    readNullable(r), r.readInt());
+                    readNullable(r), r.readInt(), readNullable(r), readNullable(r), r.readBoolean());
             case RESPONSE_OK -> new Message.OkResponse();
             case RESPONSE_ERROR -> new Message.ErrorResponse(r.readString(), r.readString());
             case RESPONSE_BUSY -> new Message.BusyResponse(r.readVarLong());

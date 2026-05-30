@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import me.predatorray.candybox.common.Mutation;
+import me.predatorray.candybox.lsm.engine.ScanDirection;
 import org.junit.jupiter.api.Test;
 
 class MergingIteratorTest {
@@ -48,5 +49,19 @@ class MergingIteratorTest {
         List<Mutation> keepTombstones = drain(new MergingIterator(
                 List.of(s1.iterator(), s2.iterator()), false));
         assertThat(keepTombstones).extracting(m -> m.key().value()).containsExactly("a", "b", "c");
+    }
+
+    @Test
+    void reverseMergesDescendingAndStillPicksHighestHlc() {
+        // Both sources are descending; "k" appears in both with the newer write in source 0.
+        List<Mutation> s0 = List.of(putMutation("k", hlc(500, 0, 1)), putMutation("a", hlc(1, 0, 1)));
+        List<Mutation> s1 = List.of(putMutation("z", hlc(1, 0, 1)), putMutation("k", hlc(10, 0, 1)));
+
+        List<Mutation> merged = drain(new MergingIterator(
+                List.of(s0.iterator(), s1.iterator()), false, ScanDirection.REVERSE));
+
+        assertThat(merged).extracting(m -> m.key().value()).containsExactly("z", "k", "a");
+        Mutation k = merged.stream().filter(m -> m.key().value().equals("k")).findFirst().orElseThrow();
+        assertThat(k.hlc()).isEqualTo(hlc(500, 0, 1)); // highest HLC won, direction notwithstanding
     }
 }

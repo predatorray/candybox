@@ -333,42 +333,71 @@ public final class BoxEngine implements AutoCloseable {
 
     /**
      * Lists live Candies whose key starts with {@code prefix}, after {@code startAfter}, up to
-     * {@code maxKeys}. Tombstones are suppressed; the result carries a continuation cursor.
+     * {@code maxKeys}. Tombstones are suppressed; the result carries a continuation cursor. A thin
+     * forward wrapper over {@link #scanCandies(ScanQuery)}.
      */
     public ListResult listCandies(String prefix, String startAfter, int maxKeys) {
-        int limit = maxKeys > 0 ? maxKeys : 1000;
-        String pfx = prefix == null ? "" : prefix;
+        CandyKey cursor = startAfter == null ? null : CandyKey.of(startAfter);
+        return scanCandies(ScanQuery.forward(prefix, cursor, maxKeys));
+    }
+
+    /**
+     * Lists live Candies over a {@link ScanQuery}: an optional {@code [start, end)} window, optionally
+     * narrowed to a prefix, walked forward or in reverse, paged by the query's cursor and limit.
+     * Tombstones are suppressed; the result's {@code nextStartAfter} is the continuation cursor for the
+     * next page in the same direction (or {@code null} when exhausted).
+     */
+    public ListResult scanCandies(ScanQuery query) {
+        int limit = query.effectiveMaxKeys();
+        boolean forward = query.direction() == ScanDirection.FORWARD;
 
         lock.readLock().lock();
         try {
-            CandyKey startKey = null;
-            if (startAfter != null) {
-                startKey = CandyKey.of(startAfter);
-            } else if (!pfx.isEmpty()) {
-                startKey = CandyKey.of(pfx);
+            // Normalize the prefix into [lower, upper) and intersect it with any explicit bounds.
+            CandyKey lower = query.startInclusive();
+            CandyKey upper = query.endExclusive();
+            if (query.prefix() != null && !query.prefix().isEmpty()) {
+                CandyKey prefixLower = CandyKey.of(query.prefix());
+                byte[] succ = me.predatorray.candybox.common.util.Bytes
+                        .prefixSuccessor(prefixLower.utf8Bytes());
+                lower = maxKey(lower, prefixLower);
+                upper = minKey(upper, succ == null ? null : CandyKey.ofUtf8(succ));
             }
+            CandyKey cursor = query.cursorExclusive();
 
-            Iterator<Mutation> merged = mergedView(startKey, true);
+            Iterator<Mutation> merged = mergedView(lower, upper, cursor, query.direction());
             List<ListResult.ListEntry> entries = new ArrayList<>();
             String next = null;
             while (merged.hasNext()) {
                 Mutation m = merged.next();
-                String keyValue = m.key().value();
-                if (startAfter != null && keyValue.compareTo(startAfter) <= 0) {
-                    continue; // startAfter is exclusive
-                }
-                if (!pfx.isEmpty() && !keyValue.startsWith(pfx)) {
-                    if (keyValue.compareTo(pfx) > 0) {
-                        break; // sorted: past the prefix range
+                CandyKey key = m.key();
+                if (cursor != null) {
+                    int c = key.compareTo(cursor);
+                    if (forward ? c <= 0 : c >= 0) {
+                        continue; // cursor is exclusive in the scan direction
                     }
-                    continue;
+                }
+                if (forward) {
+                    if (lower != null && key.compareTo(lower) < 0) {
+                        continue;
+                    }
+                    if (upper != null && key.compareTo(upper) >= 0) {
+                        break; // ascending: past the window's exclusive upper bound
+                    }
+                } else {
+                    if (upper != null && key.compareTo(upper) >= 0) {
+                        continue;
+                    }
+                    if (lower != null && key.compareTo(lower) < 0) {
+                        break; // descending: below the window's inclusive lower bound
+                    }
                 }
                 if (entries.size() == limit) {
                     next = entries.get(entries.size() - 1).key().value();
                     break;
                 }
                 CandyLocator loc = m.locator();
-                entries.add(new ListResult.ListEntry(m.key(), loc.contentLength(), loc.createdAtMillis()));
+                entries.add(new ListResult.ListEntry(key, loc.contentLength(), loc.createdAtMillis()));
             }
             listCount.incrementAndGet();
             return new ListResult(entries, next);
@@ -554,13 +583,67 @@ public final class BoxEngine implements AutoCloseable {
         }
     }
 
-    private Iterator<Mutation> mergedView(CandyKey start, boolean dropTombstones) {
+    /**
+     * Builds a tombstone-suppressed merged view over the window {@code [lower, upper)} in the given
+     * direction, seeking each source to the appropriate bound and pruning SSTables that cannot overlap
+     * the window. The caller still applies exact bound/cursor filtering on the emitted keys.
+     */
+    private Iterator<Mutation> mergedView(CandyKey lower, CandyKey upper, CandyKey cursor,
+                                          ScanDirection direction) {
         List<Iterator<Mutation>> sources = new ArrayList<>();
-        sources.add(start == null ? active.iterator() : active.iterator(start));
-        for (SSTableReader reader : readers.values()) {
-            sources.add(reader.scan(start));
+        if (direction == ScanDirection.FORWARD) {
+            CandyKey seek = maxKey(lower, cursor);
+            sources.add(seek == null ? active.iterator() : active.iterator(seek));
+            for (SSTableReader reader : readers.values()) {
+                if (overlapsWindow(reader.minKey(), reader.maxKey(), lower, upper)) {
+                    sources.add(reader.scan(seek));
+                }
+            }
+        } else {
+            CandyKey seekUpper = minKey(upper, cursor);
+            sources.add(seekUpper == null ? active.descendingIterator()
+                    : active.descendingIterator(seekUpper));
+            for (SSTableReader reader : readers.values()) {
+                if (overlapsWindow(reader.minKey(), reader.maxKey(), lower, upper)) {
+                    sources.add(reader.scanReverse(seekUpper));
+                }
+            }
         }
-        return new me.predatorray.candybox.lsm.iterator.MergingIterator(sources, dropTombstones);
+        return new me.predatorray.candybox.lsm.iterator.MergingIterator(sources, true, direction);
+    }
+
+    /** Whether {@code [minKey, maxKey]} overlaps the half-open window {@code [lower, upper)}. */
+    private static boolean overlapsWindow(CandyKey minKey, CandyKey maxKey, CandyKey lower,
+                                          CandyKey upper) {
+        if (lower != null && maxKey.compareTo(lower) < 0) {
+            return false;
+        }
+        if (upper != null && minKey.compareTo(upper) >= 0) {
+            return false;
+        }
+        return true;
+    }
+
+    /** The greater of two nullable keys, where {@code null} means "unbounded below" (loses). */
+    private static CandyKey maxKey(CandyKey a, CandyKey b) {
+        if (a == null) {
+            return b;
+        }
+        if (b == null) {
+            return a;
+        }
+        return a.compareTo(b) >= 0 ? a : b;
+    }
+
+    /** The lesser of two nullable keys, where {@code null} means "unbounded above" (loses). */
+    private static CandyKey minKey(CandyKey a, CandyKey b) {
+        if (a == null) {
+            return b;
+        }
+        if (b == null) {
+            return a;
+        }
+        return a.compareTo(b) <= 0 ? a : b;
     }
 
     /** Flushes the active memtable to an L0 SSTable if it has grown past the threshold. */

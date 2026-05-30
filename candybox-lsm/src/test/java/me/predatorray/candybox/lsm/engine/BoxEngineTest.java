@@ -90,6 +90,42 @@ class BoxEngineTest {
     }
 
     @Test
+    void boundedRangeScanHonoursHalfOpenWindowAcrossLevels() {
+        engine = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1, new ManualClock(1000), 1L);
+        for (String k : new String[] {"a", "b", "c", "d", "e"}) {
+            engine.putCandy(CandyKey.of(k), bytes("x"), null, Map.of(), null);
+        }
+        engine.flush();
+        engine.putCandy(CandyKey.of("c2"), bytes("x"), null, Map.of(), null); // memtable, inside [b,e)
+
+        ListResult result = engine.scanCandies(
+                ScanQuery.forwardRange(CandyKey.of("b"), CandyKey.of("e"), 100));
+        assertThat(result.entries()).extracting(e -> e.key().value())
+                .containsExactly("b", "c", "c2", "d"); // 'a' excluded (< b), 'e' excluded (== end)
+    }
+
+    @Test
+    void reverseScanListsDescendingAndPaginates() {
+        engine = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1, new ManualClock(1000), 1L);
+        engine.putCandy(CandyKey.of("a/1"), bytes("x"), null, Map.of(), null);
+        engine.putCandy(CandyKey.of("a/2"), bytes("x"), null, Map.of(), null);
+        engine.putCandy(CandyKey.of("a/3"), bytes("x"), null, Map.of(), null);
+        engine.putCandy(CandyKey.of("b/1"), bytes("x"), null, Map.of(), null);
+        engine.flush();
+        engine.putCandy(CandyKey.of("a/4"), bytes("x"), null, Map.of(), null); // memtable
+
+        ListResult page1 = engine.scanCandies(
+                ScanQuery.reverse("a/", null, null, null, 2));
+        assertThat(page1.entries()).extracting(e -> e.key().value()).containsExactly("a/4", "a/3");
+        assertThat(page1.isTruncated()).isTrue();
+
+        ListResult page2 = engine.scanCandies(
+                ScanQuery.reverse("a/", null, null, CandyKey.of(page1.nextStartAfter()), 100));
+        assertThat(page2.entries()).extracting(e -> e.key().value()).containsExactly("a/2", "a/1");
+        assertThat(page2.isTruncated()).isFalse();
+    }
+
+    @Test
     void idempotencyTokenDedupesRetriedPut() {
         engine = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1, new ManualClock(1000), 1L);
         CandyMetadata first = engine.putCandy(CandyKey.of("k"), bytes("payload"), null, Map.of(), "tok-1");

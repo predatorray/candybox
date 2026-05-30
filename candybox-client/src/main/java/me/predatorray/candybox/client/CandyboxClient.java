@@ -144,8 +144,24 @@ public final class CandyboxClient implements AutoCloseable {
     }
 
     public Listing listCandies(String box, String prefix, String startAfter, int maxKeys) {
-        Message response = router.callBox(box, new Message.ListCandiesRequest(BoxName.of(box).value(),
-                prefix, startAfter, maxKeys));
+        return listCandies(box, new Message.ListCandiesRequest(BoxName.of(box).value(), prefix,
+                startAfter, maxKeys));
+    }
+
+    /**
+     * Range/directional listing: lists live Candies over the half-open window {@code [startKey, endKey)}
+     * (either bound nullable), optionally narrowed by {@code prefix}, walked forward or in reverse, and
+     * paged via {@code startAfter} (the previous page's {@code nextStartAfter}, exclusive in the scan
+     * direction).
+     */
+    public Listing listCandies(String box, String prefix, String startKey, String endKey,
+                               String startAfter, boolean reverse, int maxKeys) {
+        return listCandies(box, new Message.ListCandiesRequest(BoxName.of(box).value(), prefix,
+                startAfter, maxKeys, startKey, endKey, reverse));
+    }
+
+    private Listing listCandies(String box, Message.ListCandiesRequest request) {
+        Message response = router.callBox(box, request);
         if (response instanceof Message.ListCandiesResponse list) {
             List<Listing.Entry> entries = new ArrayList<>();
             for (Message.ListedCandy c : list.entries()) {

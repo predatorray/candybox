@@ -70,10 +70,15 @@ public sealed interface Message {
         }
     }
 
-    record ListCandiesRequest(String box, String prefix, String startAfter, int maxKeys)
-            implements Message {
+    record ListCandiesRequest(String box, String prefix, String startAfter, int maxKeys,
+                              String startKey, String endKey, boolean reverse) implements Message {
         public Opcode opcode() {
             return Opcode.LIST_CANDIES;
+        }
+
+        /** A plain forward prefix/startAfter listing (the classic three-arg form). */
+        public ListCandiesRequest(String box, String prefix, String startAfter, int maxKeys) {
+            this(box, prefix, startAfter, maxKeys, null, null, false);
         }
     }
 

@@ -14,6 +14,8 @@ import me.predatorray.candybox.common.exception.NotOwnerException;
 import me.predatorray.candybox.lsm.engine.BoxEngine;
 import me.predatorray.candybox.lsm.engine.CandyMetadata;
 import me.predatorray.candybox.lsm.engine.ListResult;
+import me.predatorray.candybox.lsm.engine.ScanDirection;
+import me.predatorray.candybox.lsm.engine.ScanQuery;
 import me.predatorray.candybox.protocol.Frame;
 import me.predatorray.candybox.protocol.Message;
 import me.predatorray.candybox.protocol.MessageCodec;
@@ -124,7 +126,7 @@ final class NodeRequestHandler implements RequestHandler {
             return new Message.OkResponse();
         } else if (message instanceof Message.ListCandiesRequest m) {
             BoxEngine engine = node.engine(BoxName.of(m.box()));
-            ListResult result = engine.listCandies(m.prefix(), m.startAfter(), m.maxKeys());
+            ListResult result = engine.scanCandies(toScanQuery(m));
             List<Message.ListedCandy> entries = new ArrayList<>();
             for (ListResult.ListEntry e : result.entries()) {
                 entries.add(new Message.ListedCandy(e.key().value(), e.contentLength(),
@@ -141,6 +143,14 @@ final class NodeRequestHandler implements RequestHandler {
         }
         return new Message.ErrorResponse("UnsupportedOperation",
                 "Not implemented in this phase: " + message.opcode());
+    }
+
+    private static ScanQuery toScanQuery(Message.ListCandiesRequest m) {
+        CandyKey start = m.startKey() == null ? null : CandyKey.of(m.startKey());
+        CandyKey end = m.endKey() == null ? null : CandyKey.of(m.endKey());
+        CandyKey cursor = m.startAfter() == null ? null : CandyKey.of(m.startAfter());
+        ScanDirection direction = m.reverse() ? ScanDirection.REVERSE : ScanDirection.FORWARD;
+        return new ScanQuery(m.prefix(), start, end, cursor, direction, m.maxKeys());
     }
 
     private static String safe(String s) {
