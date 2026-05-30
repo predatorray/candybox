@@ -24,11 +24,14 @@ import me.predatorray.candybox.protocol.transport.TcpTransport;
  *   create-box  &lt;box&gt;
  *   delete-box  &lt;box&gt; [--force]
  *   head-box    &lt;box&gt;
- *   put         &lt;box&gt; &lt;key&gt; [file]      # file or stdin; --content-type T, --meta k=v (repeatable)
- *   get         &lt;box&gt; &lt;key&gt; [outfile]   # outfile or stdout
- *   head        &lt;box&gt; &lt;key&gt;
- *   delete      &lt;box&gt; &lt;key&gt;
- *   list        &lt;box&gt; [prefix] [--max N] [--start-after K]
+ *   put          &lt;box&gt; &lt;key&gt; [file]      # file or stdin; --content-type T, --meta k=v (repeatable)
+ *   get          &lt;box&gt; &lt;key&gt; [outfile]   # outfile or stdout
+ *   head         &lt;box&gt; &lt;key&gt;
+ *   delete       &lt;box&gt; &lt;key&gt;
+ *   copy         &lt;box&gt; &lt;src&gt; &lt;dst&gt;       # zero-copy, same Box
+ *   rename       &lt;box&gt; &lt;src&gt; &lt;dst&gt;       # zero-copy move, same Box
+ *   delete-range &lt;box&gt; [prefix] [--start K] [--end K]   # range tombstone
+ *   list         &lt;box&gt; [prefix] [--max N] [--start-after K] [--start K] [--end K] [--reverse]
  * </pre>
  *
  * Defaults to {@code 127.0.0.1:9709}; override with {@code -s/--server} or {@code CANDYBOX_SERVER}.
@@ -137,6 +140,19 @@ public final class CandyboxCli {
                 client.deleteCandy(requireArg(args, 0, "box"), requireArg(args, 1, "key"));
                 return 0;
             }
+            case "copy" -> {
+                client.copyCandy(requireArg(args, 0, "box"), requireArg(args, 1, "src"),
+                        requireArg(args, 2, "dst"), null);
+                return 0;
+            }
+            case "rename" -> {
+                client.renameCandy(requireArg(args, 0, "box"), requireArg(args, 1, "src"),
+                        requireArg(args, 2, "dst"), null);
+                return 0;
+            }
+            case "delete-range" -> {
+                return deleteRange(args, client);
+            }
             case "list" -> {
                 return list(args, client, out);
             }
@@ -204,14 +220,30 @@ public final class CandyboxCli {
     private static int list(List<String> args, CandyboxClient client, PrintStream out) {
         int max = Integer.parseInt(takeOption(args, "--max", "1000"));
         String startAfter = takeOptionalOption(args, "--start-after");
+        String startKey = takeOptionalOption(args, "--start");
+        String endKey = takeOptionalOption(args, "--end");
+        boolean reverse = args.remove("--reverse");
         String box = requireArg(args, 0, "box");
         String prefix = args.size() > 1 ? args.get(1) : "";
-        CandyboxClient.Listing listing = client.listCandies(box, prefix, startAfter, max);
+        CandyboxClient.Listing listing = client.listCandies(box, prefix, startKey, endKey, startAfter,
+                reverse, max);
         for (CandyboxClient.Listing.Entry e : listing.entries()) {
             out.println(e.key() + "\t" + e.contentLength() + "\t" + e.createdAtMillis());
         }
         if (listing.isTruncated()) {
             out.println("# truncated; next --start-after " + listing.nextStartAfter());
+        }
+        return 0;
+    }
+
+    private static int deleteRange(List<String> args, CandyboxClient client) {
+        String startKey = takeOptionalOption(args, "--start");
+        String endKey = takeOptionalOption(args, "--end");
+        String box = requireArg(args, 0, "box");
+        if (args.size() > 1) {
+            client.deleteRangeByPrefix(box, args.get(1)); // positional prefix form
+        } else {
+            client.deleteRange(box, startKey, endKey); // [--start, --end) window form
         }
         return 0;
     }
@@ -255,14 +287,17 @@ public final class CandyboxCli {
 
                 Commands:
                   list-boxes
-                  create-box  <box>
-                  delete-box  <box> [--force]
-                  head-box    <box>
-                  put         <box> <key> [file]    file or stdin; --content-type T, --meta k=v
-                  get         <box> <key> [outfile]  outfile or stdout
-                  head        <box> <key>
-                  delete      <box> <key>
-                  list        <box> [prefix] [--max N] [--start-after K]
+                  create-box   <box>
+                  delete-box   <box> [--force]
+                  head-box     <box>
+                  put          <box> <key> [file]    file or stdin; --content-type T, --meta k=v
+                  get          <box> <key> [outfile]  outfile or stdout
+                  head         <box> <key>
+                  delete       <box> <key>
+                  copy         <box> <src> <dst>     zero-copy, same Box
+                  rename       <box> <src> <dst>     zero-copy move, same Box
+                  delete-range <box> [prefix] [--start K] [--end K]   single range tombstone
+                  list         <box> [prefix] [--max N] [--start-after K] [--start K] [--end K] [--reverse]
 
                 Server defaults to 127.0.0.1:9709 (override with -s/--server or CANDYBOX_SERVER).""");
     }

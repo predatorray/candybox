@@ -79,6 +79,26 @@ candybox help                           # full command list
 standard output. Programmatically, the same operations are available through the `CandyboxClient`
 class in the `candybox-client` module.
 
+### Operations the sorted LSM tree makes cheap
+
+Because keys are stored sorted and object bytes live behind small pointers, Candybox offers a few
+operations an S3-style store cannot do cheaply:
+
+```bash
+candybox list   photos --start a --end m --reverse   # bounded, reverse-order range scan
+candybox copy   photos cat.jpg cat-copy.jpg          # zero-copy: shares the stored bytes
+candybox rename photos cat.jpg pets/cat.jpg          # zero-copy move (atomic, same Box)
+candybox delete-range photos thumbnails/             # one O(1) range tombstone, not N deletes
+candybox delete-range photos --start a --end m       # delete a half-open [start, end) key window
+```
+
+- **Bounded / reverse range scans** walk a `[start, end)` window in either direction (`list --start
+  K --end K --reverse`), paging with `--start-after`.
+- **Zero-copy `copy` / `rename`** point a new key at the *same* stored bytes — no data is moved — and
+  `rename` removes the source atomically (same Box).
+- **`delete-range`** deletes a whole prefix or key window with a single range tombstone (constant
+  work regardless of how many keys it covers); the bytes are reclaimed lazily by compaction.
+
 ## Configuration
 
 The node reads `conf/candybox.properties`. **Every key can be overridden by an environment

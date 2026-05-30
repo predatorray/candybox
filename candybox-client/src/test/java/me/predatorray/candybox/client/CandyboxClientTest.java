@@ -35,6 +35,9 @@ class CandyboxClientTest {
                     ? new Message.OkResponse() : new Message.NotFoundResponse();
         } else if (message instanceof Message.GetCandyRequest g && g.box().equals("moved-box")) {
             response = new Message.MovedResponse(9);
+        } else if (message instanceof Message.CopyCandyRequest
+                || message instanceof Message.RenameCandyRequest) {
+            response = new Message.HeadCandyResponse(5, "text/plain", Map.of(), 9, 1);
         } else {
             response = new Message.OkResponse();
         }
@@ -63,6 +66,19 @@ class CandyboxClientTest {
             assertThat(client.listBoxes()).containsExactly("alpha", "beta");
             assertThat(client.headBox("exists-box")).isTrue();
             assertThat(client.headBox("ghost-box")).isFalse();
+        }
+    }
+
+    @Test
+    void copyRenameAndDeleteRangeRoundTripThroughTheCodec() {
+        try (CandyboxClient client = client()) {
+            CandyboxClient.CandyInfo copied = client.copyCandy("my-box", "src", "dst", null);
+            assertThat(copied.contentLength()).isEqualTo(5);
+            CandyboxClient.CandyInfo renamed = client.renameCandy("my-box", "src", "dst", null);
+            assertThat(renamed.crc32c()).isEqualTo(9);
+            // delete-range forms return OK; assert they encode/route without error.
+            client.deleteRangeByPrefix("my-box", "logs/");
+            client.deleteRange("my-box", "a", "m");
         }
     }
 

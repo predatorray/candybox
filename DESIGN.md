@@ -107,8 +107,18 @@ varint  segment count       [+ {varlong syrupId, varlong firstEntryId, varlong l
 The segment list is O(number of Syrups), not O(number of chunks), thanks to fixed `chunkSize` +
 contiguous entries. A DELETE tombstone carries no segments and zero length.
 
-**Mutation** (`MutationSerializer`, version 1) — WAL entry and SSTable record: `version | bytes(key) |
-bytes(serialized CandyLocator)`.
+**Mutation** (`MutationSerializer`, version 1) — point WAL record and SSTable record: `version |
+bytes(key) | bytes(serialized CandyLocator)`.
+
+**RangeTombstone** (`RangeTombstoneSerializer`, version 1) — the `deleteRange` marker: `version |
+nullable bytes(startInclusive) | nullable bytes(endExclusive) | long physicalMillis | varint
+logicalCounter | int nodeId`. Carries no Syrup segments; shadows every key in `[start, end)` whose
+locator HLC is older.
+
+**WAL entry** (`WalEntrySerializer`) — the WAL is a kind-tagged log so point mutations and range
+deletes replay in one ordered pass: `byte kind (1=point mutation, 2=range delete) | <Mutation or
+RangeTombstone payload>`. Replay reports the max HLC across **both** kinds, so handover's HLC
+`observe` cannot lose a range delete.
 
 **Syrup chunk entry**: `int crc32c | payload[<= chunkSize]`. The crc covers the payload only.
 
@@ -119,21 +129,26 @@ bytes(serialized CandyLocator)`.
 **Protocol frame** (`FrameCodec`): `magic(2)=0xCB0F | version(1)=1 | opcode(1) | length(4) | payload`.
 **Message body** (`MessageCodec`): `bodyVersion(1) | <per-opcode fields>`.
 
-### SSTable on-ledger layout (`SSTableFormat`, footer version 1)
+### SSTable on-ledger layout (`SSTableFormat`, footer version 2)
 
 ```
-entry 0 .. B-1   data blocks   (each: varint count + [varint len, Mutation bytes]*, key-ascending)
-entry B          bloom block   (serialized BloomFilter over all keys)
-entry B+1        index block   (varint count + [bytes lastKey, varlong dataBlockEntryId]*)
-entry B+2 (=LAC) footer        (int magic=0x53535442 | byte version | varlong bloomEntryId |
-                                varlong indexEntryId | varint numDataBlocks | varlong numEntries |
-                                bytes minKey | bytes maxKey)
+entry 0 .. B-1   data blocks    (each: varint count + [varint len, Mutation bytes]*, key-ascending)
+entry B          bloom block    (serialized BloomFilter over all keys)
+entry B+1        index block     (varint count + [bytes lastKey, varlong dataBlockEntryId]*)
+entry [B+2]      range-del block (v2, optional: varint count + [bytes RangeTombstone]*, by start)
+entry (=LAC)     footer          (int magic=0x53535442 | byte version | varlong bloomEntryId |
+                                  varlong indexEntryId | varint numDataBlocks | varlong numEntries |
+                                  bytes minKey | bytes maxKey | bool hasRangeDel [+ varlong entryId])
 ```
 One block ⇒ one ledger entry; the data-block size target is ~64 KiB. The reader finds the footer at
-`lastAddConfirmed()`, loads the index + bloom eagerly, and reads data blocks lazily. Point lookups
-consult the bloom filter, binary-search the index, then scan one block; range scans iterate blocks
-from the one containing the start key. Within a single SSTable each key appears once (the memtable and
-merge de-duplicate by LWW), so the file holds unique, ascending keys.
+`lastAddConfirmed()`, loads the index + bloom + range tombstones eagerly, and reads data blocks
+lazily. Point lookups consult the bloom filter, binary-search the index, then scan one block; forward
+scans iterate blocks from the one containing the start key, reverse scans walk blocks high-to-low.
+Within a single SSTable each key appears once (the memtable and merge de-duplicate by LWW), so the
+file holds unique, ascending keys. **Footer v1 (no range-del block) is still readable**; v2 adds the
+optional range-tombstone block, and a table may be *range-only* (zero data blocks). A table's
+`minKey/maxKey` bound its point keys; range tombstones can reach beyond them, so the read path
+consults range tombstones across all tables rather than pruning by point range.
 
 ## 6. Read / write / merge path (Phase 1)
 
@@ -143,10 +158,21 @@ merge de-duplicate by LWW), so the file holds unique, ascending keys.
 - **flush**: seal the memtable into a new L0 SSTable, record referenced Syrups + the rotated WAL id in
   one `ManifestEdit`, open a reader for the new table.
 - **get/head**: resolve the key to the highest-HLC locator across the memtable and overlapping L0
-  SSTables (range + bloom pre-filter); a tombstone or absence ⇒ `CandyNotFound`. `getCandy` then
-  streams bytes from Syrups and validates the whole-object crc.
-- **list**: a `MergingIterator` over the memtable + SSTables (key-ascending, LWW, tombstones
-  suppressed), honoring prefix/startAfter/maxKeys and returning a continuation cursor (`lastKey`).
+  SSTables (range + bloom pre-filter); a point tombstone, a covering **range tombstone** newer than
+  that locator, or absence ⇒ `CandyNotFound`. `getCandy` then streams bytes from Syrups and validates
+  the whole-object crc.
+- **list / scan**: a `MergingIterator` over the memtable + SSTables (LWW, tombstones suppressed),
+  driven by a `ScanQuery` — an optional `[start, end)` window, optional prefix, **forward or reverse**
+  direction, page size, and a continuation cursor (`lastKey`, exclusive in the scan direction). Keys
+  covered by a newer range tombstone are suppressed too (the union of range tombstones across the
+  memtable and all SSTables is gathered per scan; they are few).
+- **deleteRange**: stamp one HLC and append a single `RangeTombstone` `[start, end)` to the WAL +
+  memtable — an O(1) delete of the whole interval. Shadowed keys are reclaimed lazily at compaction.
+  Either bound may be unbounded; `deleteRangeByPrefix` maps `prefix → [prefix, prefixSuccessor)`.
+- **copy / rename**: write a fresh PUT at the destination reusing the source locator's Syrup segments
+  and whole-object crc verbatim (zero byte copy); `rename` also tombstones the source. Both commit
+  atomically under the single owner's write lock (same Box only). Because GC is reference-counted by
+  Syrup id, several keys may share one segment set safely.
 
 Phase 1 keeps an **L0-only** merged read path (honest scope); the multi-level structure lands with
 compaction. Under write-stall (too many L0 SSTables, `l0StallThreshold`) writes return a retriable
@@ -181,8 +207,10 @@ task claims/leases and the fencing-gated commit are **TODO(phase-3)**.
 
 **Tombstone-drop rule** (LevelDB + late-write window): a DELETE is dropped only when the compaction is
 at the **bottommost** level holding overlapping data **and** the tombstone is older than the configured
-GC grace; otherwise it is preserved. Dropping early would resurrect deleted Candies. Covered by
-`CompactionTest`.
+GC grace; otherwise it is preserved. Dropping early would resurrect deleted Candies. The same rule
+governs **range tombstones**: the compactor collects them from all inputs and carries them forward
+into the output, except an aged one at the bottommost level — which is dropped together with the
+(necessarily older) point locators it covers, so nothing is resurrected. Covered by `CompactionTest`.
 
 ## 9. Garbage collection (design; Phase 3)
 
@@ -199,6 +227,12 @@ manifest snapshot** (never a stale tail), gated on the owner's fencing token, af
   Candy pins an otherwise-dead Syrup. **v1 documents and accepts this** — a Syrup is reclaimed only
   once *every* segment in it is dead. Syrup defragmentation (copying survivors into a fresh Syrup) is
   deferred. See `GarbageCollector` (scaffold).
+- (e) **shared segments from copy/rename**: orphan detection counts Syrup references by actual
+  `SegmentRef`s across the manifest's SSTables and the memtable, so several keys pointing at one
+  segment set (a `copyCandy`, or the in-flight state of a `renameCandy`) keep that Syrup live until
+  *all* of them are gone — no per-key refcount table is needed. A range tombstone holds no segments,
+  so a Candy it shadows is reclaimed only once compaction drops the covered point locator (as with a
+  point delete).
 
 ## 10. Size limits (configurable; enforced at client and node)
 
