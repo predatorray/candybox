@@ -139,4 +139,77 @@ class MessageCodecTest {
                 new Message.ListBoxesResponse(List.of("alpha", "beta")));
         assertThat(out.boxes()).containsExactly("alpha", "beta");
     }
+
+    @Test
+    void boxRequestsRoundTrip() {
+        Message.CreateBoxRequest create = (Message.CreateBoxRequest) roundTrip(
+                new Message.CreateBoxRequest("my-box"));
+        assertThat(create.box()).isEqualTo("my-box");
+        assertThat(create.opcode()).isEqualTo(Opcode.CREATE_BOX);
+
+        Message.DeleteBoxRequest forced = (Message.DeleteBoxRequest) roundTrip(
+                new Message.DeleteBoxRequest("my-box", true));
+        assertThat(forced.box()).isEqualTo("my-box");
+        assertThat(forced.force()).isTrue();
+
+        Message.DeleteBoxRequest soft = (Message.DeleteBoxRequest) roundTrip(
+                new Message.DeleteBoxRequest("my-box", false));
+        assertThat(soft.force()).isFalse();
+
+        assertThat(roundTrip(new Message.ListBoxesRequest())).isInstanceOf(Message.ListBoxesRequest.class);
+
+        Message.HeadBoxRequest head = (Message.HeadBoxRequest) roundTrip(
+                new Message.HeadBoxRequest("my-box"));
+        assertThat(head.box()).isEqualTo("my-box");
+    }
+
+    @Test
+    void candyKeyRequestsRoundTrip() {
+        Message.GetCandyRequest get = (Message.GetCandyRequest) roundTrip(
+                new Message.GetCandyRequest("box", "k/1"));
+        assertThat(get.box()).isEqualTo("box");
+        assertThat(get.key()).isEqualTo("k/1");
+
+        Message.HeadCandyRequest headCandy = (Message.HeadCandyRequest) roundTrip(
+                new Message.HeadCandyRequest("box", "k/2"));
+        assertThat(headCandy.key()).isEqualTo("k/2");
+
+        Message.DeleteCandyRequest delete = (Message.DeleteCandyRequest) roundTrip(
+                new Message.DeleteCandyRequest("box", "k/3"));
+        assertThat(delete.key()).isEqualTo("k/3");
+    }
+
+    @Test
+    void candyDataResponseRoundTrips() {
+        Message.CandyDataResponse resp = new Message.CandyDataResponse(
+                7, "application/octet-stream", Map.of("x", "y"), 0xABCD, "candy".getBytes());
+        Message.CandyDataResponse out = (Message.CandyDataResponse) roundTrip(resp);
+        assertThat(out.contentLength()).isEqualTo(7);
+        assertThat(out.contentType()).isEqualTo("application/octet-stream");
+        assertThat(out.userMetadata()).containsEntry("x", "y");
+        assertThat(out.crc32c()).isEqualTo(0xABCD);
+        assertThat(new String(out.data())).isEqualTo("candy");
+    }
+
+    @Test
+    void candyDataResponseHandlesNullContentTypeAndEmptyBody() {
+        Message.CandyDataResponse resp = new Message.CandyDataResponse(
+                0, null, Map.of(), 0, new byte[0]);
+        Message.CandyDataResponse out = (Message.CandyDataResponse) roundTrip(resp);
+        assertThat(out.contentType()).isNull();
+        assertThat(out.userMetadata()).isEmpty();
+        assertThat(out.data()).isEmpty();
+    }
+
+    @Test
+    void plainListCandiesRequestConstructorRoundTrips() {
+        Message.ListCandiesRequest req = new Message.ListCandiesRequest("box", "p/", "p/x", 25);
+        Message.ListCandiesRequest out = (Message.ListCandiesRequest) roundTrip(req);
+        assertThat(out.prefix()).isEqualTo("p/");
+        assertThat(out.startAfter()).isEqualTo("p/x");
+        assertThat(out.maxKeys()).isEqualTo(25);
+        assertThat(out.startKey()).isNull();
+        assertThat(out.endKey()).isNull();
+        assertThat(out.reverse()).isFalse();
+    }
 }
