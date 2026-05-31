@@ -235,4 +235,120 @@ class MessageCodecTest {
         assertThat(out.endKey()).isNull();
         assertThat(out.reverse()).isFalse();
     }
+
+    @Test
+    void multipartCreateAndUploadRequestsRoundTrip() {
+        Message.CreateMultipartUploadRequest create =
+                (Message.CreateMultipartUploadRequest) roundTrip(new Message.CreateMultipartUploadRequest(
+                        "box", "big", "text/plain", Map.of("k", "v")));
+        assertThat(create.key()).isEqualTo("big");
+        assertThat(create.contentType()).isEqualTo("text/plain");
+        assertThat(create.userMetadata()).containsEntry("k", "v");
+        assertThat(create.opcode()).isEqualTo(Opcode.CREATE_MULTIPART_UPLOAD);
+
+        // Null content-type should survive the round trip.
+        Message.CreateMultipartUploadRequest noType =
+                (Message.CreateMultipartUploadRequest) roundTrip(new Message.CreateMultipartUploadRequest(
+                        "box", "big", null, Map.of()));
+        assertThat(noType.contentType()).isNull();
+        assertThat(noType.userMetadata()).isEmpty();
+
+        Message.UploadPartRequest part = (Message.UploadPartRequest) roundTrip(
+                new Message.UploadPartRequest("box", "big", "upload-1", 3, "chunk".getBytes()));
+        assertThat(part.uploadId()).isEqualTo("upload-1");
+        assertThat(part.partNumber()).isEqualTo(3);
+        assertThat(new String(part.data())).isEqualTo("chunk");
+
+        Message.AbortMultipartUploadRequest abort = (Message.AbortMultipartUploadRequest) roundTrip(
+                new Message.AbortMultipartUploadRequest("box", "big", "upload-1"));
+        assertThat(abort.uploadId()).isEqualTo("upload-1");
+    }
+
+    @Test
+    void completeMultipartUploadRequestRoundTripsPartList() {
+        Message.CompleteMultipartUploadRequest req = new Message.CompleteMultipartUploadRequest(
+                "box", "big", "upload-7",
+                List.of(new Message.CompletedPart(1, 0x11), new Message.CompletedPart(2, 0x22)),
+                "idem-9");
+        Message.CompleteMultipartUploadRequest out =
+                (Message.CompleteMultipartUploadRequest) roundTrip(req);
+        assertThat(out.uploadId()).isEqualTo("upload-7");
+        assertThat(out.idempotencyToken()).isEqualTo("idem-9");
+        assertThat(out.parts()).hasSize(2);
+        assertThat(out.parts().get(1).partNumber()).isEqualTo(2);
+        assertThat(out.parts().get(1).crc32c()).isEqualTo(0x22);
+
+        // Null idempotency token and empty part list also round-trip.
+        Message.CompleteMultipartUploadRequest empty =
+                (Message.CompleteMultipartUploadRequest) roundTrip(new Message.CompleteMultipartUploadRequest(
+                        "box", "big", "upload-7", List.of(), null));
+        assertThat(empty.parts()).isEmpty();
+        assertThat(empty.idempotencyToken()).isNull();
+    }
+
+    @Test
+    void uploadPartCopyRequestRoundTripsRangeBounds() {
+        Message.UploadPartCopyRequest copy = (Message.UploadPartCopyRequest) roundTrip(
+                new Message.UploadPartCopyRequest("box", "dst", "upload-2", 4, "src", 10, 99));
+        assertThat(copy.srcKey()).isEqualTo("src");
+        assertThat(copy.partNumber()).isEqualTo(4);
+        assertThat(copy.firstByte()).isEqualTo(10);
+        assertThat(copy.lastByte()).isEqualTo(99);
+
+        // Open-ended copy (whole source) encoded as (-1, -1).
+        Message.UploadPartCopyRequest whole = (Message.UploadPartCopyRequest) roundTrip(
+                new Message.UploadPartCopyRequest("box", "dst", "upload-2", 1, "src", -1, -1));
+        assertThat(whole.firstByte()).isEqualTo(-1);
+        assertThat(whole.lastByte()).isEqualTo(-1);
+    }
+
+    @Test
+    void multipartListingRequestsRoundTrip() {
+        Message.ListMultipartUploadsRequest uploads =
+                (Message.ListMultipartUploadsRequest) roundTrip(new Message.ListMultipartUploadsRequest(
+                        "box", "p/", "key-m", "upload-m", 200));
+        assertThat(uploads.prefix()).isEqualTo("p/");
+        assertThat(uploads.keyMarker()).isEqualTo("key-m");
+        assertThat(uploads.uploadIdMarker()).isEqualTo("upload-m");
+        assertThat(uploads.maxUploads()).isEqualTo(200);
+
+        Message.ListPartsRequest parts = (Message.ListPartsRequest) roundTrip(
+                new Message.ListPartsRequest("box", "big", "upload-3", 5, 100));
+        assertThat(parts.uploadId()).isEqualTo("upload-3");
+        assertThat(parts.partNumberMarker()).isEqualTo(5);
+        assertThat(parts.maxParts()).isEqualTo(100);
+    }
+
+    @Test
+    void multipartResponsesRoundTrip() {
+        Message.CreateMultipartUploadResponse created =
+                (Message.CreateMultipartUploadResponse) roundTrip(
+                        new Message.CreateMultipartUploadResponse("upload-42"));
+        assertThat(created.uploadId()).isEqualTo("upload-42");
+
+        Message.UploadPartResponse part = (Message.UploadPartResponse) roundTrip(
+                new Message.UploadPartResponse(0xDEAD, 4096));
+        assertThat(part.crc32c()).isEqualTo(0xDEAD);
+        assertThat(part.partLength()).isEqualTo(4096);
+
+        Message.ListMultipartUploadsResponse uploads =
+                (Message.ListMultipartUploadsResponse) roundTrip(new Message.ListMultipartUploadsResponse(
+                        List.of(new Message.InProgressUpload("u1", "a", 100),
+                                new Message.InProgressUpload("u2", "b", 200)),
+                        "next-key", "next-upload"));
+        assertThat(uploads.uploads()).hasSize(2);
+        assertThat(uploads.uploads().get(0).uploadId()).isEqualTo("u1");
+        assertThat(uploads.nextKeyMarker()).isEqualTo("next-key");
+        assertThat(uploads.nextUploadIdMarker()).isEqualTo("next-upload");
+
+        Message.ListPartsResponse parts = (Message.ListPartsResponse) roundTrip(
+                new Message.ListPartsResponse(
+                        List.of(new Message.UploadedPart(1, 1024, 0x01),
+                                new Message.UploadedPart(2, 2048, 0x02)),
+                        7));
+        assertThat(parts.parts()).hasSize(2);
+        assertThat(parts.parts().get(1).partNumber()).isEqualTo(2);
+        assertThat(parts.parts().get(1).partLength()).isEqualTo(2048);
+        assertThat(parts.nextPartNumberMarker()).isEqualTo(7);
+    }
 }

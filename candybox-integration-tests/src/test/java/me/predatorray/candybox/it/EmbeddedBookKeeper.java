@@ -27,12 +27,12 @@ import org.apache.bookkeeper.util.LocalBookKeeper;
  * for the integration tests. No external services or Docker; everything runs in the test JVM and is
  * shut down by {@link #close()}.
  */
-final class EmbeddedBookKeeper implements AutoCloseable {
+public final class EmbeddedBookKeeper implements AutoCloseable {
 
     private final int zkPort;
     private final LocalBookKeeper localBookKeeper;
 
-    EmbeddedBookKeeper(int numBookies) {
+    public EmbeddedBookKeeper(int numBookies) {
         this.zkPort = freePort();
         try {
             ServerConfiguration serverConf = new ServerConfiguration();
@@ -49,12 +49,13 @@ final class EmbeddedBookKeeper implements AutoCloseable {
         awaitReady(numBookies);
     }
 
-    private String metadataServiceUri() {
+    /** The {@code zk://…/ledgers} metadata service URI for the embedded cluster. */
+    public String metadataServiceUri() {
         return "zk://127.0.0.1:" + zkPort + "/ledgers";
     }
 
     /** A client configuration pointing at the embedded cluster's metadata service. */
-    ClientConfiguration clientConfiguration() {
+    public ClientConfiguration clientConfiguration() {
         ClientConfiguration conf = new ClientConfiguration();
         conf.setMetadataServiceUri(metadataServiceUri());
         return conf;

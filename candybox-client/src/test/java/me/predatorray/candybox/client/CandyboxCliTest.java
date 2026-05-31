@@ -68,4 +68,16 @@ class CandyboxCliTest {
         assertThat(run("-s", "no-port", "list-boxes")).isEqualTo(2);
         assertThat(stderr()).contains("Invalid --server");
     }
+
+    @Test
+    void serverOptionMissingValueAtEndIsRejected() {
+        assertThat(run("create-box", "my-box", "--server")).isEqualTo(2);
+        assertThat(stderr()).contains("Missing value for --server");
+    }
+
+    @Test
+    void helpAliasesPrintUsageAndSucceed() {
+        assertThat(run("-h")).isEqualTo(0);
+        assertThat(stdout()).contains("Usage: candybox");
+    }
 }
