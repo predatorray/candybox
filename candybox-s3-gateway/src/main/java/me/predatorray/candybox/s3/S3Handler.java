@@ -40,6 +40,11 @@ import java.util.Set;
 import java.util.UUID;
 import me.predatorray.candybox.client.CandyboxClient.CandyInfo;
 import me.predatorray.candybox.client.CandyboxClient.Listing;
+import me.predatorray.candybox.client.CandyboxClient.MultipartListing;
+import me.predatorray.candybox.client.CandyboxClient.PartListing;
+import me.predatorray.candybox.client.CandyboxClient.PartUploadInfo;
+import me.predatorray.candybox.client.CandyboxClient.RangeBytes;
+import me.predatorray.candybox.client.CandyboxClient.UploadEntry;
 import me.predatorray.candybox.common.checksum.Crc32c;
 import me.predatorray.candybox.s3.S3Router.S3Action;
 import org.slf4j.Logger;
@@ -116,6 +121,12 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
                 }
             }
             case LIST_OBJECTS -> listObjects(ctx, request, parts.bucket(), decoder, requestId);
+            case LIST_MULTIPART_UPLOADS -> listMultipartUploads(ctx, request, parts.bucket(), decoder, requestId);
+            case CREATE_MULTIPART_UPLOAD -> createMultipartUpload(ctx, request, parts, requestId);
+            case UPLOAD_PART -> uploadPart(ctx, request, parts, decoder, requestId);
+            case COMPLETE_MULTIPART_UPLOAD -> completeMultipartUpload(ctx, request, parts, decoder, requestId);
+            case ABORT_MULTIPART_UPLOAD -> abortMultipartUpload(ctx, request, parts, decoder, requestId);
+            case LIST_PARTS -> listParts(ctx, request, parts, decoder, requestId);
             case LIST_OBJECT_VERSIONS -> listObjectVersions(ctx, request, parts.bucket(), decoder, requestId);
             case DELETE_OBJECTS -> deleteObjects(ctx, request, parts.bucket(), requestId);
             case GET_BUCKET_LOCATION -> sendXml(ctx, request, HttpResponseStatus.OK,
@@ -181,13 +192,121 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
     private void getObject(ChannelHandlerContext ctx, FullHttpRequest request, PathParts parts,
                            String requestId) {
         requireKey(parts);
-        // v1: Range is ignored; the whole object is returned with 200 (plan §16).
+        String rangeHeader = request.headers().get(HttpHeaderNames.RANGE);
+        if (rangeHeader == null || rangeHeader.isBlank()) {
+            // Full object, 200 OK.
+            CandyInfo info = store.headCandy(parts.bucket(), parts.key());
+            byte[] data = store.getCandy(parts.bucket(), parts.key());
+            FullHttpResponse r = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1,
+                    HttpResponseStatus.OK, Unpooled.wrappedBuffer(data));
+            applyObjectHeaders(r, info);
+            send(ctx, request, r, requestId);
+            return;
+        }
+        getObjectRange(ctx, request, parts, rangeHeader, requestId);
+    }
+
+    /**
+     * Handles {@code Range: bytes=…} with a 206 Partial Content response and a {@code Content-Range}
+     * header. Multi-range ({@code bytes=A-B,C-D}) is rejected with {@link S3ErrorCode#NOT_IMPLEMENTED}.
+     * An unparseable header that doesn't start with {@code bytes=} is ignored per RFC 9110 §14.2 and
+     * served as a full 200, matching mainstream S3 behavior.
+     */
+    private void getObjectRange(ChannelHandlerContext ctx, FullHttpRequest request, PathParts parts,
+                                String rangeHeader, String requestId) {
+        ParsedRange range = parseRange(rangeHeader);
+        if (range == null) {
+            // Unparseable / non-bytes unit; per RFC 9110 §14.2 fall back to a full 200.
+            CandyInfo info = store.headCandy(parts.bucket(), parts.key());
+            byte[] data = store.getCandy(parts.bucket(), parts.key());
+            FullHttpResponse r = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1,
+                    HttpResponseStatus.OK, Unpooled.wrappedBuffer(data));
+            applyObjectHeaders(r, info);
+            send(ctx, request, r, requestId);
+            return;
+        }
+        RangeBytes slice;
+        try {
+            slice = store.getCandyRange(parts.bucket(), parts.key(), range.firstByte,
+                    range.lastByte);
+        } catch (IllegalArgumentException e) {
+            // The engine raises IAE for an unsatisfiable range; surface as the S3 416 error code.
+            throw new S3Exception(S3ErrorCode.INVALID_RANGE, e.getMessage(), e);
+        }
         CandyInfo info = store.headCandy(parts.bucket(), parts.key());
-        byte[] data = store.getCandy(parts.bucket(), parts.key());
-        FullHttpResponse r = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK,
-                Unpooled.wrappedBuffer(data));
+        long total = slice.totalLength();
+        long emittedFirst;
+        long emittedLast;
+        if (range.firstByte < 0) {
+            // Suffix range: server clamps to start of object if suffix >= total.
+            emittedFirst = Math.max(total - range.lastByte, 0);
+            emittedLast = total - 1;
+        } else {
+            emittedFirst = range.firstByte;
+            emittedLast = Math.min(range.lastByte < 0 ? total - 1 : range.lastByte, total - 1);
+        }
+        FullHttpResponse r = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1,
+                HttpResponseStatus.PARTIAL_CONTENT, Unpooled.wrappedBuffer(slice.data()));
         applyObjectHeaders(r, info);
+        // Reset Content-Length to the slice length (the full-object applyObjectHeaders does not set it
+        // explicitly, but Netty's auto-set on the FullHttpResponse uses the body buffer, which is the
+        // slice).
+        r.headers().set(HttpHeaderNames.CONTENT_RANGE,
+                "bytes " + emittedFirst + "-" + emittedLast + "/" + total);
         send(ctx, request, r, requestId);
+    }
+
+    /**
+     * Parses an HTTP {@code Range} header value, returning the parsed bounds or {@code null} for an
+     * unparseable header (RFC fallback to full 200). A multi-range header throws
+     * {@link S3ErrorCode#NOT_IMPLEMENTED} — Candybox v1 does not implement
+     * {@code multipart/byteranges}.
+     */
+    private static ParsedRange parseRange(String headerValue) {
+        String v = headerValue.trim();
+        if (!v.toLowerCase(Locale.ROOT).startsWith("bytes=")) {
+            return null;
+        }
+        String spec = v.substring("bytes=".length()).trim();
+        if (spec.indexOf(',') >= 0) {
+            throw new S3Exception(S3ErrorCode.NOT_IMPLEMENTED,
+                    "Multi-range requests are not supported");
+        }
+        int dash = spec.indexOf('-');
+        if (dash < 0) {
+            return null;
+        }
+        String left = spec.substring(0, dash).trim();
+        String right = spec.substring(dash + 1).trim();
+        try {
+            if (left.isEmpty() && right.isEmpty()) {
+                return null;
+            }
+            if (left.isEmpty()) {
+                long n = Long.parseLong(right);
+                if (n <= 0) {
+                    throw new S3Exception(S3ErrorCode.INVALID_RANGE, "Range " + headerValue
+                            + " is not satisfiable");
+                }
+                return new ParsedRange(-1, n); // suffix
+            }
+            long first = Long.parseLong(left);
+            if (first < 0) {
+                throw new S3Exception(S3ErrorCode.INVALID_RANGE, "Range " + headerValue
+                        + " is not satisfiable");
+            }
+            long last = right.isEmpty() ? -1 : Long.parseLong(right);
+            if (last >= 0 && last < first) {
+                throw new S3Exception(S3ErrorCode.INVALID_RANGE, "Range " + headerValue
+                        + " is not satisfiable");
+            }
+            return new ParsedRange(first, last);
+        } catch (NumberFormatException nfe) {
+            return null;
+        }
+    }
+
+    private record ParsedRange(long firstByte, long lastByte) {
     }
 
     private void headObject(ChannelHandlerContext ctx, FullHttpRequest request, PathParts parts,
@@ -210,6 +329,202 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
         r.headers().set(HttpHeaderNames.ACCEPT_RANGES, "bytes");
         if (info.userMetadata() != null) {
             info.userMetadata().forEach((k, v) -> r.headers().set(META_PREFIX + k, v));
+        }
+    }
+
+    // ---- multipart upload ------------------------------------------------------------------
+
+    private void createMultipartUpload(ChannelHandlerContext ctx, FullHttpRequest request,
+                                       PathParts parts, String requestId) {
+        requireKey(parts);
+        String contentType = request.headers().get(HttpHeaderNames.CONTENT_TYPE);
+        if (contentType == null || contentType.isBlank()) {
+            contentType = "application/octet-stream";
+        }
+        Map<String, String> userMeta = userMetadata(request);
+        String uploadId = store.createMultipartUpload(parts.bucket(), parts.key(), contentType,
+                userMeta);
+        sendXml(ctx, request, HttpResponseStatus.OK,
+                S3Xml.initiateMultipartUploadResult(parts.bucket(), parts.key(), uploadId), requestId);
+    }
+
+    private void uploadPart(ChannelHandlerContext ctx, FullHttpRequest request, PathParts parts,
+                            QueryStringDecoder decoder, String requestId) {
+        requireKey(parts);
+        String uploadId = requiredQuery(decoder, "uploadId");
+        int partNumber = parseIntQuery(decoder, "partNumber");
+        if (partNumber < 1) {
+            throw new S3Exception(S3ErrorCode.INVALID_ARGUMENT, "partNumber must be >= 1");
+        }
+        String copySource = request.headers().get("x-amz-copy-source");
+        if (copySource != null && !copySource.isBlank()) {
+            uploadPartCopy(ctx, request, parts, uploadId, partNumber, copySource, requestId);
+            return;
+        }
+        byte[] body = bodyBytes(request);
+        if (body.length > config.maxObjectBytes()) {
+            // Per-part size: tracks the configured single-object cap until streaming lands.
+            throw new S3Exception(S3ErrorCode.ENTITY_TOO_LARGE,
+                    "Part exceeds the configured maximum of " + config.maxObjectBytes() + " bytes");
+        }
+        PartUploadInfo info = store.uploadPart(parts.bucket(), parts.key(), uploadId, partNumber,
+                body);
+        FullHttpResponse r = empty(HttpResponseStatus.OK);
+        r.headers().set(HttpHeaderNames.ETAG, Etag.of(info.crc32c()));
+        send(ctx, request, r, requestId);
+    }
+
+    /**
+     * Handles {@code PUT /b/k?partNumber=N&uploadId=…} with an {@code x-amz-copy-source} header
+     * (S3 UploadPartCopy). Source is required to be in the same Box; multi-Box copy is rejected
+     * with {@link S3ErrorCode#NOT_IMPLEMENTED}, matching the existing {@code CopyObject} rule.
+     */
+    private void uploadPartCopy(ChannelHandlerContext ctx, FullHttpRequest request, PathParts parts,
+                                String uploadId, int partNumber, String copySource, String requestId) {
+        PathParts src = PathParts.parse(stripLeadingSlash(uriDecode(copySource)));
+        if (src.bucket() == null || src.key() == null || src.key().isEmpty()) {
+            throw new S3Exception(S3ErrorCode.INVALID_ARGUMENT, "Malformed x-amz-copy-source");
+        }
+        if (!src.bucket().equals(parts.bucket())) {
+            throw new S3Exception(S3ErrorCode.NOT_IMPLEMENTED, "Cross-bucket UploadPartCopy is not supported");
+        }
+        String rangeHeader = request.headers().get("x-amz-copy-source-range");
+        long firstByte = -1;
+        long lastByte = -1;
+        if (rangeHeader != null && !rangeHeader.isBlank()) {
+            ParsedRange r = parseRange(rangeHeader);
+            if (r == null) {
+                throw new S3Exception(S3ErrorCode.INVALID_ARGUMENT,
+                        "Malformed x-amz-copy-source-range: " + rangeHeader);
+            }
+            firstByte = r.firstByte;
+            lastByte = r.lastByte;
+        }
+        PartUploadInfo info;
+        try {
+            info = store.uploadPartCopy(parts.bucket(), parts.key(), uploadId, partNumber,
+                    src.key(), firstByte, lastByte);
+        } catch (IllegalArgumentException e) {
+            throw new S3Exception(S3ErrorCode.INVALID_RANGE, e.getMessage(), e);
+        }
+        // S3 returns a CopyPartResult XML body for UploadPartCopy.
+        long lastModified = System.currentTimeMillis();
+        sendXml(ctx, request, HttpResponseStatus.OK,
+                S3Xml.copyPartResult(Etag.unquoted(info.crc32c()), lastModified), requestId);
+    }
+
+    private void completeMultipartUpload(ChannelHandlerContext ctx, FullHttpRequest request,
+                                         PathParts parts, QueryStringDecoder decoder,
+                                         String requestId) {
+        requireKey(parts);
+        String uploadId = requiredQuery(decoder, "uploadId");
+        byte[] body = bodyBytes(request);
+        S3RequestXml.CompleteMultipartUploadBody parsed = S3RequestXml.parseCompleteMultipart(body);
+        List<PartUploadInfo> partList = new ArrayList<>(parsed.parts().size());
+        for (S3RequestXml.CompletePart p : parsed.parts()) {
+            int crc = Etag.parseCrc32cHex(p.etag());
+            partList.add(new PartUploadInfo(p.partNumber(), crc, 0)); // length is server-known
+        }
+        CandyInfo info = store.completeMultipartUpload(parts.bucket(), parts.key(), uploadId,
+                partList);
+        String location = "/" + parts.bucket() + "/" + parts.key();
+        String etag = multipartEtag(partList.size(), info.crc32c());
+        sendXml(ctx, request, HttpResponseStatus.OK,
+                S3Xml.completeMultipartUploadResult(parts.bucket(), parts.key(), location, etag),
+                requestId);
+    }
+
+    /**
+     * Multipart ETag in Candybox's CRC32C-hex scheme: {@code <objectCrc>-N}. (S3's spec is
+     * {@code MD5(MD5||…)-N} but Candybox already returns CRC32C-hex ETags for single PUTs; we keep
+     * the family consistent.)
+     */
+    private static String multipartEtag(int partCount, int objectCrc32c) {
+        return Etag.unquoted(objectCrc32c) + "-" + partCount;
+    }
+
+    private void abortMultipartUpload(ChannelHandlerContext ctx, FullHttpRequest request,
+                                      PathParts parts, QueryStringDecoder decoder,
+                                      String requestId) {
+        requireKey(parts);
+        String uploadId = requiredQuery(decoder, "uploadId");
+        store.abortMultipartUpload(parts.bucket(), parts.key(), uploadId);
+        send(ctx, request, empty(HttpResponseStatus.NO_CONTENT), requestId);
+    }
+
+    private void listMultipartUploads(ChannelHandlerContext ctx, FullHttpRequest request,
+                                      String bucket, QueryStringDecoder decoder, String requestId) {
+        Map<String, List<String>> q = decoder.parameters();
+        String prefix = first(q, "prefix", "");
+        String keyMarker = first(q, "key-marker", null);
+        String uploadIdMarker = first(q, "upload-id-marker", null);
+        int maxUploads = clampMaxUploads(first(q, "max-uploads", null));
+
+        MultipartListing listing = store.listMultipartUploads(bucket, prefix, keyMarker,
+                uploadIdMarker, maxUploads);
+        List<S3Xml.UploadRow> rows = new ArrayList<>(listing.uploads().size());
+        for (UploadEntry u : listing.uploads()) {
+            rows.add(new S3Xml.UploadRow(u.key(), u.uploadId(), u.createdAtMillis()));
+        }
+        sendXml(ctx, request, HttpResponseStatus.OK,
+                S3Xml.listMultipartUploadsResult(bucket, prefix, keyMarker, uploadIdMarker,
+                        maxUploads, listing.isTruncated(), listing.nextKeyMarker(),
+                        listing.nextUploadIdMarker(), rows), requestId);
+    }
+
+    private void listParts(ChannelHandlerContext ctx, FullHttpRequest request, PathParts parts,
+                           QueryStringDecoder decoder, String requestId) {
+        requireKey(parts);
+        String uploadId = requiredQuery(decoder, "uploadId");
+        Map<String, List<String>> q = decoder.parameters();
+        int partNumberMarker;
+        try {
+            partNumberMarker = Integer.parseInt(first(q, "part-number-marker", "0"));
+        } catch (NumberFormatException e) {
+            throw new S3Exception(S3ErrorCode.INVALID_ARGUMENT, "Invalid part-number-marker");
+        }
+        int maxParts = clampMaxUploads(first(q, "max-parts", null));
+        PartListing listing = store.listParts(parts.bucket(), parts.key(), uploadId, partNumberMarker,
+                maxParts);
+        List<S3Xml.PartRow> rows = new ArrayList<>(listing.parts().size());
+        for (PartUploadInfo p : listing.parts()) {
+            rows.add(new S3Xml.PartRow(p.partNumber(), Etag.unquoted(p.crc32c()), p.partLength()));
+        }
+        sendXml(ctx, request, HttpResponseStatus.OK,
+                S3Xml.listPartsResult(parts.bucket(), parts.key(), uploadId, partNumberMarker,
+                        maxParts, listing.isTruncated(), listing.nextPartNumberMarker(), rows),
+                requestId);
+    }
+
+    private static int clampMaxUploads(String raw) {
+        if (raw == null) {
+            return DEFAULT_MAX_KEYS;
+        }
+        try {
+            int n = Integer.parseInt(raw);
+            if (n < 1) {
+                return DEFAULT_MAX_KEYS;
+            }
+            return Math.min(n, 1000);
+        } catch (NumberFormatException e) {
+            throw new S3Exception(S3ErrorCode.INVALID_ARGUMENT, "Invalid max-uploads/max-parts");
+        }
+    }
+
+    private static String requiredQuery(QueryStringDecoder decoder, String name) {
+        List<String> values = decoder.parameters().get(name);
+        if (values == null || values.isEmpty() || values.get(0).isEmpty()) {
+            throw new S3Exception(S3ErrorCode.INVALID_ARGUMENT, "Missing required query parameter "
+                    + name);
+        }
+        return values.get(0);
+    }
+
+    private static int parseIntQuery(QueryStringDecoder decoder, String name) {
+        try {
+            return Integer.parseInt(requiredQuery(decoder, name));
+        } catch (NumberFormatException e) {
+            throw new S3Exception(S3ErrorCode.INVALID_ARGUMENT, "Invalid " + name);
         }
     }
 

@@ -58,11 +58,12 @@ Tear it down with `docker compose down` (add `-v` to also wipe the data volumes)
 The gateway's S3 compatibility is verified against the industry-standard
 [`ceph/s3-tests`](https://github.com/ceph/s3-tests) suite — see
 [`compat/s3-tests/`](compat/s3-tests/) (`compat/s3-tests/run.sh --calibrate` against the running
-gateway). The latest calibration (suite ref `master` @ `5522d1c`, 2026-05-31) passes **149 / 838**
-tests; the remaining failures are the features the v1 gateway does not yet implement (versioning,
-multipart, ACLs, SSE, POST object, lifecycle, CORS — see
+gateway). The calibration in the project README reflects the **pre-multipart / pre-Range-GET**
+gateway; recalibrating after the Phase 5 additions (multipart upload, Range GET) is operational
+follow-up work. The remaining gaps the v1 gateway does not yet implement are versioning, ACLs,
+SSE, POST object, lifecycle, CORS — see
 [`compat/s3-tests/README.md`](compat/s3-tests/README.md#latest-calibration) for the family-by-family
-breakdown).
+breakdown.
 
 ## Storing and retrieving objects
 
@@ -88,6 +89,15 @@ candybox help                           # full command list
 `put` reads from a file or, if you omit the path, from standard input; `get` writes to a file or to
 standard output. Programmatically, the same operations are available through the `CandyboxClient`
 class in the `candybox-client` module.
+
+### Range GET and multipart upload
+
+Object reads accept HTTP `Range: bytes=A-B` (also `bytes=A-` and `bytes=-N`) and return 206
+Partial Content with the right `Content-Range`; multi-range requests are rejected. Multipart upload
+is fully wired through the S3 gateway: `CreateMultipartUpload` / `UploadPart` / `CompleteMultipart`
+/ `AbortMultipartUpload` plus `UploadPartCopy` and `ListMultipartUploads` / `ListParts`. Background
+TTL sweeps abandon stale uploads after `multipart.upload.ttl.millis` (7 days by default).
+See [`MULTIPART_RANGE_PLAN.md`](MULTIPART_RANGE_PLAN.md) for the design.
 
 ### Operations the sorted LSM tree makes cheap
 

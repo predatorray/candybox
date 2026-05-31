@@ -23,6 +23,7 @@ import java.util.Map;
 import me.predatorray.candybox.common.CandyLocator;
 import me.predatorray.candybox.common.Hlc;
 import me.predatorray.candybox.common.LocatorType;
+import me.predatorray.candybox.common.Part;
 import me.predatorray.candybox.common.SegmentRef;
 import me.predatorray.candybox.common.exception.LimitExceededException;
 import org.junit.jupiter.api.Test;
@@ -30,10 +31,9 @@ import org.junit.jupiter.api.Test;
 class CandyLocatorSerializerTest {
 
     @Test
-    void roundTripsPutLocator() {
-        CandyLocator locator = new CandyLocator(
+    void roundTripsSinglePartPutLocator() {
+        CandyLocator locator = CandyLocator.singlePart(
                 new Hlc(123456789L, 3, 5),
-                LocatorType.PUT,
                 2_500_000L,
                 1 << 20,
                 "application/octet-stream",
@@ -46,6 +46,26 @@ class CandyLocatorSerializerTest {
         CandyLocator decoded = CandyLocatorSerializer.deserialize(encoded);
 
         assertThat(decoded).isEqualTo(locator);
+        assertThat(decoded.parts()).hasSize(1);
+        assertThat(decoded.contentLength()).isEqualTo(2_500_000L);
+        assertThat(decoded.segments()).hasSize(2);
+    }
+
+    @Test
+    void roundTripsMultipartPutLocator() {
+        Part p1 = new Part(5L << 20, 1 << 20, 0xaaaaaaaa, List.of(new SegmentRef(20, 0, 4)));
+        Part p2 = new Part(2L << 20, 1 << 20, 0xbbbbbbbb, List.of(new SegmentRef(21, 0, 1)));
+        Part p3 = new Part(123L, 1 << 20, 0xcccccccc, List.of(new SegmentRef(21, 2, 2)));
+        CandyLocator locator = new CandyLocator(new Hlc(42, 7, 1), LocatorType.PUT,
+                "image/png", Map.of("x", "y"), 1000L, List.of(p1, p2, p3));
+
+        byte[] encoded = CandyLocatorSerializer.serialize(locator);
+        CandyLocator decoded = CandyLocatorSerializer.deserialize(encoded);
+
+        assertThat(decoded).isEqualTo(locator);
+        assertThat(decoded.parts()).hasSize(3);
+        assertThat(decoded.contentLength()).isEqualTo((5L << 20) + (2L << 20) + 123L);
+        assertThat(decoded.segments()).hasSize(3); // flattened across parts
     }
 
     @Test
@@ -55,6 +75,7 @@ class CandyLocatorSerializerTest {
         CandyLocator decoded = CandyLocatorSerializer.deserialize(encoded);
 
         assertThat(decoded.isTombstone()).isTrue();
+        assertThat(decoded.parts()).isEmpty();
         assertThat(decoded.segments()).isEmpty();
         assertThat(decoded).isEqualTo(tombstone);
     }
@@ -66,7 +87,7 @@ class CandyLocatorSerializerTest {
         for (int i = 0; i < 500; i++) {
             big.append("xxxxxxxx");
         }
-        CandyLocator locator = new CandyLocator(new Hlc(1, 0, 0), LocatorType.PUT, 1, 1,
+        CandyLocator locator = CandyLocator.singlePart(new Hlc(1, 0, 0), 1, 1,
                 null, Map.of("k", big.toString()), 0, 0, List.of(new SegmentRef(1, 0, 0)));
 
         assertThatThrownBy(() -> CandyLocatorSerializer.serialize(locator, 256))

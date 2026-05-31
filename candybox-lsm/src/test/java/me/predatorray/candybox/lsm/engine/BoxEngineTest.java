@@ -77,6 +77,124 @@ class BoxEngineTest {
     }
 
     @Test
+    void multipartUploadAssemblesPartsAtCompleteAndIsReadableLikeASinglePut() {
+        // Pin partMin low so the test's small parts are legal.
+        CandyboxConfig cfg = CandyboxConfig.builder().multipartMinPartBytes(1).build();
+        engine = BoxEngine.createNew(box, cfg, store, 1, new ManualClock(1000), 1L);
+
+        String uploadId = engine.createMultipartUpload(CandyKey.of("big.bin"), "application/octet-stream",
+                java.util.Map.of("k", "v"));
+        BoxEngine.PartUploadResult p1 = engine.uploadPart(uploadId, 1, bytes("hello "));
+        BoxEngine.PartUploadResult p2 = engine.uploadPart(uploadId, 2, bytes("candy"));
+        BoxEngine.PartUploadResult p3 = engine.uploadPart(uploadId, 3, bytes("box"));
+
+        CandyMetadata meta = engine.completeMultipartUpload(uploadId, java.util.List.of(
+                new BoxEngine.PartCompletion(1, p1.crc32c()),
+                new BoxEngine.PartCompletion(2, p2.crc32c()),
+                new BoxEngine.PartCompletion(3, p3.crc32c())), null);
+        assertThat(meta.contentLength()).isEqualTo(14);
+        assertThat(meta.contentType()).isEqualTo("application/octet-stream");
+        assertThat(meta.userMetadata()).containsEntry("k", "v");
+
+        // Full GET round-trips the concatenation.
+        assertThat(engine.getCandy(CandyKey.of("big.bin"))).isEqualTo(bytes("hello candybox"));
+        // Range GET works across part boundaries (part1 ends at byte 5).
+        java.io.ByteArrayOutputStream cross = new java.io.ByteArrayOutputStream();
+        engine.getCandyRange(CandyKey.of("big.bin"), 5, 7, cross);
+        assertThat(cross.toByteArray()).isEqualTo(bytes(" ca"));
+        // The upload record was dropped on Complete.
+        assertThat(engine.multipartUpload(uploadId)).isNull();
+    }
+
+    @Test
+    void completeWithMismatchedCrcIsRejected() {
+        CandyboxConfig cfg = CandyboxConfig.builder().multipartMinPartBytes(1).build();
+        engine = BoxEngine.createNew(box, cfg, store, 1, new ManualClock(1000), 1L);
+
+        String uploadId = engine.createMultipartUpload(CandyKey.of("k"), null, java.util.Map.of());
+        BoxEngine.PartUploadResult p1 = engine.uploadPart(uploadId, 1, bytes("payload"));
+        assertThatThrownBy(() -> engine.completeMultipartUpload(uploadId, java.util.List.of(
+                new BoxEngine.PartCompletion(1, p1.crc32c() ^ 0x1)), null))
+                .isInstanceOf(ValidationException.class);
+        // Upload is still in flight after a failed Complete.
+        assertThat(engine.multipartUpload(uploadId)).isNotNull();
+    }
+
+    @Test
+    void uploadPartCopySlicesABytesRangeIntoAnInFlightUpload() {
+        CandyboxConfig cfg = CandyboxConfig.builder().multipartMinPartBytes(1).build();
+        engine = BoxEngine.createNew(box, cfg, store, 1, new ManualClock(1000), 1L);
+        engine.putCandy(CandyKey.of("src"), bytes("hello candybox"), null, java.util.Map.of(), null);
+
+        String uploadId = engine.createMultipartUpload(CandyKey.of("dst"), null, java.util.Map.of());
+        BoxEngine.PartUploadResult copied = engine.uploadPartCopy(uploadId, 1,
+                CandyKey.of("src"), 6, 13); // "candybox"
+        assertThat(copied.partLength()).isEqualTo(8);
+        engine.completeMultipartUpload(uploadId, java.util.List.of(
+                new BoxEngine.PartCompletion(1, copied.crc32c())), null);
+        assertThat(engine.getCandy(CandyKey.of("dst"))).isEqualTo(bytes("candybox"));
+    }
+
+    @Test
+    void abortMultipartUploadIsIdempotentAndDropsTheRecord() {
+        engine = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1, new ManualClock(1000), 1L);
+        String uploadId = engine.createMultipartUpload(CandyKey.of("k"), null, java.util.Map.of());
+        engine.uploadPart(uploadId, 1, bytes("part1"));
+
+        engine.abortMultipartUpload(uploadId);
+        assertThat(engine.multipartUpload(uploadId)).isNull();
+        // Second abort is a no-op (mirrors S3 DELETE idempotency).
+        engine.abortMultipartUpload(uploadId);
+    }
+
+    @Test
+    void completeRejectsPartBelowMinimumExceptLast() {
+        CandyboxConfig cfg = CandyboxConfig.builder().multipartMinPartBytes(8).build();
+        engine = BoxEngine.createNew(box, cfg, store, 1, new ManualClock(1000), 1L);
+        String uploadId = engine.createMultipartUpload(CandyKey.of("k"), null, java.util.Map.of());
+        BoxEngine.PartUploadResult tiny = engine.uploadPart(uploadId, 1, bytes("hi"));     // < 8 bytes
+        BoxEngine.PartUploadResult big = engine.uploadPart(uploadId, 2, bytes("biggerthan8byte"));
+        assertThatThrownBy(() -> engine.completeMultipartUpload(uploadId, java.util.List.of(
+                new BoxEngine.PartCompletion(1, tiny.crc32c()),
+                new BoxEngine.PartCompletion(2, big.crc32c())), null))
+                .isInstanceOf(ValidationException.class)
+                .hasMessageContaining("below the multipart minimum");
+    }
+
+    @Test
+    void rangeGetReturnsSliceOfStoredCandy() {
+        engine = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1, new ManualClock(1000), 1L);
+        engine.putCandy(CandyKey.of("hello"), bytes("hello candybox"), null, Map.of(), null);
+
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        BoxEngine.RangeReadResult r = engine.getCandyRange(CandyKey.of("hello"), 6, 9, out);
+        assertThat(out.toByteArray()).isEqualTo(bytes("cand"));
+        assertThat(r.firstByte()).isEqualTo(6);
+        assertThat(r.lastByte()).isEqualTo(9);
+        assertThat(r.totalLength()).isEqualTo(14);
+        assertThat(r.contentLength()).isEqualTo(4);
+
+        // Open-ended "bytes=6-": lastByte < 0 means "to end".
+        java.io.ByteArrayOutputStream toEnd = new java.io.ByteArrayOutputStream();
+        BoxEngine.RangeReadResult re = engine.getCandyRange(CandyKey.of("hello"), 6, -1, toEnd);
+        assertThat(toEnd.toByteArray()).isEqualTo(bytes("candybox"));
+        assertThat(re.firstByte()).isEqualTo(6);
+        assertThat(re.lastByte()).isEqualTo(13);
+
+        // Suffix "bytes=-3".
+        java.io.ByteArrayOutputStream suffix = new java.io.ByteArrayOutputStream();
+        BoxEngine.RangeReadResult rs = engine.getCandyRange(CandyKey.of("hello"), -1, 3, suffix);
+        assertThat(suffix.toByteArray()).isEqualTo(bytes("box"));
+        assertThat(rs.firstByte()).isEqualTo(11);
+        assertThat(rs.lastByte()).isEqualTo(13);
+
+        // Out-of-range request → InvalidRange (IllegalArgumentException).
+        java.io.ByteArrayOutputStream sink = new java.io.ByteArrayOutputStream();
+        assertThatThrownBy(() -> engine.getCandyRange(CandyKey.of("hello"), 100, 200, sink))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
     void overwriteReturnsLatestValueAcrossLevels() {
         engine = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1, new ManualClock(1000), 1L);
         engine.putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);

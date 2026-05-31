@@ -37,6 +37,14 @@ final class S3RequestXml {
     record DeleteRequest(List<String> keys, boolean quiet) {
     }
 
+    /** One {@code <Part>} element of a {@code CompleteMultipartUpload} body. */
+    record CompletePart(int partNumber, String etag) {
+    }
+
+    /** A parsed {@code CompleteMultipartUpload} body: ordered list of {@code (partNumber, etag)}. */
+    record CompleteMultipartUploadBody(List<CompletePart> parts) {
+    }
+
     private static final XMLInputFactory INPUT_FACTORY = hardenedInputFactory();
 
     private S3RequestXml() {
@@ -73,6 +81,52 @@ final class S3RequestXml {
             return new DeleteRequest(keys, quiet);
         } catch (XMLStreamException e) {
             throw new S3Exception(S3ErrorCode.MALFORMED_XML, "Malformed DeleteObjects body", e);
+        } finally {
+            closeQuietly(reader);
+        }
+    }
+
+    /**
+     * Parses a {@code <CompleteMultipartUpload>} body. Returns a strictly-ordered list of parts;
+     * order matters for the spec and the engine validates it again server-side.
+     */
+    static CompleteMultipartUploadBody parseCompleteMultipart(byte[] body) {
+        List<CompletePart> parts = new ArrayList<>();
+        XMLStreamReader reader = null;
+        try {
+            reader = INPUT_FACTORY.createXMLStreamReader(new ByteArrayInputStream(body));
+            int currentPartNumber = -1;
+            String currentEtag = null;
+            while (reader.hasNext()) {
+                int event = reader.next();
+                if (event == XMLStreamConstants.START_ELEMENT) {
+                    switch (reader.getLocalName()) {
+                        case "PartNumber" -> currentPartNumber =
+                                Integer.parseInt(reader.getElementText().trim());
+                        case "ETag" -> currentEtag = reader.getElementText().trim();
+                        default -> { /* descend; <Part>/<CompleteMultipartUpload> are containers. */ }
+                    }
+                } else if (event == XMLStreamConstants.END_ELEMENT
+                        && "Part".equals(reader.getLocalName())) {
+                    if (currentPartNumber < 0) {
+                        throw new S3Exception(S3ErrorCode.MALFORMED_XML,
+                                "<Part> missing PartNumber");
+                    }
+                    parts.add(new CompletePart(currentPartNumber, currentEtag));
+                    currentPartNumber = -1;
+                    currentEtag = null;
+                }
+            }
+            if (parts.isEmpty()) {
+                throw new S3Exception(S3ErrorCode.MALFORMED_XML,
+                        "CompleteMultipartUpload requires at least one <Part>");
+            }
+            return new CompleteMultipartUploadBody(parts);
+        } catch (NumberFormatException e) {
+            throw new S3Exception(S3ErrorCode.MALFORMED_XML, "Invalid PartNumber", e);
+        } catch (XMLStreamException e) {
+            throw new S3Exception(S3ErrorCode.MALFORMED_XML, "Malformed CompleteMultipartUpload body",
+                    e);
         } finally {
             closeQuietly(reader);
         }

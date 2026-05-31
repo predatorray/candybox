@@ -41,6 +41,10 @@ public final class CandyboxConfig {
     private final long ledgerGcGraceMillis;
     private final int l0CompactionTrigger;
     private final int l0StallThreshold;
+    private final long multipartMinPartBytes;
+    private final int multipartMaxParts;
+    private final long multipartUploadTtlMillis;
+    private final int multipartMaxConcurrentUploadsPerBox;
 
     private CandyboxConfig(Builder b) {
         this.sizeLimits = b.sizeLimits;
@@ -58,6 +62,10 @@ public final class CandyboxConfig {
         this.ledgerGcGraceMillis = b.ledgerGcGraceMillis;
         this.l0CompactionTrigger = b.l0CompactionTrigger;
         this.l0StallThreshold = b.l0StallThreshold;
+        this.multipartMinPartBytes = b.multipartMinPartBytes;
+        this.multipartMaxParts = b.multipartMaxParts;
+        this.multipartUploadTtlMillis = b.multipartUploadTtlMillis;
+        this.multipartMaxConcurrentUploadsPerBox = b.multipartMaxConcurrentUploadsPerBox;
     }
 
     public static CandyboxConfig defaults() {
@@ -134,6 +142,26 @@ public final class CandyboxConfig {
         return l0StallThreshold;
     }
 
+    /** Minimum size of every part of a multipart upload except the last (S3-style). */
+    public long multipartMinPartBytes() {
+        return multipartMinPartBytes;
+    }
+
+    /** Maximum number of parts in a single multipart upload (S3 caps at 10,000). */
+    public int multipartMaxParts() {
+        return multipartMaxParts;
+    }
+
+    /** How long a pending multipart upload may remain before the background sweeper aborts it. */
+    public long multipartUploadTtlMillis() {
+        return multipartUploadTtlMillis;
+    }
+
+    /** Hard cap on the number of in-flight multipart uploads per Box. */
+    public int multipartMaxConcurrentUploadsPerBox() {
+        return multipartMaxConcurrentUploadsPerBox;
+    }
+
     public static final class Builder {
         private SizeLimits sizeLimits = SizeLimits.defaults();
         private Map<LedgerRole, QuorumConfig> quorums = new EnumMap<>(QuorumConfig.defaults());
@@ -150,6 +178,10 @@ public final class CandyboxConfig {
         private long ledgerGcGraceMillis = 300_000L;           // 5 min before deleting obsolete ledgers
         private int l0CompactionTrigger = 4;
         private int l0StallThreshold = 12;
+        private long multipartMinPartBytes = 5L << 20;                  // 5 MiB (S3 parity)
+        private int multipartMaxParts = 10_000;                         // S3 cap
+        private long multipartUploadTtlMillis = 7L * 24 * 3600 * 1000;  // 7 days
+        private int multipartMaxConcurrentUploadsPerBox = 10_000;       // defensive ceiling
 
         public Builder sizeLimits(SizeLimits v) {
             this.sizeLimits = v;
@@ -226,9 +258,35 @@ public final class CandyboxConfig {
             return this;
         }
 
+        public Builder multipartMinPartBytes(long v) {
+            this.multipartMinPartBytes = v;
+            return this;
+        }
+
+        public Builder multipartMaxParts(int v) {
+            this.multipartMaxParts = v;
+            return this;
+        }
+
+        public Builder multipartUploadTtlMillis(long v) {
+            this.multipartUploadTtlMillis = v;
+            return this;
+        }
+
+        public Builder multipartMaxConcurrentUploadsPerBox(int v) {
+            this.multipartMaxConcurrentUploadsPerBox = v;
+            return this;
+        }
+
         public CandyboxConfig build() {
             if (l0StallThreshold < l0CompactionTrigger) {
                 throw new IllegalArgumentException("l0StallThreshold must be >= l0CompactionTrigger");
+            }
+            if (multipartMinPartBytes < 0) {
+                throw new IllegalArgumentException("multipartMinPartBytes must be non-negative");
+            }
+            if (multipartMaxParts < 1) {
+                throw new IllegalArgumentException("multipartMaxParts must be positive");
             }
             return new CandyboxConfig(this);
         }

@@ -26,11 +26,14 @@ import me.predatorray.candybox.common.exception.BusyException;
 import me.predatorray.candybox.common.exception.CandyNotFoundException;
 import me.predatorray.candybox.common.exception.CandyboxException;
 import me.predatorray.candybox.common.exception.NotOwnerException;
+import me.predatorray.candybox.common.exception.ValidationException;
 import me.predatorray.candybox.lsm.engine.BoxEngine;
 import me.predatorray.candybox.lsm.engine.CandyMetadata;
+import me.predatorray.candybox.common.Part;
 import me.predatorray.candybox.lsm.engine.ListResult;
 import me.predatorray.candybox.lsm.engine.ScanDirection;
 import me.predatorray.candybox.lsm.engine.ScanQuery;
+import me.predatorray.candybox.lsm.manifest.MultipartUploadState;
 import me.predatorray.candybox.protocol.Frame;
 import me.predatorray.candybox.protocol.Message;
 import me.predatorray.candybox.protocol.MessageCodec;
@@ -99,6 +102,8 @@ final class NodeRequestHandler implements RequestHandler {
             return m.box();
         } else if (message instanceof Message.GetCandyRequest m) {
             return m.box();
+        } else if (message instanceof Message.RangeGetCandyRequest m) {
+            return m.box();
         } else if (message instanceof Message.HeadCandyRequest m) {
             return m.box();
         } else if (message instanceof Message.DeleteCandyRequest m) {
@@ -114,6 +119,20 @@ final class NodeRequestHandler implements RequestHandler {
         } else if (message instanceof Message.DeleteBoxRequest m) {
             return m.box();
         } else if (message instanceof Message.HeadBoxRequest m) {
+            return m.box();
+        } else if (message instanceof Message.CreateMultipartUploadRequest m) {
+            return m.box();
+        } else if (message instanceof Message.UploadPartRequest m) {
+            return m.box();
+        } else if (message instanceof Message.CompleteMultipartUploadRequest m) {
+            return m.box();
+        } else if (message instanceof Message.AbortMultipartUploadRequest m) {
+            return m.box();
+        } else if (message instanceof Message.ListMultipartUploadsRequest m) {
+            return m.box();
+        } else if (message instanceof Message.ListPartsRequest m) {
+            return m.box();
+        } else if (message instanceof Message.UploadPartCopyRequest m) {
             return m.box();
         }
         return null;
@@ -137,6 +156,19 @@ final class NodeRequestHandler implements RequestHandler {
             CandyMetadata meta = engine.getCandy(CandyKey.of(m.key()), out);
             return new Message.CandyDataResponse(meta.contentLength(), meta.contentType(),
                     meta.userMetadata(), meta.crc32c(), out.toByteArray());
+        } else if (message instanceof Message.RangeGetCandyRequest m) {
+            BoxEngine engine = node.engine(BoxName.of(m.box()));
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            BoxEngine.RangeReadResult result;
+            try {
+                result = engine.getCandyRange(CandyKey.of(m.key()), m.firstByte(), m.lastByte(), out);
+            } catch (IllegalArgumentException e) {
+                // S3's InvalidRange — surface as a typed error the gateway can map to 416.
+                throw new ValidationException("InvalidRange: " + e.getMessage());
+            }
+            CandyMetadata meta = result.metadata();
+            return new Message.CandyDataResponse(result.contentLength(), result.totalLength(),
+                    meta.contentType(), meta.userMetadata(), meta.crc32c(), out.toByteArray());
         } else if (message instanceof Message.HeadCandyRequest m) {
             BoxEngine engine = node.engine(BoxName.of(m.box()));
             CandyMetadata meta = engine.headCandy(CandyKey.of(m.key()));
@@ -181,6 +213,86 @@ final class NodeRequestHandler implements RequestHandler {
             return node.boxExists(BoxName.of(m.box()))
                     ? new Message.OkResponse()
                     : new Message.NotFoundResponse();
+        } else if (message instanceof Message.CreateMultipartUploadRequest m) {
+            BoxEngine engine = node.engine(BoxName.of(m.box()));
+            String uploadId = engine.createMultipartUpload(CandyKey.of(m.key()), m.contentType(),
+                    m.userMetadata());
+            return new Message.CreateMultipartUploadResponse(uploadId);
+        } else if (message instanceof Message.UploadPartRequest m) {
+            BoxEngine engine = node.engine(BoxName.of(m.box()));
+            BoxEngine.PartUploadResult r = engine.uploadPart(m.uploadId(), m.partNumber(), m.data());
+            return new Message.UploadPartResponse(r.crc32c(), r.partLength());
+        } else if (message instanceof Message.CompleteMultipartUploadRequest m) {
+            BoxEngine engine = node.engine(BoxName.of(m.box()));
+            java.util.List<BoxEngine.PartCompletion> parts = new java.util.ArrayList<>(m.parts().size());
+            for (Message.CompletedPart p : m.parts()) {
+                parts.add(new BoxEngine.PartCompletion(p.partNumber(), p.crc32c()));
+            }
+            CandyMetadata meta = engine.completeMultipartUpload(m.uploadId(), parts, m.idempotencyToken());
+            return new Message.HeadCandyResponse(meta.contentLength(), meta.contentType(),
+                    meta.userMetadata(), meta.crc32c(), meta.createdAtMillis());
+        } else if (message instanceof Message.AbortMultipartUploadRequest m) {
+            node.engine(BoxName.of(m.box())).abortMultipartUpload(m.uploadId());
+            return new Message.OkResponse();
+        } else if (message instanceof Message.ListMultipartUploadsRequest m) {
+            BoxEngine engine = node.engine(BoxName.of(m.box()));
+            java.util.List<Message.InProgressUpload> rows = new java.util.ArrayList<>();
+            String prefix = m.prefix() == null ? "" : m.prefix();
+            int limit = m.maxUploads() <= 0 ? 1000 : m.maxUploads();
+            String nextKey = null;
+            String nextUpl = null;
+            for (MultipartUploadState u : engine.listMultipartUploads()) {
+                if (!prefix.isEmpty() && !u.key().startsWith(prefix)) {
+                    continue;
+                }
+                if (m.keyMarker() != null && u.key().compareTo(m.keyMarker()) < 0) {
+                    continue;
+                }
+                if (m.keyMarker() != null && u.key().equals(m.keyMarker())
+                        && m.uploadIdMarker() != null
+                        && u.uploadId().compareTo(m.uploadIdMarker()) <= 0) {
+                    continue;
+                }
+                if (rows.size() == limit) {
+                    nextKey = u.key();
+                    nextUpl = u.uploadId();
+                    break;
+                }
+                rows.add(new Message.InProgressUpload(u.uploadId(), u.key(), u.createdAtMillis()));
+            }
+            return new Message.ListMultipartUploadsResponse(rows, nextKey, nextUpl);
+        } else if (message instanceof Message.ListPartsRequest m) {
+            BoxEngine engine = node.engine(BoxName.of(m.box()));
+            MultipartUploadState upload = engine.multipartUpload(m.uploadId());
+            if (upload == null) {
+                return new Message.NotFoundResponse();
+            }
+            int marker = m.partNumberMarker();
+            int limit = m.maxParts() <= 0 ? 1000 : m.maxParts();
+            java.util.List<Message.UploadedPart> rows = new java.util.ArrayList<>();
+            int next = 0;
+            for (java.util.Map.Entry<Integer, Part> e : upload.parts().entrySet()) {
+                int pn = e.getKey();
+                if (pn <= marker) {
+                    continue;
+                }
+                if (rows.size() == limit) {
+                    next = pn - 1; // continuation cursor (exclusive in S3 ListParts)
+                    break;
+                }
+                Part p = e.getValue();
+                rows.add(new Message.UploadedPart(pn, p.partLength(), p.crc32c()));
+            }
+            return new Message.ListPartsResponse(rows, next);
+        } else if (message instanceof Message.UploadPartCopyRequest m) {
+            BoxEngine engine = node.engine(BoxName.of(m.box()));
+            try {
+                BoxEngine.PartUploadResult r = engine.uploadPartCopy(m.uploadId(), m.partNumber(),
+                        CandyKey.of(m.srcKey()), m.firstByte(), m.lastByte());
+                return new Message.UploadPartResponse(r.crc32c(), r.partLength());
+            } catch (IllegalArgumentException e) {
+                throw new ValidationException("InvalidRange: " + e.getMessage());
+            }
         }
         return new Message.ErrorResponse("UnsupportedOperation",
                 "Not implemented in this phase: " + message.opcode());

@@ -183,6 +183,115 @@ final class S3Xml {
         });
     }
 
+    /** Response body for {@code POST /b/k?uploads}. */
+    static String initiateMultipartUploadResult(String bucket, String key, String uploadId) {
+        return doc(w -> {
+            root(w, "InitiateMultipartUploadResult");
+            el(w, "Bucket", bucket);
+            el(w, "Key", key);
+            el(w, "UploadId", uploadId);
+            w.writeEndElement();
+        });
+    }
+
+    /** Response body for {@code POST /b/k?uploadId=…}. */
+    static String completeMultipartUploadResult(String bucket, String key, String location,
+                                                String etag) {
+        return doc(w -> {
+            root(w, "CompleteMultipartUploadResult");
+            el(w, "Location", location);
+            el(w, "Bucket", bucket);
+            el(w, "Key", key);
+            el(w, "ETag", '"' + etag + '"');
+            w.writeEndElement();
+        });
+    }
+
+    /** Response body for {@code GET /b/?uploads}. */
+    static String listMultipartUploadsResult(String bucket, String prefix, String keyMarker,
+                                             String uploadIdMarker, int maxUploads,
+                                             boolean truncated, String nextKeyMarker,
+                                             String nextUploadIdMarker,
+                                             List<UploadRow> uploads) {
+        return doc(w -> {
+            root(w, "ListMultipartUploadsResult");
+            el(w, "Bucket", bucket);
+            if (keyMarker != null) {
+                el(w, "KeyMarker", keyMarker);
+            } else {
+                el(w, "KeyMarker", "");
+            }
+            if (uploadIdMarker != null) {
+                el(w, "UploadIdMarker", uploadIdMarker);
+            } else {
+                el(w, "UploadIdMarker", "");
+            }
+            if (nextKeyMarker != null) {
+                el(w, "NextKeyMarker", nextKeyMarker);
+            }
+            if (nextUploadIdMarker != null) {
+                el(w, "NextUploadIdMarker", nextUploadIdMarker);
+            }
+            if (prefix != null && !prefix.isEmpty()) {
+                el(w, "Prefix", prefix);
+            }
+            el(w, "MaxUploads", Integer.toString(maxUploads));
+            el(w, "IsTruncated", Boolean.toString(truncated));
+            for (UploadRow u : uploads) {
+                w.writeStartElement("Upload");
+                el(w, "Key", u.key());
+                el(w, "UploadId", u.uploadId());
+                el(w, "Initiated", ISO8601.format(Instant.ofEpochMilli(u.createdAtMillis())));
+                w.writeEndElement();
+            }
+            w.writeEndElement();
+        });
+    }
+
+    /** Response body for {@code GET /b/k?uploadId=…}. */
+    static String listPartsResult(String bucket, String key, String uploadId, int partNumberMarker,
+                                  int maxParts, boolean truncated, int nextPartNumberMarker,
+                                  List<PartRow> parts) {
+        return doc(w -> {
+            root(w, "ListPartsResult");
+            el(w, "Bucket", bucket);
+            el(w, "Key", key);
+            el(w, "UploadId", uploadId);
+            el(w, "PartNumberMarker", Integer.toString(partNumberMarker));
+            if (truncated) {
+                el(w, "NextPartNumberMarker", Integer.toString(nextPartNumberMarker));
+            }
+            el(w, "MaxParts", Integer.toString(maxParts));
+            el(w, "IsTruncated", Boolean.toString(truncated));
+            for (PartRow p : parts) {
+                w.writeStartElement("Part");
+                el(w, "PartNumber", Integer.toString(p.partNumber()));
+                el(w, "ETag", '"' + p.etag() + '"');
+                el(w, "Size", Long.toString(p.size()));
+                w.writeEndElement();
+            }
+            w.writeEndElement();
+        });
+    }
+
+    /** One row inside a {@link #listMultipartUploadsResult}. */
+    record UploadRow(String key, String uploadId, long createdAtMillis) {
+    }
+
+    /** One row inside a {@link #listPartsResult}. */
+    record PartRow(int partNumber, String etag, long size) {
+    }
+
+    /** Response body for {@code PUT /b/k?partNumber=…} with {@code x-amz-copy-source}. */
+    static String copyPartResult(String etag, long lastModifiedMillis) {
+        return doc(w -> {
+            root(w, "CopyPartResult");
+            el(w, "LastModified", ISO8601.format(Instant.ofEpochMilli(lastModifiedMillis)));
+            el(w, "ETag", '"' + etag + '"');
+            w.writeEndElement();
+        });
+    }
+
     static String copyObjectResult(String etag, long lastModifiedMillis) {
         return doc(w -> {
             w.writeStartElement("CopyObjectResult");

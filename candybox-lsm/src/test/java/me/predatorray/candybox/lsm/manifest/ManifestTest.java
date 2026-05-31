@@ -49,10 +49,54 @@ class ManifestTest {
 
     @Test
     void editsSerializeAndReplayRoundTripIncludingToken() {
-        ManifestEdit edit = new ManifestEdit(List.of(table(1, 0), table(2, 1)),
-                Set.of(99L), Set.of(7L), Set.of(8L), 5L, 3L);
+        ManifestEdit edit = ManifestEdit.builder()
+                .addedTables(List.of(table(1, 0), table(2, 1)))
+                .removedTableLedgerIds(Set.of(99L))
+                .addedSyrups(Set.of(7L))
+                .removedSyrups(Set.of(8L))
+                .newWalLedgerId(5L)
+                .ownerFencingToken(3L)
+                .build();
         byte[] bytes = ManifestSerializer.serialize(edit);
         assertThat(ManifestSerializer.deserialize(bytes)).isEqualTo(edit);
+    }
+
+    @Test
+    void multipartUploadsRoundTripThroughTheManifest() {
+        java.util.Map<Integer, me.predatorray.candybox.common.Part> initialParts = new java.util.LinkedHashMap<>();
+        MultipartUploadState created = new MultipartUploadState("upl-1", "obj/key", "image/png",
+                java.util.Map.of("k", "v"), 12345L, initialParts);
+        me.predatorray.candybox.common.Part part42 = new me.predatorray.candybox.common.Part(
+                5L << 20, 1 << 20, 0xabcd1234,
+                List.of(new me.predatorray.candybox.common.SegmentRef(77, 0, 4)));
+
+        ManifestEdit createEdit = ManifestEdit.builder().addUpload(created).build();
+        byte[] cb = ManifestSerializer.serialize(createEdit);
+        assertThat(ManifestSerializer.deserialize(cb)).isEqualTo(createEdit);
+
+        ManifestEdit partEdit = ManifestEdit.builder().addPartUpsert("upl-1", 42, part42).build();
+        byte[] pb = ManifestSerializer.serialize(partEdit);
+        assertThat(ManifestSerializer.deserialize(pb)).isEqualTo(partEdit);
+
+        ManifestEdit dropEdit = ManifestEdit.builder().removedUploads(Set.of("upl-1")).build();
+        byte[] db = ManifestSerializer.serialize(dropEdit);
+        assertThat(ManifestSerializer.deserialize(db)).isEqualTo(dropEdit);
+
+        // Apply Create + UploadPart and verify the in-memory state shows the part recorded.
+        Manifest m = Manifest.createNew(store, cfg, 1L);
+        m.apply(createEdit);
+        m.apply(partEdit);
+        assertThat(m.current().multipartUploads()).containsKey("upl-1");
+        assertThat(m.current().multipartUploads().get("upl-1").parts()).containsKey(42);
+        assertThat(m.current().multipartReferencedSyrups()).contains(77L);
+
+        // Recover into a new manifest ledger and confirm the in-flight upload survived handover.
+        long prior = m.ledgerId();
+        m.close();
+        Manifest recovered = Manifest.recover(store, cfg, prior, 2L);
+        assertThat(recovered.current().multipartUploads()).containsKey("upl-1");
+        assertThat(recovered.current().multipartUploads().get("upl-1").parts()).containsKey(42);
+        recovered.close();
     }
 
     @Test

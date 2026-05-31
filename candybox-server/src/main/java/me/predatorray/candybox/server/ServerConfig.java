@@ -259,6 +259,11 @@ public final class ServerConfig {
             applyInt("max.frame.size.bytes", b::maxFrameSizeBytes);
             applyInt("l0.compaction.trigger", b::l0CompactionTrigger);
             applyInt("l0.stall.threshold", b::l0StallThreshold);
+            applyLong("multipart.min.part.bytes", b::multipartMinPartBytes);
+            applyInt("multipart.max.parts", b::multipartMaxParts);
+            applyLong("multipart.upload.ttl.millis", b::multipartUploadTtlMillis);
+            applyInt("multipart.max.concurrent.uploads.per.box",
+                    b::multipartMaxConcurrentUploadsPerBox);
             // Per-role BookKeeper quorum overrides, "E/Qw/Qa" (e.g. 1/1/1 for a single-bookie dev box).
             applyQuorum("quorum.wal", LedgerRole.WAL, b);
             applyQuorum("quorum.manifest", LedgerRole.MANIFEST, b);

@@ -7,8 +7,11 @@ Status: **v1 implemented** (module `candybox-s3-gateway`) · Last updated: 2026-
 > (same-bucket), batch `DeleteObjects`, `ListObjectsV2`/V1 with delimiter rollup + continuation tokens,
 > deterministic CRC32C ETag, the S3 error model, `aws-chunked` decoding, ignored auth, and the canned
 > startup-probe subresources. Launch with `bin/candybox-s3-gateway`. Unit tests live in the module;
-> `S3GatewayIT` drives it end-to-end over a real node. **Deferred** (per §16): multipart upload, real
-> MD5 ETags, Range GET, virtual-host addressing, SigV4.
+> `S3GatewayIT` drives it end-to-end over a real node. **Phase 5 additions:** Range GET (HTTP 206
+> with `Content-Range`), multipart upload (`CreateMultipartUpload`/`UploadPart`/`Complete`/`Abort`
+> plus `UploadPartCopy`, `ListMultipartUploads`, `ListParts`). **Still deferred** (per §16): real
+> MD5 ETags, virtual-host addressing, SigV4. See [`MULTIPART_RANGE_PLAN.md`](MULTIPART_RANGE_PLAN.md)
+> for the engine-level changes.
 
 This document is the concrete implementation plan for an **S3-compatible HTTP gateway** in front of
 Candybox. It is a *translation layer*: it speaks the S3 REST/XML protocol to clients and the existing
@@ -39,12 +42,15 @@ change either; it adds one new leaf module.
 
 ### Out of scope (v1) — see §16 for the deferred-feature plan
 
-- **Multipart upload** (`CreateMultipartUpload`/`UploadPart`/`Complete`/`Abort`) — requires native
-  multipart support in Candybox; deferred.
+- **Multipart upload** (`CreateMultipartUpload`/`UploadPart`/`Complete`/`Abort`, plus
+  `UploadPartCopy`, `ListMultipartUploads`, `ListParts`) — **now implemented**. See
+  [`MULTIPART_RANGE_PLAN.md`](MULTIPART_RANGE_PLAN.md). v1 limitation: each part is bounded by the
+  16 MiB frame cap (until on-the-wire streaming lands; the data model is decoupled from streaming).
 - **Real MD5 ETag + `Content-MD5`/checksum verification** — requires a new object-metadata layer to
   persist the MD5 alongside the object; deferred.
-- **Range GET (HTTP 206)** — requires an engine-level byte-window read; deferred (v1 returns the full
-  object with HTTP 200 and ignores the `Range` header).
+- **Range GET (HTTP 206)** — **now implemented**. Single range only (`bytes=A-B`/`A-`/`-N`);
+  multi-range is rejected with 501 because it requires a `multipart/byteranges` response. See
+  [`MULTIPART_RANGE_PLAN.md`](MULTIPART_RANGE_PLAN.md).
 - **TLS** — terminated at the external HTTP(S) load balancer, which is **out of scope**. The gateway
   listens on plain HTTP behind the LB.
 - Authentication/authorization (SigV4), bucket policies, ACLs, CORS config, lifecycle, object
@@ -70,9 +76,9 @@ change either; it adds one new leaf module.
 | Auth | **Anonymous** (ignore `Authorization`) | Trusted-network deployment; SigV4 deferred. |
 | Addressing | **Path-style only** | One hostname/cert at the LB; no wildcard DNS. |
 | ETag | **Deterministic from CRC32C** | Stable across PUT/GET/HEAD, zero extra storage; real MD5 deferred. |
-| Range GET | **Deferred** (full object, HTTP 200) | Needs engine byte-window read; not available yet. |
-| Multipart | **Deferred** | Needs native multipart in Candybox. |
-| Object size | Single-shot PUT bounded by configured max (see §11) | No multipart, so very large single PUTs are bounded. |
+| Range GET | **HTTP 206 with `Content-Range`** | Single range only (`bytes=A-B`/`A-`/`-N`); multi-range rejected as 501. |
+| Multipart | **Implemented** | `Create`/`UploadPart`/`Complete`/`Abort` + `UploadPartCopy` + `ListMultipartUploads`/`ListParts`. ETag is CRC32C-hex with `-N` suffix for multipart objects. |
+| Object size | PUT and per-part bounded by the frame cap (16 MiB until streaming lands) | Multipart enables larger objects by parts; each part still buffered. |
 
 ---
 

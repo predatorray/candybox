@@ -117,6 +117,28 @@ public final class CandyboxClient implements AutoCloseable {
         }
     }
 
+    /**
+     * Range GET: returns a byte window of an object. Bounds follow HTTP {@code Range: bytes=…}
+     * semantics (both ends inclusive):
+     * <ul>
+     *   <li>{@code firstByte >= 0, lastByte >= firstByte} → explicit window;</li>
+     *   <li>{@code lastByte < 0} → "from {@code firstByte} to end";</li>
+     *   <li>{@code firstByte < 0, lastByte > 0} → suffix range (last {@code lastByte} bytes).</li>
+     * </ul>
+     */
+    public RangeBytes getCandyRange(String box, String key, long firstByte, long lastByte) {
+        Message response = router.callBox(box, new Message.RangeGetCandyRequest(BoxName.of(box).value(),
+                CandyKey.of(key).value(), firstByte, lastByte));
+        if (response instanceof Message.CandyDataResponse data) {
+            // For range responses, contentLength is the slice length and totalLength is the whole
+            // object; the resolved start byte is implicit: totalLength - sliceLength may differ from
+            // firstByte for suffix ranges, so the caller should derive from the request bounds.
+            return new RangeBytes(data.data(), data.totalLength(), data.contentLength(),
+                    data.contentType(), data.userMetadata(), data.crc32c());
+        }
+        throw mapUnexpected(response, box, key);
+    }
+
     public CandyInfo headCandy(String box, String key) {
         Message response = router.callBox(box, new Message.HeadCandyRequest(BoxName.of(box).value(),
                 CandyKey.of(key).value()));
@@ -156,6 +178,119 @@ public final class CandyboxClient implements AutoCloseable {
     public void deleteCandy(String box, String key) {
         expectOk(router.callBox(box,
                 new Message.DeleteCandyRequest(BoxName.of(box).value(), CandyKey.of(key).value())));
+    }
+
+    // ---- multipart upload -------------------------------------------------------------------
+
+    /** Initiates a multipart upload. Returns the {@code uploadId} the client uses for subsequent calls. */
+    public String createMultipartUpload(String box, String key, String contentType,
+                                        Map<String, String> userMetadata) {
+        CandyKey candyKey = CandyKey.of(key);
+        Validation.checkCandyKey(candyKey, limits);
+        Validation.checkUserMetadata(userMetadata, limits);
+        Message response = router.callBox(box, new Message.CreateMultipartUploadRequest(
+                BoxName.of(box).value(), candyKey.value(), contentType,
+                userMetadata == null ? Map.of() : userMetadata));
+        if (response instanceof Message.CreateMultipartUploadResponse cr) {
+            return cr.uploadId();
+        }
+        throw mapUnexpected(response, box, key);
+    }
+
+    /**
+     * Uploads one part of a multipart upload. Returns the per-part CRC32C the server stored, which the
+     * caller must supply back in {@link #completeMultipartUpload}.
+     */
+    public PartUploadInfo uploadPart(String box, String key, String uploadId, int partNumber,
+                                     byte[] data) {
+        CandyKey candyKey = CandyKey.of(key);
+        Validation.checkCandyKey(candyKey, limits);
+        Validation.checkCandySize(data.length, limits);
+        Message response = router.callBox(box, new Message.UploadPartRequest(BoxName.of(box).value(),
+                candyKey.value(), uploadId, partNumber, data));
+        if (response instanceof Message.UploadPartResponse up) {
+            return new PartUploadInfo(partNumber, up.crc32c(), up.partLength());
+        }
+        throw mapUnexpected(response, box, key);
+    }
+
+    /**
+     * Materializes the multipart upload at its target key. {@code parts} enumerates every uploaded
+     * part in ascending {@code partNumber} order, paired with the CRC32C returned by the matching
+     * {@link #uploadPart}.
+     */
+    public CandyInfo completeMultipartUpload(String box, String key, String uploadId,
+                                             List<PartUploadInfo> parts, String idempotencyToken) {
+        CandyKey candyKey = CandyKey.of(key);
+        Validation.checkCandyKey(candyKey, limits);
+        List<Message.CompletedPart> wire = new ArrayList<>(parts.size());
+        for (PartUploadInfo p : parts) {
+            wire.add(new Message.CompletedPart(p.partNumber(), p.crc32c()));
+        }
+        Message response = router.callBox(box, new Message.CompleteMultipartUploadRequest(
+                BoxName.of(box).value(), candyKey.value(), uploadId, wire, idempotencyToken));
+        if (response instanceof Message.HeadCandyResponse head) {
+            return new CandyInfo(head.contentLength(), head.contentType(), head.userMetadata(),
+                    head.crc32c(), head.createdAtMillis());
+        }
+        throw mapUnexpected(response, box, key);
+    }
+
+    /** Aborts a multipart upload; idempotent (a missing upload is a no-op, matching S3 behavior). */
+    public void abortMultipartUpload(String box, String key, String uploadId) {
+        expectOk(router.callBox(box, new Message.AbortMultipartUploadRequest(BoxName.of(box).value(),
+                CandyKey.of(key).value(), uploadId)));
+    }
+
+    /**
+     * Copies a byte range of {@code srcKey} into a part slot of an in-flight upload (same Box only).
+     * Mirrors S3 {@code UploadPartCopy}. Bounds follow the HTTP Range convention; {@code -1} for
+     * either bound means "open-ended" — pass {@code (-1, -1)} to copy the whole source.
+     */
+    public PartUploadInfo uploadPartCopy(String box, String key, String uploadId, int partNumber,
+                                         String srcKey, long firstByte, long lastByte) {
+        Validation.checkCandyKey(CandyKey.of(key), limits);
+        Validation.checkCandyKey(CandyKey.of(srcKey), limits);
+        Message response = router.callBox(box, new Message.UploadPartCopyRequest(BoxName.of(box).value(),
+                CandyKey.of(key).value(), uploadId, partNumber, CandyKey.of(srcKey).value(),
+                firstByte, lastByte));
+        if (response instanceof Message.UploadPartResponse up) {
+            return new PartUploadInfo(partNumber, up.crc32c(), up.partLength());
+        }
+        throw mapUnexpected(response, box, srcKey);
+    }
+
+    /** Lists in-flight multipart uploads in {@code box}, narrowed by an optional key prefix. */
+    public MultipartListing listMultipartUploads(String box, String prefix, String keyMarker,
+                                                 String uploadIdMarker, int maxUploads) {
+        Message response = router.callBox(box, new Message.ListMultipartUploadsRequest(
+                BoxName.of(box).value(), prefix, keyMarker, uploadIdMarker, maxUploads));
+        if (response instanceof Message.ListMultipartUploadsResponse list) {
+            List<UploadEntry> rows = new ArrayList<>();
+            for (Message.InProgressUpload u : list.uploads()) {
+                rows.add(new UploadEntry(u.uploadId(), u.key(), u.createdAtMillis()));
+            }
+            return new MultipartListing(rows, list.nextKeyMarker(), list.nextUploadIdMarker());
+        }
+        throw mapResponse(response);
+    }
+
+    /** Lists the parts recorded for one in-flight upload, paged by {@code partNumberMarker}. */
+    public PartListing listParts(String box, String key, String uploadId, int partNumberMarker,
+                                 int maxParts) {
+        Message response = router.callBox(box, new Message.ListPartsRequest(BoxName.of(box).value(),
+                CandyKey.of(key).value(), uploadId, partNumberMarker, maxParts));
+        if (response instanceof Message.ListPartsResponse list) {
+            List<PartUploadInfo> rows = new ArrayList<>();
+            for (Message.UploadedPart p : list.parts()) {
+                rows.add(new PartUploadInfo(p.partNumber(), p.crc32c(), p.partLength()));
+            }
+            return new PartListing(rows, list.nextPartNumberMarker());
+        }
+        if (response instanceof Message.NotFoundResponse) {
+            throw new CandyNotFoundException(box, key);
+        }
+        throw mapResponse(response);
     }
 
     /**
@@ -281,6 +416,44 @@ public final class CandyboxClient implements AutoCloseable {
     /** Metadata returned by {@code headCandy}. */
     public record CandyInfo(long contentLength, String contentType, Map<String, String> userMetadata,
                             int crc32c, long createdAtMillis) {
+    }
+
+    /** Per-part receipt returned by {@link #uploadPart}: the partNumber, server-side CRC, and length. */
+    public record PartUploadInfo(int partNumber, int crc32c, long partLength) {
+    }
+
+    /** A page of {@link #listMultipartUploads} results. */
+    public record MultipartListing(List<UploadEntry> uploads, String nextKeyMarker,
+                                   String nextUploadIdMarker) {
+        public boolean isTruncated() {
+            return nextKeyMarker != null;
+        }
+    }
+
+    /** One row of an in-progress upload listing. */
+    public record UploadEntry(String uploadId, String key, long createdAtMillis) {
+    }
+
+    /** A page of {@link #listParts} results. */
+    public record PartListing(List<PartUploadInfo> parts, int nextPartNumberMarker) {
+        public boolean isTruncated() {
+            return nextPartNumberMarker > 0;
+        }
+    }
+
+    /**
+     * Result of a {@link #getCandyRange} call: the slice bytes plus the whole-object's total length,
+     * so the caller (e.g. the S3 gateway) can synthesize a {@code Content-Range} header.
+     *
+     * @param data           the slice bytes
+     * @param totalLength    total length of the whole object
+     * @param sliceLength    length of {@code data} (== {@code data.length})
+     * @param contentType    object content-type (whole-object, not slice-specific)
+     * @param userMetadata   object user-metadata (whole-object)
+     * @param crc32c         first-part CRC32C (informational; not a per-slice checksum)
+     */
+    public record RangeBytes(byte[] data, long totalLength, long sliceLength, String contentType,
+                             Map<String, String> userMetadata, int crc32c) {
     }
 
     /** A page of {@code listCandies} results. */
