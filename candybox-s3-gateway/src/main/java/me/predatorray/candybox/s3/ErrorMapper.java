@@ -57,8 +57,15 @@ final class ErrorMapper {
             return new S3Exception(code, e.getMessage(), e);
         }
         if (t instanceof ValidationException e) {
-            S3ErrorCode code = lower(e.getMessage()).contains("box name")
-                    ? S3ErrorCode.INVALID_BUCKET_NAME : S3ErrorCode.INVALID_ARGUMENT;
+            String lower = lower(e.getMessage());
+            S3ErrorCode code;
+            if (lower.contains("invalidrange") || lower.contains("invalid range")) {
+                code = S3ErrorCode.INVALID_RANGE;
+            } else if (lower.contains("box name")) {
+                code = S3ErrorCode.INVALID_BUCKET_NAME;
+            } else {
+                code = S3ErrorCode.INVALID_ARGUMENT;
+            }
             return new S3Exception(code, e.getMessage(), e);
         }
         if (t instanceof CandyNotFoundException e) {
@@ -98,7 +105,9 @@ final class ErrorMapper {
             case "BoxNotEmptyException" -> S3ErrorCode.BUCKET_NOT_EMPTY;
             case "BoxNotFoundException" -> S3ErrorCode.NO_SUCH_BUCKET;
             case "CandyNotFoundException" -> S3ErrorCode.NO_SUCH_KEY;
-            case "ValidationException" -> S3ErrorCode.INVALID_ARGUMENT;
+            case "ValidationException" -> lower(message).contains("invalidrange")
+                    || lower(message).contains("invalid range")
+                    ? S3ErrorCode.INVALID_RANGE : S3ErrorCode.INVALID_ARGUMENT;
             case "LimitExceededException" -> S3ErrorCode.ENTITY_TOO_LARGE;
             case "UnsupportedOperation" -> S3ErrorCode.NOT_IMPLEMENTED;
             case "ProtocolError" -> S3ErrorCode.INVALID_REQUEST;

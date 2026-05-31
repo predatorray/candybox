@@ -16,15 +16,20 @@
 package me.predatorray.candybox.lsm.manifest;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import me.predatorray.candybox.common.Part;
+import me.predatorray.candybox.common.SegmentRef;
 import me.predatorray.candybox.lsm.sstable.SSTableMeta;
 
 /**
  * An immutable snapshot of a Box's LSM state: the SSTables that exist (with their levels and key
- * ranges), the set of live Syrups, and the id of the current WAL ledger. Produced by replaying the
- * manifest log and advanced by {@link #apply(ManifestEdit)}.
+ * ranges), the set of live Syrups, the id of the current WAL ledger, and the in-flight multipart
+ * uploads. Produced by replaying the manifest log and advanced by {@link #apply(ManifestEdit)}.
  *
  * <p>One {@code ManifestState} corresponds to one Box's single partition (v1); the structure is kept
  * partition-shaped so key-range sharding can be added later without reworking it.
@@ -32,16 +37,19 @@ import me.predatorray.candybox.lsm.sstable.SSTableMeta;
 public final class ManifestState {
 
     private static final ManifestState EMPTY =
-            new ManifestState(List.of(), Set.of(), -1L);
+            new ManifestState(List.of(), Set.of(), -1L, Map.of());
 
     private final List<SSTableMeta> tables;
     private final Set<Long> liveSyrups;
     private final long walLedgerId;
+    private final Map<String, MultipartUploadState> multipartUploads;
 
-    private ManifestState(List<SSTableMeta> tables, Set<Long> liveSyrups, long walLedgerId) {
+    private ManifestState(List<SSTableMeta> tables, Set<Long> liveSyrups, long walLedgerId,
+                          Map<String, MultipartUploadState> multipartUploads) {
         this.tables = List.copyOf(tables);
         this.liveSyrups = Set.copyOf(liveSyrups);
         this.walLedgerId = walLedgerId;
+        this.multipartUploads = Collections.unmodifiableMap(new LinkedHashMap<>(multipartUploads));
     }
 
     public static ManifestState empty() {
@@ -94,6 +102,27 @@ public final class ManifestState {
         return walLedgerId;
     }
 
+    /** Snapshot of currently in-flight multipart uploads, keyed by {@code uploadId}. */
+    public Map<String, MultipartUploadState> multipartUploads() {
+        return multipartUploads;
+    }
+
+    /**
+     * Syrups referenced by parts of in-flight multipart uploads. These must not be GC'd while the
+     * upload is pending — even though no SSTable points at them yet.
+     */
+    public Set<Long> multipartReferencedSyrups() {
+        Set<Long> referenced = new LinkedHashSet<>();
+        for (MultipartUploadState upload : multipartUploads.values()) {
+            for (Part part : upload.parts().values()) {
+                for (SegmentRef seg : part.segments()) {
+                    referenced.add(seg.syrupId());
+                }
+            }
+        }
+        return referenced;
+    }
+
     /** Returns a new state with {@code edit} applied. */
     public ManifestState apply(ManifestEdit edit) {
         List<SSTableMeta> newTables = new ArrayList<>();
@@ -109,6 +138,21 @@ public final class ManifestState {
         newSyrups.removeAll(edit.removedSyrups());
 
         long newWal = edit.newWalLedgerId() == null ? walLedgerId : edit.newWalLedgerId();
-        return new ManifestState(newTables, newSyrups, newWal);
+
+        Map<String, MultipartUploadState> newUploads = new LinkedHashMap<>(multipartUploads);
+        for (MultipartUploadState u : edit.addedUploads()) {
+            newUploads.put(u.uploadId(), u);
+        }
+        for (ManifestEdit.PartUpsert pu : edit.upsertParts()) {
+            MultipartUploadState existing = newUploads.get(pu.uploadId());
+            if (existing == null) {
+                throw new IllegalStateException("UploadPart for unknown uploadId " + pu.uploadId());
+            }
+            newUploads.put(pu.uploadId(), existing.withPart(pu.partNumber(), pu.part()));
+        }
+        for (String dropped : edit.removedUploads()) {
+            newUploads.remove(dropped);
+        }
+        return new ManifestState(newTables, newSyrups, newWal, newUploads);
     }
 }

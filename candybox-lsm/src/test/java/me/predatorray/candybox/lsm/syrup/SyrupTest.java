@@ -19,12 +19,15 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.util.List;
 import java.util.Random;
 import me.predatorray.candybox.bookkeeper.LedgerConfig;
 import me.predatorray.candybox.bookkeeper.WritableLedger;
 import me.predatorray.candybox.bookkeeper.fake.InMemoryLedgerStore;
+import me.predatorray.candybox.common.Part;
 import me.predatorray.candybox.common.SegmentRef;
+import me.predatorray.candybox.common.checksum.Crc32c;
 import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.config.LedgerRole;
 import me.predatorray.candybox.common.config.SizeLimits;
@@ -83,6 +86,53 @@ class SyrupTest {
         assertThatThrownBy(() -> new SyrupReader(store).readAll(segments, 3))
                 .isInstanceOf(StorageException.class)
                 .hasMessageContaining("CRC mismatch");
+    }
+
+    @Test
+    void readRangeReturnsSlicesAcrossSegmentsAndParts() {
+        byte[] partA = new byte[40];
+        byte[] partB = new byte[40];
+        new Random(7).nextBytes(partA);
+        new Random(11).nextBytes(partB);
+
+        SyrupManager writer = new SyrupManager(store, smallChunkConfig(),
+                LedgerConfig.forRole(LedgerRole.SYRUP));
+        SyrupWriteResult ra = writer.writeCandy(new ByteArrayInputStream(partA));
+        SyrupWriteResult rb = writer.writeCandy(new ByteArrayInputStream(partB));
+        writer.close();
+
+        // Build a two-part view over the writes (mirroring what multipart's Complete will do).
+        List<Part> parts = List.of(
+                new Part(partA.length, 16, Crc32c.of(partA), ra.segments()),
+                new Part(partB.length, 16, Crc32c.of(partB), rb.segments()));
+        byte[] whole = new byte[80];
+        System.arraycopy(partA, 0, whole, 0, 40);
+        System.arraycopy(partB, 0, whole, 40, 40);
+
+        SyrupReader reader = new SyrupReader(store);
+
+        // Whole-object readParts validates per-part CRCs as it streams.
+        ByteArrayOutputStream wholeOut = new ByteArrayOutputStream();
+        reader.readParts(parts, wholeOut);
+        assertThat(wholeOut.toByteArray()).isEqualTo(whole);
+
+        // Single-byte tail of part A.
+        ByteArrayOutputStream tailA = new ByteArrayOutputStream();
+        reader.readRange(parts, 39, 39, tailA);
+        assertThat(tailA.toByteArray()).containsExactly(whole[39]);
+
+        // Slice that crosses the part boundary at byte 40.
+        ByteArrayOutputStream cross = new ByteArrayOutputStream();
+        reader.readRange(parts, 38, 42, cross);
+        byte[] expected = new byte[]{whole[38], whole[39], whole[40], whole[41], whole[42]};
+        assertThat(cross.toByteArray()).containsExactly(expected);
+
+        // Slice that starts mid-chunk inside the second part (chunkSize=16, partB starts at offset 40).
+        ByteArrayOutputStream mid = new ByteArrayOutputStream();
+        reader.readRange(parts, 60, 75, mid);
+        byte[] expectMid = new byte[16];
+        System.arraycopy(whole, 60, expectMid, 0, 16);
+        assertThat(mid.toByteArray()).containsExactly(expectMid);
     }
 
     @Test

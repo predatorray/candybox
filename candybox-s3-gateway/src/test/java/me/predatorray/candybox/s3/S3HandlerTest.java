@@ -278,6 +278,165 @@ class S3HandlerTest {
         assertThat(r.body).contains("<Code>InvalidArgument</Code>");
     }
 
+    // ---- range GET -------------------------------------------------------------------------
+
+    @Test
+    void rangeGetReturns206WithContentRange() {
+        put("/photos");
+        byte[] data = "hello candybox".getBytes(StandardCharsets.UTF_8); // 14 bytes
+        put("/photos/hello.txt", data, h -> h.set(HttpHeaderNames.CONTENT_TYPE, "text/plain"));
+
+        Response r = exchange(HttpMethod.GET, "/photos/hello.txt", null,
+                h -> h.set(HttpHeaderNames.RANGE, "bytes=6-9"));
+        assertThat(r.status).isEqualTo(206);
+        assertThat(r.body).isEqualTo("cand");
+        assertThat(r.header(HttpHeaderNames.CONTENT_RANGE)).isEqualTo("bytes 6-9/14");
+        assertThat(r.header(HttpHeaderNames.ACCEPT_RANGES)).isEqualTo("bytes");
+    }
+
+    @Test
+    void rangeGetOpenEndedTailRange() {
+        put("/photos");
+        byte[] data = "hello candybox".getBytes(StandardCharsets.UTF_8);
+        put("/photos/hello.txt", data, null);
+
+        Response r = exchange(HttpMethod.GET, "/photos/hello.txt", null,
+                h -> h.set(HttpHeaderNames.RANGE, "bytes=6-"));
+        assertThat(r.status).isEqualTo(206);
+        assertThat(r.body).isEqualTo("candybox");
+        assertThat(r.header(HttpHeaderNames.CONTENT_RANGE)).isEqualTo("bytes 6-13/14");
+    }
+
+    @Test
+    void rangeGetSuffixRange() {
+        put("/photos");
+        byte[] data = "hello candybox".getBytes(StandardCharsets.UTF_8);
+        put("/photos/hello.txt", data, null);
+
+        Response r = exchange(HttpMethod.GET, "/photos/hello.txt", null,
+                h -> h.set(HttpHeaderNames.RANGE, "bytes=-3"));
+        assertThat(r.status).isEqualTo(206);
+        assertThat(r.body).isEqualTo("box");
+        assertThat(r.header(HttpHeaderNames.CONTENT_RANGE)).isEqualTo("bytes 11-13/14");
+    }
+
+    @Test
+    void rangeGetBeyondEndReturns416() {
+        put("/photos");
+        byte[] data = "abc".getBytes(StandardCharsets.UTF_8);
+        put("/photos/short", data, null);
+
+        Response r = exchange(HttpMethod.GET, "/photos/short", null,
+                h -> h.set(HttpHeaderNames.RANGE, "bytes=100-200"));
+        assertThat(r.status).isEqualTo(416);
+        assertThat(r.body).contains("<Code>InvalidRange</Code>");
+    }
+
+    @Test
+    void rangeGetMultiRangeReturns501() {
+        put("/photos");
+        put("/photos/hello.txt", "hello candybox".getBytes(StandardCharsets.UTF_8), null);
+
+        Response r = exchange(HttpMethod.GET, "/photos/hello.txt", null,
+                h -> h.set(HttpHeaderNames.RANGE, "bytes=0-3,6-9"));
+        assertThat(r.status).isEqualTo(501);
+        assertThat(r.body).contains("<Code>NotImplemented</Code>");
+    }
+
+    @Test
+    void unparseableRangeFallsBackToFull200() {
+        put("/photos");
+        byte[] data = "hello candybox".getBytes(StandardCharsets.UTF_8);
+        put("/photos/hello.txt", data, null);
+
+        Response r = exchange(HttpMethod.GET, "/photos/hello.txt", null,
+                h -> h.set(HttpHeaderNames.RANGE, "lemons=0-3"));
+        assertThat(r.status).isEqualTo(200);
+        assertThat(r.body).isEqualTo("hello candybox");
+        assertThat(r.header(HttpHeaderNames.CONTENT_RANGE)).isNull();
+    }
+
+    // ---- multipart upload ------------------------------------------------------------------
+
+    @Test
+    void multipartUploadRoundTripStitchesPartsTogether() {
+        put("/photos");
+        Response create = exchange(HttpMethod.POST, "/photos/big.bin?uploads", new byte[0], null);
+        assertThat(create.status).isEqualTo(200);
+        String uploadId = between(create.body, "<UploadId>", "</UploadId>");
+
+        Response p1 = exchange(HttpMethod.PUT,
+                "/photos/big.bin?partNumber=1&uploadId=" + uploadId,
+                "hello ".getBytes(StandardCharsets.UTF_8), null);
+        Response p2 = exchange(HttpMethod.PUT,
+                "/photos/big.bin?partNumber=2&uploadId=" + uploadId,
+                "candy".getBytes(StandardCharsets.UTF_8), null);
+        Response p3 = exchange(HttpMethod.PUT,
+                "/photos/big.bin?partNumber=3&uploadId=" + uploadId,
+                "box".getBytes(StandardCharsets.UTF_8), null);
+        assertThat(p1.status).isEqualTo(200);
+        String etag1 = p1.etag();
+        String etag2 = p2.etag();
+        String etag3 = p3.etag();
+        assertThat(etag1).isNotBlank();
+
+        String completeBody = "<CompleteMultipartUpload>"
+                + "<Part><PartNumber>1</PartNumber><ETag>" + etag1 + "</ETag></Part>"
+                + "<Part><PartNumber>2</PartNumber><ETag>" + etag2 + "</ETag></Part>"
+                + "<Part><PartNumber>3</PartNumber><ETag>" + etag3 + "</ETag></Part>"
+                + "</CompleteMultipartUpload>";
+        Response complete = exchange(HttpMethod.POST,
+                "/photos/big.bin?uploadId=" + uploadId,
+                completeBody.getBytes(StandardCharsets.UTF_8), null);
+        assertThat(complete.status).isEqualTo(200);
+        assertThat(complete.body).contains("<CompleteMultipartUploadResult");
+
+        // Subsequent GET sees the assembled object.
+        Response g = get("/photos/big.bin");
+        assertThat(g.status).isEqualTo(200);
+        assertThat(g.body).isEqualTo("hello candybox");
+    }
+
+    @Test
+    void abortMultipartUploadDropsTheInFlightUpload() {
+        put("/photos");
+        Response create = exchange(HttpMethod.POST, "/photos/draft?uploads", new byte[0], null);
+        String uploadId = between(create.body, "<UploadId>", "</UploadId>");
+        exchange(HttpMethod.PUT, "/photos/draft?partNumber=1&uploadId=" + uploadId,
+                "abc".getBytes(StandardCharsets.UTF_8), null);
+
+        Response abort = exchange(HttpMethod.DELETE, "/photos/draft?uploadId=" + uploadId,
+                new byte[0], null);
+        assertThat(abort.status).isEqualTo(204);
+
+        // GET on the never-completed key is a 404.
+        Response g = get("/photos/draft");
+        assertThat(g.status).isEqualTo(404);
+    }
+
+    @Test
+    void listMultipartUploadsReturnsInProgressUploadsAndListPartsReturnsRecordedParts() {
+        put("/photos");
+        Response create = exchange(HttpMethod.POST, "/photos/movie.mp4?uploads", new byte[0], null);
+        String uploadId = between(create.body, "<UploadId>", "</UploadId>");
+        exchange(HttpMethod.PUT, "/photos/movie.mp4?partNumber=1&uploadId=" + uploadId,
+                "AAAAA".getBytes(StandardCharsets.UTF_8), null);
+        exchange(HttpMethod.PUT, "/photos/movie.mp4?partNumber=2&uploadId=" + uploadId,
+                "BBBBB".getBytes(StandardCharsets.UTF_8), null);
+
+        Response listUploads = get("/photos/?uploads");
+        assertThat(listUploads.status).isEqualTo(200);
+        assertThat(listUploads.body).contains("<ListMultipartUploadsResult");
+        assertThat(listUploads.body).contains("<UploadId>" + uploadId + "</UploadId>");
+        assertThat(listUploads.body).contains("<Key>movie.mp4</Key>");
+
+        Response listParts = get("/photos/movie.mp4?uploadId=" + uploadId);
+        assertThat(listParts.status).isEqualTo(200);
+        assertThat(listParts.body).contains("<PartNumber>1</PartNumber>");
+        assertThat(listParts.body).contains("<PartNumber>2</PartNumber>");
+        assertThat(listParts.body).contains("<Size>5</Size>");
+    }
+
     @Test
     void putWithoutContentTypeDefaultsToOctetStream() {
         put("/photos");

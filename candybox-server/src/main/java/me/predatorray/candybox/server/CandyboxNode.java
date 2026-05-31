@@ -111,10 +111,14 @@ public final class CandyboxNode implements AutoCloseable {
         }
     }
 
-    /** One background maintenance tick: compact owned Boxes, then GC their obsoleted ledgers. */
+    /**
+     * One background maintenance tick: compact owned Boxes, GC their obsoleted ledgers, and sweep any
+     * abandoned in-flight multipart uploads (older than {@code multipartUploadTtlMillis}).
+     */
     private void runMaintenance() {
         compactOwnedBoxesOnce();
         collectGarbageOnce();
+        sweepStaleMultipartUploadsOnce();
     }
 
     private static ScheduledExecutorService daemonScheduler(String name) {
@@ -310,6 +314,42 @@ public final class CandyboxNode implements AutoCloseable {
             }
         }
         return deleted;
+    }
+
+    /**
+     * Aborts in-flight multipart uploads whose {@code createdAtMillis + multipartUploadTtlMillis} is
+     * already in the past. Reuses the engine's {@link me.predatorray.candybox.lsm.engine.BoxEngine
+     * #abortMultipartUpload} (fencing-gated; orphaned Syrup segments enter the normal reclaim path).
+     *
+     * @return the number of uploads aborted across all owned Boxes
+     */
+    public int sweepStaleMultipartUploadsOnce() {
+        long ttl = config.multipartUploadTtlMillis();
+        if (ttl <= 0) {
+            return 0;
+        }
+        long cutoff = clock.currentTimeMillis() - ttl;
+        int aborted = 0;
+        for (BoxOwnership ownership : boxes.values()) {
+            if (!ownership.isOwner()) {
+                continue;
+            }
+            try {
+                for (me.predatorray.candybox.lsm.manifest.MultipartUploadState u
+                        : ownership.engine().listMultipartUploads()) {
+                    if (u.createdAtMillis() <= cutoff) {
+                        ownership.engine().abortMultipartUpload(u.uploadId());
+                        aborted++;
+                    }
+                }
+            } catch (NotOwnerException lostOwnership) {
+                LOG.info("Skipping multipart TTL sweep on a box on node {}: {}", nodeId,
+                        lostOwnership.getMessage());
+            } catch (RuntimeException e) {
+                LOG.warn("Multipart TTL sweep error on node {}", nodeId, e);
+            }
+        }
+        return aborted;
     }
 
     @Override

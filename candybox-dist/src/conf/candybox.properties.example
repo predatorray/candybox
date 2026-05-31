@@ -79,6 +79,19 @@ data.dir=./data
 # l0.stall.threshold=12
 
 # ---------------------------------------------------------------------------
+# Multipart upload tuning (S3-style):
+#   min-part-bytes: minimum size of every part except the last (S3 default 5 MiB).
+#   max-parts: hard cap on parts in one upload (S3 default 10,000).
+#   upload-ttl-millis: background sweeper aborts an upload older than this (default 7 days).
+#   max-concurrent-uploads-per-box: defensive ceiling on in-flight uploads in any one Box.
+# ---------------------------------------------------------------------------
+
+# multipart.min.part.bytes=5242880
+# multipart.max.parts=10000
+# multipart.upload.ttl.millis=604800000
+# multipart.max.concurrent.uploads.per.box=10000
+
+# ---------------------------------------------------------------------------
 # BookKeeper quorum per ledger role: "E/Qw/Qa" (ensemble / write quorum / ack quorum).
 # Defaults are E=3 (so the cluster needs at least 3 bookies). For a SINGLE-BOOKIE dev box,
 # override all four roles to 1/1/1:

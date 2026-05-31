@@ -135,6 +135,7 @@ public final class Manifest implements AutoCloseable {
                 .addedTables(tables)
                 .addedSyrups(state.liveSyrups())
                 .newWalLedgerId(wal)
+                .addedUploads(new ArrayList<>(state.multipartUploads().values()))
                 .build();
     }
 }

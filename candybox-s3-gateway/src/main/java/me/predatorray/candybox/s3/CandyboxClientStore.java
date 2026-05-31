@@ -20,6 +20,10 @@ import java.util.Map;
 import me.predatorray.candybox.client.CandyboxClient;
 import me.predatorray.candybox.client.CandyboxClient.CandyInfo;
 import me.predatorray.candybox.client.CandyboxClient.Listing;
+import me.predatorray.candybox.client.CandyboxClient.MultipartListing;
+import me.predatorray.candybox.client.CandyboxClient.PartListing;
+import me.predatorray.candybox.client.CandyboxClient.PartUploadInfo;
+import me.predatorray.candybox.client.CandyboxClient.RangeBytes;
 
 /**
  * The production {@link CandyStore}: delegates to a cluster-aware {@link CandyboxClient}. Object writes
@@ -66,6 +70,11 @@ final class CandyboxClientStore implements CandyStore, AutoCloseable {
     }
 
     @Override
+    public RangeBytes getCandyRange(String box, String key, long firstByte, long lastByte) {
+        return client.getCandyRange(box, key, firstByte, lastByte);
+    }
+
+    @Override
     public CandyInfo headCandy(String box, String key) {
         return client.headCandy(box, key);
     }
@@ -83,6 +92,47 @@ final class CandyboxClientStore implements CandyStore, AutoCloseable {
     @Override
     public Listing listCandies(String box, String prefix, String startAfter, int maxKeys) {
         return client.listCandies(box, prefix, startAfter, maxKeys);
+    }
+
+    @Override
+    public String createMultipartUpload(String box, String key, String contentType,
+                                        Map<String, String> userMetadata) {
+        return client.createMultipartUpload(box, key, contentType, userMetadata);
+    }
+
+    @Override
+    public PartUploadInfo uploadPart(String box, String key, String uploadId, int partNumber,
+                                     byte[] data) {
+        return client.uploadPart(box, key, uploadId, partNumber, data);
+    }
+
+    @Override
+    public PartUploadInfo uploadPartCopy(String box, String key, String uploadId, int partNumber,
+                                         String srcKey, long firstByte, long lastByte) {
+        return client.uploadPartCopy(box, key, uploadId, partNumber, srcKey, firstByte, lastByte);
+    }
+
+    @Override
+    public CandyInfo completeMultipartUpload(String box, String key, String uploadId,
+                                             List<PartUploadInfo> parts) {
+        return client.completeMultipartUpload(box, key, uploadId, parts, null);
+    }
+
+    @Override
+    public void abortMultipartUpload(String box, String key, String uploadId) {
+        client.abortMultipartUpload(box, key, uploadId);
+    }
+
+    @Override
+    public MultipartListing listMultipartUploads(String box, String prefix, String keyMarker,
+                                                 String uploadIdMarker, int maxUploads) {
+        return client.listMultipartUploads(box, prefix, keyMarker, uploadIdMarker, maxUploads);
+    }
+
+    @Override
+    public PartListing listParts(String box, String key, String uploadId, int partNumberMarker,
+                                 int maxParts) {
+        return client.listParts(box, key, uploadId, partNumberMarker, maxParts);
     }
 
     @Override

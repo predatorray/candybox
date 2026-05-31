@@ -41,4 +41,35 @@ final class Etag {
     static String unquoted(int crc32c) {
         return String.format("%032x", crc32c & 0xffffffffL);
     }
+
+    /**
+     * Parses a quoted or unquoted ETag that this class produced back to the CRC32C int. Lenient about
+     * a possible {@code -N} multipart suffix (which is dropped — the CRC is the part of interest).
+     *
+     * @throws S3Exception {@link S3ErrorCode#INVALID_ARGUMENT} if the ETag is not in the format
+     *                     Candybox produces
+     */
+    static int parseCrc32cHex(String etag) {
+        if (etag == null) {
+            throw new S3Exception(S3ErrorCode.INVALID_ARGUMENT, "Missing ETag");
+        }
+        String s = etag.trim();
+        if (s.startsWith("\"") && s.endsWith("\"") && s.length() >= 2) {
+            s = s.substring(1, s.length() - 1);
+        }
+        int dash = s.indexOf('-');
+        if (dash >= 0) {
+            s = s.substring(0, dash);
+        }
+        if (s.length() < 8) {
+            throw new S3Exception(S3ErrorCode.INVALID_ARGUMENT, "Malformed ETag: " + etag);
+        }
+        // Take the low 8 hex chars (the CRC32C). Higher chars are the zero-padding.
+        String hex = s.substring(s.length() - 8);
+        try {
+            return (int) (Long.parseLong(hex, 16) & 0xffffffffL);
+        } catch (NumberFormatException e) {
+            throw new S3Exception(S3ErrorCode.INVALID_ARGUMENT, "Malformed ETag: " + etag);
+        }
+    }
 }

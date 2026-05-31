@@ -19,6 +19,10 @@ import java.util.List;
 import java.util.Map;
 import me.predatorray.candybox.client.CandyboxClient.CandyInfo;
 import me.predatorray.candybox.client.CandyboxClient.Listing;
+import me.predatorray.candybox.client.CandyboxClient.MultipartListing;
+import me.predatorray.candybox.client.CandyboxClient.PartListing;
+import me.predatorray.candybox.client.CandyboxClient.PartUploadInfo;
+import me.predatorray.candybox.client.CandyboxClient.RangeBytes;
 
 /**
  * The narrow seam the gateway's request handling depends on, exactly the subset of the Candybox client
@@ -42,6 +46,12 @@ interface CandyStore {
 
     byte[] getCandy(String box, String key);
 
+    /**
+     * Range GET: returns a byte window of an object. {@code firstByte}/{@code lastByte} follow the
+     * HTTP {@code Range:} convention (inclusive on both ends, {@code -1} sentinel for "unbounded").
+     */
+    RangeBytes getCandyRange(String box, String key, long firstByte, long lastByte);
+
     CandyInfo headCandy(String box, String key);
 
     void deleteCandy(String box, String key);
@@ -50,4 +60,24 @@ interface CandyStore {
     CandyInfo copyCandy(String box, String srcKey, String dstKey);
 
     Listing listCandies(String box, String prefix, String startAfter, int maxKeys);
+
+    // ---- multipart upload -------------------------------------------------------------------
+
+    String createMultipartUpload(String box, String key, String contentType,
+                                 Map<String, String> userMetadata);
+
+    PartUploadInfo uploadPart(String box, String key, String uploadId, int partNumber, byte[] data);
+
+    PartUploadInfo uploadPartCopy(String box, String key, String uploadId, int partNumber,
+                                  String srcKey, long firstByte, long lastByte);
+
+    CandyInfo completeMultipartUpload(String box, String key, String uploadId,
+                                      List<PartUploadInfo> parts);
+
+    void abortMultipartUpload(String box, String key, String uploadId);
+
+    MultipartListing listMultipartUploads(String box, String prefix, String keyMarker,
+                                          String uploadIdMarker, int maxUploads);
+
+    PartListing listParts(String box, String key, String uploadId, int partNumberMarker, int maxParts);
 }

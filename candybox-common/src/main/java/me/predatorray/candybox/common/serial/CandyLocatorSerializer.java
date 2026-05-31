@@ -22,35 +22,42 @@ import java.util.Map;
 import me.predatorray.candybox.common.CandyLocator;
 import me.predatorray.candybox.common.Hlc;
 import me.predatorray.candybox.common.LocatorType;
+import me.predatorray.candybox.common.Part;
 import me.predatorray.candybox.common.SegmentRef;
 import me.predatorray.candybox.common.config.SizeLimits;
 import me.predatorray.candybox.common.exception.LimitExceededException;
 import me.predatorray.candybox.common.exception.SerializationException;
 
 /**
- * Versioned binary codec for {@link CandyLocator}. Layout (big-endian, varints where noted):
+ * Versioned binary codec for {@link CandyLocator}. <b>v2 layout</b> (big-endian; varints where
+ * noted):
  *
  * <pre>
- *   byte    formatVersion (= 1)
- *   byte    locator type code
+ *   byte    formatVersion (= 2)
+ *   byte    locator type code (PUT=1, DELETE=2)
  *   long    hlc.physicalMillis
  *   varint  hlc.logicalCounter
  *   int     hlc.nodeId
- *   varlong contentLength
- *   varint  chunkSize
- *   int     crc32c
  *   varlong createdAtMillis
- *   byte    contentType present?  [+ string]
- *   varint  userMetadata entry count   [+ key/value strings]
- *   varint  segment count              [+ {varlong syrupId, varlong firstEntryId, varlong lastEntryId}]
+ *   byte    contentType present?      [+ string]
+ *   varint  userMetadata entry count  [+ key/value strings]
+ *   varint  part count                [+ Part records]
+ *     Part record:
+ *       varlong partLength
+ *       varint  chunkSize
+ *       int     crc32c
+ *       varint  segment count         [+ {varlong syrupId, varlong firstEntryId, varlong lastEntryId}]
  * </pre>
  *
- * <p>Every encode is checked against the configured {@code maxLocatorBytes} (default 64 KiB) so a
- * locator always fits comfortably in one SSTable data-block entry.
+ * <p>A {@code DELETE} tombstone serializes with {@code part count = 0}. A v1 single-part Candy is the
+ * same shape with {@code part count = 1}.
+ *
+ * <p>Every encode is checked against the configured {@code maxLocatorBytes} (default 256 KiB in v2 —
+ * enough room for the ~200 KiB needed to hold an S3-cap 10,000-part multipart object).
  */
 public final class CandyLocatorSerializer {
 
-    public static final byte FORMAT_VERSION = 1;
+    public static final byte FORMAT_VERSION = 2;
 
     private CandyLocatorSerializer() {
     }
@@ -67,9 +74,6 @@ public final class CandyLocatorSerializer {
         w.writeLong(hlc.physicalMillis());
         w.writeVarInt(hlc.logicalCounter());
         w.writeInt(hlc.nodeId());
-        w.writeVarLong(locator.contentLength());
-        w.writeVarInt(locator.chunkSize());
-        w.writeInt(locator.crc32c());
         w.writeVarLong(Math.max(0, locator.createdAtMillis()));
 
         if (locator.contentType() == null) {
@@ -86,12 +90,19 @@ public final class CandyLocatorSerializer {
             w.writeString(e.getValue());
         }
 
-        List<SegmentRef> segments = locator.segments();
-        w.writeVarInt(segments.size());
-        for (SegmentRef s : segments) {
-            w.writeVarLong(s.syrupId());
-            w.writeVarLong(s.firstEntryId());
-            w.writeVarLong(s.lastEntryId());
+        List<Part> parts = locator.parts();
+        w.writeVarInt(parts.size());
+        for (Part p : parts) {
+            w.writeVarLong(p.partLength());
+            w.writeVarInt(p.chunkSize());
+            w.writeInt(p.crc32c());
+            List<SegmentRef> segs = p.segments();
+            w.writeVarInt(segs.size());
+            for (SegmentRef s : segs) {
+                w.writeVarLong(s.syrupId());
+                w.writeVarLong(s.firstEntryId());
+                w.writeVarLong(s.lastEntryId());
+            }
         }
 
         byte[] out = w.toByteArray();
@@ -113,9 +124,6 @@ public final class CandyLocatorSerializer {
         }
         LocatorType type = LocatorType.fromCode(r.readByte());
         Hlc hlc = new Hlc(r.readLong(), r.readVarInt(), r.readInt());
-        long contentLength = r.readVarLong();
-        int chunkSize = r.readVarInt();
-        int crc32c = r.readInt();
         long createdAtMillis = r.readVarLong();
 
         String contentType = r.readBoolean() ? r.readString() : null;
@@ -128,13 +136,20 @@ public final class CandyLocatorSerializer {
             md.put(k, v);
         }
 
-        int segCount = r.readVarInt();
-        List<SegmentRef> segments = new ArrayList<>(segCount);
-        for (int i = 0; i < segCount; i++) {
-            segments.add(new SegmentRef(r.readVarLong(), r.readVarLong(), r.readVarLong()));
+        int partCount = r.readVarInt();
+        List<Part> parts = new ArrayList<>(partCount);
+        for (int p = 0; p < partCount; p++) {
+            long partLength = r.readVarLong();
+            int chunkSize = r.readVarInt();
+            int crc32c = r.readInt();
+            int segCount = r.readVarInt();
+            List<SegmentRef> segments = new ArrayList<>(segCount);
+            for (int i = 0; i < segCount; i++) {
+                segments.add(new SegmentRef(r.readVarLong(), r.readVarLong(), r.readVarLong()));
+            }
+            parts.add(new Part(partLength, chunkSize, crc32c, segments));
         }
 
-        return new CandyLocator(hlc, type, contentLength, chunkSize, contentType, md, crc32c,
-                createdAtMillis, segments);
+        return new CandyLocator(hlc, type, contentType, md, createdAtMillis, parts);
     }
 }

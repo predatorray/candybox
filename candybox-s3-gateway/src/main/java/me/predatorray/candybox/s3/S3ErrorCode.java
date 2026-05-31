@@ -31,6 +31,7 @@ enum S3ErrorCode {
     INVALID_REQUEST(400, "InvalidRequest", "Invalid Request."),
     KEY_TOO_LONG(400, "KeyTooLongError", "Your key is too long."),
     ENTITY_TOO_LARGE(400, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed object size."),
+    INVALID_RANGE(416, "InvalidRange", "The requested range is not satisfiable."),
     MALFORMED_XML(400, "MalformedXML", "The XML you provided was not well-formed or did not validate."),
     METHOD_NOT_ALLOWED(405, "MethodNotAllowed", "The specified method is not allowed against this resource."),
     NOT_IMPLEMENTED(501, "NotImplemented", "A header or operation you provided is not implemented."),

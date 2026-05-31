@@ -20,7 +20,6 @@ import java.util.Map;
 import me.predatorray.candybox.common.CandyKey;
 import me.predatorray.candybox.common.CandyLocator;
 import me.predatorray.candybox.common.Hlc;
-import me.predatorray.candybox.common.LocatorType;
 import me.predatorray.candybox.common.Mutation;
 import me.predatorray.candybox.common.SegmentRef;
 
@@ -35,7 +34,7 @@ public final class TestData {
     }
 
     public static CandyLocator put(Hlc hlc, long syrupId, long contentLength) {
-        return new CandyLocator(hlc, LocatorType.PUT, contentLength, 1 << 20, "application/octet-stream",
+        return CandyLocator.singlePart(hlc, contentLength, 1 << 20, "application/octet-stream",
                 Map.of(), 0, hlc.physicalMillis(), List.of(new SegmentRef(syrupId, 0, 0)));
     }
 

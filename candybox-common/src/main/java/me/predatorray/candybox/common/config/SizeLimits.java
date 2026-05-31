@@ -23,7 +23,8 @@ package me.predatorray.candybox.common.config;
  *                              overhead (validated against the BK client config on startup). Default 1 MiB.
  * @param maxCandyKeyBytes      max CandyKey length in UTF-8 bytes. Default 1 KiB.
  * @param maxUserMetadataBytes  max total user-metadata size. Default 8 KiB.
- * @param maxLocatorBytes       hard cap on a serialized CandyLocator. Default 64 KiB.
+ * @param maxLocatorBytes       hard cap on a serialized CandyLocator. Default 256 KiB (large enough
+ *                              for a 10,000-part multipart Candy; see {@code MULTIPART_RANGE_PLAN.md}).
  * @param maxCandySizeBytes     max Candy size; {@code 0} means effectively unbounded. Default 0.
  */
 public record SizeLimits(
@@ -36,7 +37,7 @@ public record SizeLimits(
     public static final int DEFAULT_CHUNK_SIZE = 1 << 20;        // 1 MiB
     public static final int DEFAULT_MAX_KEY_BYTES = 1 << 10;     // 1 KiB
     public static final int DEFAULT_MAX_METADATA_BYTES = 8 << 10; // 8 KiB
-    public static final int DEFAULT_MAX_LOCATOR_BYTES = 64 << 10; // 64 KiB
+    public static final int DEFAULT_MAX_LOCATOR_BYTES = 256 << 10; // 256 KiB
     public static final long DEFAULT_MAX_CANDY_SIZE = 0L;        // unbounded
 
     public SizeLimits {

@@ -95,23 +95,29 @@ Every persisted record begins with a **format version byte** for forward compati
 big-endian via `BinaryWriter`/`BinaryReader`; length prefixes and small counts use unsigned LEB128
 varints, and every decode is bounds-checked (a corrupt buffer cannot over-read or over-allocate).
 
-**CandyLocator** (`CandyLocatorSerializer`, version 1), the LSM value, capped at 64 KiB:
+**CandyLocator** (`CandyLocatorSerializer`, **version 2**), the LSM value, capped at 256 KiB:
 ```
-byte    formatVersion (=1)
+byte    formatVersion (=2)
 byte    type (1=PUT, 2=DELETE tombstone)
 long    hlc.physicalMillis
 varint  hlc.logicalCounter
 int     hlc.nodeId
-varlong contentLength
-varint  chunkSize
-int     crc32c (whole-object)
 varlong createdAtMillis
 byte    contentType present? [+ string]
-varint  userMetadata count  [+ {string key, string value}]
-varint  segment count       [+ {varlong syrupId, varlong firstEntryId, varlong lastEntryId}]
+varint  userMetadata count   [+ {string key, string value}]
+varint  part count           [+ Part records]
+  Part:
+    varlong partLength
+    varint  chunkSize
+    int     crc32c (per-part end-to-end)
+    varint  segment count    [+ {varlong syrupId, varlong firstEntryId, varlong lastEntryId}]
 ```
-The segment list is O(number of Syrups), not O(number of chunks), thanks to fixed `chunkSize` +
-contiguous entries. A DELETE tombstone carries no segments and zero length.
+The locator is a list of *parts*. A single-PUT or `copy/rename` produces a one-element list; a
+multipart-uploaded Candy stitches its parts together in part-number order. Each Part is internally
+uniform-chunked with its own end-to-end CRC32C — short-tail chunks therefore only sit at part
+boundaries, where the read path knows to look (see `MULTIPART_RANGE_PLAN.md`). A DELETE tombstone
+carries an empty parts list. The 256 KiB cap accommodates a 10,000-part multipart Candy
+(~200 KiB).
 
 **Mutation** (`MutationSerializer`, version 1) — point WAL record and SSTable record: `version |
 bytes(key) | bytes(serialized CandyLocator)`.
@@ -128,9 +134,14 @@ RangeTombstone payload>`. Replay reports the max HLC across **both** kinds, so h
 
 **Syrup chunk entry**: `int crc32c | payload[<= chunkSize]`. The crc covers the payload only.
 
-**ManifestEdit** (`ManifestSerializer`, version 1): `version | addedTables[] | removedTableLedgerIds[]
-| addedSyrups[] | removedSyrups[] | (bool, varlong) newWalLedgerId`, where each `SSTableMeta` is
-`varlong ledgerId | varint level | bytes minKey | bytes maxKey | varlong entryCount`.
+**ManifestEdit** (`ManifestSerializer`, **version 2**): `version | addedTables[]
+| removedTableLedgerIds[] | addedSyrups[] | removedSyrups[] | (bool, varlong) newWalLedgerId
+| ownerFencingToken | addedUploads[] | upsertParts[] | removedUploads[]`, where each `SSTableMeta`
+is `varlong ledgerId | varint level | bytes minKey | bytes maxKey | varlong entryCount`. The
+multipart-tracking trailing fields (Phase 5) carry in-flight upload state: a `MultipartUploadState`
+record per `addedUpload`, a `(uploadId, partNumber, Part)` triple per `upsertParts`, and a string
+per `removedUpload`. Replayed on handover so a takeover sees the upload exactly where the prior
+owner left it.
 
 **Protocol frame** (`FrameCodec`): `magic(2)=0xCB0F | version(1)=1 | opcode(1) | length(4) | payload`.
 **Message body** (`MessageCodec`): `bodyVersion(1) | <per-opcode fields>`.
@@ -175,10 +186,26 @@ consults range tombstones across all tables rather than pruning by point range.
 - **deleteRange**: stamp one HLC and append a single `RangeTombstone` `[start, end)` to the WAL +
   memtable — an O(1) delete of the whole interval. Shadowed keys are reclaimed lazily at compaction.
   Either bound may be unbounded; `deleteRangeByPrefix` maps `prefix → [prefix, prefixSuccessor)`.
-- **copy / rename**: write a fresh PUT at the destination reusing the source locator's Syrup segments
-  and whole-object crc verbatim (zero byte copy); `rename` also tombstones the source. Both commit
-  atomically under the single owner's write lock (same Box only). Because GC is reference-counted by
-  Syrup id, several keys may share one segment set safely.
+- **copy / rename**: write a fresh PUT at the destination reusing the source locator's *parts*
+  verbatim (zero byte copy and zero locator rebuild — a multipart source becomes a multipart-shaped
+  copy); `rename` also tombstones the source. Both commit atomically under the single owner's
+  write lock (same Box only). Because GC is reference-counted by Syrup id, several keys may share
+  one segment set safely.
+- **range get**: `getCandyRange(key, firstByte, lastByte)` over HTTP `Range: bytes=…` semantics
+  (inclusive on both ends). Prefix-sums the part lengths to find the first/last parts, then indexes
+  into chunks by `byteWithinPart / part.chunkSize`. Chunks at the slice boundary are read whole —
+  the per-chunk CRC still validates — and trimmed before emission. Multi-range
+  (`bytes=A-B,C-D`) is rejected; a single absent/unparseable header falls back to a full 200 per
+  RFC 9110 §14.2.
+- **multipart upload**: `CreateMultipartUpload(key, contentType, userMetadata) → uploadId`,
+  `UploadPart(uploadId, partNumber, body) → partCrc`, `CompleteMultipartUpload(uploadId, parts) →
+  metadata`, `AbortMultipartUpload(uploadId)`, plus `UploadPartCopy` (same-Box only) and
+  `ListMultipartUploads`/`ListParts`. In-flight state lives in the manifest's `multipartUploads`
+  section (see §7), so it is fencing-gated, replayed on handover, and pins its parts' Syrups via
+  the existing reference-count walk. `Complete` assembles a multi-part `CandyLocator` at the target
+  key in one fenced manifest edit; superseded parts (re-uploading the same `partNumber`) and
+  aborted uploads enter the pending-orphan path for GC. The TTL sweeper on the
+  compaction/GC worker aborts uploads older than `multipart.upload.ttl.millis` (default 7 days).
 
 The merged read path spans **all levels** (L0 plus the compaction-produced L1+); within a level keys
 are non-overlapping, while L0 tables may overlap, so L0 is consulted table-by-table. Under
@@ -275,7 +302,10 @@ Box drops its manifest pointer but does not yet reclaim that Box's SSTable/Syrup
 | Max CandyKey length | 1 KiB UTF-8 | client + node |
 | Box name | 3–63 chars `[a-z0-9-]` | `BoxName` |
 | Max user-metadata total | 8 KiB | inside locator |
-| Max CandyLocator serialized size | 64 KiB hard cap | `CandyLocatorSerializer` |
+| Max CandyLocator serialized size | 256 KiB hard cap | `CandyLocatorSerializer` (room for 10k-part multipart) |
+| Min multipart part size (except last) | 5 MiB | S3 parity; `multipart.min.part.bytes` |
+| Max multipart parts per upload | 10,000 | S3 parity; `multipart.max.parts` |
+| Multipart upload TTL | 7 days | sweeper auto-aborts; `multipart.upload.ttl.millis` |
 | Max Candy size | unlimited (`maxCandySizeBytes=0`) | configurable |
 | Max protocol frame | 16 MiB | `FrameCodec`, rejected before allocation |
 
@@ -315,9 +345,15 @@ Per-role BK quorum (E/Qw/Qa) defaults: **WAL 3/3/2, Manifest 3/3/2, SSTable 3/2/
   replicated, so any node *could* serve reads of flushed data; only unflushed-memtable read-your-writes
   needs the owner. Not built in v1.
 - **No small-object inlining** — all bytes go to Syrups (an extra BK round trip + fragmentation for
-  tiny Candies). The 64 KiB locator cap leaves room to inline small bytes later.
-- **No Syrup defragmentation, no multipart upload** — see §9(d); large-object streaming over the wire
-  and resumable writes are future work (client currently buffers).
+  tiny Candies). The 256 KiB locator cap leaves room to inline small bytes later.
+- **No Syrup defragmentation** — see §9(d). Syrup compaction (copying survivors into a fresh Syrup)
+  is future work.
+- **Buffered wire protocol** — PUT/GET/UploadPart bodies are inlined in one framed message (16 MiB
+  cap). Multipart upload partially substitutes for streaming, but each part is still bounded by the
+  frame cap. True on-the-wire chunked streaming remains `TODO(phase-2)`.
+- **UploadPartCopy buffers in memory** — the engine reads the source slice and writes it as a fresh
+  part rather than sharing Syrup segments when the range aligns to chunk boundaries; the optimization
+  is a strictly-internal future change.
 
 ## 13. What's done vs. remaining
 
@@ -333,8 +369,9 @@ hardening and operational docs (`OPERATIONS.md`) landed in Phase 4.
 **Remaining future work:**
 
 - **True on-the-wire streaming.** The protocol still inlines a Candy's bytes in one framed message and
-  the client buffers a stream in memory; chunked PUT/GET bodies and resumable/multipart upload are
-  future work (`TODO(phase-2)` in `Message`/`CandyboxClient`).
+  the client buffers a stream in memory; chunked PUT/GET/UploadPart bodies are future work
+  (`TODO(phase-2)` in `Message`/`CandyboxClient`). Multipart upload partially fills the
+  "resumable / parallel upload" gap, but each part is still bounded by the frame cap.
 - **Distributed cross-node compaction scheduling.** Compaction runs in-process on each Box's owner;
   claiming work via ZK task leases so it can run off the owner is `TODO(phase-3)` (the *commit* is
   already fencing-gated).

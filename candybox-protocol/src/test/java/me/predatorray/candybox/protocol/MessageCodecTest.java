@@ -128,6 +128,29 @@ class MessageCodecTest {
     }
 
     @Test
+    void rangeGetCandyRequestRoundTrips() {
+        Message.RangeGetCandyRequest req = new Message.RangeGetCandyRequest("box", "k", 6, 9);
+        Message.RangeGetCandyRequest out = (Message.RangeGetCandyRequest) roundTrip(req);
+        assertThat(out.firstByte()).isEqualTo(6);
+        assertThat(out.lastByte()).isEqualTo(9);
+
+        Message.RangeGetCandyRequest suffix = (Message.RangeGetCandyRequest) roundTrip(
+                new Message.RangeGetCandyRequest("box", "k", -1, 3));
+        assertThat(suffix.firstByte()).isEqualTo(-1);
+        assertThat(suffix.lastByte()).isEqualTo(3);
+    }
+
+    @Test
+    void candyDataResponseCarriesTotalLength() {
+        Message.CandyDataResponse resp = new Message.CandyDataResponse(4, 14, "text/plain",
+                Map.of(), 0x99, "cand".getBytes());
+        Message.CandyDataResponse out = (Message.CandyDataResponse) roundTrip(resp);
+        assertThat(out.contentLength()).isEqualTo(4);
+        assertThat(out.totalLength()).isEqualTo(14);
+        assertThat(new String(out.data())).isEqualTo("cand");
+    }
+
+    @Test
     void movedResponseRoundTrips() {
         Message.MovedResponse out = (Message.MovedResponse) roundTrip(new Message.MovedResponse(7));
         assertThat(out.ownerNodeId()).isEqualTo(7);

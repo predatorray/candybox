@@ -51,6 +51,10 @@ public final class MessageCodec {
             w.writeBytes(m.data() == null ? new byte[0] : m.data());
         } else if (message instanceof Message.GetCandyRequest m) {
             writeBoxKey(w, m.box(), m.key());
+        } else if (message instanceof Message.RangeGetCandyRequest m) {
+            writeBoxKey(w, m.box(), m.key());
+            w.writeLong(m.firstByte());
+            w.writeLong(m.lastByte());
         } else if (message instanceof Message.HeadCandyRequest m) {
             writeBoxKey(w, m.box(), m.key());
         } else if (message instanceof Message.DeleteCandyRequest m) {
@@ -70,6 +74,73 @@ public final class MessageCodec {
             writeNullable(w, m.prefix());
             writeNullable(w, m.startKey());
             writeNullable(w, m.endKey());
+        } else if (message instanceof Message.CreateMultipartUploadRequest m) {
+            w.writeString(m.box());
+            w.writeString(m.key());
+            writeNullable(w, m.contentType());
+            writeMetadata(w, m.userMetadata());
+        } else if (message instanceof Message.UploadPartRequest m) {
+            w.writeString(m.box());
+            w.writeString(m.key());
+            w.writeString(m.uploadId());
+            w.writeVarInt(m.partNumber());
+            w.writeBytes(m.data() == null ? new byte[0] : m.data());
+        } else if (message instanceof Message.CompleteMultipartUploadRequest m) {
+            w.writeString(m.box());
+            w.writeString(m.key());
+            w.writeString(m.uploadId());
+            w.writeVarInt(m.parts().size());
+            for (Message.CompletedPart p : m.parts()) {
+                w.writeVarInt(p.partNumber());
+                w.writeInt(p.crc32c());
+            }
+            writeNullable(w, m.idempotencyToken());
+        } else if (message instanceof Message.AbortMultipartUploadRequest m) {
+            w.writeString(m.box());
+            w.writeString(m.key());
+            w.writeString(m.uploadId());
+        } else if (message instanceof Message.ListMultipartUploadsRequest m) {
+            w.writeString(m.box());
+            writeNullable(w, m.prefix());
+            writeNullable(w, m.keyMarker());
+            writeNullable(w, m.uploadIdMarker());
+            w.writeVarInt(m.maxUploads());
+        } else if (message instanceof Message.ListPartsRequest m) {
+            w.writeString(m.box());
+            w.writeString(m.key());
+            w.writeString(m.uploadId());
+            w.writeVarInt(m.partNumberMarker());
+            w.writeVarInt(m.maxParts());
+        } else if (message instanceof Message.UploadPartCopyRequest m) {
+            w.writeString(m.box());
+            w.writeString(m.key());
+            w.writeString(m.uploadId());
+            w.writeVarInt(m.partNumber());
+            w.writeString(m.srcKey());
+            w.writeLong(m.firstByte());
+            w.writeLong(m.lastByte());
+        } else if (message instanceof Message.CreateMultipartUploadResponse m) {
+            w.writeString(m.uploadId());
+        } else if (message instanceof Message.UploadPartResponse m) {
+            w.writeInt(m.crc32c());
+            w.writeVarLong(m.partLength());
+        } else if (message instanceof Message.ListMultipartUploadsResponse m) {
+            w.writeVarInt(m.uploads().size());
+            for (Message.InProgressUpload u : m.uploads()) {
+                w.writeString(u.uploadId());
+                w.writeString(u.key());
+                w.writeVarLong(Math.max(0, u.createdAtMillis()));
+            }
+            writeNullable(w, m.nextKeyMarker());
+            writeNullable(w, m.nextUploadIdMarker());
+        } else if (message instanceof Message.ListPartsResponse m) {
+            w.writeVarInt(m.parts().size());
+            for (Message.UploadedPart p : m.parts()) {
+                w.writeVarInt(p.partNumber());
+                w.writeVarLong(p.partLength());
+                w.writeInt(p.crc32c());
+            }
+            w.writeVarInt(m.nextPartNumberMarker());
         } else if (message instanceof Message.ListCandiesRequest m) {
             w.writeString(m.box());
             writeNullable(w, m.prefix());
@@ -89,6 +160,7 @@ public final class MessageCodec {
             // no body
         } else if (message instanceof Message.CandyDataResponse m) {
             w.writeVarLong(m.contentLength());
+            w.writeVarLong(m.totalLength());
             writeNullable(w, m.contentType());
             writeMetadata(w, m.userMetadata());
             w.writeInt(m.crc32c());
@@ -134,6 +206,8 @@ public final class MessageCodec {
             case PUT_CANDY -> new Message.PutCandyRequest(r.readString(), r.readString(),
                     readNullable(r), readMetadata(r), readNullable(r), r.readBytes());
             case GET_CANDY -> new Message.GetCandyRequest(r.readString(), r.readString());
+            case RANGE_GET_CANDY -> new Message.RangeGetCandyRequest(r.readString(), r.readString(),
+                    r.readLong(), r.readLong());
             case HEAD_CANDY -> new Message.HeadCandyRequest(r.readString(), r.readString());
             case DELETE_CANDY -> new Message.DeleteCandyRequest(r.readString(), r.readString());
             case COPY_CANDY -> new Message.CopyCandyRequest(r.readString(), r.readString(),
@@ -144,12 +218,29 @@ public final class MessageCodec {
                     readNullable(r), readNullable(r));
             case LIST_CANDIES -> new Message.ListCandiesRequest(r.readString(), readNullable(r),
                     readNullable(r), r.readInt(), readNullable(r), readNullable(r), r.readBoolean());
+            case CREATE_MULTIPART_UPLOAD -> new Message.CreateMultipartUploadRequest(r.readString(),
+                    r.readString(), readNullable(r), readMetadata(r));
+            case UPLOAD_PART -> new Message.UploadPartRequest(r.readString(), r.readString(),
+                    r.readString(), r.readVarInt(), r.readBytes());
+            case COMPLETE_MULTIPART_UPLOAD -> decodeCompleteMultipart(r);
+            case ABORT_MULTIPART_UPLOAD -> new Message.AbortMultipartUploadRequest(r.readString(),
+                    r.readString(), r.readString());
+            case LIST_MULTIPART_UPLOADS -> new Message.ListMultipartUploadsRequest(r.readString(),
+                    readNullable(r), readNullable(r), readNullable(r), r.readVarInt());
+            case LIST_PARTS -> new Message.ListPartsRequest(r.readString(), r.readString(),
+                    r.readString(), r.readVarInt(), r.readVarInt());
+            case UPLOAD_PART_COPY -> new Message.UploadPartCopyRequest(r.readString(), r.readString(),
+                    r.readString(), r.readVarInt(), r.readString(), r.readLong(), r.readLong());
+            case RESPONSE_CREATE_MULTIPART -> new Message.CreateMultipartUploadResponse(r.readString());
+            case RESPONSE_UPLOAD_PART -> new Message.UploadPartResponse(r.readInt(), r.readVarLong());
+            case RESPONSE_LIST_MULTIPART_UPLOADS -> decodeListMultipart(r);
+            case RESPONSE_LIST_PARTS -> decodeListParts(r);
             case RESPONSE_OK -> new Message.OkResponse();
             case RESPONSE_ERROR -> new Message.ErrorResponse(r.readString(), r.readString());
             case RESPONSE_BUSY -> new Message.BusyResponse(r.readVarLong());
             case RESPONSE_NOT_FOUND -> new Message.NotFoundResponse();
-            case RESPONSE_CANDY_DATA -> new Message.CandyDataResponse(r.readVarLong(), readNullable(r),
-                    readMetadata(r), r.readInt(), r.readBytes());
+            case RESPONSE_CANDY_DATA -> new Message.CandyDataResponse(r.readVarLong(), r.readVarLong(),
+                    readNullable(r), readMetadata(r), r.readInt(), r.readBytes());
             case RESPONSE_LIST -> decodeList(r);
             case RESPONSE_HEAD -> new Message.HeadCandyResponse(r.readVarLong(), readNullable(r),
                     readMetadata(r), r.readInt(), r.readVarLong());
@@ -165,6 +256,40 @@ public final class MessageCodec {
             boxes.add(r.readString());
         }
         return new Message.ListBoxesResponse(boxes);
+    }
+
+    private static Message decodeCompleteMultipart(BinaryReader r) {
+        String box = r.readString();
+        String key = r.readString();
+        String uploadId = r.readString();
+        int count = r.readVarInt();
+        List<Message.CompletedPart> parts = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            parts.add(new Message.CompletedPart(r.readVarInt(), r.readInt()));
+        }
+        String idempotency = readNullable(r);
+        return new Message.CompleteMultipartUploadRequest(box, key, uploadId, parts, idempotency);
+    }
+
+    private static Message decodeListMultipart(BinaryReader r) {
+        int count = r.readVarInt();
+        List<Message.InProgressUpload> uploads = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            uploads.add(new Message.InProgressUpload(r.readString(), r.readString(), r.readVarLong()));
+        }
+        String nextKey = readNullable(r);
+        String nextUploadId = readNullable(r);
+        return new Message.ListMultipartUploadsResponse(uploads, nextKey, nextUploadId);
+    }
+
+    private static Message decodeListParts(BinaryReader r) {
+        int count = r.readVarInt();
+        List<Message.UploadedPart> parts = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            parts.add(new Message.UploadedPart(r.readVarInt(), r.readVarLong(), r.readInt()));
+        }
+        int nextMarker = r.readVarInt();
+        return new Message.ListPartsResponse(parts, nextMarker);
     }
 
     private static Message decodeList(BinaryReader r) {

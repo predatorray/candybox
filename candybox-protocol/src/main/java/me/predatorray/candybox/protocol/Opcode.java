@@ -33,6 +33,14 @@ public enum Opcode {
     COPY_CANDY(15),
     RENAME_CANDY(16),
     DELETE_RANGE(17),
+    RANGE_GET_CANDY(18),
+    CREATE_MULTIPART_UPLOAD(19),
+    UPLOAD_PART(30),
+    COMPLETE_MULTIPART_UPLOAD(31),
+    ABORT_MULTIPART_UPLOAD(32),
+    LIST_MULTIPART_UPLOADS(33),
+    LIST_PARTS(34),
+    UPLOAD_PART_COPY(35),
 
     RESPONSE_OK(20),
     RESPONSE_ERROR(21),
@@ -43,7 +51,11 @@ public enum Opcode {
     RESPONSE_HEAD(26),
     /** The target Box is owned by another node; the client should re-route (see routing, WS5). */
     RESPONSE_MOVED(27),
-    RESPONSE_BOX_LIST(28);
+    RESPONSE_BOX_LIST(28),
+    RESPONSE_CREATE_MULTIPART(40),
+    RESPONSE_UPLOAD_PART(41),
+    RESPONSE_LIST_MULTIPART_UPLOADS(42),
+    RESPONSE_LIST_PARTS(43);
 
     private final int code;
 

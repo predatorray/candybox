@@ -38,10 +38,16 @@ final class S3Router {
         GET_BUCKET_LOCATION,
         GET_BUCKET_VERSIONING,
         GET_BUCKET_ACL,
+        LIST_MULTIPART_UPLOADS,
         PUT_OBJECT,
         GET_OBJECT,
         HEAD_OBJECT,
         DELETE_OBJECT,
+        CREATE_MULTIPART_UPLOAD,
+        UPLOAD_PART,
+        COMPLETE_MULTIPART_UPLOAD,
+        ABORT_MULTIPART_UPLOAD,
+        LIST_PARTS,
         UNSUPPORTED
     }
 
@@ -62,10 +68,36 @@ final class S3Router {
             return routeBucket(method, queries);
         }
         return switch (method) {
-            case "PUT" -> S3Action.PUT_OBJECT; // copy is decided from x-amz-copy-source later
-            case "GET" -> S3Action.GET_OBJECT;
+            case "PUT" -> {
+                // PUT ?partNumber&uploadId is UploadPart; otherwise it's PUT_OBJECT (copy is decided
+                // from x-amz-copy-source later).
+                if (queries.contains("partnumber") && queries.contains("uploadid")) {
+                    yield S3Action.UPLOAD_PART;
+                }
+                yield S3Action.PUT_OBJECT;
+            }
+            case "GET" -> {
+                if (queries.contains("uploadid")) {
+                    yield S3Action.LIST_PARTS;
+                }
+                yield S3Action.GET_OBJECT;
+            }
             case "HEAD" -> S3Action.HEAD_OBJECT;
-            case "DELETE" -> S3Action.DELETE_OBJECT;
+            case "DELETE" -> {
+                if (queries.contains("uploadid")) {
+                    yield S3Action.ABORT_MULTIPART_UPLOAD;
+                }
+                yield S3Action.DELETE_OBJECT;
+            }
+            case "POST" -> {
+                if (queries.contains("uploads")) {
+                    yield S3Action.CREATE_MULTIPART_UPLOAD;
+                }
+                if (queries.contains("uploadid")) {
+                    yield S3Action.COMPLETE_MULTIPART_UPLOAD;
+                }
+                yield S3Action.UNSUPPORTED;
+            }
             default -> S3Action.UNSUPPORTED;
         };
     }
@@ -88,6 +120,9 @@ final class S3Router {
                 }
                 if (queries.contains("versions")) {
                     yield S3Action.LIST_OBJECT_VERSIONS;
+                }
+                if (queries.contains("uploads")) {
+                    yield S3Action.LIST_MULTIPART_UPLOADS;
                 }
                 yield S3Action.LIST_OBJECTS;
             }

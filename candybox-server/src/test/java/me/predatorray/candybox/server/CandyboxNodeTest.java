@@ -64,6 +64,41 @@ class CandyboxNodeTest {
     }
 
     @Test
+    void multipartTtlSweeperAbortsStaleUploadsOlderThanTtl() {
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        ManualClock clock = new ManualClock(1000);
+        CandyboxConfig cfg = CandyboxConfig.builder()
+                .multipartUploadTtlMillis(60_000) // 60s for the test
+                .multipartMinPartBytes(1)
+                .build();
+        try (CandyboxNode node = new CandyboxNode(1, cfg, store,
+                new InMemoryCoordinationService(), clock)) {
+            node.createBox(BoxName.of("my-box"));
+            RequestHandler handler = node.requestHandler();
+
+            Message create = roundTrip(handler, new Message.CreateMultipartUploadRequest("my-box",
+                    "k", null, Map.of()));
+            assertThat(create).isInstanceOf(Message.CreateMultipartUploadResponse.class);
+            String uploadId = ((Message.CreateMultipartUploadResponse) create).uploadId();
+
+            // Sweep right away: the upload is fresh, no abort.
+            assertThat(node.sweepStaleMultipartUploadsOnce()).isZero();
+
+            // Advance the clock past the TTL. Now the sweep aborts it.
+            clock.advance(120_000);
+            assertThat(node.sweepStaleMultipartUploadsOnce()).isEqualTo(1);
+            assertThat(node.sweepStaleMultipartUploadsOnce()).isZero();
+
+            // A subsequent UploadPart against the swept uploadId returns NOT_FOUND (server maps
+            // CandyNotFound to NotFoundResponse).
+            Message upload = roundTrip(handler, new Message.UploadPartRequest("my-box", "k",
+                    uploadId, 1, "x".getBytes(StandardCharsets.UTF_8)));
+            assertThat(upload).isInstanceOf(Message.NotFoundResponse.class);
+        }
+        store.close();
+    }
+
+    @Test
     void handlesHeadCandyListBoxesAndHeadBox() {
         InMemoryLedgerStore store = new InMemoryLedgerStore();
         try (CandyboxNode node = new CandyboxNode(1, CandyboxConfig.defaults(), store,
