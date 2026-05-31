@@ -7,7 +7,7 @@
 #
 # suite ref : master (5522d1c)
 # endpoint  : http://127.0.0.1:9711
-# calibrated: 2026-05-31T02:14:41Z
+# calibrated: 2026-05-31T02:50:42Z
 #
 s3tests/functional/test_s3.py::test_atomic_conditional_write_1mb
 s3tests/functional/test_s3.py::test_atomic_dual_write_1mb

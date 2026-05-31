@@ -89,6 +89,46 @@ re-calibrate and the allowlist grows on its own.
 Requirements on the runner host: `python3` (with `venv`), `git`, and network access to clone the
 suite and pip-install boto3/pytest the first time.
 
+## Latest calibration
+
+Last calibrated against ceph/s3-tests `master` @ `5522d1c` on **2026-05-31** (full suite path
+`s3tests/functional/test_s3.py`, 7m 52s wall on an Apple-Silicon laptop). The result is
+reproducible — re-running `--calibrate` against the same source produces a byte-identical
+`allowlist.txt` apart from the timestamp header.
+
+| Outcome | Count | Notes |
+|---|---:|---|
+| **Passed** (in `allowlist.txt`) | **149** | The compatibility gate. |
+| Failed | 595 | Features the v1 gateway doesn't yet implement (breakdown below). |
+| Skipped | 94 | Suite-level `pytest.mark` opt-outs — never executed (bucket logging, cloud-tier lifecycle, restore-status). |
+| Collected | 838 | All of `s3tests/functional/test_s3.py`. |
+
+The 595 failures are the **growth surface** — implementing any of these would expand the allowlist
+on the next `--calibrate`:
+
+| Failures | Feature family |
+|---:|---|
+| 106 | Server-side encryption — SSE-C / SSE-S3 / SSE-KMS (incl. the 64-test `copy_enc[…]` matrix) |
+| 51 | Multipart upload + `copy_part` / `multipart_copy` |
+| 40 | ACLs / ownership controls (`object_acl`, `bucket_acl`, `access_bucket_*`) |
+| 38 | Versioning (`versioning_*`, `delete_marker_*`, `*_versioned`) |
+| 36 | Object Lock / retention / legal hold (beyond the 3 that already pass) |
+| 36 | POST object (browser-style form uploads) |
+| 33 | Lifecycle / expiration / non-current-version rules |
+| 29 | Bucket policy / block-public-access |
+| 29 | Bucket logging (the bits not behind the `pytest.mark` skip) |
+| 25 | `ListObjects(V2)` edge cases — encoding-type, exotic keys, sort order |
+| 13 | CORS preflight + actual cross-origin |
+| 13 | Anonymous raw-HTTP negative tests |
+| 11 | Object copy edge (metadata-directive, content-type override, ACL on copy) |
+| 10 | Range GET + `If-Match` / `If-Modified-Since` matrix |
+| 9 | Bucket create / naming negative + target-bucket setup |
+| 8 | Tagging beyond the basic put/get already in the allowlist |
+| 67 | Other — object attributes (checksum SHA-256, CRC64NVMe), public-access-block, `expected_bucket_owner`, bucket-recreate ACL, account-usage, misc PUT/GET/HEAD/DELETE response-shape edges |
+
+The headers in `allowlist.txt` always record the exact suite SHA + endpoint a result was calibrated
+against, so the table above can be reproduced verbatim from the checked-in artifact.
+
 ## In CI
 
 [`.github/workflows/s3-compat.yml`](../../.github/workflows/s3-compat.yml) runs this gate on **every
