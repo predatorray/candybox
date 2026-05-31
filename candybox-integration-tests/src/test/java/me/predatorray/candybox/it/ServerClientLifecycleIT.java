@@ -309,6 +309,38 @@ class ServerClientLifecycleIT {
     }
 
     @Test
+    void deleteBoxRequiresForceWhenNonEmptyThenSucceeds() {
+        String box = "nonempty-box";
+        client.createBox(box);
+        client.putCandy(box, "k", bytes("v"), "text/plain", Map.of(), null);
+
+        // A non-empty Box cannot be deleted without force.
+        assertThatThrownBy(() -> client.deleteBox(box, false))
+                .isInstanceOf(CandyboxException.class);
+        assertThat(client.headBox(box)).isTrue();
+
+        // Forced delete removes it.
+        client.deleteBox(box, true);
+        assertThat(client.headBox(box)).isFalse();
+    }
+
+    @Test
+    void boxOwnershipReleaseAndReopenReplaysState() {
+        String box = "handover-box";
+        client.createBox(box);
+        client.putCandy(box, "durable", bytes("survives-handover"), "text/plain", Map.of(), null);
+
+        BoxName boxName = BoxName.of(box);
+        // Hand the Box off this node and re-acquire it: the open path fences prior owners and replays
+        // the WAL, so the previously written value must still be readable.
+        node.releaseBox(boxName);
+        node.openBox(boxName);
+
+        assertThat(node.currentOwner(boxName)).contains(node.nodeId());
+        assertThat(client.getCandy(box, "durable")).isEqualTo(bytes("survives-handover"));
+    }
+
+    @Test
     void nodeMaintenanceOperationsRunOverOwnedBoxes() {
         // Drive enough churn through a Box that the maintenance passes have real work to do.
         String box = "maint-box";
