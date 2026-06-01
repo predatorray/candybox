@@ -201,6 +201,33 @@ class CandyboxCliIT {
         assertThat(stderr()).contains("Unknown command: frobnicate");
     }
 
+    @Test
+    void getOfMissingKeyFailsWithErrorExitCode() {
+        assertThat(cli("create-box", "cli-missing")).isZero();
+        assertThat(cli("get", "cli-missing", "absent")).isEqualTo(1);
+        assertThat(stderr()).contains("error:");
+    }
+
+    @Test
+    void deleteRangeWindowFormAndListOptions(@TempDir Path tmp) throws IOException {
+        assertThat(cli("create-box", "cli-range")).isZero();
+        Path v = tmp.resolve("v");
+        Files.write(v, "x".getBytes(StandardCharsets.UTF_8));
+        for (String k : new String[] {"r1", "r2", "r3", "r4"}) {
+            assertThat(cli("put", "cli-range", k, v.toString())).isZero();
+        }
+
+        // Reverse listing with an explicit window and start-after, exercising the option parser.
+        assertThat(cli("list", "cli-range", "--reverse", "--start", "r1", "--end", "r4",
+                "--start-after", "r4")).isZero();
+
+        // Window-form range delete (no positional prefix; bounded by --start/--end).
+        assertThat(cli("delete-range", "cli-range", "--start", "r1", "--end", "r3")).isZero();
+        assertThat(cli("list", "cli-range", "r")).isZero();
+        // r1, r2 deleted; r3, r4 remain.
+        assertThat(stdout()).contains("r3").contains("r4").doesNotContain("r1");
+    }
+
     // ---- helpers ---------------------------------------------------------------------------
 
     private static int freePort() {

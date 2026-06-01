@@ -120,4 +120,38 @@ class CandyboxConfigTest {
         builder.quorum(LedgerRole.WAL, new QuorumConfig(9, 9, 9));
         assertThat(cfg.quorum(LedgerRole.WAL)).isEqualTo(new QuorumConfig(3, 3, 2));
     }
+
+    @Test
+    void multipartTuningDefaultsAndOverrides() {
+        CandyboxConfig defaults = CandyboxConfig.defaults();
+        assertThat(defaults.multipartMinPartBytes()).isEqualTo(5L << 20);
+        assertThat(defaults.multipartMaxParts()).isEqualTo(10_000);
+        assertThat(defaults.multipartUploadTtlMillis()).isPositive();
+        assertThat(defaults.multipartMaxConcurrentUploadsPerBox()).isEqualTo(10_000);
+
+        CandyboxConfig cfg = CandyboxConfig.builder()
+                .multipartMinPartBytes(1024)
+                .multipartMaxParts(50)
+                .multipartUploadTtlMillis(123)
+                .multipartMaxConcurrentUploadsPerBox(7)
+                .build();
+        assertThat(cfg.multipartMinPartBytes()).isEqualTo(1024);
+        assertThat(cfg.multipartMaxParts()).isEqualTo(50);
+        assertThat(cfg.multipartUploadTtlMillis()).isEqualTo(123);
+        assertThat(cfg.multipartMaxConcurrentUploadsPerBox()).isEqualTo(7);
+    }
+
+    @Test
+    void buildRejectsNegativeMultipartMinPartBytes() {
+        assertThatThrownBy(() -> CandyboxConfig.builder().multipartMinPartBytes(-1).build())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("multipartMinPartBytes");
+    }
+
+    @Test
+    void buildRejectsNonPositiveMultipartMaxParts() {
+        assertThatThrownBy(() -> CandyboxConfig.builder().multipartMaxParts(0).build())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("multipartMaxParts");
+    }
 }

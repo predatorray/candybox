@@ -23,6 +23,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import me.predatorray.candybox.common.SystemClock;
+import me.predatorray.candybox.common.exception.CandyboxException;
 import me.predatorray.candybox.common.exception.NotOwnerException;
 import me.predatorray.candybox.coordination.CandyboxKeys;
 import me.predatorray.candybox.coordination.fake.InMemoryCoordinationService;
@@ -125,6 +126,107 @@ class ClusterRouterTest {
             Message resp = router.callAny(new Message.CreateBoxRequest("new-box"));
             assertThat(resp).isInstanceOf(Message.OkResponse.class);
             assertThat(transport.contacted).hasSize(1);
+        }
+    }
+
+    @Test
+    void callAnyThrowsWhenThereAreNoMembers() {
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(); // no members
+        RecordingTransport transport = new RecordingTransport();
+        try (ClusterRouter router = new ClusterRouter(transport, coordination, 5_000, SystemClock.INSTANCE)) {
+            assertThatThrownBy(() -> router.callAny(new Message.ListBoxesRequest()))
+                    .isInstanceOf(CandyboxException.class)
+                    .hasMessageContaining("No cluster members");
+        }
+    }
+
+    @Test
+    void throwsWhenOwnerNodeIsNotRegistered() {
+        InMemoryCoordinationService coordination = coordinationWithMembers();
+        coordination.tryAcquireLease(CandyboxKeys.ownerResource("b"), 99, 10_000); // node 99 unknown
+        RecordingTransport transport = new RecordingTransport();
+        try (ClusterRouter router = new ClusterRouter(transport, coordination, 5_000, SystemClock.INSTANCE)) {
+            assertThatThrownBy(() -> router.callBox("b", new Message.GetCandyRequest("b", "k")))
+                    .isInstanceOf(NotOwnerException.class)
+                    .hasMessageContaining("not registered");
+        }
+    }
+
+    @Test
+    void throwsOnUnparseableMemberAddress() {
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService();
+        coordination.registerMember(5, "no-colon-here".getBytes(StandardCharsets.UTF_8));
+        coordination.tryAcquireLease(CandyboxKeys.ownerResource("b"), 5, 10_000);
+        RecordingTransport transport = new RecordingTransport();
+        try (ClusterRouter router = new ClusterRouter(transport, coordination, 5_000, SystemClock.INSTANCE)) {
+            assertThatThrownBy(() -> router.callBox("b", new Message.GetCandyRequest("b", "k")))
+                    .isInstanceOf(NotOwnerException.class)
+                    .hasMessageContaining("Unroutable");
+        }
+    }
+
+    @Test
+    void exceedingRoutingAttemptsThrowsNotOwner() {
+        InMemoryCoordinationService coordination = coordinationWithMembers();
+        coordination.tryAcquireLease(CandyboxKeys.ownerResource("b"), 2, 10_000);
+        // A transport that always redirects: the router exhausts MAX_ATTEMPTS and gives up.
+        Transport alwaysMoved = new Transport() {
+            @Override
+            public Connection connect(String host, int port) {
+                return new Connection() {
+                    @Override
+                    public Frame call(Frame request) {
+                        return CODEC.encode(new Message.MovedResponse(2));
+                    }
+
+                    @Override
+                    public void close() {
+                    }
+                };
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        try (ClusterRouter router = new ClusterRouter(alwaysMoved, coordination, 5_000, SystemClock.INSTANCE)) {
+            assertThatThrownBy(() -> router.callBox("b", new Message.GetCandyRequest("b", "k")))
+                    .isInstanceOf(NotOwnerException.class)
+                    .hasMessageContaining("exceeded routing attempts");
+        }
+    }
+
+    @Test
+    void brokenConnectionIsDroppedAndReopenedOnRetry() {
+        InMemoryCoordinationService coordination = coordinationWithMembers();
+        coordination.tryAcquireLease(CandyboxKeys.ownerResource("b"), 2, 10_000);
+        // First call on each freshly-opened connection throws; the router must drop it and rethrow.
+        Transport flaky = new Transport() {
+            @Override
+            public Connection connect(String host, int port) {
+                return new Connection() {
+                    @Override
+                    public Frame call(Frame request) {
+                        throw new IllegalStateException("connection reset");
+                    }
+
+                    @Override
+                    public void close() {
+                    }
+                };
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        try (ClusterRouter router = new ClusterRouter(flaky, coordination, 5_000, SystemClock.INSTANCE)) {
+            assertThatThrownBy(() -> router.callBox("b", new Message.GetCandyRequest("b", "k")))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("connection reset");
+            // A subsequent call reopens the connection and fails the same way (not a stale-handle error).
+            assertThatThrownBy(() -> router.callBox("b", new Message.GetCandyRequest("b", "k")))
+                    .isInstanceOf(IllegalStateException.class);
         }
     }
 }
