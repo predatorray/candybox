@@ -75,4 +75,33 @@ class FrameCodecTest {
                 .isInstanceOf(ProtocolException.class)
                 .hasMessageContaining("magic");
     }
+
+    @Test
+    void unsupportedVersionIsRejected() {
+        byte[] bytes = codec.encode(new Frame(Opcode.RESPONSE_OK, new byte[0]));
+        bytes[2] = 0x7F; // corrupt the version byte
+        assertThatThrownBy(() -> codec.decode(bytes))
+                .isInstanceOf(ProtocolException.class)
+                .hasMessageContaining("version");
+    }
+
+    @Test
+    void constructorRejectsNegativeMaxAndExposesTheCap() {
+        assertThatThrownBy(() -> new FrameCodec(-1))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("maxFrameBytes");
+        assertThat(new FrameCodec(1234).maxFrameBytes()).isEqualTo(1234);
+    }
+
+    @Test
+    void writeAndReadOverStreamsRoundTrip() throws Exception {
+        Frame frame = new Frame(Opcode.GET_CANDY, "streamed".getBytes());
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        codec.write(out, frame);
+
+        // read(InputStream) wraps a non-DataInputStream, exercising that overload too.
+        Frame decoded = codec.read(new ByteArrayInputStream(out.toByteArray()));
+        assertThat(decoded.opcode()).isEqualTo(Opcode.GET_CANDY);
+        assertThat(new String(decoded.payload())).isEqualTo("streamed");
+    }
 }

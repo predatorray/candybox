@@ -91,4 +91,38 @@ class HybridLogicalClockTest {
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("skew");
     }
+
+    @Test
+    void constructorRejectsNegativeSkewBound() {
+        assertThatThrownBy(() -> new HybridLogicalClock(1, new ManualClock(0), -1))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("maxAcceptableSkewMillis");
+    }
+
+    @Test
+    void peekReportsTheLatestStampWithoutAdvancing() {
+        ManualClock clock = new ManualClock(1000);
+        HybridLogicalClock hlc = new HybridLogicalClock(3, clock, 60_000);
+        assertThat(hlc.nodeId()).isEqualTo(3);
+
+        Hlc ticked = hlc.tick();
+        Hlc first = hlc.peek();
+        Hlc second = hlc.peek();
+        // peek() is idempotent and equal to the last issued stamp.
+        assertThat(first).isEqualTo(ticked);
+        assertThat(second).isEqualTo(first);
+        // ...and the next tick still advances past it.
+        assertThat(hlc.tick()).isGreaterThan(first);
+    }
+
+    @Test
+    void observeWithinSkewButNotAheadLeavesClockUnchanged() {
+        ManualClock clock = new ManualClock(1000);
+        HybridLogicalClock hlc = new HybridLogicalClock(1, clock, 60_000);
+        Hlc current = hlc.tick(); // physical=1000, logical=0
+
+        // An older observed stamp must not move the clock backwards.
+        hlc.observe(new Hlc(500, 9, 0));
+        assertThat(hlc.peek()).isEqualTo(current);
+    }
 }
