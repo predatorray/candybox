@@ -58,10 +58,10 @@ Tear it down with `docker compose down` (add `-v` to also wipe the data volumes)
 The gateway's S3 compatibility is verified against the industry-standard
 [`ceph/s3-tests`](https://github.com/ceph/s3-tests) suite — see
 [`compat/s3-tests/`](compat/s3-tests/) (`compat/s3-tests/run.sh --calibrate` against the running
-gateway). The calibration in the project README reflects the **pre-multipart / pre-Range-GET**
-gateway; recalibrating after the Phase 5 additions (multipart upload, Range GET) is operational
-follow-up work. The remaining gaps the v1 gateway does not yet implement are versioning, ACLs,
-SSE, POST object, lifecycle, CORS — see
+gateway). The latest calibration was taken after the Phase 5 additions (multipart upload, Range
+GET) landed: **164 / 838 boto3 functional tests pass** (up from 149 pre-Phase-5). The remaining
+gaps the v1 gateway does not yet implement are versioning, ACLs, SSE, POST object, lifecycle,
+CORS — see
 [`compat/s3-tests/README.md`](compat/s3-tests/README.md#latest-calibration) for the family-by-family
 breakdown.
 

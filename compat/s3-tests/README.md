@@ -18,10 +18,12 @@ The v1 gateway is **anonymous** (the `Authorization` header is accepted and igno
 | Supported (allowlist candidates)        | Not supported in v1 (excluded)                          |
 |------------------------------------------|---------------------------------------------------------|
 | Bucket create / head / delete            | Versioning                                              |
-| ListObjectsV2: prefix, delimiter,        | Multipart upload                                        |
-| max-keys, continuation-token, start-after| ACLs / bucket policy / ownership                        |
-| Object PUT / GET / HEAD / DELETE         | Range GET and conditional GET (If-Match/If-None-Match)  |
-| Multi-object delete                      | Tagging, lifecycle, CORS, SSE                           |
+| ListObjectsV2: prefix, delimiter,        | ACLs / bucket policy / ownership                        |
+| max-keys, continuation-token, start-after| Conditional GET (If-Match / If-None-Match / If-*-Since) |
+| Object PUT / GET / HEAD / DELETE         | Tagging, lifecycle, CORS, SSE                           |
+| Multi-object delete                      | POST object (browser-style form upload)                 |
+| Range GET (Phase 5)                      | Object Lock / retention / legal hold (3 trivial passes) |
+| Multipart upload — create / parts / complete / abort / list (Phase 5) | `UploadPartCopy` / multipart-copy        |
 | `x-amz-meta-*` user metadata, CRC32C ETag| Per-user auth / multi-account isolation                 |
 
 Because auth is ignored, the suite's `[s3 alt]` / `[s3 tenant]` accounts all collapse onto one
@@ -91,25 +93,40 @@ suite and pip-install boto3/pytest the first time.
 
 ## Latest calibration
 
-Last calibrated against ceph/s3-tests `master` @ `5522d1c` on **2026-05-31** (full suite path
-`s3tests/functional/test_s3.py`, 7m 52s wall on an Apple-Silicon laptop). The result is
-reproducible — re-running `--calibrate` against the same source produces a byte-identical
-`allowlist.txt` apart from the timestamp header.
+Last calibrated against ceph/s3-tests `master` @ `5522d1c` on **2026-06-01**, after the Phase 5
+gateway additions (multipart upload + Range GET) landed (full suite path
+`s3tests/functional/test_s3.py`, 10m 25s wall on an Apple-Silicon laptop — slower than the
+pre-Phase-5 7m 52s because the new multipart / range tests actually push MBs through instead of
+failing fast on the first PUT). The result is reproducible — re-running `--calibrate` against the
+same source produces a byte-identical `allowlist.txt` apart from the timestamp header.
 
-| Outcome | Count | Notes |
-|---|---:|---|
-| **Passed** (in `allowlist.txt`) | **149** | The compatibility gate. |
-| Failed | 595 | Features the v1 gateway doesn't yet implement (breakdown below). |
-| Skipped | 94 | Suite-level `pytest.mark` opt-outs — never executed (bucket logging, cloud-tier lifecycle, restore-status). |
-| Collected | 838 | All of `s3tests/functional/test_s3.py`. |
+| Outcome | Count | Δ vs pre-Phase-5 | Notes |
+|---|---:|---:|---|
+| **Passed** (in `allowlist.txt`) | **164** | +15 | The compatibility gate. |
+| Failed | 580 | −15 | Features the v1 gateway doesn't yet implement (breakdown below). |
+| Skipped | 94 | — | Suite-level `pytest.mark` opt-outs — never executed (bucket logging, cloud-tier lifecycle, restore-status). |
+| Collected | 838 | — | All of `s3tests/functional/test_s3.py`. |
 
-The 595 failures are the **growth surface** — implementing any of these would expand the allowlist
-on the next `--calibrate`:
+What Phase 5 added to the allowlist (no previously-passing test regressed):
+
+- **Range GET (6 new passes):** the `test_ranged_request_*` response-code family, including the
+  invalid-range path and the empty-object / trailing-bytes / skip-leading-bytes edges.
+- **Multipart upload (7 new passes):** `test_abort_multipart_upload`,
+  `test_atomic_multipart_upload_write`, `test_list_multipart_upload`,
+  `test_multipart_upload_empty`, `test_multipart_upload_multiple_sizes`,
+  `test_multipart_upload_overwrite_existing_object`,
+  `test_upload_part_copy_percent_encoded_key`.
+- **SSE-KMS × multipart (2 new passes):** `test_sse_kms_multipart_invalid_chunks_{1,2}`. The
+  gateway still ignores `x-amz-server-side-encryption-*`, so once multipart works these
+  SSE-negative-path tests fall through to plain multipart and pass.
+
+The 580 remaining failures are the **growth surface** — implementing any of these would expand the
+allowlist on the next `--calibrate`:
 
 | Failures | Feature family |
 |---:|---|
-| 106 | Server-side encryption — SSE-C / SSE-S3 / SSE-KMS (incl. the 64-test `copy_enc[…]` matrix) |
-| 51 | Multipart upload + `copy_part` / `multipart_copy` |
+| 104 | Server-side encryption — SSE-C / SSE-S3 / SSE-KMS (incl. the 64-test `copy_enc[…]` matrix) |
+| 44 | Multipart upload edges still unimplemented — `copy_part` / `multipart_copy`, checksum-on-complete, resume / list-parts pagination |
 | 40 | ACLs / ownership controls (`object_acl`, `bucket_acl`, `access_bucket_*`) |
 | 38 | Versioning (`versioning_*`, `delete_marker_*`, `*_versioned`) |
 | 36 | Object Lock / retention / legal hold (beyond the 3 that already pass) |
@@ -121,9 +138,9 @@ on the next `--calibrate`:
 | 13 | CORS preflight + actual cross-origin |
 | 13 | Anonymous raw-HTTP negative tests |
 | 11 | Object copy edge (metadata-directive, content-type override, ACL on copy) |
-| 10 | Range GET + `If-Match` / `If-Modified-Since` matrix |
 | 9 | Bucket create / naming negative + target-bucket setup |
 | 8 | Tagging beyond the basic put/get already in the allowlist |
+| 4 | Range GET + `If-Match` / `If-Modified-Since` matrix (conditional-GET headers still TODO) |
 | 67 | Other — object attributes (checksum SHA-256, CRC64NVMe), public-access-block, `expected_bucket_owner`, bucket-recreate ACL, account-usage, misc PUT/GET/HEAD/DELETE response-shape edges |
 
 The headers in `allowlist.txt` always record the exact suite SHA + endpoint a result was calibrated
