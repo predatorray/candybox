@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>me.predatorray.candybox</groupId>
+        <artifactId>candybox-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>candybox-admin-api</artifactId>
+    <name>Candybox :: Admin API</name>
+    <description>JSON HTTP admin/observability surface for Candybox (cluster, boxes, LSM internals,
+        metrics passthrough) plus the static web dashboard mount. Like the s3-gateway, it is a
+        *client* of the cluster — it talks to nodes via the thin client and reads coordination state
+        via the SPI; it never touches BookKeeper directly. See WEB_DASHBOARD_PLAN.md.</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>me.predatorray.candybox</groupId>
+            <artifactId>candybox-common</artifactId>
+        </dependency>
+        <!-- Client + coordination, same shape as candybox-s3-gateway: this module is a cluster
+             client, not a storage node. It must NOT depend on candybox-lsm/candybox-bookkeeper. -->
+        <dependency>
+            <groupId>me.predatorray.candybox</groupId>
+            <artifactId>candybox-client</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>me.predatorray.candybox</groupId>
+            <artifactId>candybox-coordination</artifactId>
+        </dependency>
+
+        <!-- candybox-web is intentionally NOT declared here. It produces a jar only under
+             `-Pfrontend`, so a default-profile reactor build wouldn't be able to resolve the
+             artifact. Instead, candybox-dist composes the runtime classpath and ensures the
+             web bundle jar lands next to the admin-api jar; at runtime StaticUiHandler reads the
+             SPA from classpath:/ui/, falling back to a placeholder page if the bundle isn't there. -->
+
+        <!-- Same runtime-backend pattern as the gateway: provide curator here, never reference raw
+             curator from code. -->
+        <dependency>
+            <groupId>org.apache.curator</groupId>
+            <artifactId>curator-framework</artifactId>
+        </dependency>
+
+        <!-- Jackson handles request-body parsing for the mutating endpoints (POST /api/boxes etc.).
+             Response shaping is still the dependency-free JsonWriter — the read side benefits from
+             Jackson's well-tested error messages and BigInteger/long handling more than the write
+             side did. Aligned via the parent's jackson-bom. -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+    </dependencies>
+</project>

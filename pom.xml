@@ -22,6 +22,8 @@
         <module>candybox-server</module>
         <module>candybox-client</module>
         <module>candybox-s3-gateway</module>
+        <module>candybox-admin-api</module>
+        <module>candybox-web</module>
         <module>candybox-integration-tests</module>
         <module>candybox-dist</module>
     </modules>
@@ -37,6 +39,7 @@
         <netty.version>4.1.118.Final</netty.version>
         <slf4j.version>2.0.13</slf4j.version>
         <logback.version>1.5.6</logback.version>
+        <jackson.version>2.18.2</jackson.version>
         <junit.version>5.10.2</junit.version>
         <assertj.version>3.27.7</assertj.version>
 
@@ -48,6 +51,9 @@
         <assembly.plugin.version>3.7.1</assembly.plugin.version>
         <license.plugin.version>4.6</license.plugin.version>
         <jacoco.plugin.version>0.8.12</jacoco.plugin.version>
+        <frontend.plugin.version>1.15.1</frontend.plugin.version>
+        <node.version>v20.18.0</node.version>
+        <npm.version>10.9.0</npm.version>
     </properties>
 
     <dependencyManagement>
@@ -93,6 +99,16 @@
                 <artifactId>candybox-s3-gateway</artifactId>
                 <version>${project.version}</version>
             </dependency>
+            <dependency>
+                <groupId>me.predatorray.candybox</groupId>
+                <artifactId>candybox-admin-api</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>me.predatorray.candybox</groupId>
+                <artifactId>candybox-web</artifactId>
+                <version>${project.version}</version>
+            </dependency>
 
             <!-- third-party -->
             <!-- Align every Netty artifact (incl. those BookKeeper pulls transitively) to one version
@@ -123,6 +139,18 @@
                 <groupId>org.slf4j</groupId>
                 <artifactId>slf4j-api</artifactId>
                 <version>${slf4j.version}</version>
+            </dependency>
+            <!-- Jackson BOM aligns every jackson-* artifact pulled either directly or transitively
+                 (e.g. by future modules) onto one version. candybox-admin-api consumes
+                 jackson-databind for its small request-body parsing surface; this BOM keeps any
+                 future addition (e.g. jackson-dataformat-yaml in tooling) on the same release
+                 train. -->
+            <dependency>
+                <groupId>com.fasterxml.jackson</groupId>
+                <artifactId>jackson-bom</artifactId>
+                <version>${jackson.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
             </dependency>
 
             <!-- test -->

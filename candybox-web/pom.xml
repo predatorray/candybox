@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>me.predatorray.candybox</groupId>
+        <artifactId>candybox-parent</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>candybox-web</artifactId>
+    <name>Candybox :: Web Dashboard</name>
+    <description>React + TypeScript + MUI dashboard, packaged as a Maven jar so the admin API can
+        serve it from the classpath under /ui/*. The actual frontend build (npm install + vite
+        build) only runs under the `-Pfrontend` profile so the default `mvn -DskipTests package`
+        stays as fast as it is today. Without the profile this module still emits a (near-empty)
+        jar; StaticUiHandler in candybox-admin-api detects the missing bundle and serves a
+        placeholder page that tells the operator to re-build with the profile.</description>
+
+    <build>
+        <!-- The frontend-maven-plugin writes the vite build output into target/classes/ui/ via
+             vite.config.ts (outDir: ../target/classes/ui), so the resulting jar carries the assets
+             at root path "ui/" — which is exactly what StaticUiHandler.CLASSPATH_ROOT expects. -->
+        <plugins>
+            <!-- Skip the Java compiler entirely: there are no Java sources in this module, and the
+                 default-compile execution would otherwise emit a noisy "no sources" warning every
+                 build. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>default-compile</id>
+                        <phase>none</phase>
+                    </execution>
+                    <execution>
+                        <id>default-testCompile</id>
+                        <phase>none</phase>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <skip>true</skip>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <!-- Activate with `mvn -Pfrontend ...` to actually run npm install + vite build. CI ships
+             a second job with this profile; local devs hitting `mvn -DskipTests package` skip it
+             so the build stays seconds-fast. -->
+        <profile>
+            <id>frontend</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>com.github.eirslett</groupId>
+                        <artifactId>frontend-maven-plugin</artifactId>
+                        <version>${frontend.plugin.version}</version>
+                        <configuration>
+                            <nodeVersion>${node.version}</nodeVersion>
+                            <npmVersion>${npm.version}</npmVersion>
+                            <installDirectory>target</installDirectory>
+                        </configuration>
+                        <executions>
+                            <execution>
+                                <id>install-node-and-npm</id>
+                                <goals>
+                                    <goal>install-node-and-npm</goal>
+                                </goals>
+                                <phase>generate-resources</phase>
+                            </execution>
+                            <execution>
+                                <id>npm-install</id>
+                                <goals>
+                                    <goal>npm</goal>
+                                </goals>
+                                <phase>generate-resources</phase>
+                                <configuration>
+                                    <arguments>ci --no-fund --no-audit</arguments>
+                                </configuration>
+                            </execution>
+                            <execution>
+                                <id>npm-build</id>
+                                <goals>
+                                    <goal>npm</goal>
+                                </goals>
+                                <phase>process-resources</phase>
+                                <configuration>
+                                    <arguments>run build</arguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+</project>

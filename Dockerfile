@@ -28,6 +28,8 @@ COPY candybox-protocol/pom.xml          candybox-protocol/
 COPY candybox-server/pom.xml            candybox-server/
 COPY candybox-client/pom.xml            candybox-client/
 COPY candybox-s3-gateway/pom.xml        candybox-s3-gateway/
+COPY candybox-admin-api/pom.xml         candybox-admin-api/
+COPY candybox-web/pom.xml               candybox-web/
 COPY candybox-integration-tests/pom.xml candybox-integration-tests/
 COPY candybox-dist/pom.xml              candybox-dist/
 RUN --mount=type=cache,target=/root/.m2 \
@@ -35,9 +37,14 @@ RUN --mount=type=cache,target=/root/.m2 \
 
 # Now the sources. Build and assemble the distribution tarball (tests run via `mvn verify`
 # in CI, not here, so the image build stays fast and dependency-free).
+#
+# `-Pfrontend` activates the candybox-web frontend-maven-plugin executions: download node, run
+# `npm ci` + `vite build`, and emit the SPA into the web jar at /ui/. The admin API picks the
+# bundle up off the classpath at runtime. Without this profile the image still works but /ui/
+# serves the "UI bundle not built" placeholder.
 COPY . .
 RUN --mount=type=cache,target=/root/.m2 \
-    mvn -q -B -DskipTests package
+    mvn -q -B -DskipTests -Pfrontend package
 
 # Unpack the assembled distribution to a stable, version-independent path so the runtime
 # stage does not need to know the project version.
@@ -72,8 +79,8 @@ ENV CANDYBOX_HOME=/opt/candybox \
 USER candybox
 WORKDIR /opt/candybox
 
-# Client (TCP) and health/metrics (HTTP).
-EXPOSE 9709 9710
+# Client (TCP), per-node health/metrics (HTTP), and the admin/dashboard API (HTTP).
+EXPOSE 9709 9710 9713
 
 # Default to the storage node (foreground; Docker/Kubernetes delivers SIGTERM for graceful lease
 # release). Pass `candybox <args…>` to use the same image as the client CLI instead.

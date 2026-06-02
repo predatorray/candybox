@@ -23,7 +23,6 @@ name: candybox
 # ---- shared bookie definition -------------------------------------------------------------
 x-bookie: &bookie
   image: apache/bookkeeper:4.17.1
-  platform: linux/amd64
   restart: on-failure
   depends_on:
     zookeeper:
@@ -50,7 +49,6 @@ x-bookie: &bookie
 # ---- shared candybox node definition ------------------------------------------------------
 x-candybox: &candybox
   image: zetaplusae/candybox:latest
-  platform: linux/amd64
   restart: on-failure
   # The server requires a config FILE to exist; point it at the shipped example and let the
   # CANDYBOX_* environment variables override individual keys (env wins over the file).
@@ -88,7 +86,6 @@ services:
   # fall back to a no-op identity check so the bookies are still allowed to start.
   bk-init:
     image: apache/bookkeeper:4.17.1
-    platform: linux/amd64
     restart: "no"
     depends_on:
       zookeeper:
@@ -171,12 +168,37 @@ services:
       - "9729:9709"
       - "9730:9710"
 
+  # Admin / dashboard HTTP API + React+MUI web dashboard. Stateless client of the cluster: reads
+  # coordination state, fans out box/candy listings via the thin client, and (when scrape targets
+  # are set) polls each node's /metrics for the time-series charts. Reachable on the host at
+  # :9713 — visit http://localhost:9713/ui/ for the dashboard. See WEB_DASHBOARD_PLAN.md.
+  admin-api:
+    image: zetaplusae/candybox:latest
+    restart: on-failure
+    command: ["admin-api"]
+    depends_on:
+      candybox-1:
+        condition: service_started
+    environment:
+      CANDYBOX_ADMIN_PORT: "9713"
+      CANDYBOX_ADMIN_ZK: zookeeper:2181
+      # Scrape every node + the gateway so the Metrics page has real data out of the box.
+      CANDYBOX_ADMIN_SCRAPE_TARGETS: "http://candybox-1:9710/metrics,http://candybox-2:9710/metrics,http://candybox-3:9710/metrics,http://s3-gateway:9712/metrics"
+      CANDYBOX_HEAP_OPTS: "-Xms128m -Xmx256m"
+    ports:
+      - "9713:9713"   # admin API + UI
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/9713"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 20s
+
   # Anonymous, path-style S3-compatible HTTP gateway. Stateless client of the cluster; reachable on
   # the host at :9711 (S3) and :9712 (health). Used by the ceph/s3-tests harness in
   # compat/s3-tests/. Runs the shipped example config with CANDYBOX_* env overrides applied.
   s3-gateway:
     image: zetaplusae/candybox:latest
-    platform: linux/amd64
     restart: on-failure
     command: ["candybox-s3-gateway", "/opt/candybox/conf/candybox-s3-gateway.properties.example"]
     depends_on:
@@ -214,7 +236,6 @@ services:
   # (-T disables the TTY so stdin can be piped into `put`.)
   cli:
     image: zetaplusae/candybox:latest
-    platform: linux/amd64
     profiles: ["cli"]   # excluded from `docker compose up`; only `docker compose run cli …` uses it
     entrypoint: ["candybox"]
     environment:

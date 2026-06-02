@@ -5,6 +5,8 @@
 #
 #   docker run … zetaplusae/candybox                       # storage node, default example config
 #   docker run … zetaplusae/candybox server [config-path]  # storage node (optional config path)
+#   docker run … zetaplusae/candybox admin-api             # the dashboard / admin HTTP API (port 9713)
+#   docker run … zetaplusae/candybox s3-gateway [config]   # the S3 gateway (alias for the script)
 #   docker run … zetaplusae/candybox candybox <args…>      # client CLI (honors CANDYBOX_SERVER / -s)
 #   docker run … zetaplusae/candybox <anything-else>       # run it verbatim (escape hatch)
 #
@@ -19,6 +21,15 @@ case "${1:-server}" in
     shift || true
     [[ "$#" -eq 0 ]] && set -- "$DEFAULT_CONF"
     exec candybox-server "$@"
+    ;;
+  admin-api)
+    # The admin / dashboard HTTP API. Stateless; the same image runs node, gateway, or this.
+    shift || true
+    exec candybox-admin-api "$@"
+    ;;
+  s3-gateway)
+    shift || true
+    exec candybox-s3-gateway "$@"
     ;;
   candybox | candybox-server)
     # Explicit binary name: run it as given (e.g. `candybox list-boxes`).

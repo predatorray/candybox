@@ -55,6 +55,24 @@ docker compose run --rm cli get photos hello.txt   # -> hello candybox
 
 Tear it down with `docker compose down` (add `-v` to also wipe the data volumes).
 
+### Web dashboard
+
+The compose stack also brings up a stateless **admin / dashboard service** at
+[`http://localhost:9713/ui/`](http://localhost:9713/ui/) — a React + TypeScript + MUI single-page
+app that shows cluster topology, the box browser, LSM internals (manifest version + fencing
+token), and a small set of time-series charts polled from each node's `/metrics`. The same
+process exposes a JSON API at `/api/*` (see [`OPERATIONS.md`](OPERATIONS.md#admin--dashboard-api-candybox-admin-api)).
+
+The Maven build packages the SPA into `candybox-web-*.jar` only when activated explicitly so the
+default fast build is unchanged:
+
+```bash
+mvn -DskipTests -Pfrontend package         # builds the React bundle into the jar
+```
+
+Without `-Pfrontend` the admin API still runs; `/ui/` serves a small placeholder page that points
+operators at the right command.
+
 The gateway's S3 compatibility is verified against the industry-standard
 [`ceph/s3-tests`](https://github.com/ceph/s3-tests) suite — see
 [`compat/s3-tests/`](compat/s3-tests/) (`compat/s3-tests/run.sh --calibrate` against the running
@@ -266,5 +284,7 @@ hard fencing/handover scenarios. No mocking frameworks are used anywhere.
 | `candybox-server` | The storage node: wires the engine behind the protocol, plus the runnable entrypoint, health/metrics, and ownership. |
 | `candybox-client` | The thin client library and the `candybox` command-line tool. |
 | `candybox-s3-gateway` | An anonymous, path-style, S3-compatible HTTP gateway (Netty) that translates the S3 REST/XML API onto the client. Stateless; runs behind an HTTP(S) load balancer. See `S3_GATEWAY_PLAN.md`. |
+| `candybox-admin-api` | A stateless HTTP service exposing cluster / boxes / LSM / metrics as JSON, plus the static SPA mount. See `WEB_DASHBOARD_PLAN.md`. |
+| `candybox-web` | React + TypeScript + MUI dashboard, built by `frontend-maven-plugin` under `-Pfrontend` and packaged into a jar so the admin API serves it from the classpath. |
 | `candybox-dist` | Packages the runnable distribution (`bin/ lib/ conf/`) and the Docker/Kubernetes assets. |
 | `candybox-integration-tests` | End-to-end tests on embedded BookKeeper + ZooKeeper. |

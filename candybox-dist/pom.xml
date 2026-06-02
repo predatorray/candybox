@@ -40,6 +40,19 @@
             <artifactId>candybox-s3-gateway</artifactId>
             <version>${project.version}</version>
         </dependency>
+        <!-- The admin/dashboard API + the web bundle. The web jar is empty unless the build was
+             run with `-Pfrontend`; admin-api's StaticUiHandler detects that and serves a
+             placeholder page (see WEB_DASHBOARD_PLAN.md). -->
+        <dependency>
+            <groupId>me.predatorray.candybox</groupId>
+            <artifactId>candybox-admin-api</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>me.predatorray.candybox</groupId>
+            <artifactId>candybox-web</artifactId>
+            <version>${project.version}</version>
+        </dependency>
         <!-- The single production SLF4J binding (tests elsewhere use slf4j-simple). -->
         <dependency>
             <groupId>ch.qos.logback</groupId>

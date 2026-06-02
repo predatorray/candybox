@@ -94,7 +94,43 @@ enumeration backstop is added (future).
 
 `BoxEngine.stats()` returns a `BoxEngineStats` snapshot: cumulative `puts`, `deletes`, `gets`, `heads`,
 `lists`, `flushes`, `compactions`, and `stallRejections`. Logging is SLF4J with box / key / ledger
-context. A metrics-system exporter is not yet wired.
+context. Each node also exposes a small Prometheus exposition on its HTTP health port
+(`/metrics`, port 9710 by default), and the gateway's health port (9712 by default) does the same.
+
+### Admin / dashboard API (`candybox-admin-api`)
+
+A stateless HTTP service that fans out reads against the cluster and serves a React+MUI web
+dashboard. Like the S3 gateway it's a *client* of the cluster — it never touches BookKeeper
+directly. Single port (default `9713`); the SPA lives at `/ui/` and the JSON API at `/api/*`.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CANDYBOX_ADMIN_PORT` | `9713` | TCP port for the JSON API + UI. |
+| `CANDYBOX_ADMIN_BIND` | `0.0.0.0` | Bind interface. |
+| `CANDYBOX_ADMIN_CORS` | `*` | `Access-Control-Allow-Origin`. Tighten in production. |
+| `CANDYBOX_ADMIN_UI` | (enabled) | Set to `false` to disable `/ui/*` and run headless. |
+| `CANDYBOX_ADMIN_ZK` | (unset) | ZooKeeper connect string. Enables the live cluster/box reads; unset = empty-data demo mode. |
+| `CANDYBOX_ADMIN_SCRAPE_TARGETS` | (empty) | Comma-separated Prometheus URLs (e.g. each node's `http://host:9710/metrics`). Drives the Metrics page. |
+| `CANDYBOX_ADMIN_SCRAPE_INTERVAL_MS` | `5000` | Scrape interval. |
+| `CANDYBOX_ADMIN_SCRAPE_WINDOW` | `60` | Samples retained per series (≈ 5 minutes at the default interval). |
+
+Routes:
+
+| Method · Path | Returns |
+|---|---|
+| `GET /api/cluster` | nodes, owned-box counts, ownerless boxes |
+| `GET /api/boxes` | all box names + owner |
+| `GET /api/boxes/{name}` | one box (owner, metadata) |
+| `GET /api/boxes/{name}/objects?prefix=&startAfter=&max=` | candy listing |
+| `GET /api/lsm` | per-box manifest version + fencing token (coordination-derived) |
+| `GET /api/metrics` | passthrough of the latest scrape text |
+| `GET /api/metrics/timeseries?names=a,b,...` | the rolling per-series window |
+| `GET /healthz`, `GET /readyz` | mirror the per-node probes |
+| `GET /ui/*`, `GET /` | static SPA bundle (or a placeholder if `-Pfrontend` was off) |
+
+v1 has **no authentication** (matching the rest of candybox today); the deploy assumption is a
+trusted network. The single mutating dashboard operation in v1 — deleting an object — goes through
+the S3 gateway from the browser, not through this API. See `WEB_DASHBOARD_PLAN.md`.
 
 ## Known limitations / deferred work
 
