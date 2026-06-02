@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+#
+# Starts the Candybox admin/dashboard API in the FOREGROUND so a process supervisor or container
+# orchestrator owns its lifecycle. The admin API is a *client* of the cluster (like the S3
+# gateway): it talks to nodes via the thin client and reads coordination state via the SPI; it
+# never touches BookKeeper directly.
+#
+# Configuration is entirely via environment variables — no config file. The recognized variables
+# are listed in AdminApiMain.java's class-level javadoc. The most useful ones:
+#
+#   CANDYBOX_ADMIN_PORT             TCP port (default 9713)
+#   CANDYBOX_ADMIN_BIND             interface (default 0.0.0.0)
+#   CANDYBOX_ADMIN_CORS             Access-Control-Allow-Origin (default *)
+#   CANDYBOX_ADMIN_UI               set to `false` to disable /ui/*
+#   CANDYBOX_ADMIN_ZK               ZooKeeper connect string (enables live data)
+#   CANDYBOX_ADMIN_SCRAPE_TARGETS   comma-separated Prometheus URLs to scrape for the Metrics page
+#   CANDYBOX_ADMIN_SCRAPE_INTERVAL_MS  default 5000
+#   CANDYBOX_ADMIN_SCRAPE_WINDOW    samples per series, default 60
+#
+# Set CANDYBOX_DRY_RUN=1 to print the resolved java command instead of executing it.
+#
+set -euo pipefail
+
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=candybox-env.sh
+source "$BIN_DIR/candybox-env.sh"
+
+mkdir -p "$CANDYBOX_LOG_DIR"
+
+CMD=("$JAVA" "${CANDYBOX_JVM_OPTS[@]}" -cp "$CLASSPATH"
+     me.predatorray.candybox.admin.AdminApiMain)
+
+if [[ -n "${CANDYBOX_DRY_RUN:-}" ]]; then
+  printf '%s ' "${CMD[@]}"
+  printf '\n'
+  exit 0
+fi
+
+exec "${CMD[@]}"

@@ -26,8 +26,8 @@ jobs:
           java-version: '17'
           cache: maven
 
-      - name: Compile and package (no tests)
-        run: mvn -q -B -ntp -DskipTests package
+      - name: Compile and install (no tests)
+        run: mvn -q -B -ntp -DskipTests install
 
       - name: Run unit tests
         run: mvn -B -ntp test
