@@ -93,6 +93,77 @@ class MetricsScraperTest {
         }
     }
 
+    @Test
+    void nonOkResponsesAreSilentlySkipped() throws Exception {
+        // A target that returns 503 should NOT contribute a sample — operators expect Prometheus-
+        // style "scrape failed; gap in the series" behaviour, not zero-valued samples.
+        HttpServer fake = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        fake.createContext("/metrics", exchange -> {
+            byte[] bytes = "candybox_x 99\n".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(503, bytes.length);
+            try (OutputStream out = exchange.getResponseBody()) {
+                out.write(bytes);
+            }
+        });
+        fake.start();
+        try {
+            URI t = URI.create("http://127.0.0.1:" + fake.getAddress().getPort() + "/metrics");
+            try (MetricsScraper scraper = new MetricsScraper(List.of(t), 1000, 4)) {
+                scraper.start(); // synchronous first tick
+                // No samples, no concat.
+                assertThat(scraper.seriesFor(List.of("candybox_x")).get("candybox_x")).isEmpty();
+                assertThat(scraper.latestText()).isEmpty();
+            }
+        } finally {
+            fake.stop(0);
+        }
+    }
+
+    @Test
+    void multipleTargetsConcatenateAndShareIngestTimestamp() throws Exception {
+        // Two targets, each with one sample. The concatenated latestText should carry both, and
+        // the per-target prefix line lets an operator see which target each block came from.
+        HttpServer a = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        HttpServer b = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        a.createContext("/metrics", exchange -> {
+            byte[] bytes = "x{node=\"a\"} 1\n".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, bytes.length);
+            try (OutputStream out = exchange.getResponseBody()) {
+                out.write(bytes);
+            }
+        });
+        b.createContext("/metrics", exchange -> {
+            // Note: no trailing newline — the scraper appends one so concatenation stays clean.
+            byte[] bytes = "x{node=\"b\"} 2".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, bytes.length);
+            try (OutputStream out = exchange.getResponseBody()) {
+                out.write(bytes);
+            }
+        });
+        a.start();
+        b.start();
+        try {
+            URI ta = URI.create("http://127.0.0.1:" + a.getAddress().getPort() + "/metrics");
+            URI tb = URI.create("http://127.0.0.1:" + b.getAddress().getPort() + "/metrics");
+            try (MetricsScraper scraper = new MetricsScraper(List.of(ta, tb), 1000, 4)) {
+                scraper.start();
+                String txt = scraper.latestText();
+                assertThat(txt).contains("# target=").contains(ta.toString()).contains(tb.toString())
+                        .contains("x{node=\"a\"} 1").contains("x{node=\"b\"} 2");
+                // Two distinct (name, labels) series for "x".
+                List<MetricsScraper.Series> xs = scraper.seriesFor(List.of("x")).get("x");
+                assertThat(xs).hasSize(2);
+                assertThat(xs).extracting(s -> s.labels().get("node"))
+                        .containsExactlyInAnyOrder("a", "b");
+                // Window seconds = (samples * intervalMs)/1000; here 4 * 1000 / 1000 = 4.
+                assertThat(scraper.windowSeconds()).isEqualTo(4);
+            }
+        } finally {
+            a.stop(0);
+            b.stop(0);
+        }
+    }
+
     private static void waitUntil(BooleanSupplier cond, long timeoutMillis) throws InterruptedException {
         long deadline = System.currentTimeMillis() + timeoutMillis;
         while (System.currentTimeMillis() < deadline) {

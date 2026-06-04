@@ -46,7 +46,7 @@ import me.predatorray.candybox.protocol.transport.Transport;
  * re-routes on {@code MOVED}). Large objects are buffered in memory for now; chunked streaming over the
  * wire is TODO(phase-2.5).
  */
-public final class CandyboxClient implements AutoCloseable {
+public final class CandyboxClient implements BoxClient, AutoCloseable {
 
     private final Router router;
     private final SizeLimits limits;

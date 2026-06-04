@@ -49,4 +49,51 @@ class AdminApiMainTest {
         AdminApiConfig c = AdminApiMain.fromEnv(Map.of("CANDYBOX_ADMIN_PORT", "not-a-port"));
         assertThat(c.port()).isEqualTo(AdminApiConfig.DEFAULT_PORT);
     }
+
+    @Test
+    void blankEnvOverridesFallBackToDefaults() {
+        // Setting an env var to the empty string is a common mistake — should be treated as
+        // "not set" rather than overriding the default bind to "".
+        AdminApiConfig c = AdminApiMain.fromEnv(Map.of(
+                "CANDYBOX_ADMIN_PORT", "  ",
+                "CANDYBOX_ADMIN_BIND", "",
+                "CANDYBOX_ADMIN_CORS", ""));
+        assertThat(c.port()).isEqualTo(AdminApiConfig.DEFAULT_PORT);
+        assertThat(c.bindAddress()).isEqualTo("0.0.0.0");
+        assertThat(c.corsAllowOrigin()).isEqualTo("*");
+    }
+
+    @Test
+    void scraperIsNullWhenNoTargets() {
+        // No env, empty env, only-whitespace env — all three must yield null so AdminApiMain skips
+        // wiring the scraper into the server.
+        assertThat(AdminApiMain.buildScraper(Map.of())).isNull();
+        assertThat(AdminApiMain.buildScraper(Map.of("CANDYBOX_ADMIN_SCRAPE_TARGETS", ""))).isNull();
+        assertThat(AdminApiMain.buildScraper(Map.of("CANDYBOX_ADMIN_SCRAPE_TARGETS", " , , "))).isNull();
+    }
+
+    @Test
+    void scraperParsesCommaSeparatedTargetsAndIntervalWindow() {
+        MetricsScraper scraper = AdminApiMain.buildScraper(Map.of(
+                "CANDYBOX_ADMIN_SCRAPE_TARGETS",
+                "http://a:9710/metrics, http://b:9710/metrics",
+                "CANDYBOX_ADMIN_SCRAPE_INTERVAL_MS", "2000",
+                "CANDYBOX_ADMIN_SCRAPE_WINDOW", "30"));
+        assertThat(scraper).isNotNull();
+        // 30 samples * 2000ms / 1000 = 60s rolling window.
+        assertThat(scraper.windowSeconds()).isEqualTo(60);
+        // Don't start() it — no real targets to scrape against.
+        scraper.close();
+    }
+
+    @Test
+    void scraperSkipsMalformedTargetsButKeepsValidOnes() {
+        // ":://bad uri" is unparseable; "http://ok:9710/metrics" is fine — the malformed one
+        // should be logged and dropped, not crash the whole build.
+        MetricsScraper scraper = AdminApiMain.buildScraper(Map.of(
+                "CANDYBOX_ADMIN_SCRAPE_TARGETS",
+                ":://bad uri, http://ok:9710/metrics"));
+        assertThat(scraper).isNotNull();
+        scraper.close();
+    }
 }

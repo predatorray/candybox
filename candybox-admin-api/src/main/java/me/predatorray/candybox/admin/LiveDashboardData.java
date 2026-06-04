@@ -21,6 +21,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import me.predatorray.candybox.client.BoxClient;
 import me.predatorray.candybox.client.CandyboxClient;
 import me.predatorray.candybox.coordination.CandyboxKeys;
 import me.predatorray.candybox.coordination.CoordinationService;
@@ -30,9 +31,14 @@ import org.slf4j.LoggerFactory;
 
 /**
  * Production implementation of {@link DashboardData}. Fans out reads across the cluster's
- * {@link CoordinationService} (for membership + lease holders) and a cluster-aware
- * {@link CandyboxClient} (for box / candy listings). Mirrors the gateway's wiring — see
- * {@code S3GatewayMain} — so the same SPI shapes power both.
+ * {@link CoordinationService} (for membership + lease holders) and a {@link BoxClient} (for box /
+ * candy listings). Mirrors the gateway's wiring — see {@code S3GatewayMain} — so the same SPI
+ * shapes power both.
+ *
+ * <p>The {@code BoxClient} seam (implemented in production by {@link CandyboxClient}) lets the
+ * unit tests substitute a hand-written fake without standing up a Transport or coordination
+ * backend; same precedent as {@code CandyStore} / {@code FakeCandyStore} in
+ * {@code candybox-s3-gateway}.
  *
  * <p>All methods are blocking but bounded: the v1 polling cadence (5 s) and small cluster sizes
  * make a fan-out per request acceptable. If a node is unreachable, that single row falls back to
@@ -43,9 +49,9 @@ public final class LiveDashboardData implements DashboardData {
     private static final Logger LOG = LoggerFactory.getLogger(LiveDashboardData.class);
 
     private final CoordinationService coordination;
-    private final CandyboxClient client;
+    private final BoxClient client;
 
-    public LiveDashboardData(CoordinationService coordination, CandyboxClient client) {
+    public LiveDashboardData(CoordinationService coordination, BoxClient client) {
         this.coordination = coordination;
         this.client = client;
     }
