@@ -344,6 +344,393 @@ class AdminApiServerTest {
         }
     }
 
+    @Test
+    void readOnlyRoutesReject405OnNonGet() throws Exception {
+        try (AdminApiServer server = start(new EmptyDashboardData(), new AtomicBoolean(true), false)) {
+            HttpClient http = HttpClient.newHttpClient();
+            String base = "http://127.0.0.1:" + server.port();
+            // /api/cluster, /api/lsm, /api/metrics, /api/metrics/timeseries are GET-only.
+            for (String path : new String[]{"/api/cluster", "/api/lsm", "/api/metrics",
+                    "/api/metrics/timeseries"}) {
+                HttpResponse<String> r = http.send(
+                        HttpRequest.newBuilder(URI.create(base + path))
+                                .method("POST", HttpRequest.BodyPublishers.noBody())
+                                .build(),
+                        BodyHandlers.ofString());
+                assertThat(r.statusCode()).as("POST %s", path).isEqualTo(405);
+            }
+            // /api/boxes/{name}/objects is also GET-only.
+            HttpResponse<String> r = http.send(
+                    HttpRequest.newBuilder(URI.create(base + "/api/boxes/photos/objects"))
+                            .method("DELETE", HttpRequest.BodyPublishers.noBody())
+                            .build(),
+                    BodyHandlers.ofString());
+            assertThat(r.statusCode()).isEqualTo(405);
+        }
+    }
+
+    @Test
+    void rootPathOtherThanSlashIs404() throws Exception {
+        try (AdminApiServer server = start(new EmptyDashboardData(), new AtomicBoolean(true), false)) {
+            // The "/" context matches any path the more-specific contexts don't claim, but the
+            // handler only honours an exact "/" — everything else gets a 404 so an SPA-style URL
+            // like /unknown doesn't accidentally redirect.
+            HttpResponse<String> r = HttpClient.newHttpClient().send(
+                    HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + server.port()
+                            + "/nope")).GET().build(),
+                    BodyHandlers.ofString());
+            assertThat(r.statusCode()).isEqualTo(404);
+        }
+    }
+
+    @Test
+    void corsHeadersOmittedWhenAllowOriginIsEmpty() throws Exception {
+        // The empty-string corsAllowOrigin is the documented "disable CORS" signal — the server
+        // must not emit Access-Control-* headers at all (a "*" + empty string would be the worst
+        // of both worlds).
+        AdminApiConfig cfg = new AdminApiConfig(0, "127.0.0.1", "", false);
+        try (AdminApiServer server = new AdminApiServer(cfg, () -> true, new EmptyDashboardData())) {
+            server.start();
+            HttpResponse<String> r = HttpClient.newHttpClient().send(
+                    HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + server.port()
+                            + "/api/cluster")).GET().build(),
+                    BodyHandlers.ofString());
+            assertThat(r.statusCode()).isEqualTo(200);
+            assertThat(r.headers().firstValue("Access-Control-Allow-Origin")).isEmpty();
+        }
+    }
+
+    @Test
+    void mutatingOpsReturn503WhenBackendIsStubForAllVerbs() throws Exception {
+        // The createBox 503 case is already covered; pin DELETE box, PUT candy, DELETE candy too
+        // so a future regression to one of them (silently returning 204) gets caught.
+        try (AdminApiServer server = start(new EmptyDashboardData(), new AtomicBoolean(true), false)) {
+            HttpClient http = HttpClient.newHttpClient();
+            String base = "http://127.0.0.1:" + server.port();
+
+            HttpResponse<String> delBox = http.send(
+                    HttpRequest.newBuilder(URI.create(base + "/api/boxes/x")).DELETE().build(),
+                    BodyHandlers.ofString());
+            assertThat(delBox.statusCode()).isEqualTo(503);
+            assertThat(delBox.body()).contains("\"error\":\"NotConfigured\"");
+
+            HttpResponse<String> putCandy = http.send(
+                    HttpRequest.newBuilder(URI.create(base + "/api/boxes/x/objects/k"))
+                            .PUT(HttpRequest.BodyPublishers.ofByteArray(new byte[]{1})).build(),
+                    BodyHandlers.ofString());
+            assertThat(putCandy.statusCode()).isEqualTo(503);
+
+            HttpResponse<String> delCandy = http.send(
+                    HttpRequest.newBuilder(URI.create(base + "/api/boxes/x/objects/k"))
+                            .DELETE().build(),
+                    BodyHandlers.ofString());
+            assertThat(delCandy.statusCode()).isEqualTo(503);
+        }
+    }
+
+    @Test
+    void validationFailuresMapToInvalidArgument400() throws Exception {
+        // FakeDashboardData.createBox treats an empty name as ValidationException — the server's
+        // catch block in handleCreateBox should map that to 400 InvalidArgument, not 409.
+        try (AdminApiServer server = start(new FakeDashboardData(), new AtomicBoolean(true), false)) {
+            HttpClient http = HttpClient.newHttpClient();
+            String base = "http://127.0.0.1:" + server.port();
+
+            HttpResponse<String> bad = http.send(
+                    HttpRequest.newBuilder(URI.create(base + "/api/boxes"))
+                            .header("Content-Type", "application/json")
+                            .POST(HttpRequest.BodyPublishers.ofString("{\"name\":\"x\"}"))
+                            .build(),
+                    BodyHandlers.ofString());
+            // First create succeeds; second one fails with 409 (already exists). Then test a
+            // PUT-candy ValidationException by hitting the empty-key route (the server rejects
+            // the empty key with its own 404 before delegating — but a non-existent box is a
+            // FakeDashboardData CandyboxException → 409).
+            assertThat(bad.statusCode()).isEqualTo(201);
+
+            HttpResponse<String> noSuch = http.send(
+                    HttpRequest.newBuilder(URI.create(base + "/api/boxes/missing/objects/k"))
+                            .PUT(HttpRequest.BodyPublishers.ofByteArray(new byte[]{1})).build(),
+                    BodyHandlers.ofString());
+            assertThat(noSuch.statusCode()).isEqualTo(409);
+            assertThat(noSuch.body()).contains("no such box");
+
+            HttpResponse<String> delMissing = http.send(
+                    HttpRequest.newBuilder(URI.create(base + "/api/boxes/never")).DELETE().build(),
+                    BodyHandlers.ofString());
+            assertThat(delMissing.statusCode()).isEqualTo(409);
+        }
+    }
+
+    @Test
+    void putCandyMissingKeyIs404() throws Exception {
+        // "PUT /api/boxes/photos/objects/" — empty key past objects/ should fail-fast rather than
+        // hand the empty string off to the storage layer.
+        try (AdminApiServer server = start(
+                new FakeDashboardData().withBox(DashboardData.BoxSummary.minimal("photos", "1")),
+                new AtomicBoolean(true), false)) {
+            HttpResponse<String> r = HttpClient.newHttpClient().send(
+                    HttpRequest.newBuilder(URI.create(
+                                    "http://127.0.0.1:" + server.port() + "/api/boxes/photos/objects/"))
+                            .GET().build(),
+                    BodyHandlers.ofString());
+            // /objects/ falls under handleBoxObjects (GET listing) — 200.
+            assertThat(r.statusCode()).isEqualTo(200);
+
+            HttpResponse<String> bad = HttpClient.newHttpClient().send(
+                    HttpRequest.newBuilder(URI.create(
+                                    "http://127.0.0.1:" + server.port() + "/api/boxes/photos/unknown"))
+                            .GET().build(),
+                    BodyHandlers.ofString());
+            // /api/boxes/photos/unknown — not "objects[/...]"; the catch-all 404 fires.
+            assertThat(bad.statusCode()).isEqualTo(404);
+        }
+    }
+
+    @Test
+    void listingPassesPaginationParamsThrough() throws Exception {
+        // prefix + startAfter + max should all round-trip through query parsing into the listing
+        // call. FakeDashboardData honours them so we can assert the surface behaviour end-to-end.
+        FakeDashboardData data = new FakeDashboardData()
+                .withBox(DashboardData.BoxSummary.minimal("photos", "1"))
+                .withCandy("photos", new DashboardData.CandyRow("a.jpg", 1, 1))
+                .withCandy("photos", new DashboardData.CandyRow("b.jpg", 1, 2))
+                .withCandy("photos", new DashboardData.CandyRow("c.jpg", 1, 3));
+        try (AdminApiServer server = start(data, new AtomicBoolean(true), false)) {
+            HttpClient http = HttpClient.newHttpClient();
+            String base = "http://127.0.0.1:" + server.port();
+
+            // max=1, startAfter=a.jpg should yield exactly b.jpg with c.jpg as the next cursor.
+            HttpResponse<String> r = http.send(
+                    HttpRequest.newBuilder(URI.create(
+                                    base + "/api/boxes/photos/objects?max=1&startAfter=a.jpg"))
+                            .GET().build(),
+                    BodyHandlers.ofString());
+            assertThat(r.statusCode()).isEqualTo(200);
+            assertThat(r.body()).contains("\"b.jpg\"").doesNotContain("\"a.jpg\"")
+                    .doesNotContain("\"c.jpg\"")
+                    .contains("\"nextStartAfter\":\"b.jpg\"");
+
+            // Non-numeric max falls back to the default (100) — no crash, all rows surface.
+            HttpResponse<String> all = http.send(
+                    HttpRequest.newBuilder(URI.create(
+                                    base + "/api/boxes/photos/objects?max=oops"))
+                            .GET().build(),
+                    BodyHandlers.ofString());
+            assertThat(all.body()).contains("\"a.jpg\"").contains("\"b.jpg\"").contains("\"c.jpg\"");
+        }
+    }
+
+    @Test
+    void metricsTextRouteWithoutScraperReturnsPlaceholder() throws Exception {
+        // No scraper wired → /api/metrics returns a comment-only body, not a 500. The Prometheus
+        // exposition format treats lines starting with # as comments so this is a valid scrape.
+        try (AdminApiServer server = start(new EmptyDashboardData(), new AtomicBoolean(true), false)) {
+            HttpResponse<String> r = HttpClient.newHttpClient().send(
+                    HttpRequest.newBuilder(URI.create(
+                                    "http://127.0.0.1:" + server.port() + "/api/metrics"))
+                            .GET().build(),
+                    BodyHandlers.ofString());
+            assertThat(r.statusCode()).isEqualTo(200);
+            assertThat(r.headers().firstValue("Content-Type"))
+                    .hasValueSatisfying(ct -> assertThat(ct).startsWith("text/plain"));
+            assertThat(r.body()).contains("scraping disabled");
+        }
+    }
+
+    @Test
+    void metricsTimeseriesEmptyWhenNoScraper() throws Exception {
+        try (AdminApiServer server = start(new EmptyDashboardData(), new AtomicBoolean(true), false)) {
+            HttpResponse<String> r = HttpClient.newHttpClient().send(
+                    HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + server.port()
+                            + "/api/metrics/timeseries?names=a,b")).GET().build(),
+                    BodyHandlers.ofString());
+            assertThat(r.statusCode()).isEqualTo(200);
+            assertThat(r.body()).contains("\"series\":[]").contains("\"windowSeconds\":0");
+        }
+    }
+
+    @Test
+    void metricsTimeseriesSerializesSeriesWhenScraperWired() throws Exception {
+        // Stand up a tiny target with one sample so the timeseries route has data to return; also
+        // confirms /api/metrics text returns the concatenated body, not the placeholder.
+        com.sun.net.httpserver.HttpServer fake = com.sun.net.httpserver.HttpServer.create(
+                new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        fake.createContext("/metrics", exchange -> {
+            byte[] body = "candy_total{box=\"photos\"} 7\n".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            try (java.io.OutputStream out = exchange.getResponseBody()) {
+                out.write(body);
+            }
+        });
+        fake.start();
+        try (MetricsScraper scraper = new MetricsScraper(
+                java.util.List.of(URI.create(
+                        "http://127.0.0.1:" + fake.getAddress().getPort() + "/metrics")),
+                1000, 4)) {
+            scraper.start(); // synchronous first scrape
+            AdminApiConfig cfg = new AdminApiConfig(0, "127.0.0.1", "*", false);
+            try (AdminApiServer server = new AdminApiServer(cfg, () -> true, new EmptyDashboardData(),
+                    scraper)) {
+                server.start();
+                HttpClient http = HttpClient.newHttpClient();
+                String base = "http://127.0.0.1:" + server.port();
+
+                HttpResponse<String> text = http.send(
+                        HttpRequest.newBuilder(URI.create(base + "/api/metrics")).GET().build(),
+                        BodyHandlers.ofString());
+                assertThat(text.body()).contains("candy_total");
+
+                HttpResponse<String> ts = http.send(
+                        HttpRequest.newBuilder(URI.create(
+                                        base + "/api/metrics/timeseries?names=candy_total"))
+                                .GET().build(),
+                        BodyHandlers.ofString());
+                assertThat(ts.statusCode()).isEqualTo(200);
+                assertThat(ts.body()).contains("\"name\":\"candy_total\"")
+                        .contains("\"labels\":{\"box\":\"photos\"}")
+                        .contains("\"v\":7");
+            }
+        } finally {
+            fake.stop(0);
+        }
+    }
+
+    @Test
+    void putCandyContentLengthHeaderTriggersEarly413() throws Exception {
+        // The cheap path: a well-behaved client declares Content-Length up front, and the server
+        // can reject before reading the body. JDK HttpClient blocks Content-Length as a restricted
+        // header so this case must be exercised via a raw socket — distinct from the streaming-cap
+        // path that uploadBeyondCapReturns413 already covers.
+        FakeDashboardData data = new FakeDashboardData()
+                .withBox(DashboardData.BoxSummary.minimal("photos", "1"));
+        AdminApiConfig small = new AdminApiConfig(0, "127.0.0.1", "*", false, 4);
+        try (AdminApiServer server = new AdminApiServer(small, () -> true, data)) {
+            server.start();
+            String response = rawHttp(server.port(),
+                    "PUT /api/boxes/photos/objects/big HTTP/1.1\r\n"
+                            + "Host: localhost\r\nContent-Length: 5\r\nConnection: close\r\n\r\n"
+                            + "ABCDE");
+            assertThat(response).startsWith("HTTP/1.1 413");
+            assertThat(response).contains("PayloadTooLarge");
+            assertThat(data.candyDataOf("photos", "big")).isNull();
+        }
+    }
+
+    private static String rawHttp(int port, String request) throws Exception {
+        try (java.net.Socket sock = new java.net.Socket("127.0.0.1", port);
+             java.io.OutputStream out = sock.getOutputStream();
+             java.io.InputStream in = sock.getInputStream()) {
+            out.write(request.getBytes(StandardCharsets.UTF_8));
+            out.flush();
+            return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+        }
+    }
+
+    @Test
+    void createBoxRejectsArrayBodyAndEmptyName() throws Exception {
+        // Two more 400 paths: a top-level JSON array (root.isObject() returns false), and a name
+        // that's the empty string (n.asText().isEmpty()).
+        try (AdminApiServer server = start(new FakeDashboardData(), new AtomicBoolean(true), false)) {
+            HttpClient http = HttpClient.newHttpClient();
+            String base = "http://127.0.0.1:" + server.port();
+
+            HttpResponse<String> arr = http.send(
+                    HttpRequest.newBuilder(URI.create(base + "/api/boxes"))
+                            .header("Content-Type", "application/json")
+                            .POST(HttpRequest.BodyPublishers.ofString("[1,2,3]")).build(),
+                    BodyHandlers.ofString());
+            assertThat(arr.statusCode()).isEqualTo(400);
+            assertThat(arr.body()).contains("expected JSON object");
+
+            HttpResponse<String> empty = http.send(
+                    HttpRequest.newBuilder(URI.create(base + "/api/boxes"))
+                            .header("Content-Type", "application/json")
+                            .POST(HttpRequest.BodyPublishers.ofString("{\"name\":\"\"}")).build(),
+                    BodyHandlers.ofString());
+            assertThat(empty.statusCode()).isEqualTo(400);
+            assertThat(empty.body()).contains("missing string field 'name'");
+
+            HttpResponse<String> nonString = http.send(
+                    HttpRequest.newBuilder(URI.create(base + "/api/boxes"))
+                            .header("Content-Type", "application/json")
+                            .POST(HttpRequest.BodyPublishers.ofString("{\"name\":42}")).build(),
+                    BodyHandlers.ofString());
+            assertThat(nonString.statusCode()).isEqualTo(400);
+        }
+    }
+
+    /** Captures the Content-Type the server hands to {@link FakeDashboardData#putCandy}. */
+    private static final class CtCapturingFake extends FakeDashboardData {
+        String observed = "sentinel";
+
+        @Override
+        public void putCandy(String box, String key, byte[] d, String contentType) {
+            observed = contentType;
+            super.putCandy(box, key, d, contentType);
+        }
+    }
+
+    @Test
+    void putCandyStripsContentTypeParameters() throws Exception {
+        // "text/plain; charset=utf-8" should arrive at the data layer as "text/plain" — operators
+        // generally don't want the parameter noise in HEAD output.
+        CtCapturingFake data = new CtCapturingFake();
+        data.withBox(DashboardData.BoxSummary.minimal("photos", "1"));
+        try (AdminApiServer server = start(data, new AtomicBoolean(true), false)) {
+            HttpResponse<String> r = HttpClient.newHttpClient().send(
+                    HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + server.port()
+                            + "/api/boxes/photos/objects/note.txt"))
+                            .header("Content-Type", "text/plain; charset=utf-8")
+                            .PUT(HttpRequest.BodyPublishers.ofByteArray(new byte[]{1})).build(),
+                    BodyHandlers.ofString());
+            assertThat(r.statusCode()).isEqualTo(201);
+            assertThat(data.observed).isEqualTo("text/plain");
+        }
+    }
+
+    @Test
+    void putCandyTreatsBareSemicolonContentTypeAsNull() throws Exception {
+        // "; charset=utf-8" alone — after stripping params, what's left is empty; the server should
+        // hand null down to the LSM so it falls back to "application/octet-stream".
+        CtCapturingFake data = new CtCapturingFake();
+        data.withBox(DashboardData.BoxSummary.minimal("photos", "1"));
+        try (AdminApiServer server = start(data, new AtomicBoolean(true), false)) {
+            HttpClient.newHttpClient().send(
+                    HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + server.port()
+                            + "/api/boxes/photos/objects/x"))
+                            .header("Content-Type", "; charset=utf-8")
+                            .PUT(HttpRequest.BodyPublishers.ofByteArray(new byte[]{1})).build(),
+                    BodyHandlers.ofString());
+            assertThat(data.observed).isNull();
+        }
+    }
+
+    @Test
+    void deleteBoxForceFlagReachesBackend() throws Exception {
+        // ?force=true tears down a non-empty box; ?force=false rejects with 409. Pin both so the
+        // boolean parse + handover to the backend stays honest.
+        FakeDashboardData data = new FakeDashboardData()
+                .withBox(DashboardData.BoxSummary.minimal("photos", "1"))
+                .withCandy("photos", new DashboardData.CandyRow("k", 1, 1));
+        try (AdminApiServer server = start(data, new AtomicBoolean(true), false)) {
+            HttpClient http = HttpClient.newHttpClient();
+            String base = "http://127.0.0.1:" + server.port();
+
+            HttpResponse<String> noForce = http.send(
+                    HttpRequest.newBuilder(URI.create(base + "/api/boxes/photos")).DELETE().build(),
+                    BodyHandlers.ofString());
+            assertThat(noForce.statusCode()).isEqualTo(409);
+            assertThat(noForce.body()).contains("box not empty");
+
+            HttpResponse<String> withForce = http.send(
+                    HttpRequest.newBuilder(URI.create(base + "/api/boxes/photos?force=true"))
+                            .DELETE().build(),
+                    BodyHandlers.ofString());
+            assertThat(withForce.statusCode()).isEqualTo(204);
+        }
+    }
+
     private static HttpResponse<String> get(HttpClient http, String url) throws Exception {
         return http.send(HttpRequest.newBuilder(URI.create(url)).GET().build(),
                 BodyHandlers.ofString());
