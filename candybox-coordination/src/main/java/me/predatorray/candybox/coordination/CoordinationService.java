@@ -65,6 +65,13 @@ public interface CoordinationService extends AutoCloseable {
      */
     void delete(String key, long expectedVersion);
 
+    /**
+     * Lists the direct child names under {@code path}, considering every key and lease resource as a
+     * {@code /}-separated path (e.g. {@code children("boxes")} returns the Box names that have any
+     * coordination state). Sorted ascending; empty if the path has no children.
+     */
+    List<String> children(String path);
+
     // ---- leases / leader election -----------------------------------------------------------
 
     /**

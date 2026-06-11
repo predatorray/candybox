@@ -18,6 +18,7 @@ package me.predatorray.candybox.server;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executors;
@@ -28,26 +29,30 @@ import me.predatorray.candybox.common.BoxName;
 import me.predatorray.candybox.common.Clock;
 import me.predatorray.candybox.common.SystemClock;
 import me.predatorray.candybox.common.config.CandyboxConfig;
+import me.predatorray.candybox.common.exception.BoxAlreadyExistsException;
 import me.predatorray.candybox.common.exception.BoxNotEmptyException;
 import me.predatorray.candybox.common.exception.BoxNotFoundException;
 import me.predatorray.candybox.common.exception.FencedException;
 import me.predatorray.candybox.common.exception.NotOwnerException;
+import me.predatorray.candybox.coordination.BoxDescriptor;
+import me.predatorray.candybox.coordination.CandyboxKeys;
+import me.predatorray.candybox.coordination.CasConflictException;
 import me.predatorray.candybox.coordination.CoordinationService;
 import me.predatorray.candybox.coordination.VersionedValue;
 import me.predatorray.candybox.lsm.engine.BoxEngine;
 import me.predatorray.candybox.protocol.transport.RequestHandler;
+import me.predatorray.candybox.server.PartitionAssignment.BoxPartition;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * A Candybox storage node. It owns a set of Boxes under fenced ZooKeeper leases (via
- * {@link BoxOwnership}), serving each from its local {@link BoxEngine}. {@link #createBox} takes
- * ownership of a brand-new Box; {@link #openBox} takes over an existing Box (the failover/handover
- * path), recovering its manifest and WAL. A background heartbeat renews the leases.
- *
- * <p>Still scaffolded for later: request <em>routing</em> across the cluster (a non-owner currently
- * surfaces {@link me.predatorray.candybox.common.exception.NotOwnerException}; WS5 turns that into a
- * {@code MOVED} response), and background compaction/GC workers (Phase 3).
+ * A Candybox storage node. Every Box is split into a creation-time-fixed number of hash partitions
+ * (its {@link BoxDescriptor}); the node owns a set of <em>partitions</em> under fenced ZooKeeper
+ * leases (via {@link PartitionOwnership}), serving each from its own {@link BoxEngine}, so the
+ * write load of one Box spreads across the cluster. {@link #createBox} creates the descriptor and
+ * takes initial ownership of every partition; the {@link PartitionBalancer} then spreads ownership
+ * evenly and {@link #openPartition} is the per-partition failover/takeover path. A background
+ * heartbeat renews the leases.
  */
 public final class CandyboxNode implements AutoCloseable {
 
@@ -58,13 +63,17 @@ public final class CandyboxNode implements AutoCloseable {
     private final LedgerStore ledgerStore;
     private final CoordinationService coordination;
     private final Clock clock;
-    private final ConcurrentMap<String, BoxOwnership> boxes = new ConcurrentHashMap<>();
+    private final ConcurrentMap<BoxPartition, PartitionOwnership> partitions =
+            new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, BoxDescriptor> descriptorCache = new ConcurrentHashMap<>();
     private final ScheduledExecutorService leaseHeartbeat;
     private final ScheduledExecutorService compactionWorker;
+    private final ScheduledExecutorService balancerWorker;
     private final CompactionService compactionService;
     private final GarbageCollector garbageCollector;
+    private final PartitionBalancer balancer;
 
-    /** Bounded compaction passes per Box per worker tick, so one Box cannot starve the others. */
+    /** Bounded compaction passes per partition per worker tick, so one cannot starve the others. */
     private static final int MAX_COMPACTIONS_PER_TICK = 8;
 
     public CandyboxNode(int nodeId, CandyboxConfig config, LedgerStore ledgerStore,
@@ -91,6 +100,7 @@ public final class CandyboxNode implements AutoCloseable {
         coordination.registerMember(nodeId, advertisedAddress.getBytes(StandardCharsets.UTF_8));
         this.compactionService = new CompactionService(ledgerStore, config, clock);
         this.garbageCollector = new GarbageCollector(ledgerStore, config.ledgerGcGraceMillis(), clock);
+        this.balancer = new PartitionBalancer(this, coordination, config);
 
         long renewInterval = config.leaseRenewIntervalMillis();
         if (renewInterval > 0) {
@@ -109,11 +119,20 @@ public final class CandyboxNode implements AutoCloseable {
         } else {
             this.compactionWorker = null;
         }
+
+        long balancerInterval = config.balancerIntervalMillis();
+        if (balancerInterval > 0) {
+            this.balancerWorker = daemonScheduler("candybox-balancer-" + nodeId);
+            this.balancerWorker.scheduleWithFixedDelay(this::runBalancerOnce, balancerInterval,
+                    balancerInterval, TimeUnit.MILLISECONDS);
+        } else {
+            this.balancerWorker = null;
+        }
     }
 
     /**
-     * One background maintenance tick: compact owned Boxes, GC their obsoleted ledgers, and sweep any
-     * abandoned in-flight multipart uploads (older than {@code multipartUploadTtlMillis}).
+     * One background maintenance tick: compact owned partitions, GC their obsoleted ledgers, and sweep
+     * any abandoned in-flight multipart uploads (older than {@code multipartUploadTtlMillis}).
      */
     private void runMaintenance() {
         compactOwnedBoxesOnce();
@@ -133,145 +152,314 @@ public final class CandyboxNode implements AutoCloseable {
         return nodeId;
     }
 
-    /** Creates and takes ownership of a brand-new Box on this node. */
+    /** Creates a Box with the configured default partition count and owns all partitions here. */
     public void createBox(BoxName box) {
-        boxes.compute(box.value(), (name, existing) -> {
-            if (existing != null && existing.isOwner()) {
-                throw new me.predatorray.candybox.common.exception.BoxAlreadyExistsException(name);
-            }
-            LOG.info("Creating box {} on node {}", name, nodeId);
-            return BoxOwnership.createNew(box, config, ledgerStore, coordination, nodeId, clock);
-        });
+        createBox(box, 0);
     }
 
     /**
-     * Takes over ownership of an existing Box (failover/handover): acquires the lease, recovers the
-     * manifest + WAL from the current pointer, and advances the pointer.
+     * Creates a brand-new Box: publishes its descriptor ({@code partitionCount}, or the configured
+     * default if {@code 0}) and takes initial ownership of every partition on this node — the
+     * balancer spreads them across the cluster afterwards.
      */
-    public void openBox(BoxName box) {
-        boxes.compute(box.value(), (name, existing) -> {
+    public void createBox(BoxName box, int partitionCount) {
+        int count = partitionCount > 0 ? partitionCount : config.partitionsPerBoxDefault();
+        BoxDescriptor descriptor = new BoxDescriptor(count);
+        try {
+            coordination.create(CandyboxKeys.boxMetaKey(box.value()), descriptor.encode());
+        } catch (CasConflictException exists) {
+            throw new BoxAlreadyExistsException(box.value());
+        }
+        LOG.info("Creating box {} with {} partitions on node {}", box, count, nodeId);
+        List<PartitionOwnership> created = new ArrayList<>(count);
+        try {
+            for (int p = 0; p < count; p++) {
+                PartitionOwnership ownership = PartitionOwnership.createNew(box, p, config,
+                        ledgerStore, coordination, nodeId, clock);
+                created.add(ownership);
+                partitions.put(new BoxPartition(box.value(), p), ownership);
+            }
+            descriptorCache.put(box.value(), descriptor);
+        } catch (RuntimeException e) {
+            // Roll back the half-created Box so a retry starts clean.
+            for (PartitionOwnership ownership : created) {
+                dropPartition(ownership);
+            }
+            deleteMetaQuietly(box);
+            throw e;
+        }
+    }
+
+    /**
+     * Takes over ownership of one existing partition (failover/handover): acquires its lease,
+     * recovers the manifest + WAL from the current pointer, and advances the pointer.
+     */
+    public void openPartition(BoxName box, int partition) {
+        partitions.compute(new BoxPartition(box.value(), partition), (bp, existing) -> {
             if (existing != null && existing.isOwner()) {
                 return existing; // already owned here
             }
-            LOG.info("Opening (taking over) box {} on node {}", name, nodeId);
-            return BoxOwnership.recover(box, config, ledgerStore, coordination, nodeId, clock);
+            LOG.info("Opening (taking over) box {} partition {} on node {}", bp.box(),
+                    bp.partition(), nodeId);
+            return PartitionOwnership.recover(box, partition, config, ledgerStore, coordination,
+                    nodeId, clock);
         });
     }
 
-    /** Relinquishes ownership of a Box (releases the lease, closes the engine); does not delete data. */
-    public void releaseBox(BoxName box) {
-        BoxOwnership ownership = boxes.remove(box.value());
+    /** Takes over ownership of every partition of an existing Box (test/operational convenience). */
+    public void openBox(BoxName box) {
+        BoxDescriptor descriptor = descriptor(box);
+        for (int p = 0; p < descriptor.partitionCount(); p++) {
+            openPartition(box, p);
+        }
+    }
+
+    /** Relinquishes one partition (releases the lease, closes the engine); does not delete data. */
+    public void releasePartition(BoxName box, int partition) {
+        PartitionOwnership ownership = partitions.remove(new BoxPartition(box.value(), partition));
         if (ownership != null) {
             ownership.close();
         }
     }
 
-    /** Deletes a Box. Requires this node to own it and (unless {@code force}) for it to be empty. */
-    public void deleteBox(BoxName box, boolean force) {
-        BoxOwnership ownership = require(box);
-        if (!force && !ownership.engine().listCandies("", null, 1).entries().isEmpty()) {
-            throw new BoxNotEmptyException(box.value());
+    /** Like {@link #releasePartition} but flushes first so the next owner's WAL replay is small. */
+    void releasePartitionForHandover(BoxName box, int partition) {
+        PartitionOwnership ownership = partitions.remove(new BoxPartition(box.value(), partition));
+        if (ownership != null) {
+            ownership.closeForHandover();
         }
-        boxes.remove(box.value());
-        // Drop the manifest pointer (CAS on its version) so the Box no longer exists, then release.
-        ownership.currentPointer().ifPresent(p -> {
-            try {
-                coordination.delete(BoxOwnership.manifestKey(box), p.version());
-            } catch (RuntimeException e) {
-                LOG.warn("Failed to delete manifest pointer for box {}: {}", box, e.getMessage());
+    }
+
+    /** Relinquishes every locally owned partition of a Box; does not delete data. */
+    public void releaseBox(BoxName box) {
+        for (BoxPartition bp : ownedPartitionsOf(box)) {
+            releasePartition(box, bp.partition());
+        }
+    }
+
+    /**
+     * Deletes a Box: takes over every partition this node does not own (their leases must be free —
+     * with the balancer running, other owners release within a round of the descriptor disappearing),
+     * checks emptiness across all partitions unless {@code force}, drops every manifest pointer, and
+     * finally the descriptor.
+     *
+     * @throws NotOwnerException if {@code !force} and another live node still owns a partition
+     */
+    public void deleteBox(BoxName box, boolean force) {
+        BoxDescriptor descriptor = descriptor(box);
+        List<PartitionOwnership> owned = new ArrayList<>(descriptor.partitionCount());
+        for (int p = 0; p < descriptor.partitionCount(); p++) {
+            PartitionOwnership ownership = partitions.get(new BoxPartition(box.value(), p));
+            if (ownership != null && ownership.isOwner()) {
+                owned.add(ownership);
+                continue;
             }
-        });
-        ownership.close();
+            try {
+                openPartition(box, p);
+                owned.add(partitions.get(new BoxPartition(box.value(), p)));
+            } catch (RuntimeException e) {
+                if (!force) {
+                    throw new NotOwnerException(box.value());
+                }
+                // force: the live owner cleans its partition up once it sees the descriptor gone.
+            }
+        }
+        if (!force) {
+            for (PartitionOwnership ownership : owned) {
+                if (!ownership.engine().listCandies("", null, 1).entries().isEmpty()) {
+                    throw new BoxNotEmptyException(box.value());
+                }
+            }
+        }
+        for (PartitionOwnership ownership : owned) {
+            partitions.remove(new BoxPartition(box.value(), ownership.partition()));
+            dropPartition(ownership);
+        }
+        descriptorCache.remove(box.value());
+        deleteMetaQuietly(box);
         // TODO(phase-3): reference-counted GC of the Box's SSTable/Syrup/WAL/manifest ledgers.
     }
 
+    /** Drops a partition's manifest pointer (so it no longer exists) and closes its engine/lease. */
+    private void dropPartition(PartitionOwnership ownership) {
+        ownership.currentPointer().ifPresent(p -> {
+            try {
+                coordination.delete(
+                        PartitionOwnership.manifestKey(ownership.box(), ownership.partition()),
+                        p.version());
+            } catch (RuntimeException e) {
+                LOG.warn("Failed to delete manifest pointer for box {} partition {}: {}",
+                        ownership.box(), ownership.partition(), e.getMessage());
+            }
+        });
+        ownership.close();
+    }
+
+    private void deleteMetaQuietly(BoxName box) {
+        try {
+            Optional<VersionedValue> meta = coordination.get(CandyboxKeys.boxMetaKey(box.value()));
+            if (meta.isPresent()) {
+                coordination.delete(CandyboxKeys.boxMetaKey(box.value()), meta.get().version());
+            }
+        } catch (RuntimeException e) {
+            LOG.warn("Failed to delete descriptor for box {}: {}", box, e.getMessage());
+        }
+    }
+
+    /** Every existing Box in the cluster (descriptor present), sorted by name. */
     public List<String> listBoxes() {
-        List<String> names = new ArrayList<>(boxes.keySet());
+        List<String> names = new ArrayList<>();
+        for (String boxName : coordination.children(CandyboxKeys.BOXES_ROOT)) {
+            if (coordination.get(CandyboxKeys.boxMetaKey(boxName)).isPresent()) {
+                names.add(boxName);
+            }
+        }
         names.sort(String::compareTo);
         return names;
     }
 
     /**
      * A point-in-time snapshot of {@link me.predatorray.candybox.lsm.engine.BoxEngineStats} for every
-     * Box this node currently owns, keyed by Box name. Used by the health/metrics endpoint; a Box that
-     * has just lost ownership is simply omitted rather than failing the whole snapshot.
+     * partition this node currently owns, keyed by {@code box/partition}. Used by the health/metrics
+     * endpoint; a partition that has just lost ownership is omitted rather than failing the snapshot.
      */
     public java.util.Map<String, me.predatorray.candybox.lsm.engine.BoxEngineStats> ownedBoxStats() {
         java.util.Map<String, me.predatorray.candybox.lsm.engine.BoxEngineStats> out =
                 new java.util.TreeMap<>();
-        for (java.util.Map.Entry<String, BoxOwnership> e : boxes.entrySet()) {
-            BoxOwnership ownership = e.getValue();
+        for (java.util.Map.Entry<BoxPartition, PartitionOwnership> e : partitions.entrySet()) {
+            PartitionOwnership ownership = e.getValue();
             if (!ownership.isOwner()) {
                 continue;
             }
             try {
-                out.put(e.getKey(), ownership.engine().stats());
+                out.put(e.getKey().box() + "/" + e.getKey().partition(), ownership.engine().stats());
             } catch (RuntimeException ignore) {
-                // Ownership lost between the check and the read; drop this Box from the snapshot.
+                // Ownership lost between the check and the read; drop this partition.
             }
         }
         return out;
     }
 
+    /** Whether the Box exists in the cluster (its descriptor is present in coordination). */
     public boolean boxExists(BoxName box) {
-        BoxOwnership o = boxes.get(box.value());
-        return o != null && o.isOwner();
+        return findDescriptor(box).isPresent();
     }
 
-    /** The node id currently owning {@code box} (from the coordination lease), if any. */
-    public java.util.Optional<Integer> currentOwner(BoxName box) {
-        return coordination.leaseHolder(BoxOwnership.ownerResource(box))
+    /** The Box's descriptor, or throws {@link BoxNotFoundException}. Cached (it is immutable). */
+    public BoxDescriptor descriptor(BoxName box) {
+        return findDescriptor(box).orElseThrow(() -> new BoxNotFoundException(box.value()));
+    }
+
+    private Optional<BoxDescriptor> findDescriptor(BoxName box) {
+        BoxDescriptor cached = descriptorCache.get(box.value());
+        if (cached != null) {
+            return Optional.of(cached);
+        }
+        Optional<BoxDescriptor> loaded = coordination.get(CandyboxKeys.boxMetaKey(box.value()))
+                .map(v -> BoxDescriptor.decode(v.value()));
+        loaded.ifPresent(d -> descriptorCache.put(box.value(), d));
+        return loaded;
+    }
+
+    /** The node currently owning one partition of {@code box} (from the lease), if any. */
+    public Optional<Integer> currentOwner(BoxName box, int partition) {
+        return coordination.leaseHolder(PartitionOwnership.ownerResource(box, partition))
                 .map(me.predatorray.candybox.coordination.LeaseInfo::ownerNodeId);
     }
 
-    /**
-     * Returns the engine for a Box this node owns. Throws {@link BoxNotFoundException} if this node has
-     * no ownership object for the Box, or {@link me.predatorray.candybox.common.exception.NotOwnerException}
-     * if its lease is no longer valid.
-     */
-    public BoxEngine engine(BoxName box) {
-        return require(box).engine();
+    /** Whether this node currently owns the given partition. */
+    boolean ownsPartition(String box, int partition) {
+        PartitionOwnership ownership = partitions.get(new BoxPartition(box, partition));
+        return ownership != null && ownership.isOwner();
     }
 
-    private BoxOwnership require(BoxName box) {
-        BoxOwnership ownership = boxes.get(box.value());
+    /**
+     * Returns the engine of the partition holding {@code key}. Throws {@link BoxNotFoundException}
+     * if the Box does not exist or this node has no ownership object for the partition, or
+     * {@link NotOwnerException} if its lease is no longer valid.
+     */
+    public BoxEngine engine(BoxName box, String key) {
+        return enginePartition(box, descriptor(box).partitionOf(key));
+    }
+
+    /** Returns the engine of one partition this node owns (see {@link #engine}). */
+    public BoxEngine enginePartition(BoxName box, int partition) {
+        PartitionOwnership ownership = partitions.get(new BoxPartition(box.value(), partition));
         if (ownership == null) {
             throw new BoxNotFoundException(box.value());
         }
-        return ownership;
+        return ownership.engine();
+    }
+
+    /**
+     * Drops locally owned partitions whose Box descriptor no longer exists — the convergence path of
+     * a (force) {@link #deleteBox} issued on another node while this one owned some partitions.
+     */
+    void sweepDeletedBoxes() {
+        for (BoxPartition bp : partitions.keySet()) {
+            if (coordination.get(CandyboxKeys.boxMetaKey(bp.box())).isEmpty()) {
+                PartitionOwnership ownership = partitions.remove(bp);
+                if (ownership != null) {
+                    LOG.info("Dropping box {} partition {} on node {}: the Box was deleted",
+                            bp.box(), bp.partition(), nodeId);
+                    dropPartition(ownership);
+                }
+                descriptorCache.remove(bp.box());
+            }
+        }
+    }
+
+    private List<BoxPartition> ownedPartitionsOf(BoxName box) {
+        List<BoxPartition> owned = new ArrayList<>();
+        for (BoxPartition bp : partitions.keySet()) {
+            if (bp.box().equals(box.value())) {
+                owned.add(bp);
+            }
+        }
+        return owned;
     }
 
     CandyboxConfig config() {
         return config;
     }
 
-    /** A request handler that serves this node's Boxes; wire it into a Transport server or loopback. */
+    /** A request handler that serves this node's partitions; wire it into a Transport or loopback. */
     public RequestHandler requestHandler() {
         return new NodeRequestHandler(this);
     }
 
+    /**
+     * Runs one partition-balancing round (coordinate if elected, then converge on the assignment).
+     * Driven by the background worker when {@code balancerIntervalMillis > 0}; exposed so tests and
+     * operational tooling can drive it manually.
+     */
+    public void runBalancerOnce() {
+        balancer.runOnce();
+    }
+
     private void renewLeases() {
-        for (BoxOwnership ownership : boxes.values()) {
+        for (PartitionOwnership ownership : partitions.values()) {
             try {
                 ownership.renew();
             } catch (RuntimeException e) {
-                LOG.warn("Lease renewal error for a box on node {}", nodeId, e);
+                LOG.warn("Lease renewal error for a partition on node {}", nodeId, e);
             }
         }
     }
 
     /**
-     * Runs one bounded round of compaction over every Box this node still owns. The commit is gated on
-     * the owner's fencing token by the manifest, so a Box whose ownership was lost mid-round fails the
-     * commit ({@link FencedException}) and is simply skipped — a zombie owner cannot corrupt state.
+     * Runs one bounded round of compaction over every partition this node still owns. The commit is
+     * gated on the owner's fencing token by the manifest, so a partition whose ownership was lost
+     * mid-round fails the commit ({@link FencedException}) and is simply skipped — a zombie owner
+     * cannot corrupt state.
      *
      * <p>Exposed so it can be driven manually (tests, operational triggers) without the scheduler.
      *
-     * @return the number of compactions performed across all Boxes
+     * @return the number of compactions performed across all partitions
      */
     public int compactOwnedBoxesOnce() {
         int performed = 0;
-        for (BoxOwnership ownership : boxes.values()) {
+        for (PartitionOwnership ownership : partitions.values()) {
             if (!ownership.isOwner()) {
                 continue;
             }
@@ -284,7 +472,7 @@ public final class CandyboxNode implements AutoCloseable {
                     performed++;
                 }
             } catch (FencedException | NotOwnerException lostOwnership) {
-                LOG.info("Stopping compaction of a box on node {}: {}", nodeId,
+                LOG.info("Stopping compaction of a partition on node {}: {}", nodeId,
                         lostOwnership.getMessage());
             } catch (RuntimeException e) {
                 LOG.warn("Compaction error on node {}", nodeId, e);
@@ -294,21 +482,22 @@ public final class CandyboxNode implements AutoCloseable {
     }
 
     /**
-     * Runs one GC pass over every Box this node owns, deleting SSTable ledgers obsoleted by committed
+     * Runs one GC pass over every partition this node owns, deleting ledgers obsoleted by committed
      * compactions past the grace period. Exposed for manual/operational triggering.
      *
      * @return the number of ledgers deleted
      */
     public int collectGarbageOnce() {
         int deleted = 0;
-        for (BoxOwnership ownership : boxes.values()) {
+        for (PartitionOwnership ownership : partitions.values()) {
             if (!ownership.isOwner()) {
                 continue;
             }
             try {
                 deleted += garbageCollector.collect(ownership.engine());
             } catch (NotOwnerException lostOwnership) {
-                LOG.info("Skipping GC of a box on node {}: {}", nodeId, lostOwnership.getMessage());
+                LOG.info("Skipping GC of a partition on node {}: {}", nodeId,
+                        lostOwnership.getMessage());
             } catch (RuntimeException e) {
                 LOG.warn("GC error on node {}", nodeId, e);
             }
@@ -321,7 +510,7 @@ public final class CandyboxNode implements AutoCloseable {
      * already in the past. Reuses the engine's {@link me.predatorray.candybox.lsm.engine.BoxEngine
      * #abortMultipartUpload} (fencing-gated; orphaned Syrup segments enter the normal reclaim path).
      *
-     * @return the number of uploads aborted across all owned Boxes
+     * @return the number of uploads aborted across all owned partitions
      */
     public int sweepStaleMultipartUploadsOnce() {
         long ttl = config.multipartUploadTtlMillis();
@@ -330,7 +519,7 @@ public final class CandyboxNode implements AutoCloseable {
         }
         long cutoff = clock.currentTimeMillis() - ttl;
         int aborted = 0;
-        for (BoxOwnership ownership : boxes.values()) {
+        for (PartitionOwnership ownership : partitions.values()) {
             if (!ownership.isOwner()) {
                 continue;
             }
@@ -343,7 +532,7 @@ public final class CandyboxNode implements AutoCloseable {
                     }
                 }
             } catch (NotOwnerException lostOwnership) {
-                LOG.info("Skipping multipart TTL sweep on a box on node {}: {}", nodeId,
+                LOG.info("Skipping multipart TTL sweep on a partition on node {}: {}", nodeId,
                         lostOwnership.getMessage());
             } catch (RuntimeException e) {
                 LOG.warn("Multipart TTL sweep error on node {}", nodeId, e);
@@ -360,10 +549,13 @@ public final class CandyboxNode implements AutoCloseable {
         if (compactionWorker != null) {
             compactionWorker.shutdownNow();
         }
-        for (BoxOwnership ownership : boxes.values()) {
+        if (balancerWorker != null) {
+            balancerWorker.shutdownNow();
+        }
+        for (PartitionOwnership ownership : partitions.values()) {
             ownership.close();
         }
-        boxes.clear();
+        partitions.clear();
         coordination.unregisterMember(nodeId);
     }
 }

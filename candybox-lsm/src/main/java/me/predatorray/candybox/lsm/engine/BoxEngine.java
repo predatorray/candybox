@@ -196,8 +196,12 @@ public final class BoxEngine implements AutoCloseable {
                 }
             }
             // The current WAL always holds the most recent mutations (it is rotated on flush), so its
-            // max HLC dominates the flushed SSTables — observing it suffices for LWW correctness.
-            hlc.observe(replay.maxHlc());
+            // max HLC dominates the flushed SSTables — observing it suffices for LWW correctness. An
+            // empty WAL (prior owner flushed before handing over) reports Hlc.MIN: nothing to observe,
+            // and the SSTables' HLCs are in the past relative to any clock the prior owner stamped by.
+            if (!replay.entries().isEmpty()) {
+                hlc.observe(replay.maxHlc());
+            }
         }
 
         WriteAheadLog newWal = WriteAheadLog.create(ledgerStore,

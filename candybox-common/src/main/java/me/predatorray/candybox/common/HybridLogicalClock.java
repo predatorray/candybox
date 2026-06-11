@@ -100,7 +100,10 @@ public final class HybridLogicalClock {
      */
     public synchronized void observe(Hlc observed) {
         long localPhysical = clock.currentTimeMillis();
-        if (observed.physicalMillis() - localPhysical > maxAcceptableSkewMillis) {
+        // Only a timestamp *ahead* of the local clock can violate the skew bound; checking the sign
+        // first also keeps the subtraction from overflowing on extreme inputs (e.g. Hlc.MIN).
+        if (observed.physicalMillis() > localPhysical
+                && observed.physicalMillis() - localPhysical > maxAcceptableSkewMillis) {
             throw new IllegalStateException("Observed HLC physical time " + observed.physicalMillis()
                     + " leads local clock " + localPhysical + " by more than the accepted skew of "
                     + maxAcceptableSkewMillis + "ms");

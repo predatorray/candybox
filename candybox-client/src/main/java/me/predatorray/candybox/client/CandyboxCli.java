@@ -36,7 +36,7 @@ import me.predatorray.candybox.protocol.transport.TcpTransport;
  *   candybox [-s host:port] &lt;command&gt; [args]
  *
  *   list-boxes
- *   create-box  &lt;box&gt;
+ *   create-box  &lt;box&gt; [partitions]
  *   delete-box  &lt;box&gt; [--force]
  *   head-box    &lt;box&gt;
  *   put          &lt;box&gt; &lt;key&gt; [file]      # file or stdin; --content-type T, --meta k=v (repeatable)
@@ -122,7 +122,9 @@ public final class CandyboxCli {
                 return 0;
             }
             case "create-box" -> {
-                client.createBox(requireArg(args, 0, "box"));
+                String box = requireArg(args, 0, "box");
+                int partitions = args.size() > 1 ? Integer.parseInt(args.get(1)) : 0;
+                client.createBox(box, partitions);
                 return 0;
             }
             case "delete-box" -> {
@@ -302,7 +304,7 @@ public final class CandyboxCli {
 
                 Commands:
                   list-boxes
-                  create-box   <box>
+                  create-box   <box> [partitions]
                   delete-box   <box> [--force]
                   head-box     <box>
                   put          <box> <key> [file]    file or stdin; --content-type T, --meta k=v

@@ -157,6 +157,19 @@ public final class ZooKeeperCoordinationService implements CoordinationService {
         }
     }
 
+    @Override
+    public List<String> children(String path) {
+        try {
+            List<String> names = new ArrayList<>(client.getChildren().forPath(path(path)));
+            names.sort(String::compareTo);
+            return names;
+        } catch (KeeperException.NoNodeException e) {
+            return List.of();
+        } catch (Exception e) {
+            throw wrap("children", path, e);
+        }
+    }
+
     private long currentVersion(String key) {
         Stat stat = new Stat();
         try {

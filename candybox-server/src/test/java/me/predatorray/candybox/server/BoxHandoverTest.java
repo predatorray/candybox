@@ -56,9 +56,9 @@ class BoxHandoverTest {
         CandyboxNode nodeA = new CandyboxNode(1, config, store, coordination, clock);
         CandyboxNode nodeB = new CandyboxNode(2, config, store, coordination, clock);
         try {
-            nodeA.createBox(box);
+            nodeA.createBox(box, 1);
             // Unflushed write: lives only in A's WAL, exercising WAL recovery on handover.
-            nodeA.engine(box).putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
+            nodeA.enginePartition(box, 0).putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
 
             // While A holds a valid lease, B cannot take over.
             assertThatThrownBy(() -> nodeB.openBox(box)).isInstanceOf(NotOwnerException.class);
@@ -67,15 +67,15 @@ class BoxHandoverTest {
             clock.advance(11_000);
             nodeB.openBox(box);
 
-            assertThat(nodeB.engine(box).getCandy(CandyKey.of("k"))).isEqualTo(bytes("v1"));
+            assertThat(nodeB.enginePartition(box, 0).getCandy(CandyKey.of("k"))).isEqualTo(bytes("v1"));
 
             // The old owner is fenced: it no longer owns the Box.
-            assertThatThrownBy(() -> nodeA.engine(box)).isInstanceOf(NotOwnerException.class);
+            assertThatThrownBy(() -> nodeA.enginePartition(box, 0)).isInstanceOf(NotOwnerException.class);
 
             // The manifest pointer now names B's manifest ledger.
             ManifestPointer pointer = ManifestPointer.decode(
-                    coordination.get(BoxOwnership.manifestKey(box)).orElseThrow().value());
-            assertThat(pointer.ledgerId()).isEqualTo(nodeB.engine(box).manifestLedgerId());
+                    coordination.get(PartitionOwnership.manifestKey(box, 0)).orElseThrow().value());
+            assertThat(pointer.ledgerId()).isEqualTo(nodeB.enginePartition(box, 0).manifestLedgerId());
             assertThat(pointer.ownerToken()).isGreaterThan(1L);
         } finally {
             nodeA.close();
@@ -95,13 +95,13 @@ class BoxHandoverTest {
         CandyboxNode nodeA = new CandyboxNode(1, config, store, coordination, clock);
         CandyboxNode nodeB = new CandyboxNode(2, config, store, coordination, clock);
         try {
-            nodeA.createBox(box);
-            nodeA.engine(box).putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
+            nodeA.createBox(box, 1);
+            nodeA.enginePartition(box, 0).putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
             clock.advance(11_000);
             nodeB.openBox(box);
 
-            nodeB.engine(box).putCandy(CandyKey.of("k"), bytes("v2"), null, Map.of(), null);
-            assertThat(nodeB.engine(box).getCandy(CandyKey.of("k"))).isEqualTo(bytes("v2"));
+            nodeB.enginePartition(box, 0).putCandy(CandyKey.of("k"), bytes("v2"), null, Map.of(), null);
+            assertThat(nodeB.enginePartition(box, 0).getCandy(CandyKey.of("k"))).isEqualTo(bytes("v2"));
         } finally {
             nodeA.close();
             nodeB.close();
@@ -121,7 +121,7 @@ class BoxHandoverTest {
         CandyboxNode owner = new CandyboxNode(1, config, store, coordination, clock);
         CandyboxNode other = new CandyboxNode(2, config, store, coordination, clock);
         try {
-            owner.createBox(box);
+            owner.createBox(box, 1);
 
             // A request for the Box that lands on the non-owner is redirected to the owner (node 1).
             Message moved = codec.decode(other.requestHandler()

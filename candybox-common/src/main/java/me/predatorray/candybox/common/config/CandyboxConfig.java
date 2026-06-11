@@ -45,6 +45,9 @@ public final class CandyboxConfig {
     private final int multipartMaxParts;
     private final long multipartUploadTtlMillis;
     private final int multipartMaxConcurrentUploadsPerBox;
+    private final int partitionsPerBoxDefault;
+    private final long balancerIntervalMillis;
+    private final int balancerMaxMovesPerRound;
 
     private CandyboxConfig(Builder b) {
         this.sizeLimits = b.sizeLimits;
@@ -66,6 +69,9 @@ public final class CandyboxConfig {
         this.multipartMaxParts = b.multipartMaxParts;
         this.multipartUploadTtlMillis = b.multipartUploadTtlMillis;
         this.multipartMaxConcurrentUploadsPerBox = b.multipartMaxConcurrentUploadsPerBox;
+        this.partitionsPerBoxDefault = b.partitionsPerBoxDefault;
+        this.balancerIntervalMillis = b.balancerIntervalMillis;
+        this.balancerMaxMovesPerRound = b.balancerMaxMovesPerRound;
     }
 
     public static CandyboxConfig defaults() {
@@ -162,6 +168,21 @@ public final class CandyboxConfig {
         return multipartMaxConcurrentUploadsPerBox;
     }
 
+    /** Partition count given to a new Box when the creator does not specify one. */
+    public int partitionsPerBoxDefault() {
+        return partitionsPerBoxDefault;
+    }
+
+    /** How often a node runs a partition-balancing round. {@code 0} disables the balancer. */
+    public long balancerIntervalMillis() {
+        return balancerIntervalMillis;
+    }
+
+    /** Max partitions moved away from live owners per balancing round (failover is not limited). */
+    public int balancerMaxMovesPerRound() {
+        return balancerMaxMovesPerRound;
+    }
+
     public static final class Builder {
         private SizeLimits sizeLimits = SizeLimits.defaults();
         private Map<LedgerRole, QuorumConfig> quorums = new EnumMap<>(QuorumConfig.defaults());
@@ -182,6 +203,9 @@ public final class CandyboxConfig {
         private int multipartMaxParts = 10_000;                         // S3 cap
         private long multipartUploadTtlMillis = 7L * 24 * 3600 * 1000;  // 7 days
         private int multipartMaxConcurrentUploadsPerBox = 10_000;       // defensive ceiling
+        private int partitionsPerBoxDefault = 8;                        // write spread vs. per-engine cost
+        private long balancerIntervalMillis = 0L;                       // balancing round; 0 disables
+        private int balancerMaxMovesPerRound = 4;                       // migration rate limit
 
         public Builder sizeLimits(SizeLimits v) {
             this.sizeLimits = v;
@@ -278,6 +302,21 @@ public final class CandyboxConfig {
             return this;
         }
 
+        public Builder partitionsPerBoxDefault(int v) {
+            this.partitionsPerBoxDefault = v;
+            return this;
+        }
+
+        public Builder balancerIntervalMillis(long v) {
+            this.balancerIntervalMillis = v;
+            return this;
+        }
+
+        public Builder balancerMaxMovesPerRound(int v) {
+            this.balancerMaxMovesPerRound = v;
+            return this;
+        }
+
         public CandyboxConfig build() {
             if (l0StallThreshold < l0CompactionTrigger) {
                 throw new IllegalArgumentException("l0StallThreshold must be >= l0CompactionTrigger");
@@ -287,6 +326,12 @@ public final class CandyboxConfig {
             }
             if (multipartMaxParts < 1) {
                 throw new IllegalArgumentException("multipartMaxParts must be positive");
+            }
+            if (partitionsPerBoxDefault < 1) {
+                throw new IllegalArgumentException("partitionsPerBoxDefault must be positive");
+            }
+            if (balancerMaxMovesPerRound < 1) {
+                throw new IllegalArgumentException("balancerMaxMovesPerRound must be positive");
             }
             return new CandyboxConfig(this);
         }

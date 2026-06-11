@@ -80,15 +80,15 @@ class BoxHandoverIT {
              CandyboxNode nodeA = new CandyboxNode(1, config, storeA, coordA, SystemClock.INSTANCE);
              CandyboxNode nodeB = new CandyboxNode(2, config, storeB, coordB, SystemClock.INSTANCE)
         ) {
-            nodeA.createBox(box);
-            nodeA.engine(box).putCandy(CandyKey.of("k"), bytes("v1"), "text/plain", Map.of(), null);
+            nodeA.createBox(box, 1);
+            nodeA.enginePartition(box, 0).putCandy(CandyKey.of("k"), bytes("v1"), "text/plain", Map.of(), null);
 
             // A relinquishes ownership (releases the lease, closes its engine).
             nodeA.releaseBox(box);
 
             // B takes over: acquires the lease, recovers the manifest + WAL, advances the pointer.
             nodeB.openBox(box);
-            assertThat(nodeB.engine(box).getCandy(CandyKey.of("k"))).isEqualTo(bytes("v1"));
+            assertThat(nodeB.enginePartition(box, 0).getCandy(CandyKey.of("k"))).isEqualTo(bytes("v1"));
         }
     }
 }

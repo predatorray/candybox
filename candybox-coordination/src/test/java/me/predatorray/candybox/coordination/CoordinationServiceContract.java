@@ -100,6 +100,22 @@ public abstract class CoordinationServiceContract {
     }
 
     @Test
+    void childrenListsDirectChildNamesAcrossKeysAndLeases() {
+        assertThat(service.children("boxes")).isEmpty();
+
+        service.create("boxes/alpha/meta", b("d"));
+        service.create("boxes/alpha/partitions/0/manifest", b("m"));
+        service.create("boxes/beta/meta", b("d"));
+        service.tryAcquireLease("boxes/gamma/partitions/0/owner", 1, 5_000).orElseThrow();
+
+        // Direct child names only, deduplicated, sorted — and lease resources count as paths too.
+        assertThat(service.children("boxes")).containsExactly("alpha", "beta", "gamma");
+        assertThat(service.children("boxes/alpha")).containsExactly("meta", "partitions");
+        assertThat(service.children("boxes/alpha/partitions")).containsExactly("0");
+        assertThat(service.children("elsewhere")).isEmpty();
+    }
+
+    @Test
     void leaseBlocksOthersThenExpiresAndTokenIncreases() {
         Lease ownerA = service.tryAcquireLease("owner", 1, 5_000).orElseThrow();
         assertThat(ownerA.isValid()).isTrue();

@@ -80,11 +80,11 @@ class CompactionGcCycleIT {
                 new ZooKeeperCoordinationService(zookeeper.getConnectString(), SystemClock.INSTANCE);
         CandyboxNode node = new CandyboxNode(1, config, store, coordination, SystemClock.INSTANCE);
         try {
-            node.createBox(box);
+            node.createBox(box, 1);
             for (int i = 0; i < 4; i++) {
-                node.engine(box).putCandy(CandyKey.of("k" + i), bytes("v"), null, Map.of(), null);
+                node.enginePartition(box, 0).putCandy(CandyKey.of("k" + i), bytes("v"), null, Map.of(), null);
             }
-            node.engine(box).putCandy(CandyKey.of("k0"), bytes("v-new"), null, Map.of(), null); // overwrite
+            node.enginePartition(box, 0).putCandy(CandyKey.of("k0"), bytes("v-new"), null, Map.of(), null); // overwrite
 
             int ledgersBefore = store.listLedgers().size();
 
@@ -96,9 +96,9 @@ class CompactionGcCycleIT {
             assertThat(ledgersAfter).isLessThan(ledgersBefore);
 
             // The live data is intact after compaction + GC.
-            assertThat(node.engine(box).getCandy(CandyKey.of("k0"))).isEqualTo(bytes("v-new"));
+            assertThat(node.enginePartition(box, 0).getCandy(CandyKey.of("k0"))).isEqualTo(bytes("v-new"));
             for (int i = 1; i < 4; i++) {
-                assertThat(node.engine(box).getCandy(CandyKey.of("k" + i))).isEqualTo(bytes("v"));
+                assertThat(node.enginePartition(box, 0).getCandy(CandyKey.of("k" + i))).isEqualTo(bytes("v"));
             }
         } finally {
             node.close();

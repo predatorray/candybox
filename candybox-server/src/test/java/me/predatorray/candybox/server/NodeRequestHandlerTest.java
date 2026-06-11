@@ -108,10 +108,10 @@ class NodeRequestHandlerTest {
         try (CandyboxNode node = new CandyboxNode(1, config(), new InMemoryLedgerStore(),
                 new InMemoryCoordinationService(), new ManualClock(1000))) {
             RequestHandler handler = node.requestHandler();
-            assertThat(roundTrip(handler, new Message.CreateBoxRequest("dup-box")))
+            assertThat(roundTrip(handler, new Message.CreateBoxRequest("dup-box", 1)))
                     .isInstanceOf(Message.OkResponse.class);
             // Re-create is a typed CandyboxException -> ErrorResponse.
-            assertThat(roundTrip(handler, new Message.CreateBoxRequest("dup-box")))
+            assertThat(roundTrip(handler, new Message.CreateBoxRequest("dup-box", 1)))
                     .isInstanceOf(Message.ErrorResponse.class);
 
             roundTrip(handler, new Message.PutCandyRequest("dup-box", "k", null, Map.of(), null,
@@ -130,7 +130,7 @@ class NodeRequestHandlerTest {
         try (CandyboxNode node = new CandyboxNode(1, config(), new InMemoryLedgerStore(),
                 new InMemoryCoordinationService(), new ManualClock(1000))) {
             RequestHandler handler = node.requestHandler();
-            roundTrip(handler, new Message.CreateBoxRequest("range-box"));
+            roundTrip(handler, new Message.CreateBoxRequest("range-box", 1));
             roundTrip(handler, new Message.PutCandyRequest("range-box", "k", null, Map.of(), null,
                     bytes("0123456789")));
 
@@ -145,7 +145,7 @@ class NodeRequestHandlerTest {
         try (CandyboxNode node = new CandyboxNode(1, config(), new InMemoryLedgerStore(),
                 new InMemoryCoordinationService(), new ManualClock(1000))) {
             RequestHandler handler = node.requestHandler();
-            roundTrip(handler, new Message.CreateBoxRequest("ops-box"));
+            roundTrip(handler, new Message.CreateBoxRequest("ops-box", 1));
             for (String k : List.of("a", "b", "c")) {
                 roundTrip(handler, new Message.PutCandyRequest("ops-box", k, null, Map.of(), null,
                         bytes(k)));
@@ -156,7 +156,7 @@ class NodeRequestHandlerTest {
             assertThat(((Message.ListBoxesResponse) boxes).boxes()).contains("ops-box");
 
             // Reverse, ranged listing exercises the toScanQuery direction/bounds mapping.
-            Message listed = roundTrip(handler, new Message.ListCandiesRequest("ops-box", null, null,
+            Message listed = roundTrip(handler, new Message.ListCandiesRequest("ops-box", 0, null, null,
                     100, "a", "c", true));
             assertThat(listed).isInstanceOf(Message.ListCandiesResponse.class);
 
@@ -167,7 +167,7 @@ class NodeRequestHandlerTest {
                     .isInstanceOf(Message.HeadCandyResponse.class);
 
             // Range delete (window form) returns OK.
-            assertThat(roundTrip(handler, new Message.DeleteRangeRequest("ops-box", null, "a", "c")))
+            assertThat(roundTrip(handler, new Message.DeleteRangeRequest("ops-box", 0, null, "a", "c")))
                     .isInstanceOf(Message.OkResponse.class);
         }
     }
@@ -177,7 +177,7 @@ class NodeRequestHandlerTest {
         try (CandyboxNode node = new CandyboxNode(1, config(), new InMemoryLedgerStore(),
                 new InMemoryCoordinationService(), new ManualClock(1000))) {
             RequestHandler handler = node.requestHandler();
-            roundTrip(handler, new Message.CreateBoxRequest("mp-box"));
+            roundTrip(handler, new Message.CreateBoxRequest("mp-box", 1));
 
             Message created = roundTrip(handler, new Message.CreateMultipartUploadRequest(
                     "mp-box", "obj", "text/plain", Map.of()));
@@ -196,7 +196,7 @@ class NodeRequestHandlerTest {
             assertThat(((Message.ListPartsResponse) parts).parts()).hasSize(2);
 
             Message uploads = roundTrip(handler, new Message.ListMultipartUploadsRequest(
-                    "mp-box", null, null, null, 100));
+                    "mp-box", 0, null, null, null, 100));
             assertThat(((Message.ListMultipartUploadsResponse) uploads).uploads()).hasSize(1);
 
             // Complete and read back the assembled object.

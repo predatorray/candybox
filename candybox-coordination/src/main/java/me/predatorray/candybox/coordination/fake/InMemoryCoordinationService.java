@@ -99,6 +99,29 @@ public final class InMemoryCoordinationService implements CoordinationService {
         kv.remove(key);
     }
 
+    @Override
+    public synchronized List<String> children(String path) {
+        String prefix = path.endsWith("/") ? path : path + "/";
+        java.util.TreeSet<String> names = new java.util.TreeSet<>();
+        for (String key : kv.keySet()) {
+            childOf(key, prefix).ifPresent(names::add);
+        }
+        for (String resource : leases.keySet()) {
+            childOf(resource, prefix).ifPresent(names::add);
+        }
+        return new ArrayList<>(names);
+    }
+
+    private static Optional<String> childOf(String key, String prefix) {
+        if (!key.startsWith(prefix)) {
+            return Optional.empty();
+        }
+        String rest = key.substring(prefix.length());
+        int slash = rest.indexOf('/');
+        String child = slash < 0 ? rest : rest.substring(0, slash);
+        return child.isEmpty() ? Optional.empty() : Optional.of(child);
+    }
+
     // ---- leases ----------------------------------------------------------------------------
 
     @Override

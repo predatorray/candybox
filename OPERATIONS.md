@@ -8,11 +8,20 @@ For architecture and on-ledger formats see [`DESIGN.md`](DESIGN.md); for build/t
 A Candybox cluster is a set of **storage nodes** over a shared **Apache BookKeeper** ensemble and a
 shared **ZooKeeper** ensemble:
 
-- **BookKeeper** stores all ledgers — WALs, SSTables, Syrups (Candy bytes), and the per-Box manifest.
-- **ZooKeeper** (via the coordination SPI) holds cluster membership, per-Box ownership **leases**, and
-  the versioned pointer to each Box's current manifest ledger.
-- Each **Box** is owned by exactly one node at a time (a fenced, movable lease). The owner is the sole
-  writer of that Box's WAL, memtable flushes, and manifest. Clients route requests to the owner.
+- **BookKeeper** stores all ledgers — WALs, SSTables, Syrups (Candy bytes), and the per-partition
+  manifests.
+- **ZooKeeper** (via the coordination SPI) holds cluster membership, each Box's **descriptor**
+  (its creation-time-fixed partition count), per-partition ownership **leases**, the versioned
+  pointer to each partition's current manifest ledger, and the balancer's election lease +
+  assignment table.
+- Each **Box** is split into hash **partitions** (`partitions.per.box.default`, default 8); each
+  partition is owned by exactly one node at a time (a fenced, movable lease) and is a full LSM
+  engine. The owner is the sole writer of that partition's WAL, memtable flushes, and manifest.
+  Clients route each request to the owner of the key's partition, so one Box's writes spread across
+  the cluster. The **balancer** (`balancer.interval.millis` > 0; one node coordinates under the
+  `cluster/balancer` lease) keeps partition ownership evenly distributed, fails over dead nodes'
+  partitions, and rate-limits migrations away from live owners
+  (`balancer.max.moves.per.round`).
 
 A node is `CandyboxNode(nodeId, config, ledgerStore, coordination, clock, advertisedAddress)` wired
 behind a `TcpTransportServer`; the advertised `host:port` is published to membership so the
@@ -35,9 +44,12 @@ All knobs are configurable; pick defaults unless a workload demands otherwise.
 | `memtableFlushThresholdBytes` | 4 MiB | Memtable size that triggers a flush to an L0 SSTable. |
 | `syrupRolloverBytes` | 1 GiB | Open Syrup size before rolling to a fresh one. |
 | `maxFrameSizeBytes` | 16 MiB | Protocol frame cap; oversized/malformed frames are rejected pre-allocation. |
-| `ownershipLeaseTtlMillis` | 10 s | Box ownership lease TTL; must be renewed within it. |
+| `ownershipLeaseTtlMillis` | 10 s | Partition ownership lease TTL; must be renewed within it. |
 | `leaseRenewIntervalMillis` | 3 s | Lease heartbeat interval; `0` disables the background heartbeat. |
-| `routerCacheTtlMillis` | 5 s | Client Box→owner routing-cache TTL. |
+| `routerCacheTtlMillis` | 5 s | Client partition→owner routing-cache TTL. |
+| `partitionsPerBoxDefault` | 8 | Hash-partition count for a new Box when the creator passes none; fixed for the Box's lifetime. |
+| `balancerIntervalMillis` | 0 (disabled) | Partition-balancing round period; **set > 0 in production** (shipped conf: 5 s). |
+| `balancerMaxMovesPerRound` | 4 | Max partitions migrated away from live owners per round (failover is unlimited). |
 | `compactionIntervalMillis` | 0 (disabled) | Background compaction+GC tick; **set > 0 in production**. |
 | `l0CompactionTrigger` | 4 | L0 SSTable count that triggers a compaction. |
 | `l0StallThreshold` | 12 | L0 SSTable count at which writes are rejected with `BUSY`. |
@@ -55,9 +67,12 @@ level N's budget is `levelBaseBytes × multiplier^(N-1)`.
 
 ## Consistency & backpressure
 
-- **Per-key linearizable on the owner.** A single fenced owner serializes all writes for a Box and
-  stamps a Hybrid Logical Clock at ingest; reads resolve to the highest HLC (LWW, nodeId tiebreaker).
-  The only eventual-consistency window is ownership handover.
+- **Per-key linearizable on the owner.** Every key maps to one partition, and a single fenced owner
+  serializes all writes for a partition and stamps a Hybrid Logical Clock at ingest; reads resolve
+  to the highest HLC (LWW, nodeId tiebreaker). The only per-key eventual-consistency window is
+  ownership handover. Cross-partition operations are weaker: listings are scatter-gather merges,
+  `deleteRange` is one tombstone per partition (idempotent, not atomic), and a cross-partition
+  rename is copy-then-delete.
 - **Backpressure.** When a Box accumulates `l0StallThreshold` L0 SSTables, writes return a retriable
   `BUSY` (protocol `RESPONSE_BUSY`) instead of blocking. Clients should back off and retry; the stall
   clears once compaction drains L0.
@@ -74,8 +89,10 @@ level N's budget is `levelBaseBytes × multiplier^(N-1)`.
 | **Client hits the wrong node** | The node replies `RESPONSE_MOVED(ownerNodeId)`; the client re-resolves via coordination and retries. |
 | **Clock skew** | HLC ordering survives a regressing wall clock; an observed HLC leading local time by more than `maxClockSkewMillis` is rejected. |
 
-Recovery currently requires some node to take over an unowned Box (`CandyboxNode.openBox`); automatic
-failover (watch lease loss → elect a new owner) is future work.
+With the balancer enabled (`balancerIntervalMillis > 0`), a dead node's partitions are reassigned
+and taken over automatically within a round or two of its leases expiring. With it disabled,
+recovery requires some node to take over unowned partitions manually
+(`CandyboxNode.openPartition` / `openBox`).
 
 ## Garbage collection
 
@@ -136,8 +153,10 @@ the S3 gateway from the browser, not through this API. See `WEB_DASHBOARD_PLAN.m
 
 - **Streaming on the wire (Phase 2.5):** large objects are buffered in a single frame (≤ 16 MiB);
   chunked multi-frame PUT/GET is not yet implemented.
-- **Automatic failover:** a crashed owner's Box is served again only when some node calls `openBox`.
-- **Cluster-wide `listBoxes`:** returns the contacted node's Boxes only.
+- **Automatic failover needs the balancer:** with `balancerIntervalMillis = 0`, a crashed owner's
+  partitions are served again only when some node calls `openPartition`/`openBox`.
+- **Fixed partition count per Box:** set at creation, no re-partitioning; ordered listings
+  scatter-gather every partition per page.
 - **Distributed compaction offload:** the owner produces and commits its own compactions; offloading
   output production to non-owners under a ZK task lease is future work.
 - **GC enumeration backstop** and **Syrup defragmentation** (see above).
