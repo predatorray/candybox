@@ -19,10 +19,16 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
 import me.predatorray.candybox.bookkeeper.fake.InMemoryLedgerStore;
 import me.predatorray.candybox.common.BoxName;
+import me.predatorray.candybox.common.CandyKey;
 import me.predatorray.candybox.common.ManualClock;
 import me.predatorray.candybox.common.config.CandyboxConfig;
+import me.predatorray.candybox.common.exception.BoxAlreadyExistsException;
+import me.predatorray.candybox.common.exception.NotOwnerException;
+import me.predatorray.candybox.coordination.CandyboxKeys;
 import me.predatorray.candybox.coordination.fake.InMemoryCoordinationService;
 import me.predatorray.candybox.protocol.Frame;
 import me.predatorray.candybox.protocol.Message;
@@ -318,6 +324,65 @@ class CandyboxNodeTest {
             // Data still readable from the L0 tables.
             assertThat(roundTrip(handler, new Message.GetCandyRequest("my-box", "a")))
                     .isInstanceOf(Message.CandyDataResponse.class);
+        }
+        store.close();
+    }
+
+    @Test
+    void createBoxRollsBackWhenAPartitionCannotBeCreated() {
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService();
+        // A leftover manifest pointer for partition 1 makes the second partition's creation fail.
+        coordination.create(CandyboxKeys.manifestKey("half-box", 1), new byte[] {0});
+        try (CandyboxNode node = new CandyboxNode(1, CandyboxConfig.defaults(), store, coordination,
+                new ManualClock(1000))) {
+            assertThatThrownBy(() -> node.createBox(BoxName.of("half-box"), 2))
+                    .isInstanceOf(BoxAlreadyExistsException.class);
+            // The descriptor and the partition that *was* created are rolled back.
+            assertThat(node.boxExists(BoxName.of("half-box"))).isFalse();
+            assertThat(coordination.get(CandyboxKeys.boxMetaKey("half-box"))).isEmpty();
+            assertThat(coordination.get(CandyboxKeys.manifestKey("half-box", 0))).isEmpty();
+            assertThat(node.ownedBoxStats()).isEmpty();
+        }
+        store.close();
+    }
+
+    @Test
+    void nonForceDeleteBoxFailsWhileAnotherLiveNodeOwnsAPartition() {
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService();
+        try (CandyboxNode owner = new CandyboxNode(1, CandyboxConfig.defaults(), store, coordination,
+                new ManualClock(1000));
+             CandyboxNode other = new CandyboxNode(2, CandyboxConfig.defaults(), store, coordination,
+                new ManualClock(1000))) {
+            owner.createBox(BoxName.of("held-box"), 2);
+            // Node 2 cannot take over partitions whose leases node 1 still holds.
+            assertThatThrownBy(() -> other.deleteBox(BoxName.of("held-box"), false))
+                    .isInstanceOf(NotOwnerException.class);
+            assertThat(owner.boxExists(BoxName.of("held-box"))).isTrue();
+        }
+        store.close();
+    }
+
+    @Test
+    void releaseBoxThenOpenBoxReplaysEveryPartition() {
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService();
+        try (CandyboxNode node = new CandyboxNode(1, CandyboxConfig.defaults(), store, coordination,
+                new ManualClock(1000))) {
+            BoxName box = BoxName.of("reopen-box");
+            node.createBox(box, 2);
+            node.engine(box, "k").putCandy(CandyKey.of("k"),
+                    "v".getBytes(StandardCharsets.UTF_8), null, Map.of(), null);
+
+            node.releaseBox(box);
+            assertThat(node.ownedBoxStats()).isEmpty();
+            assertThat(node.currentOwner(box, 0)).isEmpty(); // released, not just expired
+
+            node.openBox(box);
+            assertThat(node.ownedBoxStats()).containsKeys("reopen-box/0", "reopen-box/1");
+            assertThat(node.engine(box, "k").getCandy(CandyKey.of("k")))
+                    .isEqualTo("v".getBytes(StandardCharsets.UTF_8));
         }
         store.close();
     }

@@ -52,11 +52,6 @@ final class PartitionAssignment {
         return java.util.Collections.unmodifiableMap(targets);
     }
 
-    /** The node assigned to a partition, or {@code null} if the table does not mention it. */
-    Integer targetNode(String box, int partition) {
-        return targets.get(new BoxPartition(box, partition));
-    }
-
     byte[] encode() {
         BinaryWriter w = new BinaryWriter(64);
         w.writeByte(FORMAT_VERSION);

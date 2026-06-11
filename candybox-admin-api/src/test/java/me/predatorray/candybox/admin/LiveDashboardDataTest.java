@@ -151,6 +151,27 @@ class LiveDashboardDataTest {
     }
 
     @Test
+    void ownerSummarizesSpreadPartitionOwnership() {
+        // A Box whose two partitions are owned by different nodes reports both, sorted and joined.
+        InMemoryCoordinationService coord = new InMemoryCoordinationService();
+        coord.create(CandyboxKeys.boxMetaKey("spread"), new BoxDescriptor(2).encode());
+        coord.tryAcquireLease(CandyboxKeys.ownerResource("spread", 0), 2, 60_000);
+        coord.tryAcquireLease(CandyboxKeys.ownerResource("spread", 1), 1, 60_000);
+
+        FakeBoxClient client = new FakeBoxClient();
+        client.boxes.add("spread");
+        LiveDashboardData data = new LiveDashboardData(coord, client);
+
+        assertThat(data.boxes()).singleElement()
+                .satisfies(row -> assertThat(row.owner()).isEqualTo("1,2"));
+        // One LSM row per partition, each naming its own holder.
+        assertThat(data.lsm()).extracting(DashboardData.LsmRow::box)
+                .containsExactly("spread/0", "spread/1");
+        assertThat(data.lsm()).extracting(DashboardData.LsmRow::owner)
+                .containsExactly("2", "1");
+    }
+
+    @Test
     void mutatingOpsDelegateToClient() {
         InMemoryCoordinationService coord = new InMemoryCoordinationService();
         FakeBoxClient client = new FakeBoxClient();

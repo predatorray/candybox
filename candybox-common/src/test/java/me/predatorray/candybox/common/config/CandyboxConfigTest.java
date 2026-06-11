@@ -154,4 +154,31 @@ class CandyboxConfigTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("multipartMaxParts");
     }
+
+    @Test
+    void partitioningAndBalancerDefaultsAndOverrides() {
+        CandyboxConfig defaults = CandyboxConfig.defaults();
+        assertThat(defaults.partitionsPerBoxDefault()).isEqualTo(8);
+        assertThat(defaults.balancerIntervalMillis()).isZero(); // off by default (tests drive rounds)
+        assertThat(defaults.balancerMaxMovesPerRound()).isEqualTo(4);
+
+        CandyboxConfig cfg = CandyboxConfig.builder()
+                .partitionsPerBoxDefault(2)
+                .balancerIntervalMillis(5_000)
+                .balancerMaxMovesPerRound(1)
+                .build();
+        assertThat(cfg.partitionsPerBoxDefault()).isEqualTo(2);
+        assertThat(cfg.balancerIntervalMillis()).isEqualTo(5_000);
+        assertThat(cfg.balancerMaxMovesPerRound()).isEqualTo(1);
+    }
+
+    @Test
+    void buildRejectsNonPositivePartitionCountAndMoveBudget() {
+        assertThatThrownBy(() -> CandyboxConfig.builder().partitionsPerBoxDefault(0).build())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("partitionsPerBoxDefault");
+        assertThatThrownBy(() -> CandyboxConfig.builder().balancerMaxMovesPerRound(0).build())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("balancerMaxMovesPerRound");
+    }
 }
