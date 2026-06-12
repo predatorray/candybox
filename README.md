@@ -27,7 +27,8 @@ replicated across a cluster.
 
 Under the hood it is a **distributed LSM tree built on [Apache BookKeeper](https://bookkeeper.apache.org/)**:
 object data and index live in BookKeeper's replicated, append-only ledgers, and a single fenced owner
-per bucket keeps reads and writes consistent during failover.
+per bucket partition keeps reads and writes consistent during failover, with partitions spread
+evenly across the cluster.
 
 > **Vocabulary**
 >
@@ -125,7 +126,7 @@ operations an S3-style store cannot do cheaply:
 ```bash
 candybox list   photos --start a --end m --reverse   # bounded, reverse-order range scan
 candybox copy   photos cat.jpg cat-copy.jpg          # zero-copy: shares the stored bytes
-candybox rename photos cat.jpg pets/cat.jpg          # zero-copy move (atomic, same Box)
+candybox rename photos cat.jpg pets/cat.jpg          # zero-copy move (same Box)
 candybox delete-range photos thumbnails/             # one O(1) range tombstone, not N deletes
 candybox delete-range photos --start a --end m       # delete a half-open [start, end) key window
 ```
@@ -133,7 +134,9 @@ candybox delete-range photos --start a --end m       # delete a half-open [start
 - **Bounded / reverse range scans** walk a `[start, end)` window in either direction (`list --start
   K --end K --reverse`), paging with `--start-after`.
 - **Zero-copy `copy` / `rename`** point a new key at the *same* stored bytes — no data is moved — and
-  `rename` removes the source atomically (same Box).
+  `rename` removes the source atomically (same Box; when source and destination land in different
+  hash partitions the client transparently falls back to a byte copy, and the rename is no longer
+  atomic).
 - **`delete-range`** deletes a whole prefix or key window with a single range tombstone (constant
   work regardless of how many keys it covers); the bytes are reclaimed lazily by compaction.
 
@@ -208,7 +211,7 @@ Candybox blends three well-known designs:
 flowchart TB
     client([Client])
 
-    subgraph owner["Box owner (single, fenced node)"]
+    subgraph owner["Partition owner (single, fenced node)"]
         direction TB
         wal[Write-ahead log]
         memtable[Memtable]
@@ -250,11 +253,14 @@ flowchart TB
   BookKeeper ledger — append-only, replicated, and self-fencing. Candybox never mutates data in
   place; updates and deletes are new appends (with tombstones), Apache-Pulsar-style.
 
-Consistency rests on **single, fenced ownership**: at any moment exactly one node owns a Box, holding
-a ZooKeeper lease with a *fencing token*. Every state-changing operation carries that token, so if
-ownership moves during a failure, a stale former owner can no longer corrupt the Box. Each write is
-stamped with a hybrid logical clock for last-writer-wins ordering across nodes. The full record
-formats and the reasoning behind the fencing/handover protocol are in [`DESIGN.md`](DESIGN.md).
+Consistency rests on **single, fenced ownership per partition**: every Box is split into a fixed
+number of hash partitions, and at any moment exactly one node owns a partition, holding a ZooKeeper
+lease with a *fencing token*. Every state-changing operation carries that token, so if ownership
+moves during a failure, a stale former owner can no longer corrupt the partition. An elected
+balancer spreads partition ownership evenly across the cluster, so one Box's writes are served by
+many nodes. Each write is stamped with a hybrid logical clock for last-writer-wins ordering across
+nodes. The full record formats and the reasoning behind the fencing/handover protocol are in
+[`DESIGN.md`](DESIGN.md); partitioning is described in [`BOX_PARTITIONING_PLAN.md`](BOX_PARTITIONING_PLAN.md).
 
 ## Building from source
 

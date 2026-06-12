@@ -6,10 +6,10 @@ on **Apache BookKeeper** ledgers. This document captures the architecture, on-le
 decisions made (with rationale), and the deliberate v1 simplifications.
 
 It is written against the implementation in this repository: **Phases 0–4 are implemented and
-tested** — the LSM engine, ZooKeeper-backed coordination, fenced Box ownership/handover, the framed
-TCP protocol with cluster membership + client-side routing, multi-level leveled compaction, and
-reference-counted GC all run, with the storage node, CLI, and a packaged distribution (Docker /
-Kubernetes) on top. A handful of deliberate v1 simplifications remain (true on-the-wire streaming,
+tested** — the LSM engine, ZooKeeper-backed coordination, hash-partitioned Boxes with fenced
+per-partition ownership/handover and an elected-coordinator balancer, the framed TCP protocol with
+cluster membership + client-side routing, multi-level leveled compaction, and reference-counted GC
+all run, with the storage node, CLI, and a packaged distribution (Docker / Kubernetes) on top. A handful of deliberate v1 simplifications remain (true on-the-wire streaming,
 distributed cross-node compaction scheduling, watch-based coordination, a GC enumeration backstop);
 they are called out inline and collected in §12–§13, and a few are still marked `// TODO(phase-N)` in
 code.
@@ -52,13 +52,22 @@ Dependency rule: `candybox-lsm` depends **only** on the two SPIs (`bookkeeper`, 
   nodeId)`. Reads resolve a key to the **highest HLC** (LWW); the deterministic final tiebreaker is
   `nodeId`. HLC beats a raw wall clock (a fast clock cannot permanently win or resurrect deletes) and
   beats a global counter (no coordination bottleneck).
-- **Leased single-owner-per-Box.** At any instant one node owns a Box and is the sole writer of its
-  WAL, memtable flushes, and manifest. Ownership is a movable, ZK-leased, **fenced** assignment.
+- **Hash-partitioned Boxes, leased single-owner-per-partition.** Every Box is split into a
+  creation-time-fixed number of **hash partitions** (`Partitioning`: CRC32C of the key's UTF-8 bytes
+  mod the count in the Box's `BoxDescriptor`; default 8, `partitions.per.box.default`). Each
+  partition is an independent LSM engine — its own WAL, memtable, manifest, SSTables, and Syrups —
+  and at any instant one node owns a partition and is the sole writer of it. Ownership is a movable,
+  ZK-leased, **fenced** per-partition assignment, so one Box's write load spreads across the
+  cluster (see §7a for the balancer).
 - **The owner stamps the HLC at ingest** (never the client), so client clock skew is irrelevant.
-- Because a single fenced owner serializes all writes for a Box, the system is **effectively per-key
-  linearizable on the owner**. The eventual-consistency window is confined to ownership handover (a
-  fenced old owner may briefly serve a stale memtable read, but its *writes* fail). This is the
-  guarantee Candybox documents — not general eventual consistency.
+- Because every key maps to exactly one partition and a single fenced owner serializes all writes
+  for a partition, the system is **effectively per-key linearizable on the owner**. The
+  eventual-consistency window is confined to ownership handover (a fenced old owner may briefly
+  serve a stale memtable read, but its *writes* fail). Operations spanning partitions are weaker by
+  construction: `deleteRange` is one tombstone per partition (idempotent, not atomic across them),
+  listings are scatter-gather merges (each partition's page is consistent; the merged page is not a
+  snapshot), and a cross-partition `rename` is copy-then-delete (not atomic). This is the guarantee
+  Candybox documents — not general eventual consistency.
 
 ### HLC recovery on handover (critical correctness point)
 
@@ -178,19 +187,26 @@ consults range tombstones across all tables rather than pruning by point range.
   SSTables at every level (range + bloom pre-filter); a point tombstone, a covering **range tombstone** newer than
   that locator, or absence ⇒ `CandyNotFound`. `getCandy` then streams bytes from Syrups and validates
   the whole-object crc.
-- **list / scan**: a `MergingIterator` over the memtable + SSTables (LWW, tombstones suppressed),
-  driven by a `ScanQuery` — an optional `[start, end)` window, optional prefix, **forward or reverse**
-  direction, page size, and a continuation cursor (`lastKey`, exclusive in the scan direction). Keys
-  covered by a newer range tombstone are suppressed too (the union of range tombstones across the
-  memtable and all SSTables is gathered per scan; they are few).
+- **list / scan**: per partition, a `MergingIterator` over the memtable + SSTables (LWW, tombstones
+  suppressed), driven by a `ScanQuery` — an optional `[start, end)` window, optional prefix,
+  **forward or reverse** direction, page size, and a continuation cursor (`lastKey`, exclusive in
+  the scan direction). Keys covered by a newer range tombstone are suppressed too (the union of
+  range tombstones across the memtable and all SSTables is gathered per scan; they are few). The
+  **client scatter-gathers** every partition for each page and merge-sorts by key; the `lastKey`
+  cursor still works because every partition is re-queried past it.
 - **deleteRange**: stamp one HLC and append a single `RangeTombstone` `[start, end)` to the WAL +
-  memtable — an O(1) delete of the whole interval. Shadowed keys are reclaimed lazily at compaction.
-  Either bound may be unbounded; `deleteRangeByPrefix` maps `prefix → [prefix, prefixSuccessor)`.
-- **copy / rename**: write a fresh PUT at the destination reusing the source locator's *parts*
-  verbatim (zero byte copy and zero locator rebuild — a multipart source becomes a multipart-shaped
-  copy); `rename` also tombstones the source. Both commit atomically under the single owner's
-  write lock (same Box only). Because GC is reference-counted by Syrup id, several keys may share
-  one segment set safely.
+  memtable — an O(1) delete of the whole interval *per partition* (the client fans the request out;
+  idempotent to retry, not atomic across partitions). Shadowed keys are reclaimed lazily at
+  compaction. Either bound may be unbounded; `deleteRangeByPrefix` maps
+  `prefix → [prefix, prefixSuccessor)`.
+- **copy / rename**: when source and destination hash to the **same partition**, write a fresh PUT
+  at the destination reusing the source locator's *parts* verbatim (zero byte copy and zero locator
+  rebuild — a multipart source becomes a multipart-shaped copy); `rename` also tombstones the
+  source. Both commit atomically under the partition owner's write lock (same Box only). Because GC
+  is reference-counted by Syrup id *within one manifest*, several keys may share one segment set
+  safely — which is also why a **cross-partition** copy/rename cannot share segments (the source
+  partition's GC would not see the destination's references) and instead degrades to a client-side
+  byte copy (`rename`: copy then delete, not atomic).
 - **range get**: `getCandyRange(key, firstByte, lastByte)` over HTTP `Range: bytes=…` semantics
   (inclusive on both ends). Prefix-sums the part lengths to find the first/last parts, then indexes
   into chunks by `byteWithinPart / part.chunkSize`. Chunks at the slice boundary are read whole —
@@ -214,9 +230,9 @@ dedicated `RESPONSE_BUSY` opcode.
 
 ## 7. Manifest, fencing & ownership
 
-The manifest is an **append-only metadata ledger**; a Box's manifest has exactly one writer (the
-owner). `ManifestLog` appends serialized edits; `Manifest` keeps an in-memory `ManifestState` in
-lock-step (append durably, then advance state). Handover (`Manifest.recover`):
+The manifest is an **append-only metadata ledger**; a partition's manifest has exactly one writer
+(the partition's owner). `ManifestLog` appends serialized edits; `Manifest` keeps an in-memory
+`ManifestState` in lock-step (append durably, then advance state). Handover (`Manifest.recover`):
 
 1. **recover-open** (fence + seal) the prior manifest ledger;
 2. replay its edits to rebuild `ManifestState`;
@@ -231,9 +247,39 @@ live in the `CoordinationService` SPI: an in-memory fake that models lease expir
 CAS conflicts (so these tests are not vacuous — `InMemoryCoordinationServiceTest`), and the real
 `ZooKeeperCoordinationService`. Both run the shared `CoordinationServiceContract` (as a
 `*ContractTest` against the fake and a `*ContractIT` against a live ZooKeeper), so the fast tests are
-a faithful stand-in. `BoxOwnership` (server) ties the lease, fencing token, and manifest pointer
-together; `CandyboxNode.createBox`/`openBox` are the take-ownership and failover/handover entry
+a faithful stand-in. `PartitionOwnership` (server) ties the lease, fencing token, and manifest
+pointer together for one partition; `CandyboxNode.createBox` (descriptor + all partitions on the
+creating node) and `openPartition` (per-partition failover/handover) are the take-ownership entry
 points, with a background heartbeat renewing leases within the TTL.
+
+The coordination layout:
+
+```
+boxes/<box>/meta                      BoxDescriptor {partitionCount} — immutable, the routing truth
+boxes/<box>/partitions/<p>/owner      partition p's ownership lease (fenced, TTL'd)
+boxes/<box>/partitions/<p>/manifest   partition p's manifest-ledger pointer (versioned CAS)
+cluster/balancer                      the balancer's coordinator-election lease
+cluster/assignment                    the desired partition→node assignment table (versioned CAS)
+members/<nodeId>                      membership (advertised host:port)
+```
+
+### 7a. Partition balancing (elected coordinator)
+
+`PartitionBalancer` runs a round on every node (`balancer.interval.millis`; 0 disables). Whichever
+node holds the `cluster/balancer` lease is the **elected coordinator**: it enumerates every
+`(box, partition)` (via `CoordinationService.children` + descriptors) and the live members, computes
+a target assignment, and CAS-publishes it at `cluster/assignment`. The computation is **sticky**
+(a live owner keeps its partitions up to the fair-share capacity ⌈partitions/members⌉),
+**failover-eager** (unowned partitions — a new Box, a dead node — go to the least-loaded members
+without limit), and **rate-limited** (at most `balancer.max.moves.per.round` partitions are taken
+away from live owners per round, so a node join migrates load gradually). Every node — coordinator
+or not — then converges on the table: partitions assigned elsewhere are released after a
+**pre-handover flush** (shrinking the next owner's WAL replay to ~nothing), and partitions assigned
+to it are acquired once their lease is observed free. The table is advisory: safety always rests on
+the per-partition fenced lease, never on the balancer. Each round also sweeps locally owned
+partitions whose Box descriptor is gone (the convergence path of a force `deleteBox` issued
+elsewhere). Requests that land on the wrong node get `RESPONSE_MOVED` naming the partition's
+current owner, and the client re-routes.
 
 ## 8. Compaction model
 
@@ -328,6 +374,8 @@ Per-role BK quorum (E/Qw/Qa) defaults: **WAL 3/3/2, Manifest 3/3/2, SSTable 3/2/
 | Leveled level base / multiplier | 10 MiB / 10× | LevelDB-style growing per-level byte budgets for L≥1. |
 | HLC logical width / skew bound | 32-bit logical; 5-min skew rejection | Overflow needs ~2.1e9 events/ms; bound stops a wild clock dragging us forward. |
 | Ownership lease TTL / renew / fencing token | 10 s TTL; 3 s renew; monotonic per-resource counter (ZK version) | Short TTL for quick failover; renew well inside it; strictly increasing tokens fence zombies. |
+| Partitions per Box | 8 (fixed at create; `createBox` may override) | Spreads one Box's writes over up to 8 nodes while bounding per-Box engine cost (each partition is a full WAL/memtable/manifest). Immutable: re-hashing would re-home every key. |
+| Balancer round interval / move rate | 5 s in shipped conf (0 = off, the unit-test default) / 4 moves per round | Frequent enough to converge quickly after joins/failures; the move cap keeps a node join from stampeding handovers (failover is never rate-limited). |
 | Compaction + GC worker interval | configurable; 0 disables | Background maintenance cadence on the owner. |
 | Tombstone-GC time bound | 24 h | Covers in-flight late writes before a delete is reclaimable. |
 | Ledger-GC grace | 5 min | Margin for in-flight readers / continuation tokens before a physical delete. |
@@ -338,12 +386,20 @@ Per-role BK quorum (E/Qw/Qa) defaults: **WAL 3/3/2, Manifest 3/3/2, SSTable 3/2/
 
 ## 12. Deliberate v1 simplifications (escape hatches)
 
-- **Single owner per Box, no sub-Box partitioning** — caps a Box's write throughput at one node and
-  makes it unavailable during the handover fence+replay window. Manifest/ownership structures are kept
-  **partition-shaped** (one partition per Box now) so key-range tablets can be added later.
-- **Reads served by the Box owner** — simple and correct. Sealed SSTables/Syrups are immutable and
-  replicated, so any node *could* serve reads of flushed data; only unflushed-memtable read-your-writes
-  needs the owner. Not built in v1.
+- **Fixed hash partitioning, no key-range tablets** — a Box's partition count is set at creation and
+  never changes (changing it would re-home every key), and hash partitioning makes every ordered
+  listing a scatter-gather fan-out (each page queries all partitions). Key-range partitions with
+  splits, and re-partitioning, are future work. A partition is still unavailable during its own
+  handover fence+replay window (shrunk by the pre-handover flush).
+- **Cross-partition copy/rename byte-copies through the client** — zero-copy segment sharing is only
+  safe within one partition's manifest (§6); a cross-partition `rename` is copy-then-delete and not
+  atomic. S3 semantics (CopyObject, no rename) are unaffected.
+- **Box-level `deleteBox` needs takeover or the balancer** — the deleting node takes over partitions
+  whose leases are free; partitions held by other live nodes fail a non-force delete, while a force
+  delete removes the descriptor and lets each owner's balancer sweep drop its partitions.
+- **Reads served by the partition owner** — simple and correct. Sealed SSTables/Syrups are immutable
+  and replicated, so any node *could* serve reads of flushed data; only unflushed-memtable
+  read-your-writes needs the owner. Not built in v1.
 - **No small-object inlining** — all bytes go to Syrups (an extra BK round trip + fragmentation for
   tiny Candies). The 256 KiB locator cap leaves room to inline small bytes later.
 - **No Syrup defragmentation** — see §9(d). Syrup compaction (copying survivors into a fresh Syrup)
@@ -360,11 +416,15 @@ Per-role BK quorum (E/Qw/Qa) defaults: **WAL 3/3/2, Manifest 3/3/2, SSTable 3/2/
 **Implemented (Phases 0–4):** the LSM engine (memtable/WAL/SSTable/Syrup, merged multi-level read
 path, range tombstones, zero-copy copy/rename); ZooKeeper-backed coordination
 (`ZooKeeperCoordinationService`) with the manifest ZK pointer under versioned CAS and fenced
-ownership/handover; cluster membership + client-side routing over the framed TCP protocol
-(`RESPONSE_MOVED`); multi-level leveled compaction on a background worker; reference-counted GC of
-SSTable/Syrup/WAL ledgers; the storage node with health/metrics, the `candybox` CLI, and a packaged
-distribution (Docker image + Compose + Kubernetes manifests). Fault-injection / failure-path
-hardening and operational docs (`OPERATIONS.md`) landed in Phase 4.
+ownership/handover; **hash-partitioned Boxes** — per-partition fenced ownership spread across the
+cluster by the elected-coordinator `PartitionBalancer` (sticky, failover-eager, rate-limited
+moves), with partition-aware client routing (keyed ops to the key's partition owner; scatter-gather
+listing; fanned-out range deletes; cross-partition copy fallback); cluster membership + client-side
+routing over the framed TCP protocol (`RESPONSE_MOVED`); multi-level leveled compaction on a
+background worker; reference-counted GC of SSTable/Syrup/WAL ledgers; the storage node with
+health/metrics, the `candybox` CLI, and a packaged distribution (Docker image + Compose +
+Kubernetes manifests). Fault-injection / failure-path hardening and operational docs
+(`OPERATIONS.md`) landed in Phase 4; Box partitioning is documented in `BOX_PARTITIONING_PLAN.md`.
 
 **Remaining future work:**
 

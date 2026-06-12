@@ -33,9 +33,15 @@ public sealed interface Message {
 
     // ---- Box admin requests ----------------------------------------------------------------
 
-    record CreateBoxRequest(String box) implements Message {
+    /** Creates a Box. {@code partitionCount == 0} means "use the server's configured default". */
+    record CreateBoxRequest(String box, int partitionCount) implements Message {
         public Opcode opcode() {
             return Opcode.CREATE_BOX;
+        }
+
+        /** Creates with the server's default partition count. */
+        public CreateBoxRequest(String box) {
+            this(box, 0);
         }
     }
 
@@ -54,6 +60,13 @@ public sealed interface Message {
     record HeadBoxRequest(String box) implements Message {
         public Opcode opcode() {
             return Opcode.HEAD_BOX;
+        }
+    }
+
+    /** Asks any node for a Box's descriptor (currently just its partition count). */
+    record BoxInfoRequest(String box) implements Message {
+        public Opcode opcode() {
+            return Opcode.BOX_INFO;
         }
     }
 
@@ -113,12 +126,13 @@ public sealed interface Message {
     }
 
     /**
-     * Deletes a key range with a single range tombstone. Exactly one of: a {@code prefix}, or a
+     * Deletes a key range with a single range tombstone <em>in one partition</em>; the client fans
+     * the request out to every partition of the Box. Exactly one of: a {@code prefix}, or a
      * {@code [startKey, endKey)} window (either bound nullable). {@code prefix} non-null selects the
      * prefix form.
      */
-    record DeleteRangeRequest(String box, String prefix, String startKey, String endKey)
-            implements Message {
+    record DeleteRangeRequest(String box, int partition, String prefix, String startKey,
+                              String endKey) implements Message {
         public Opcode opcode() {
             return Opcode.DELETE_RANGE;
         }
@@ -158,8 +172,11 @@ public sealed interface Message {
         }
     }
 
-    /** Lists in-flight multipart uploads in a Box, narrowed by an optional key prefix. */
-    record ListMultipartUploadsRequest(String box, String prefix, String keyMarker,
+    /**
+     * Lists in-flight multipart uploads in one partition of a Box, narrowed by an optional key
+     * prefix; the client fans out across partitions and merges.
+     */
+    record ListMultipartUploadsRequest(String box, int partition, String prefix, String keyMarker,
                                        String uploadIdMarker, int maxUploads) implements Message {
         public Opcode opcode() {
             return Opcode.LIST_MULTIPART_UPLOADS;
@@ -186,15 +203,18 @@ public sealed interface Message {
         }
     }
 
-    record ListCandiesRequest(String box, String prefix, String startAfter, int maxKeys,
-                              String startKey, String endKey, boolean reverse) implements Message {
+    /** Lists live Candies in one partition of a Box; the client fans out and merge-sorts pages. */
+    record ListCandiesRequest(String box, int partition, String prefix, String startAfter,
+                              int maxKeys, String startKey, String endKey, boolean reverse)
+            implements Message {
         public Opcode opcode() {
             return Opcode.LIST_CANDIES;
         }
 
-        /** A plain forward prefix/startAfter listing (the classic three-arg form). */
-        public ListCandiesRequest(String box, String prefix, String startAfter, int maxKeys) {
-            this(box, prefix, startAfter, maxKeys, null, null, false);
+        /** A plain forward prefix/startAfter listing of one partition. */
+        public ListCandiesRequest(String box, int partition, String prefix, String startAfter,
+                                  int maxKeys) {
+            this(box, partition, prefix, startAfter, maxKeys, null, null, false);
         }
     }
 
@@ -264,10 +284,17 @@ public sealed interface Message {
         }
     }
 
-    /** Tells the client which node now owns the Box, so it can re-route (Phase 2 routing). */
+    /** Tells the client which node owns the requested partition, so it can re-route. */
     record MovedResponse(int ownerNodeId) implements Message {
         public Opcode opcode() {
             return Opcode.RESPONSE_MOVED;
+        }
+    }
+
+    /** A Box's descriptor: its (creation-time-fixed) partition count. */
+    record BoxInfoResponse(int partitionCount) implements Message {
+        public Opcode opcode() {
+            return Opcode.RESPONSE_BOX_INFO;
         }
     }
 

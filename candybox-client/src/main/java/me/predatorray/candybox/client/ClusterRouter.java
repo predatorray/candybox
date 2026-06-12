@@ -32,10 +32,11 @@ import me.predatorray.candybox.protocol.transport.Connection;
 import me.predatorray.candybox.protocol.transport.Transport;
 
 /**
- * A cluster-aware {@link Router}: it resolves a Box to its owning node via the coordination lease, maps
- * the owner's node id to its advertised {@code host:port} via membership, connects there, and re-routes
- * on a {@code MOVED} response (using the named owner). Box→address resolutions are cached with a TTL
- * and invalidated on redirect; one connection is kept per node address.
+ * A cluster-aware {@link Router}: it resolves a (Box, partition) to its owning node via the
+ * per-partition coordination lease, maps the owner's node id to its advertised {@code host:port} via
+ * membership, connects there, and re-routes on a {@code MOVED} response (using the named owner).
+ * Partition→address resolutions are cached with a TTL and invalidated on redirect; one connection is
+ * kept per node address.
  */
 final class ClusterRouter implements Router {
 
@@ -47,7 +48,7 @@ final class ClusterRouter implements Router {
     private final Clock clock;
     private final MessageCodec codec = new MessageCodec();
 
-    private final ConcurrentMap<String, CachedAddress> boxCache = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, CachedAddress> partitionCache = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, Connection> connections = new ConcurrentHashMap<>();
 
     ClusterRouter(Transport transport, CoordinationService coordination, long cacheTtlMillis,
@@ -59,18 +60,21 @@ final class ClusterRouter implements Router {
     }
 
     @Override
-    public Message callBox(String box, Message request) {
-        NodeAddress address = resolveOwner(box);
+    public Message callPartition(String box, int partition, Message request) {
+        String cacheKey = box + "#" + partition;
+        NodeAddress address = resolveOwner(box, partition, cacheKey);
         for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
             Message response = send(address, request);
             if (response instanceof Message.MovedResponse moved) {
                 address = addressOfNode(moved.ownerNodeId());
-                boxCache.put(box, new CachedAddress(address, clock.currentTimeMillis() + cacheTtlMillis));
+                partitionCache.put(cacheKey,
+                        new CachedAddress(address, clock.currentTimeMillis() + cacheTtlMillis));
                 continue;
             }
             return response;
         }
-        throw new NotOwnerException("box " + box + ": exceeded routing attempts");
+        throw new NotOwnerException("box " + box + " partition " + partition
+                + ": exceeded routing attempts");
     }
 
     @Override
@@ -78,15 +82,17 @@ final class ClusterRouter implements Router {
         return send(anyMember(), request);
     }
 
-    private NodeAddress resolveOwner(String box) {
-        CachedAddress cached = boxCache.get(box);
+    private NodeAddress resolveOwner(String box, int partition, String cacheKey) {
+        CachedAddress cached = partitionCache.get(cacheKey);
         if (cached != null && clock.currentTimeMillis() < cached.expiry()) {
             return cached.address();
         }
-        LeaseInfo holder = coordination.leaseHolder(CandyboxKeys.ownerResource(box))
-                .orElseThrow(() -> new NotOwnerException("box " + box + " has no current owner"));
+        LeaseInfo holder = coordination.leaseHolder(CandyboxKeys.ownerResource(box, partition))
+                .orElseThrow(() -> new NotOwnerException("box " + box + " partition " + partition
+                        + " has no current owner"));
         NodeAddress address = addressOfNode(holder.ownerNodeId());
-        boxCache.put(box, new CachedAddress(address, clock.currentTimeMillis() + cacheTtlMillis));
+        partitionCache.put(cacheKey,
+                new CachedAddress(address, clock.currentTimeMillis() + cacheTtlMillis));
         return address;
     }
 

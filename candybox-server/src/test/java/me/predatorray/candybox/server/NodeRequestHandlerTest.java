@@ -20,6 +20,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
+import me.predatorray.candybox.common.Partitioning;
 import me.predatorray.candybox.bookkeeper.fake.InMemoryLedgerStore;
 import me.predatorray.candybox.common.BoxName;
 import me.predatorray.candybox.common.ManualClock;
@@ -104,14 +105,101 @@ class NodeRequestHandlerTest {
     }
 
     @Test
+    void everyKeyedAndPartitionedRequestRedirectsWithMovedFromANonOwner() {
+        // Node 1 owns the (single-partition) Box; every Box-routed request sent to node 2 must come
+        // back as MOVED(1) — this pins the per-message routing-key/partition extraction.
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService();
+        try (CandyboxNode owner = new CandyboxNode(1, config(), store, coordination, new ManualClock(1000));
+             CandyboxNode other = new CandyboxNode(2, config(), store, coordination, new ManualClock(1000))) {
+            owner.createBox(BoxName.of("routed-box"), 1);
+            RequestHandler handler = other.requestHandler();
+
+            List<Message> boxRouted = List.of(
+                    new Message.PutCandyRequest("routed-box", "k", null, Map.of(), null, bytes("v")),
+                    new Message.GetCandyRequest("routed-box", "k"),
+                    new Message.RangeGetCandyRequest("routed-box", "k", 0, 1),
+                    new Message.HeadCandyRequest("routed-box", "k"),
+                    new Message.DeleteCandyRequest("routed-box", "k"),
+                    new Message.CopyCandyRequest("routed-box", "k", "k2", null),
+                    new Message.RenameCandyRequest("routed-box", "k", "k2", null),
+                    new Message.DeleteRangeRequest("routed-box", 0, "p/", null, null),
+                    new Message.ListCandiesRequest("routed-box", 0, null, null, 10),
+                    new Message.CreateMultipartUploadRequest("routed-box", "k", null, Map.of()),
+                    new Message.UploadPartRequest("routed-box", "k", "u1", 1, bytes("v")),
+                    new Message.CompleteMultipartUploadRequest("routed-box", "k", "u1", List.of(), null),
+                    new Message.AbortMultipartUploadRequest("routed-box", "k", "u1"),
+                    new Message.ListMultipartUploadsRequest("routed-box", 0, null, null, null, 10),
+                    new Message.ListPartsRequest("routed-box", "k", "u1", 0, 10),
+                    new Message.UploadPartCopyRequest("routed-box", "k", "u1", 1, "src", -1, -1));
+            for (Message request : boxRouted) {
+                Message response = roundTrip(handler, request);
+                assertThat(response).as(request.opcode().toString())
+                        .isInstanceOf(Message.MovedResponse.class);
+                assertThat(((Message.MovedResponse) response).ownerNodeId()).isEqualTo(1);
+            }
+
+            // Box-level requests are answered from coordination, not redirected.
+            assertThat(roundTrip(handler, new Message.HeadBoxRequest("routed-box")))
+                    .isInstanceOf(Message.OkResponse.class);
+            Message info = roundTrip(handler, new Message.BoxInfoRequest("routed-box"));
+            assertThat(((Message.BoxInfoResponse) info).partitionCount()).isEqualTo(1);
+            assertThat(roundTrip(handler, new Message.BoxInfoRequest("ghost-box")))
+                    .isInstanceOf(Message.NotFoundResponse.class);
+
+            // A non-force deleteBox needs partitions node 1 still owns: a NotOwner error, not MOVED.
+            Message denied = roundTrip(handler, new Message.DeleteBoxRequest("routed-box", false));
+            assertThat(denied).isInstanceOf(Message.ErrorResponse.class);
+            assertThat(((Message.ErrorResponse) denied).errorType()).isEqualTo("NotOwnerException");
+        }
+        store.close();
+    }
+
+    @Test
+    void crossPartitionServerSideCopyIsRejectedAsValidationError() {
+        try (CandyboxNode node = new CandyboxNode(1, config(), new InMemoryLedgerStore(),
+                new InMemoryCoordinationService(), new ManualClock(1000))) {
+            RequestHandler handler = node.requestHandler();
+            roundTrip(handler, new Message.CreateBoxRequest("split-box", 4));
+
+            // Find two keys in different partitions: the zero-copy path must refuse them (the client
+            // is responsible for the byte-copy fallback).
+            String src = keyInPartition(0, 4);
+            String dst = keyInPartition(3, 4);
+            roundTrip(handler, new Message.PutCandyRequest("split-box", src, null, Map.of(), null,
+                    bytes("v")));
+            for (Message request : List.of(
+                    new Message.CopyCandyRequest("split-box", src, dst, null),
+                    new Message.RenameCandyRequest("split-box", src, dst, null),
+                    new Message.UploadPartCopyRequest("split-box", dst, "u1", 1, src, -1, -1))) {
+                Message response = roundTrip(handler, request);
+                assertThat(response).as(request.opcode().toString())
+                        .isInstanceOf(Message.ErrorResponse.class);
+                assertThat(((Message.ErrorResponse) response).message())
+                        .contains("Cross-partition");
+            }
+        }
+    }
+
+    private static String keyInPartition(int partition, int count) {
+        for (int i = 0; i < 10_000; i++) {
+            String candidate = "key-" + i;
+            if (Partitioning.partitionOf(candidate, count) == partition) {
+                return candidate;
+            }
+        }
+        throw new AssertionError("no key found for partition " + partition);
+    }
+
+    @Test
     void duplicateCreateBoxAndNonEmptyDeleteMapToErrorResponses() {
         try (CandyboxNode node = new CandyboxNode(1, config(), new InMemoryLedgerStore(),
                 new InMemoryCoordinationService(), new ManualClock(1000))) {
             RequestHandler handler = node.requestHandler();
-            assertThat(roundTrip(handler, new Message.CreateBoxRequest("dup-box")))
+            assertThat(roundTrip(handler, new Message.CreateBoxRequest("dup-box", 1)))
                     .isInstanceOf(Message.OkResponse.class);
             // Re-create is a typed CandyboxException -> ErrorResponse.
-            assertThat(roundTrip(handler, new Message.CreateBoxRequest("dup-box")))
+            assertThat(roundTrip(handler, new Message.CreateBoxRequest("dup-box", 1)))
                     .isInstanceOf(Message.ErrorResponse.class);
 
             roundTrip(handler, new Message.PutCandyRequest("dup-box", "k", null, Map.of(), null,
@@ -130,7 +218,7 @@ class NodeRequestHandlerTest {
         try (CandyboxNode node = new CandyboxNode(1, config(), new InMemoryLedgerStore(),
                 new InMemoryCoordinationService(), new ManualClock(1000))) {
             RequestHandler handler = node.requestHandler();
-            roundTrip(handler, new Message.CreateBoxRequest("range-box"));
+            roundTrip(handler, new Message.CreateBoxRequest("range-box", 1));
             roundTrip(handler, new Message.PutCandyRequest("range-box", "k", null, Map.of(), null,
                     bytes("0123456789")));
 
@@ -145,7 +233,7 @@ class NodeRequestHandlerTest {
         try (CandyboxNode node = new CandyboxNode(1, config(), new InMemoryLedgerStore(),
                 new InMemoryCoordinationService(), new ManualClock(1000))) {
             RequestHandler handler = node.requestHandler();
-            roundTrip(handler, new Message.CreateBoxRequest("ops-box"));
+            roundTrip(handler, new Message.CreateBoxRequest("ops-box", 1));
             for (String k : List.of("a", "b", "c")) {
                 roundTrip(handler, new Message.PutCandyRequest("ops-box", k, null, Map.of(), null,
                         bytes(k)));
@@ -156,7 +244,7 @@ class NodeRequestHandlerTest {
             assertThat(((Message.ListBoxesResponse) boxes).boxes()).contains("ops-box");
 
             // Reverse, ranged listing exercises the toScanQuery direction/bounds mapping.
-            Message listed = roundTrip(handler, new Message.ListCandiesRequest("ops-box", null, null,
+            Message listed = roundTrip(handler, new Message.ListCandiesRequest("ops-box", 0, null, null,
                     100, "a", "c", true));
             assertThat(listed).isInstanceOf(Message.ListCandiesResponse.class);
 
@@ -167,7 +255,7 @@ class NodeRequestHandlerTest {
                     .isInstanceOf(Message.HeadCandyResponse.class);
 
             // Range delete (window form) returns OK.
-            assertThat(roundTrip(handler, new Message.DeleteRangeRequest("ops-box", null, "a", "c")))
+            assertThat(roundTrip(handler, new Message.DeleteRangeRequest("ops-box", 0, null, "a", "c")))
                     .isInstanceOf(Message.OkResponse.class);
         }
     }
@@ -177,7 +265,7 @@ class NodeRequestHandlerTest {
         try (CandyboxNode node = new CandyboxNode(1, config(), new InMemoryLedgerStore(),
                 new InMemoryCoordinationService(), new ManualClock(1000))) {
             RequestHandler handler = node.requestHandler();
-            roundTrip(handler, new Message.CreateBoxRequest("mp-box"));
+            roundTrip(handler, new Message.CreateBoxRequest("mp-box", 1));
 
             Message created = roundTrip(handler, new Message.CreateMultipartUploadRequest(
                     "mp-box", "obj", "text/plain", Map.of()));
@@ -196,7 +284,7 @@ class NodeRequestHandlerTest {
             assertThat(((Message.ListPartsResponse) parts).parts()).hasSize(2);
 
             Message uploads = roundTrip(handler, new Message.ListMultipartUploadsRequest(
-                    "mp-box", null, null, null, 100));
+                    "mp-box", 0, null, null, null, 100));
             assertThat(((Message.ListMultipartUploadsResponse) uploads).uploads()).hasSize(1);
 
             // Complete and read back the assembled object.

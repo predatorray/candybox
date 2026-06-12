@@ -27,6 +27,7 @@ import me.predatorray.candybox.common.exception.CandyNotFoundException;
 import me.predatorray.candybox.common.exception.CandyboxException;
 import me.predatorray.candybox.common.exception.NotOwnerException;
 import me.predatorray.candybox.common.exception.ValidationException;
+import me.predatorray.candybox.coordination.BoxDescriptor;
 import me.predatorray.candybox.lsm.engine.BoxEngine;
 import me.predatorray.candybox.lsm.engine.CandyMetadata;
 import me.predatorray.candybox.common.Part;
@@ -46,8 +47,10 @@ import org.slf4j.LoggerFactory;
  * results (and the Candybox exception hierarchy) back into response frames — including the retriable
  * {@code BUSY} response under write-stall.
  *
- * <p>Candy CRUD and list, plus createBox/deleteBox, are fully wired. listBoxes/headBox and large-object
- * streaming are TODO(phase-2).
+ * <p>Every keyed request is dispatched to the engine of the key's hash partition; partition-scoped
+ * requests (list, delete-range, list-uploads — fanned out by the client) carry an explicit partition.
+ * A request landing on a node that does not own the target partition gets a {@code MOVED} response
+ * naming the partition's current owner.
  */
 final class NodeRequestHandler implements RequestHandler {
 
@@ -75,8 +78,8 @@ final class NodeRequestHandler implements RequestHandler {
         } catch (CandyNotFoundException e) {
             return codec.encode(new Message.NotFoundResponse());
         } catch (NotOwnerException | BoxNotFoundException e) {
-            // We don't own this Box. If another node does, tell the client to re-route; else not found.
-            return codec.encode(movedOrNotFound(message));
+            // We don't own this partition. If another node does, tell the client to re-route.
+            return codec.encode(movedOrNotFound(message, e));
         } catch (CandyboxException e) {
             return codec.encode(new Message.ErrorResponse(e.getClass().getSimpleName(), safe(e.getMessage())));
         } catch (RuntimeException e) {
@@ -85,18 +88,24 @@ final class NodeRequestHandler implements RequestHandler {
         }
     }
 
-    private Message movedOrNotFound(Message message) {
+    private Message movedOrNotFound(Message message, RuntimeException cause) {
+        Integer partition = partitionOf(message);
         String box = boxOf(message);
-        if (box != null) {
-            Optional<Integer> owner = node.currentOwner(BoxName.of(box));
+        if (box != null && partition != null) {
+            Optional<Integer> owner = node.currentOwner(BoxName.of(box), partition);
             if (owner.isPresent() && owner.get() != node.nodeId()) {
                 return new Message.MovedResponse(owner.get());
             }
+            return new Message.NotFoundResponse();
+        }
+        if (cause instanceof NotOwnerException) {
+            // A Box-level request (e.g. deleteBox) that needs partitions another node still owns.
+            return new Message.ErrorResponse("NotOwnerException", safe(cause.getMessage()));
         }
         return new Message.NotFoundResponse();
     }
 
-    /** The target Box of a Box-routed request, or {@code null} for cluster-wide requests. */
+    /** The target Box of a Box- or partition-routed request, or {@code null} for cluster-wide ones. */
     private static String boxOf(Message message) {
         if (message instanceof Message.PutCandyRequest m) {
             return m.box();
@@ -116,10 +125,6 @@ final class NodeRequestHandler implements RequestHandler {
             return m.box();
         } else if (message instanceof Message.ListCandiesRequest m) {
             return m.box();
-        } else if (message instanceof Message.DeleteBoxRequest m) {
-            return m.box();
-        } else if (message instanceof Message.HeadBoxRequest m) {
-            return m.box();
         } else if (message instanceof Message.CreateMultipartUploadRequest m) {
             return m.box();
         } else if (message instanceof Message.UploadPartRequest m) {
@@ -138,26 +143,97 @@ final class NodeRequestHandler implements RequestHandler {
         return null;
     }
 
+    /**
+     * The partition a request targets: the key's hash partition for keyed requests, the explicit
+     * partition for fanned-out ones, {@code null} for Box-level/cluster-wide requests (no single
+     * owner to redirect to).
+     */
+    private Integer partitionOf(Message message) {
+        Integer explicit = explicitPartitionOf(message);
+        if (explicit != null) {
+            return explicit;
+        }
+        String box = boxOf(message);
+        String key = routingKeyOf(message);
+        if (box == null || key == null) {
+            return null;
+        }
+        try {
+            return node.descriptor(BoxName.of(box)).partitionOf(key);
+        } catch (BoxNotFoundException gone) {
+            return null;
+        }
+    }
+
+    private static Integer explicitPartitionOf(Message message) {
+        if (message instanceof Message.ListCandiesRequest m) {
+            return m.partition();
+        } else if (message instanceof Message.DeleteRangeRequest m) {
+            return m.partition();
+        } else if (message instanceof Message.ListMultipartUploadsRequest m) {
+            return m.partition();
+        }
+        return null;
+    }
+
+    /** The key whose hash partition a keyed request routes by, or {@code null}. */
+    private static String routingKeyOf(Message message) {
+        if (message instanceof Message.PutCandyRequest m) {
+            return m.key();
+        } else if (message instanceof Message.GetCandyRequest m) {
+            return m.key();
+        } else if (message instanceof Message.RangeGetCandyRequest m) {
+            return m.key();
+        } else if (message instanceof Message.HeadCandyRequest m) {
+            return m.key();
+        } else if (message instanceof Message.DeleteCandyRequest m) {
+            return m.key();
+        } else if (message instanceof Message.CopyCandyRequest m) {
+            return m.dstKey();
+        } else if (message instanceof Message.RenameCandyRequest m) {
+            return m.dstKey();
+        } else if (message instanceof Message.CreateMultipartUploadRequest m) {
+            return m.key();
+        } else if (message instanceof Message.UploadPartRequest m) {
+            return m.key();
+        } else if (message instanceof Message.CompleteMultipartUploadRequest m) {
+            return m.key();
+        } else if (message instanceof Message.AbortMultipartUploadRequest m) {
+            return m.key();
+        } else if (message instanceof Message.ListPartsRequest m) {
+            return m.key();
+        } else if (message instanceof Message.UploadPartCopyRequest m) {
+            return m.key();
+        }
+        return null;
+    }
+
     private Message dispatch(Message message) {
         if (message instanceof Message.CreateBoxRequest m) {
-            node.createBox(BoxName.of(m.box()));
+            node.createBox(BoxName.of(m.box()), m.partitionCount());
             return new Message.OkResponse();
+        } else if (message instanceof Message.BoxInfoRequest m) {
+            BoxName box = BoxName.of(m.box());
+            if (!node.boxExists(box)) {
+                return new Message.NotFoundResponse();
+            }
+            return new Message.BoxInfoResponse(node.descriptor(box).partitionCount());
         } else if (message instanceof Message.DeleteBoxRequest m) {
             node.deleteBox(BoxName.of(m.box()), m.force());
             return new Message.OkResponse();
         } else if (message instanceof Message.PutCandyRequest m) {
-            BoxEngine engine = node.engine(BoxName.of(m.box()));
+            BoxEngine engine = node.engine(BoxName.of(m.box()), m.key());
             engine.putCandy(CandyKey.of(m.key()), m.data(), m.contentType(), m.userMetadata(),
                     m.idempotencyToken());
             return new Message.OkResponse();
         } else if (message instanceof Message.GetCandyRequest m) {
-            BoxEngine engine = node.engine(BoxName.of(m.box()));
+            BoxEngine engine = node.engine(BoxName.of(m.box()), m.key());
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             CandyMetadata meta = engine.getCandy(CandyKey.of(m.key()), out);
             return new Message.CandyDataResponse(meta.contentLength(), meta.contentType(),
                     meta.userMetadata(), meta.crc32c(), out.toByteArray());
         } else if (message instanceof Message.RangeGetCandyRequest m) {
-            BoxEngine engine = node.engine(BoxName.of(m.box()));
+            BoxEngine engine = node.engine(BoxName.of(m.box()), m.key());
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             BoxEngine.RangeReadResult result;
             try {
@@ -170,25 +246,27 @@ final class NodeRequestHandler implements RequestHandler {
             return new Message.CandyDataResponse(result.contentLength(), result.totalLength(),
                     meta.contentType(), meta.userMetadata(), meta.crc32c(), out.toByteArray());
         } else if (message instanceof Message.HeadCandyRequest m) {
-            BoxEngine engine = node.engine(BoxName.of(m.box()));
+            BoxEngine engine = node.engine(BoxName.of(m.box()), m.key());
             CandyMetadata meta = engine.headCandy(CandyKey.of(m.key()));
             return new Message.HeadCandyResponse(meta.contentLength(), meta.contentType(),
                     meta.userMetadata(), meta.crc32c(), meta.createdAtMillis());
         } else if (message instanceof Message.DeleteCandyRequest m) {
-            node.engine(BoxName.of(m.box())).deleteCandy(CandyKey.of(m.key()));
+            node.engine(BoxName.of(m.box()), m.key()).deleteCandy(CandyKey.of(m.key()));
             return new Message.OkResponse();
         } else if (message instanceof Message.CopyCandyRequest m) {
-            CandyMetadata meta = node.engine(BoxName.of(m.box())).copyCandy(CandyKey.of(m.srcKey()),
-                    CandyKey.of(m.dstKey()), m.idempotencyToken());
+            CandyMetadata meta = samePartitionEngine(m.box(), m.srcKey(), m.dstKey())
+                    .copyCandy(CandyKey.of(m.srcKey()), CandyKey.of(m.dstKey()),
+                            m.idempotencyToken());
             return new Message.HeadCandyResponse(meta.contentLength(), meta.contentType(),
                     meta.userMetadata(), meta.crc32c(), meta.createdAtMillis());
         } else if (message instanceof Message.RenameCandyRequest m) {
-            CandyMetadata meta = node.engine(BoxName.of(m.box())).renameCandy(CandyKey.of(m.srcKey()),
-                    CandyKey.of(m.dstKey()), m.idempotencyToken());
+            CandyMetadata meta = samePartitionEngine(m.box(), m.srcKey(), m.dstKey())
+                    .renameCandy(CandyKey.of(m.srcKey()), CandyKey.of(m.dstKey()),
+                            m.idempotencyToken());
             return new Message.HeadCandyResponse(meta.contentLength(), meta.contentType(),
                     meta.userMetadata(), meta.crc32c(), meta.createdAtMillis());
         } else if (message instanceof Message.DeleteRangeRequest m) {
-            BoxEngine engine = node.engine(BoxName.of(m.box()));
+            BoxEngine engine = node.enginePartition(BoxName.of(m.box()), m.partition());
             if (m.prefix() != null) {
                 engine.deleteRangeByPrefix(m.prefix());
             } else {
@@ -198,7 +276,7 @@ final class NodeRequestHandler implements RequestHandler {
             }
             return new Message.OkResponse();
         } else if (message instanceof Message.ListCandiesRequest m) {
-            BoxEngine engine = node.engine(BoxName.of(m.box()));
+            BoxEngine engine = node.enginePartition(BoxName.of(m.box()), m.partition());
             ListResult result = engine.scanCandies(toScanQuery(m));
             List<Message.ListedCandy> entries = new ArrayList<>();
             for (ListResult.ListEntry e : result.entries()) {
@@ -207,23 +285,22 @@ final class NodeRequestHandler implements RequestHandler {
             }
             return new Message.ListCandiesResponse(entries, result.nextStartAfter());
         } else if (message instanceof Message.ListBoxesRequest) {
-            // Boxes owned by this node. Cluster-wide listing needs a coordination list op (later).
             return new Message.ListBoxesResponse(node.listBoxes());
         } else if (message instanceof Message.HeadBoxRequest m) {
             return node.boxExists(BoxName.of(m.box()))
                     ? new Message.OkResponse()
                     : new Message.NotFoundResponse();
         } else if (message instanceof Message.CreateMultipartUploadRequest m) {
-            BoxEngine engine = node.engine(BoxName.of(m.box()));
+            BoxEngine engine = node.engine(BoxName.of(m.box()), m.key());
             String uploadId = engine.createMultipartUpload(CandyKey.of(m.key()), m.contentType(),
                     m.userMetadata());
             return new Message.CreateMultipartUploadResponse(uploadId);
         } else if (message instanceof Message.UploadPartRequest m) {
-            BoxEngine engine = node.engine(BoxName.of(m.box()));
+            BoxEngine engine = node.engine(BoxName.of(m.box()), m.key());
             BoxEngine.PartUploadResult r = engine.uploadPart(m.uploadId(), m.partNumber(), m.data());
             return new Message.UploadPartResponse(r.crc32c(), r.partLength());
         } else if (message instanceof Message.CompleteMultipartUploadRequest m) {
-            BoxEngine engine = node.engine(BoxName.of(m.box()));
+            BoxEngine engine = node.engine(BoxName.of(m.box()), m.key());
             java.util.List<BoxEngine.PartCompletion> parts = new java.util.ArrayList<>(m.parts().size());
             for (Message.CompletedPart p : m.parts()) {
                 parts.add(new BoxEngine.PartCompletion(p.partNumber(), p.crc32c()));
@@ -232,10 +309,10 @@ final class NodeRequestHandler implements RequestHandler {
             return new Message.HeadCandyResponse(meta.contentLength(), meta.contentType(),
                     meta.userMetadata(), meta.crc32c(), meta.createdAtMillis());
         } else if (message instanceof Message.AbortMultipartUploadRequest m) {
-            node.engine(BoxName.of(m.box())).abortMultipartUpload(m.uploadId());
+            node.engine(BoxName.of(m.box()), m.key()).abortMultipartUpload(m.uploadId());
             return new Message.OkResponse();
         } else if (message instanceof Message.ListMultipartUploadsRequest m) {
-            BoxEngine engine = node.engine(BoxName.of(m.box()));
+            BoxEngine engine = node.enginePartition(BoxName.of(m.box()), m.partition());
             java.util.List<Message.InProgressUpload> rows = new java.util.ArrayList<>();
             String prefix = m.prefix() == null ? "" : m.prefix();
             int limit = m.maxUploads() <= 0 ? 1000 : m.maxUploads();
@@ -262,7 +339,7 @@ final class NodeRequestHandler implements RequestHandler {
             }
             return new Message.ListMultipartUploadsResponse(rows, nextKey, nextUpl);
         } else if (message instanceof Message.ListPartsRequest m) {
-            BoxEngine engine = node.engine(BoxName.of(m.box()));
+            BoxEngine engine = node.engine(BoxName.of(m.box()), m.key());
             MultipartUploadState upload = engine.multipartUpload(m.uploadId());
             if (upload == null) {
                 return new Message.NotFoundResponse();
@@ -285,7 +362,7 @@ final class NodeRequestHandler implements RequestHandler {
             }
             return new Message.ListPartsResponse(rows, next);
         } else if (message instanceof Message.UploadPartCopyRequest m) {
-            BoxEngine engine = node.engine(BoxName.of(m.box()));
+            BoxEngine engine = samePartitionEngine(m.box(), m.srcKey(), m.key());
             try {
                 BoxEngine.PartUploadResult r = engine.uploadPartCopy(m.uploadId(), m.partNumber(),
                         CandyKey.of(m.srcKey()), m.firstByte(), m.lastByte());
@@ -296,6 +373,23 @@ final class NodeRequestHandler implements RequestHandler {
         }
         return new Message.ErrorResponse("UnsupportedOperation",
                 "Not implemented in this phase: " + message.opcode());
+    }
+
+    /**
+     * The engine shared by two keys of the same Box — the zero-copy copy/rename/upload-part-copy
+     * path is only valid when both keys hash to the same partition (one manifest tracks the shared
+     * Syrup segments); the client falls back to a byte copy otherwise.
+     */
+    private BoxEngine samePartitionEngine(String box, String srcKey, String dstKey) {
+        BoxDescriptor descriptor = node.descriptor(BoxName.of(box));
+        int srcPartition = descriptor.partitionOf(srcKey);
+        int dstPartition = descriptor.partitionOf(dstKey);
+        if (srcPartition != dstPartition) {
+            throw new ValidationException("Cross-partition server-side copy is not supported "
+                    + "(src partition " + srcPartition + ", dst partition " + dstPartition
+                    + "); the client must byte-copy");
+        }
+        return node.enginePartition(BoxName.of(box), dstPartition);
     }
 
     private static ScanQuery toScanQuery(Message.ListCandiesRequest m) {

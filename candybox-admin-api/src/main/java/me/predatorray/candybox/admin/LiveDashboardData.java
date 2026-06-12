@@ -23,6 +23,7 @@ import java.util.Map;
 import java.util.Optional;
 import me.predatorray.candybox.client.BoxClient;
 import me.predatorray.candybox.client.CandyboxClient;
+import me.predatorray.candybox.coordination.BoxDescriptor;
 import me.predatorray.candybox.coordination.CandyboxKeys;
 import me.predatorray.candybox.coordination.CoordinationService;
 import me.predatorray.candybox.coordination.LeaseInfo;
@@ -59,13 +60,20 @@ public final class LiveDashboardData implements DashboardData {
     @Override
     public ClusterSnapshot cluster() {
         List<String> boxes = safeListBoxes();
-        Map<Integer, Integer> ownedCount = new HashMap<>();
-        List<String> ownerless = new ArrayList<>();
+        Map<Integer, Integer> ownedCount = new HashMap<>(); // owned *partitions* per node
+        List<String> ownerless = new ArrayList<>(); // boxes with at least one ownerless partition
         for (String box : boxes) {
-            Optional<LeaseInfo> holder = coordination.leaseHolder(CandyboxKeys.ownerResource(box));
-            if (holder.isPresent()) {
-                ownedCount.merge(holder.get().ownerNodeId(), 1, Integer::sum);
-            } else {
+            boolean allOwned = true;
+            for (int p = 0; p < partitionCountOf(box); p++) {
+                Optional<LeaseInfo> holder =
+                        coordination.leaseHolder(CandyboxKeys.ownerResource(box, p));
+                if (holder.isPresent()) {
+                    ownedCount.merge(holder.get().ownerNodeId(), 1, Integer::sum);
+                } else {
+                    allOwned = false;
+                }
+            }
+            if (!allOwned) {
                 ownerless.add(box);
             }
         }
@@ -109,19 +117,21 @@ public final class LiveDashboardData implements DashboardData {
         List<String> boxes = safeListBoxes();
         List<LsmRow> rows = new ArrayList<>(boxes.size());
         for (String box : boxes) {
-            String owner = ownerOf(box);
-            long fencing = coordination.leaseHolder(CandyboxKeys.ownerResource(box))
-                    .map(LeaseInfo::fencingToken)
-                    .orElse(-1L);
-            // TODO(phase-5.5): the manifest pointer's coordination version is a proxy for
-            // "manifest revision" — bumps every CAS on the pointer, so it's monotonic per box.
-            // Per-box runtime fields (ledger counts, compactions, GC) require a new per-node
-            // JSON endpoint on HealthServer to fan out against; deferred to keep this commit
-            // contained to the admin API + UI.
-            long manifestVersion = coordination.get(CandyboxKeys.manifestKey(box))
-                    .map(v -> v.version())
-                    .orElse(-1L);
-            rows.add(LsmRow.coordinationOnly(box, owner, manifestVersion, fencing));
+            for (int p = 0; p < partitionCountOf(box); p++) {
+                Optional<LeaseInfo> holder =
+                        coordination.leaseHolder(CandyboxKeys.ownerResource(box, p));
+                String owner = holder.map(h -> String.valueOf(h.ownerNodeId())).orElse(null);
+                long fencing = holder.map(LeaseInfo::fencingToken).orElse(-1L);
+                // TODO(phase-5.5): the manifest pointer's coordination version is a proxy for
+                // "manifest revision" — bumps every CAS on the pointer, so it's monotonic per
+                // partition. Per-partition runtime fields (ledger counts, compactions, GC) require
+                // a new per-node JSON endpoint on HealthServer to fan out against; deferred to keep
+                // this commit contained to the admin API + UI.
+                long manifestVersion = coordination.get(CandyboxKeys.manifestKey(box, p))
+                        .map(v -> v.version())
+                        .orElse(-1L);
+                rows.add(LsmRow.coordinationOnly(box + "/" + p, owner, manifestVersion, fencing));
+            }
         }
         return rows;
     }
@@ -173,9 +183,33 @@ public final class LiveDashboardData implements DashboardData {
         }
     }
 
+    /** The Box's partition count from its descriptor, or 0 if the descriptor is missing. */
+    private int partitionCountOf(String box) {
+        return coordination.get(CandyboxKeys.boxMetaKey(box))
+                .map(v -> BoxDescriptor.decode(v.value()).partitionCount())
+                .orElse(0);
+    }
+
+    /**
+     * Summarizes who owns a Box: the single node id when one node owns every partition, a
+     * comma-joined list when ownership is spread, {@code null} when no partition has an owner.
+     */
     private String ownerOf(String box) {
-        return coordination.leaseHolder(CandyboxKeys.ownerResource(box))
-                .map(h -> String.valueOf(h.ownerNodeId()))
-                .orElse(null);
+        java.util.TreeSet<Integer> owners = new java.util.TreeSet<>();
+        for (int p = 0; p < partitionCountOf(box); p++) {
+            coordination.leaseHolder(CandyboxKeys.ownerResource(box, p))
+                    .ifPresent(h -> owners.add(h.ownerNodeId()));
+        }
+        if (owners.isEmpty()) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder();
+        for (Integer owner : owners) {
+            if (sb.length() > 0) {
+                sb.append(',');
+            }
+            sb.append(owner);
+        }
+        return sb.toString();
     }
 }

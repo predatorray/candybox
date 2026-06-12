@@ -41,7 +41,9 @@ class CandyboxClientTest {
     private static final RequestHandler HANDLER = request -> {
         Message message = CODEC.decode(request);
         Message response;
-        if (message instanceof Message.HeadCandyRequest) {
+        if (message instanceof Message.BoxInfoRequest) {
+            response = new Message.BoxInfoResponse(1); // single partition keeps the stub canned
+        } else if (message instanceof Message.HeadCandyRequest) {
             response = new Message.HeadCandyResponse(42, "text/plain", Map.of("a", "b"), 7, 123);
         } else if (message instanceof Message.ListBoxesRequest) {
             response = new Message.ListBoxesResponse(List.of("alpha", "beta"));

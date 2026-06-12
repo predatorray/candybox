@@ -19,10 +19,16 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
 import me.predatorray.candybox.bookkeeper.fake.InMemoryLedgerStore;
 import me.predatorray.candybox.common.BoxName;
+import me.predatorray.candybox.common.CandyKey;
 import me.predatorray.candybox.common.ManualClock;
 import me.predatorray.candybox.common.config.CandyboxConfig;
+import me.predatorray.candybox.common.exception.BoxAlreadyExistsException;
+import me.predatorray.candybox.common.exception.NotOwnerException;
+import me.predatorray.candybox.coordination.CandyboxKeys;
 import me.predatorray.candybox.coordination.fake.InMemoryCoordinationService;
 import me.predatorray.candybox.protocol.Frame;
 import me.predatorray.candybox.protocol.Message;
@@ -44,7 +50,7 @@ class CandyboxNodeTest {
         InMemoryLedgerStore store = new InMemoryLedgerStore();
         try (CandyboxNode node = new CandyboxNode(1, CandyboxConfig.defaults(), store,
                 new InMemoryCoordinationService(), new ManualClock(1000))) {
-            node.createBox(BoxName.of("my-box"));
+            node.createBox(BoxName.of("my-box"), 1);
             RequestHandler handler = node.requestHandler();
 
             assertThat(roundTrip(handler, new Message.PutCandyRequest("my-box", "k",
@@ -73,7 +79,7 @@ class CandyboxNodeTest {
                 .build();
         try (CandyboxNode node = new CandyboxNode(1, cfg, store,
                 new InMemoryCoordinationService(), clock)) {
-            node.createBox(BoxName.of("my-box"));
+            node.createBox(BoxName.of("my-box"), 1);
             RequestHandler handler = node.requestHandler();
 
             Message create = roundTrip(handler, new Message.CreateMultipartUploadRequest("my-box",
@@ -103,7 +109,7 @@ class CandyboxNodeTest {
         InMemoryLedgerStore store = new InMemoryLedgerStore();
         try (CandyboxNode node = new CandyboxNode(1, CandyboxConfig.defaults(), store,
                 new InMemoryCoordinationService(), new ManualClock(1000))) {
-            node.createBox(BoxName.of("my-box"));
+            node.createBox(BoxName.of("my-box"), 1);
             RequestHandler handler = node.requestHandler();
             roundTrip(handler, new Message.PutCandyRequest("my-box", "k", "text/plain",
                     Map.of("m", "v"), null, "candy".getBytes(StandardCharsets.UTF_8)));
@@ -136,7 +142,7 @@ class CandyboxNodeTest {
         InMemoryLedgerStore store = new InMemoryLedgerStore();
         try (CandyboxNode node = new CandyboxNode(1, stall, store,
                 new InMemoryCoordinationService(), new ManualClock(1000))) {
-            node.createBox(BoxName.of("my-box"));
+            node.createBox(BoxName.of("my-box"), 1);
             RequestHandler handler = node.requestHandler();
 
             roundTrip(handler, put("my-box", "k1"));
@@ -156,12 +162,12 @@ class CandyboxNodeTest {
         InMemoryLedgerStore store = new InMemoryLedgerStore();
         ManualClock clock = new ManualClock(1000);
         try (CandyboxNode node = new CandyboxNode(1, cfg, store, new InMemoryCoordinationService(), clock)) {
-            node.createBox(BoxName.of("my-box"));
+            node.createBox(BoxName.of("my-box"), 1);
             RequestHandler handler = node.requestHandler();
             for (int i = 0; i < 4; i++) {
                 roundTrip(handler, put("my-box", "key-" + i));
             }
-            var engine = node.engine(BoxName.of("my-box"));
+            var engine = node.enginePartition(BoxName.of("my-box"), 0);
             assertThat(engine.manifestState().level0().size()).isGreaterThanOrEqualTo(3);
 
             CompactionService compaction = new CompactionService(store, cfg, clock);
@@ -188,17 +194,17 @@ class CandyboxNodeTest {
         InMemoryLedgerStore store = new InMemoryLedgerStore();
         try (CandyboxNode node = new CandyboxNode(1, cfg, store, new InMemoryCoordinationService(),
                 new ManualClock(1000))) {
-            node.createBox(BoxName.of("my-box"));
+            node.createBox(BoxName.of("my-box"), 1);
             RequestHandler handler = node.requestHandler();
             for (int i = 0; i < 5; i++) {
                 roundTrip(handler, put("my-box", "key-" + i));
             }
-            assertThat(node.engine(BoxName.of("my-box")).manifestState().level0().size())
+            assertThat(node.enginePartition(BoxName.of("my-box"), 0).manifestState().level0().size())
                     .isGreaterThanOrEqualTo(3);
 
             int performed = node.compactOwnedBoxesOnce();
             assertThat(performed).isGreaterThanOrEqualTo(1);
-            assertThat(node.engine(BoxName.of("my-box")).manifestState().level0()).isEmpty();
+            assertThat(node.enginePartition(BoxName.of("my-box"), 0).manifestState().level0()).isEmpty();
             // Data survives the background compaction.
             for (int i = 0; i < 5; i++) {
                 Message resp = roundTrip(handler, new Message.GetCandyRequest("my-box", "key-" + i));
@@ -219,14 +225,14 @@ class CandyboxNodeTest {
         InMemoryLedgerStore store = new InMemoryLedgerStore();
         try (CandyboxNode node = new CandyboxNode(1, cfg, store, new InMemoryCoordinationService(),
                 new ManualClock(1000))) {
-            node.createBox(BoxName.of("my-box"));
+            node.createBox(BoxName.of("my-box"), 1);
             RequestHandler handler = node.requestHandler();
             for (int i = 0; i < 5; i++) {
                 roundTrip(handler, put("my-box", "key-" + i));
             }
 
             java.util.Set<Long> inputLedgerIds = new java.util.HashSet<>();
-            for (var table : node.engine(BoxName.of("my-box")).manifestState().level0()) {
+            for (var table : node.enginePartition(BoxName.of("my-box"), 0).manifestState().level0()) {
                 inputLedgerIds.add(table.ledgerId());
             }
             assertThat(inputLedgerIds.size()).isGreaterThanOrEqualTo(3);
@@ -234,7 +240,7 @@ class CandyboxNodeTest {
 
             // Compaction merges L0 into L1 (inputs leave the committed manifest)...
             node.compactOwnedBoxesOnce();
-            assertThat(node.engine(BoxName.of("my-box")).manifestState().level0()).isEmpty();
+            assertThat(node.enginePartition(BoxName.of("my-box"), 0).manifestState().level0()).isEmpty();
             assertThat(store.listLedgers()).containsAll(inputLedgerIds); // not deleted yet
 
             // ...then GC physically deletes the obsolete input ledgers (plus rotated WALs).
@@ -263,7 +269,7 @@ class CandyboxNodeTest {
         InMemoryLedgerStore store = new InMemoryLedgerStore();
         try (CandyboxNode node = new CandyboxNode(1, cfg, store, new InMemoryCoordinationService(),
                 new ManualClock(1000))) {
-            node.createBox(BoxName.of("my-box"));
+            node.createBox(BoxName.of("my-box"), 1);
             RequestHandler handler = node.requestHandler();
 
             // Two versions of the same key => two Syrups, two L0 tables.
@@ -271,13 +277,13 @@ class CandyboxNodeTest {
             roundTrip(handler, putValue("my-box", "k", "v2"));
 
             java.util.Set<Long> liveBefore =
-                    new java.util.HashSet<>(node.engine(BoxName.of("my-box")).manifestState().liveSyrups());
+                    new java.util.HashSet<>(node.enginePartition(BoxName.of("my-box"), 0).manifestState().liveSyrups());
             assertThat(liveBefore).hasSize(2);
 
             // Compaction keeps only v2 (S2); the v1 Syrup (S1) becomes unreferenced.
             node.compactOwnedBoxesOnce();
             java.util.Set<Long> referenced =
-                    node.engine(BoxName.of("my-box")).manifestState().referencedSyrups();
+                    node.enginePartition(BoxName.of("my-box"), 0).manifestState().referencedSyrups();
             assertThat(referenced).hasSize(1);
             java.util.Set<Long> orphan = new java.util.HashSet<>(liveBefore);
             orphan.removeAll(referenced);
@@ -308,7 +314,7 @@ class CandyboxNodeTest {
         InMemoryLedgerStore store = new InMemoryLedgerStore();
         try (CandyboxNode node = new CandyboxNode(1, cfg, store, new InMemoryCoordinationService(),
                 new ManualClock(1000))) {
-            node.createBox(BoxName.of("my-box"));
+            node.createBox(BoxName.of("my-box"), 1);
             RequestHandler handler = node.requestHandler();
             roundTrip(handler, put("my-box", "a")); // flush => WAL_0 rotated out
             roundTrip(handler, put("my-box", "b")); // flush => WAL_1 rotated out
@@ -318,6 +324,65 @@ class CandyboxNodeTest {
             // Data still readable from the L0 tables.
             assertThat(roundTrip(handler, new Message.GetCandyRequest("my-box", "a")))
                     .isInstanceOf(Message.CandyDataResponse.class);
+        }
+        store.close();
+    }
+
+    @Test
+    void createBoxRollsBackWhenAPartitionCannotBeCreated() {
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService();
+        // A leftover manifest pointer for partition 1 makes the second partition's creation fail.
+        coordination.create(CandyboxKeys.manifestKey("half-box", 1), new byte[] {0});
+        try (CandyboxNode node = new CandyboxNode(1, CandyboxConfig.defaults(), store, coordination,
+                new ManualClock(1000))) {
+            assertThatThrownBy(() -> node.createBox(BoxName.of("half-box"), 2))
+                    .isInstanceOf(BoxAlreadyExistsException.class);
+            // The descriptor and the partition that *was* created are rolled back.
+            assertThat(node.boxExists(BoxName.of("half-box"))).isFalse();
+            assertThat(coordination.get(CandyboxKeys.boxMetaKey("half-box"))).isEmpty();
+            assertThat(coordination.get(CandyboxKeys.manifestKey("half-box", 0))).isEmpty();
+            assertThat(node.ownedBoxStats()).isEmpty();
+        }
+        store.close();
+    }
+
+    @Test
+    void nonForceDeleteBoxFailsWhileAnotherLiveNodeOwnsAPartition() {
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService();
+        try (CandyboxNode owner = new CandyboxNode(1, CandyboxConfig.defaults(), store, coordination,
+                new ManualClock(1000));
+             CandyboxNode other = new CandyboxNode(2, CandyboxConfig.defaults(), store, coordination,
+                new ManualClock(1000))) {
+            owner.createBox(BoxName.of("held-box"), 2);
+            // Node 2 cannot take over partitions whose leases node 1 still holds.
+            assertThatThrownBy(() -> other.deleteBox(BoxName.of("held-box"), false))
+                    .isInstanceOf(NotOwnerException.class);
+            assertThat(owner.boxExists(BoxName.of("held-box"))).isTrue();
+        }
+        store.close();
+    }
+
+    @Test
+    void releaseBoxThenOpenBoxReplaysEveryPartition() {
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService();
+        try (CandyboxNode node = new CandyboxNode(1, CandyboxConfig.defaults(), store, coordination,
+                new ManualClock(1000))) {
+            BoxName box = BoxName.of("reopen-box");
+            node.createBox(box, 2);
+            node.engine(box, "k").putCandy(CandyKey.of("k"),
+                    "v".getBytes(StandardCharsets.UTF_8), null, Map.of(), null);
+
+            node.releaseBox(box);
+            assertThat(node.ownedBoxStats()).isEmpty();
+            assertThat(node.currentOwner(box, 0)).isEmpty(); // released, not just expired
+
+            node.openBox(box);
+            assertThat(node.ownedBoxStats()).containsKeys("reopen-box/0", "reopen-box/1");
+            assertThat(node.engine(box, "k").getCandy(CandyKey.of("k")))
+                    .isEqualTo("v".getBytes(StandardCharsets.UTF_8));
         }
         store.close();
     }

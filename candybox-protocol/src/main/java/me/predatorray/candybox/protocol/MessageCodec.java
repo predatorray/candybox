@@ -35,6 +35,9 @@ public final class MessageCodec {
         w.writeByte(BODY_VERSION);
         if (message instanceof Message.CreateBoxRequest m) {
             w.writeString(m.box());
+            w.writeVarInt(m.partitionCount());
+        } else if (message instanceof Message.BoxInfoRequest m) {
+            w.writeString(m.box());
         } else if (message instanceof Message.DeleteBoxRequest m) {
             w.writeString(m.box());
             w.writeBoolean(m.force());
@@ -71,6 +74,7 @@ public final class MessageCodec {
             writeNullable(w, m.idempotencyToken());
         } else if (message instanceof Message.DeleteRangeRequest m) {
             w.writeString(m.box());
+            w.writeVarInt(m.partition());
             writeNullable(w, m.prefix());
             writeNullable(w, m.startKey());
             writeNullable(w, m.endKey());
@@ -101,6 +105,7 @@ public final class MessageCodec {
             w.writeString(m.uploadId());
         } else if (message instanceof Message.ListMultipartUploadsRequest m) {
             w.writeString(m.box());
+            w.writeVarInt(m.partition());
             writeNullable(w, m.prefix());
             writeNullable(w, m.keyMarker());
             writeNullable(w, m.uploadIdMarker());
@@ -143,6 +148,7 @@ public final class MessageCodec {
             w.writeVarInt(m.nextPartNumberMarker());
         } else if (message instanceof Message.ListCandiesRequest m) {
             w.writeString(m.box());
+            w.writeVarInt(m.partition());
             writeNullable(w, m.prefix());
             writeNullable(w, m.startAfter());
             w.writeInt(m.maxKeys());
@@ -181,6 +187,8 @@ public final class MessageCodec {
             w.writeVarLong(Math.max(0, m.createdAtMillis()));
         } else if (message instanceof Message.MovedResponse m) {
             w.writeInt(m.ownerNodeId());
+        } else if (message instanceof Message.BoxInfoResponse m) {
+            w.writeVarInt(m.partitionCount());
         } else if (message instanceof Message.ListBoxesResponse m) {
             w.writeVarInt(m.boxes().size());
             for (String box : m.boxes()) {
@@ -199,7 +207,8 @@ public final class MessageCodec {
             throw new ProtocolException("Unsupported message body version: " + version);
         }
         return switch (frame.opcode()) {
-            case CREATE_BOX -> new Message.CreateBoxRequest(r.readString());
+            case CREATE_BOX -> new Message.CreateBoxRequest(r.readString(), r.readVarInt());
+            case BOX_INFO -> new Message.BoxInfoRequest(r.readString());
             case DELETE_BOX -> new Message.DeleteBoxRequest(r.readString(), r.readBoolean());
             case LIST_BOXES -> new Message.ListBoxesRequest();
             case HEAD_BOX -> new Message.HeadBoxRequest(r.readString());
@@ -214,10 +223,11 @@ public final class MessageCodec {
                     r.readString(), readNullable(r));
             case RENAME_CANDY -> new Message.RenameCandyRequest(r.readString(), r.readString(),
                     r.readString(), readNullable(r));
-            case DELETE_RANGE -> new Message.DeleteRangeRequest(r.readString(), readNullable(r),
-                    readNullable(r), readNullable(r));
-            case LIST_CANDIES -> new Message.ListCandiesRequest(r.readString(), readNullable(r),
-                    readNullable(r), r.readInt(), readNullable(r), readNullable(r), r.readBoolean());
+            case DELETE_RANGE -> new Message.DeleteRangeRequest(r.readString(), r.readVarInt(),
+                    readNullable(r), readNullable(r), readNullable(r));
+            case LIST_CANDIES -> new Message.ListCandiesRequest(r.readString(), r.readVarInt(),
+                    readNullable(r), readNullable(r), r.readInt(), readNullable(r), readNullable(r),
+                    r.readBoolean());
             case CREATE_MULTIPART_UPLOAD -> new Message.CreateMultipartUploadRequest(r.readString(),
                     r.readString(), readNullable(r), readMetadata(r));
             case UPLOAD_PART -> new Message.UploadPartRequest(r.readString(), r.readString(),
@@ -226,7 +236,7 @@ public final class MessageCodec {
             case ABORT_MULTIPART_UPLOAD -> new Message.AbortMultipartUploadRequest(r.readString(),
                     r.readString(), r.readString());
             case LIST_MULTIPART_UPLOADS -> new Message.ListMultipartUploadsRequest(r.readString(),
-                    readNullable(r), readNullable(r), readNullable(r), r.readVarInt());
+                    r.readVarInt(), readNullable(r), readNullable(r), readNullable(r), r.readVarInt());
             case LIST_PARTS -> new Message.ListPartsRequest(r.readString(), r.readString(),
                     r.readString(), r.readVarInt(), r.readVarInt());
             case UPLOAD_PART_COPY -> new Message.UploadPartCopyRequest(r.readString(), r.readString(),
@@ -245,6 +255,7 @@ public final class MessageCodec {
             case RESPONSE_HEAD -> new Message.HeadCandyResponse(r.readVarLong(), readNullable(r),
                     readMetadata(r), r.readInt(), r.readVarLong());
             case RESPONSE_MOVED -> new Message.MovedResponse(r.readInt());
+            case RESPONSE_BOX_INFO -> new Message.BoxInfoResponse(r.readVarInt());
             case RESPONSE_BOX_LIST -> decodeBoxList(r);
         };
     }

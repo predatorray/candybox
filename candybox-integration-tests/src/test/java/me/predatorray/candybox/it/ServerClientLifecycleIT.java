@@ -72,6 +72,7 @@ class ServerClientLifecycleIT {
         CandyboxConfig config = CandyboxConfig.builder()
                 .leaseRenewIntervalMillis(0)
                 .multipartMinPartBytes(0)
+                .partitionsPerBoxDefault(2) // small but real partition spread over embedded BK
                 .build();
         int port = freePort();
         store = new BookKeeperLedgerStore(bookKeeper.clientConfiguration(), bytes("candybox"));
@@ -336,7 +337,7 @@ class ServerClientLifecycleIT {
         node.releaseBox(boxName);
         node.openBox(boxName);
 
-        assertThat(node.currentOwner(boxName)).contains(node.nodeId());
+        assertThat(node.currentOwner(boxName, 0)).contains(node.nodeId());
         assertThat(client.getCandy(box, "durable")).isEqualTo(bytes("survives-handover"));
     }
 
@@ -354,9 +355,9 @@ class ServerClientLifecycleIT {
 
         BoxName boxName = BoxName.of(box);
         assertThat(node.boxExists(boxName)).isTrue();
-        assertThat(node.currentOwner(boxName)).contains(node.nodeId());
+        assertThat(node.currentOwner(boxName, 0)).contains(node.nodeId());
         assertThat(node.listBoxes()).contains(box);
-        assertThat(node.ownedBoxStats()).containsKey(box);
+        assertThat(node.ownedBoxStats()).containsKeys(box + "/0", box + "/1");
 
         // The three periodic maintenance passes should run without error and report a non-negative
         // count of units processed.

@@ -68,12 +68,13 @@ class MessageCodecTest {
         assertThat(rename.idempotencyToken()).isNull();
 
         Message.DeleteRangeRequest byPrefix = (Message.DeleteRangeRequest) roundTrip(
-                new Message.DeleteRangeRequest("box", "logs/", null, null));
+                new Message.DeleteRangeRequest("box", 3, "logs/", null, null));
+        assertThat(byPrefix.partition()).isEqualTo(3);
         assertThat(byPrefix.prefix()).isEqualTo("logs/");
         assertThat(byPrefix.startKey()).isNull();
 
         Message.DeleteRangeRequest byWindow = (Message.DeleteRangeRequest) roundTrip(
-                new Message.DeleteRangeRequest("box", null, "b", "e"));
+                new Message.DeleteRangeRequest("box", 1, null, "b", "e"));
         assertThat(byWindow.prefix()).isNull();
         assertThat(byWindow.startKey()).isEqualTo("b");
         assertThat(byWindow.endKey()).isEqualTo("e");
@@ -81,9 +82,10 @@ class MessageCodecTest {
 
     @Test
     void listCandiesRequestRoundTripsRangeAndDirection() {
-        Message.ListCandiesRequest req = new Message.ListCandiesRequest("box", "p/", "p/cursor", 50,
+        Message.ListCandiesRequest req = new Message.ListCandiesRequest("box", 2, "p/", "p/cursor", 50,
                 "p/a", "p/z", true);
         Message.ListCandiesRequest out = (Message.ListCandiesRequest) roundTrip(req);
+        assertThat(out.partition()).isEqualTo(2);
         assertThat(out.startKey()).isEqualTo("p/a");
         assertThat(out.endKey()).isEqualTo("p/z");
         assertThat(out.reverse()).isTrue();
@@ -157,6 +159,19 @@ class MessageCodecTest {
     }
 
     @Test
+    void boxInfoRequestAndResponseRoundTrip() {
+        Message.BoxInfoRequest req = (Message.BoxInfoRequest) roundTrip(
+                new Message.BoxInfoRequest("my-box"));
+        assertThat(req.box()).isEqualTo("my-box");
+        assertThat(req.opcode()).isEqualTo(Opcode.BOX_INFO);
+
+        Message.BoxInfoResponse resp = (Message.BoxInfoResponse) roundTrip(
+                new Message.BoxInfoResponse(8));
+        assertThat(resp.partitionCount()).isEqualTo(8);
+        assertThat(resp.opcode()).isEqualTo(Opcode.RESPONSE_BOX_INFO);
+    }
+
+    @Test
     void listBoxesResponseRoundTrips() {
         Message.ListBoxesResponse out = (Message.ListBoxesResponse) roundTrip(
                 new Message.ListBoxesResponse(List.of("alpha", "beta")));
@@ -168,7 +183,12 @@ class MessageCodecTest {
         Message.CreateBoxRequest create = (Message.CreateBoxRequest) roundTrip(
                 new Message.CreateBoxRequest("my-box"));
         assertThat(create.box()).isEqualTo("my-box");
+        assertThat(create.partitionCount()).isZero(); // convenience ctor = server default
         assertThat(create.opcode()).isEqualTo(Opcode.CREATE_BOX);
+
+        Message.CreateBoxRequest partitioned = (Message.CreateBoxRequest) roundTrip(
+                new Message.CreateBoxRequest("my-box", 16));
+        assertThat(partitioned.partitionCount()).isEqualTo(16);
 
         Message.DeleteBoxRequest forced = (Message.DeleteBoxRequest) roundTrip(
                 new Message.DeleteBoxRequest("my-box", true));
@@ -226,7 +246,7 @@ class MessageCodecTest {
 
     @Test
     void plainListCandiesRequestConstructorRoundTrips() {
-        Message.ListCandiesRequest req = new Message.ListCandiesRequest("box", "p/", "p/x", 25);
+        Message.ListCandiesRequest req = new Message.ListCandiesRequest("box", 0, "p/", "p/x", 25);
         Message.ListCandiesRequest out = (Message.ListCandiesRequest) roundTrip(req);
         assertThat(out.prefix()).isEqualTo("p/");
         assertThat(out.startAfter()).isEqualTo("p/x");
@@ -306,7 +326,8 @@ class MessageCodecTest {
     void multipartListingRequestsRoundTrip() {
         Message.ListMultipartUploadsRequest uploads =
                 (Message.ListMultipartUploadsRequest) roundTrip(new Message.ListMultipartUploadsRequest(
-                        "box", "p/", "key-m", "upload-m", 200));
+                        "box", 4, "p/", "key-m", "upload-m", 200));
+        assertThat(uploads.partition()).isEqualTo(4);
         assertThat(uploads.prefix()).isEqualTo("p/");
         assertThat(uploads.keyMarker()).isEqualTo("key-m");
         assertThat(uploads.uploadIdMarker()).isEqualTo("upload-m");

@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 import me.predatorray.candybox.client.BoxClient;
 import me.predatorray.candybox.client.CandyboxClient;
+import me.predatorray.candybox.coordination.BoxDescriptor;
 import me.predatorray.candybox.coordination.CandyboxKeys;
 import me.predatorray.candybox.coordination.fake.InMemoryCoordinationService;
 import org.junit.jupiter.api.Test;
@@ -44,9 +45,12 @@ class LiveDashboardDataTest {
         // two boxes and node 2 owns one — the snapshot's ownedBoxCount needs to count accordingly.
         coord.registerMember(1, "host-a:9709".getBytes(StandardCharsets.UTF_8));
         coord.registerMember(2, "host-b:9709".getBytes(StandardCharsets.UTF_8));
-        coord.tryAcquireLease(CandyboxKeys.ownerResource("photos"), 1, 60_000);
-        coord.tryAcquireLease(CandyboxKeys.ownerResource("docs"), 1, 60_000);
-        coord.tryAcquireLease(CandyboxKeys.ownerResource("backups"), 2, 60_000);
+        for (String box : List.of("photos", "docs", "backups", "orphan")) {
+            coord.create(CandyboxKeys.boxMetaKey(box), new BoxDescriptor(1).encode());
+        }
+        coord.tryAcquireLease(CandyboxKeys.ownerResource("photos", 0), 1, 60_000);
+        coord.tryAcquireLease(CandyboxKeys.ownerResource("docs", 0), 1, 60_000);
+        coord.tryAcquireLease(CandyboxKeys.ownerResource("backups", 0), 2, 60_000);
 
         FakeBoxClient client = new FakeBoxClient();
         client.boxes.addAll(List.of("photos", "docs", "backups", "orphan"));
@@ -104,10 +108,12 @@ class LiveDashboardDataTest {
     @Test
     void boxesAndLsmReadOwnerAndManifestVersion() throws Exception {
         InMemoryCoordinationService coord = new InMemoryCoordinationService();
-        coord.tryAcquireLease(CandyboxKeys.ownerResource("photos"), 4, 60_000);
+        coord.create(CandyboxKeys.boxMetaKey("photos"), new BoxDescriptor(1).encode());
+        coord.create(CandyboxKeys.boxMetaKey("orphan"), new BoxDescriptor(1).encode());
+        coord.tryAcquireLease(CandyboxKeys.ownerResource("photos", 0), 4, 60_000);
         // Bumping the manifest pointer twice gives us a deterministic version (2 after create + CAS).
-        long v0 = coord.create(CandyboxKeys.manifestKey("photos"), new byte[] {1});
-        long v1 = coord.compareAndSet(CandyboxKeys.manifestKey("photos"), new byte[] {2}, v0);
+        long v0 = coord.create(CandyboxKeys.manifestKey("photos", 0), new byte[] {1});
+        long v1 = coord.compareAndSet(CandyboxKeys.manifestKey("photos", 0), new byte[] {2}, v0);
 
         FakeBoxClient client = new FakeBoxClient();
         client.boxes.add("photos");
@@ -131,7 +137,7 @@ class LiveDashboardDataTest {
         List<DashboardData.LsmRow> lsm = data.lsm();
         assertThat(lsm).hasSize(2);
         DashboardData.LsmRow photos = lsm.get(0);
-        assertThat(photos.box()).isEqualTo("photos");
+        assertThat(photos.box()).isEqualTo("photos/0");
         assertThat(photos.owner()).isEqualTo("4");
         assertThat(photos.manifestVersion()).isEqualTo(v1);
         assertThat(photos.fencingToken()).isGreaterThan(0);
@@ -142,6 +148,27 @@ class LiveDashboardDataTest {
         assertThat(orphan.owner()).isNull();
         assertThat(orphan.manifestVersion()).isEqualTo(-1);
         assertThat(orphan.fencingToken()).isEqualTo(-1);
+    }
+
+    @Test
+    void ownerSummarizesSpreadPartitionOwnership() {
+        // A Box whose two partitions are owned by different nodes reports both, sorted and joined.
+        InMemoryCoordinationService coord = new InMemoryCoordinationService();
+        coord.create(CandyboxKeys.boxMetaKey("spread"), new BoxDescriptor(2).encode());
+        coord.tryAcquireLease(CandyboxKeys.ownerResource("spread", 0), 2, 60_000);
+        coord.tryAcquireLease(CandyboxKeys.ownerResource("spread", 1), 1, 60_000);
+
+        FakeBoxClient client = new FakeBoxClient();
+        client.boxes.add("spread");
+        LiveDashboardData data = new LiveDashboardData(coord, client);
+
+        assertThat(data.boxes()).singleElement()
+                .satisfies(row -> assertThat(row.owner()).isEqualTo("1,2"));
+        // One LSM row per partition, each naming its own holder.
+        assertThat(data.lsm()).extracting(DashboardData.LsmRow::box)
+                .containsExactly("spread/0", "spread/1");
+        assertThat(data.lsm()).extracting(DashboardData.LsmRow::owner)
+                .containsExactly("2", "1");
     }
 
     @Test

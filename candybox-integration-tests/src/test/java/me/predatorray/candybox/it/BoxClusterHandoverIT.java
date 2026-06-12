@@ -106,8 +106,8 @@ class BoxClusterHandoverIT {
         TcpTransport transport = new TcpTransport();
         CandyboxClient client = new CandyboxClient(transport, coordClient, config);
         try {
-            // createBox lands on a node (node 1, lowest member) which acquires ownership.
-            client.createBox(box.value());
+            // createBox lands on a node (node 1, lowest member) which owns all partitions initially.
+            client.createBox(box.value(), 2);
             client.putCandy(box.value(), "k", bytes("v1"), "text/plain", Map.of(), null);
             assertThat(client.getCandy(box.value(), "k")).isEqualTo(bytes("v1"));
 

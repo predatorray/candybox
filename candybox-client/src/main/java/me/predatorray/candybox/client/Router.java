@@ -24,10 +24,10 @@ import me.predatorray.candybox.protocol.Message;
  */
 interface Router extends AutoCloseable {
 
-    /** Routes a Box-scoped request to that Box's current owner. */
-    Message callBox(String box, Message request);
+    /** Routes a partition-scoped request to that partition's current owner. */
+    Message callPartition(String box, int partition, Message request);
 
-    /** Routes a cluster-wide request (createBox, listBoxes) to any reachable node. */
+    /** Routes a cluster-wide request (createBox, boxInfo, listBoxes) to any reachable node. */
     Message callAny(Message request);
 
     @Override

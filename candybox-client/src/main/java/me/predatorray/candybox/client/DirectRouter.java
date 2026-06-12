@@ -36,7 +36,7 @@ final class DirectRouter implements Router {
     }
 
     @Override
-    public Message callBox(String box, Message request) {
+    public Message callPartition(String box, int partition, Message request) {
         return send(request);
     }
 
