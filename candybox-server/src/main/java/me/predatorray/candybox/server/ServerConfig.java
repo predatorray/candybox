@@ -29,6 +29,7 @@ import java.util.regex.Pattern;
 import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.config.LedgerRole;
 import me.predatorray.candybox.common.config.QuorumConfig;
+import me.predatorray.candybox.common.config.SecurityConfig;
 
 /**
  * Runtime, deployment-facing configuration for a {@link CandyboxServer} process: endpoints, ports,
@@ -68,6 +69,7 @@ public final class ServerConfig {
     private final Path dataDir;
     private final Path logDir;
     private final CandyboxConfig tuning;
+    private final SecurityConfig security;
 
     private ServerConfig(Builder b) {
         this.nodeId = b.nodeId;
@@ -82,6 +84,7 @@ public final class ServerConfig {
         this.dataDir = b.dataDir;
         this.logDir = b.logDir;
         this.tuning = b.tuning;
+        this.security = b.security;
     }
 
     /** Loads configuration from a properties file, layering environment-variable overrides on top. */
@@ -126,6 +129,7 @@ public final class ServerConfig {
                 .dataDir(Path.of(r.get("data.dir").orElse("./data")))
                 .logDir(Path.of(r.get("log.dir").orElse("./logs")))
                 .tuning(r.buildTuning())
+                .security(SecurityConfig.resolve(r::get))
                 .build();
     }
 
@@ -175,6 +179,10 @@ public final class ServerConfig {
 
     public CandyboxConfig tuning() {
         return tuning;
+    }
+
+    public SecurityConfig security() {
+        return security;
     }
 
     /** A {@code host:port} pair. */
@@ -317,6 +325,7 @@ public final class ServerConfig {
         private Path dataDir = Path.of("./data");
         private Path logDir = Path.of("./logs");
         private CandyboxConfig tuning = CandyboxConfig.defaults();
+        private SecurityConfig security = SecurityConfig.disabled();
 
         Builder nodeId(int v) {
             this.nodeId = v;
@@ -375,6 +384,11 @@ public final class ServerConfig {
 
         Builder tuning(CandyboxConfig v) {
             this.tuning = v;
+            return this;
+        }
+
+        Builder security(SecurityConfig v) {
+            this.security = v;
             return this;
         }
 

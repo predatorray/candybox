@@ -48,10 +48,13 @@ public final class LoopbackTransport implements Transport {
     }
 
     private final class LoopbackConnection implements Connection {
+        // One context per connection, like the TCP server, so SASL state is exercised in-JVM too.
+        private final ConnectionContext context = new ConnectionContext();
+
         @Override
         public Frame call(Frame request) {
             Frame onWire = codec.decode(codec.encode(request)); // exercise the codec
-            Frame response = handler.handle(onWire);
+            Frame response = handler.handle(context, onWire);
             return codec.decode(codec.encode(response));
         }
 

@@ -218,6 +218,47 @@ public sealed interface Message {
         }
     }
 
+    // ---- SASL authentication (see protocol.auth) ---------------------------------------------
+
+    /** Selects the SASL mechanism for this connection. Must be the first request when the server
+     * requires authentication; the SASL token exchange itself happens via
+     * {@link SaslAuthenticateRequest}. */
+    record SaslHandshakeRequest(String mechanism) implements Message {
+        public Opcode opcode() {
+            return Opcode.SASL_HANDSHAKE;
+        }
+    }
+
+    /** {@code ok=false} ⇒ the requested mechanism is not enabled; {@code enabledMechanisms} lists
+     * what the server accepts (also populated on success, for diagnostics). */
+    record SaslHandshakeResponse(boolean ok, List<String> enabledMechanisms) implements Message {
+        public Opcode opcode() {
+            return Opcode.RESPONSE_SASL_HANDSHAKE;
+        }
+    }
+
+    /** One opaque, mechanism-defined SASL client token. */
+    record SaslAuthenticateRequest(byte[] token) implements Message {
+        public Opcode opcode() {
+            return Opcode.SASL_AUTHENTICATE;
+        }
+    }
+
+    /** The server's SASL challenge; {@code complete=true} ends the exchange (the final
+     * {@code challenge} — e.g. SCRAM's server signature — must still be evaluated by the client). */
+    record SaslAuthenticateResponse(boolean complete, byte[] challenge) implements Message {
+        public Opcode opcode() {
+            return Opcode.RESPONSE_SASL_AUTHENTICATE;
+        }
+    }
+
+    /** Terminal authentication failure (bad credentials, or a request before authenticating). */
+    record AuthFailedResponse(String message) implements Message {
+        public Opcode opcode() {
+            return Opcode.RESPONSE_AUTH_FAILED;
+        }
+    }
+
     // ---- Responses -------------------------------------------------------------------------
 
     record OkResponse() implements Message {

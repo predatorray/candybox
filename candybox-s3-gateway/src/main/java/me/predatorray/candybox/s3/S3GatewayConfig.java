@@ -23,6 +23,7 @@ import java.nio.file.Path;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
+import me.predatorray.candybox.common.config.SecurityConfig;
 
 /**
  * Deployment-facing configuration for the S3 gateway process, loaded from a {@code .properties} file
@@ -49,6 +50,7 @@ public final class S3GatewayConfig {
     private final long maxObjectBytes;
     private final int workerThreads;
     private final long routerCacheTtlMillis;
+    private final SecurityConfig security;
 
     private S3GatewayConfig(Builder b) {
         this.bindHost = b.bindHost;
@@ -59,6 +61,7 @@ public final class S3GatewayConfig {
         this.maxObjectBytes = b.maxObjectBytes;
         this.workerThreads = b.workerThreads;
         this.routerCacheTtlMillis = b.routerCacheTtlMillis;
+        this.security = b.security;
     }
 
     public static S3GatewayConfig load(Path propertiesFile) {
@@ -84,6 +87,7 @@ public final class S3GatewayConfig {
                 .workerThreads(r.getInt("s3.worker-threads")
                         .orElse(Math.max(4, Runtime.getRuntime().availableProcessors() * 2)))
                 .routerCacheTtlMillis(r.getLong("s3.router-cache-ttl-ms").orElse(5_000L))
+                .security(SecurityConfig.resolve(r::get))
                 .build();
     }
 
@@ -117,6 +121,11 @@ public final class S3GatewayConfig {
 
     public long routerCacheTtlMillis() {
         return routerCacheTtlMillis;
+    }
+
+    /** The shared {@code auth.*} / {@code tls.*} surface: how this gateway dials the nodes. */
+    public SecurityConfig security() {
+        return security;
     }
 
     private record HostPort(String host, int port) {
@@ -171,6 +180,7 @@ public final class S3GatewayConfig {
         private String zookeeperConnect;
         private String region = "us-east-1";
         private long maxObjectBytes = DEFAULT_MAX_OBJECT_BYTES;
+        private SecurityConfig security = SecurityConfig.disabled();
         private int workerThreads = 8;
         private long routerCacheTtlMillis = 5_000L;
 
@@ -211,6 +221,11 @@ public final class S3GatewayConfig {
 
         Builder routerCacheTtlMillis(long v) {
             this.routerCacheTtlMillis = v;
+            return this;
+        }
+
+        Builder security(SecurityConfig v) {
+            this.security = v;
             return this;
         }
 

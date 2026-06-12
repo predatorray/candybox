@@ -194,6 +194,21 @@ public final class MessageCodec {
             for (String box : m.boxes()) {
                 w.writeString(box);
             }
+        } else if (message instanceof Message.SaslHandshakeRequest m) {
+            w.writeString(m.mechanism());
+        } else if (message instanceof Message.SaslHandshakeResponse m) {
+            w.writeBoolean(m.ok());
+            w.writeVarInt(m.enabledMechanisms().size());
+            for (String mechanism : m.enabledMechanisms()) {
+                w.writeString(mechanism);
+            }
+        } else if (message instanceof Message.SaslAuthenticateRequest m) {
+            w.writeBytes(m.token() == null ? new byte[0] : m.token());
+        } else if (message instanceof Message.SaslAuthenticateResponse m) {
+            w.writeBoolean(m.complete());
+            w.writeBytes(m.challenge() == null ? new byte[0] : m.challenge());
+        } else if (message instanceof Message.AuthFailedResponse m) {
+            w.writeString(m.message());
         } else {
             throw new ProtocolException("Unknown message type: " + message.getClass());
         }
@@ -257,7 +272,23 @@ public final class MessageCodec {
             case RESPONSE_MOVED -> new Message.MovedResponse(r.readInt());
             case RESPONSE_BOX_INFO -> new Message.BoxInfoResponse(r.readVarInt());
             case RESPONSE_BOX_LIST -> decodeBoxList(r);
+            case SASL_HANDSHAKE -> new Message.SaslHandshakeRequest(r.readString());
+            case RESPONSE_SASL_HANDSHAKE -> decodeSaslHandshakeResponse(r);
+            case SASL_AUTHENTICATE -> new Message.SaslAuthenticateRequest(r.readBytes());
+            case RESPONSE_SASL_AUTHENTICATE ->
+                    new Message.SaslAuthenticateResponse(r.readBoolean(), r.readBytes());
+            case RESPONSE_AUTH_FAILED -> new Message.AuthFailedResponse(r.readString());
         };
+    }
+
+    private static Message decodeSaslHandshakeResponse(BinaryReader r) {
+        boolean ok = r.readBoolean();
+        int count = r.readVarInt();
+        List<String> mechanisms = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) {
+            mechanisms.add(r.readString());
+        }
+        return new Message.SaslHandshakeResponse(ok, mechanisms);
     }
 
     private static Message decodeBoxList(BinaryReader r) {

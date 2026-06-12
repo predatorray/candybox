@@ -117,3 +117,36 @@ balancer.interval.millis=5000
 # quorum.manifest=1/1/1
 # quorum.sstable=1/1/1
 # quorum.syrup=1/1/1
+
+# ---------------------------------------------------------------------------
+# Security — SASL authentication on the TCP listener and in-process TLS.
+# Every key maps to CANDYBOX_<KEY> (dots to underscores, upper-cased), so secrets can be
+# injected through the environment / Kubernetes Secrets instead of this file.
+#
+# The credentials file is a properties file holding every credential kind (see
+# `candybox make-credentials <user>` to generate the entries):
+#   sasl.user.<name>           = pbkdf2-sha256:...          (PLAIN verifier, one-way hash)
+#   sasl.scram-sha-256.<name>  = salt=...,iterations=...,storedKey=...,serverKey=...
+#   sasl.principal.<name>      = Gateway:s3-gw              (optional; default User:<name>)
+# It is reloaded automatically when its mtime changes (rotation needs no restart).
+#
+# TLS paths are PEM (cert-manager-style): a certificate chain, an UNENCRYPTED PKCS#8 key
+# ("BEGIN PRIVATE KEY"; convert legacy keys with `openssl pkcs8 -topk8 -nocrypt`), and a CA
+# bundle. tls.client.auth=true additionally demands a client certificate (mTLS) verified
+# against tls.ca.path.
+#
+# PLAIN sends the password over the connection — enable it only with TLS. SCRAM-SHA-256
+# never sends the password and authenticates the server back to the client, so it is the
+# safer choice when TLS is off or terminated elsewhere.
+# ---------------------------------------------------------------------------
+
+# auth.enabled=true
+# auth.required=true
+# auth.sasl.mechanisms=PLAIN,SCRAM-SHA-256
+# auth.credentials.file=/etc/candybox/credentials.properties
+
+# tls.enabled=true
+# tls.cert.path=/etc/candybox/tls/tls.crt
+# tls.key.path=/etc/candybox/tls/tls.key
+# tls.ca.path=/etc/candybox/tls/ca.crt
+# tls.client.auth=false

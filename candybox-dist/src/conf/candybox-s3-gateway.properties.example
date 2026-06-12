@@ -28,3 +28,16 @@ s3.region=us-east-1
 
 # HTTP port for /healthz, /readyz, /metrics. Default: 9712.
 # health.port=9712
+
+# ---------------------------------------------------------------------------
+# Security — how the gateway dials the storage nodes (same auth.*/tls.* surface as the
+# node config; see candybox.properties.example). The gateway logs in over SASL with its
+# own service account, which should map to a Gateway:* principal in the cluster's
+# credentials file (sasl.principal.<user> = Gateway:<user>).
+# ---------------------------------------------------------------------------
+
+# auth.client.mechanism=PLAIN
+# auth.client.username=s3-gw
+# auth.client.password=...            # or auth.client.password.file=/etc/candybox/s3-gw.password
+# tls.enabled=true
+# tls.ca.path=/etc/candybox/tls/ca.crt
