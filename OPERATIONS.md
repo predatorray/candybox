@@ -241,6 +241,21 @@ The bookie side (`bookieAuthProviderFactoryClass`, bookie TLS, the bookies' own 
 configured in each bookie's `bookkeeper.conf` per the BookKeeper security docs — Candybox only
 brings the client half.
 
+### Admin API & metrics endpoints
+
+Set `CANDYBOX_ADMIN_AUTH_TOKEN` on the admin API: every `/api/*` route (cluster state, box
+browsing, uploads) then demands `Authorization: Bearer <token>`; `/healthz`, `/readyz` and the
+static SPA shell stay open. The dashboard captures the token once from `/ui/?token=<token>`
+(stored in localStorage, stripped from the URL; `/ui/?token=` clears it). Give the admin API an
+explicit `CANDYBOX_ADMIN_CORS` origin instead of `*` when it serves anything but same-origin.
+The listener serves HTTPS when the `tls.*` keys are set in its environment.
+
+Node and gateway `/metrics` accept an optional guard: set `metrics.auth.token` (or
+`CANDYBOX_METRICS_AUTH_TOKEN`) on the node/gateway, and give the admin API's scraper the same
+value via `CANDYBOX_ADMIN_SCRAPE_TOKEN` (Prometheus: `authorization.credentials`). The
+`/healthz`/`/readyz` probes stay unauthenticated plain-HTTP — they reveal only a boolean, and
+Kubernetes probes them directly.
+
 ### Ledger password vs. authentication
 
 `ledger.password` predates all of the above: it is BookKeeper's per-ledger access password, a

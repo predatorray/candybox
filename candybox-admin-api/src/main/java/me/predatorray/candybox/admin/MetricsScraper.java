@@ -64,9 +64,17 @@ final class MetricsScraper implements AutoCloseable {
     private final HttpClient http;
     private final ScheduledExecutorService scheduler;
     private final Map<SeriesKey, Deque<Sample>> series = new ConcurrentHashMap<>();
+    private final String scrapeToken;
     private volatile String latestText = "";
 
     MetricsScraper(List<URI> targets, long pollIntervalMillis, int windowSamples) {
+        this(targets, pollIntervalMillis, windowSamples, null);
+    }
+
+    /** @param scrapeToken sent as {@code Authorization: Bearer} to token-guarded /metrics targets */
+    MetricsScraper(List<URI> targets, long pollIntervalMillis, int windowSamples,
+                   String scrapeToken) {
+        this.scrapeToken = scrapeToken;
         this.targets = List.copyOf(targets);
         this.pollIntervalMillis = pollIntervalMillis;
         this.windowSamples = windowSamples;
@@ -136,9 +144,12 @@ final class MetricsScraper implements AutoCloseable {
         long ingestMillis = System.currentTimeMillis();
         for (URI target : targets) {
             try {
-                HttpResponse<String> resp = http.send(
-                        HttpRequest.newBuilder(target).timeout(Duration.ofSeconds(3))
-                                .header("Accept", "text/plain").GET().build(),
+                HttpRequest.Builder rb = HttpRequest.newBuilder(target)
+                        .timeout(Duration.ofSeconds(3)).header("Accept", "text/plain").GET();
+                if (scrapeToken != null) {
+                    rb.header("Authorization", "Bearer " + scrapeToken);
+                }
+                HttpResponse<String> resp = http.send(rb.build(),
                         HttpResponse.BodyHandlers.ofString());
                 if (resp.statusCode() != 200) {
                     LOG.debug("metrics target {} returned {}", target, resp.statusCode());

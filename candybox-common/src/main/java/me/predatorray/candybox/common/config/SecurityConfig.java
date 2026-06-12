@@ -76,13 +76,14 @@ public final class SecurityConfig {
     private final String zkAuthScheme;
     private final String zkAuthCredentials;
     private final boolean zkAclEnabled;
+    private final String metricsAuthToken;
 
     private SecurityConfig(boolean authEnabled, boolean authRequired, List<String> saslMechanisms,
                            Path credentialsFile, List<String> superUsers, String clientMechanism,
                            String clientUsername, String clientPassword, boolean tlsEnabled,
                            Path tlsCertPath, Path tlsKeyPath, Path tlsCaPath, boolean tlsClientAuth,
                            boolean tlsVerifyEndpoint, String zkAuthScheme, String zkAuthCredentials,
-                           boolean zkAclEnabled) {
+                           boolean zkAclEnabled, String metricsAuthToken) {
         this.authEnabled = authEnabled;
         this.authRequired = authRequired;
         this.saslMechanisms = saslMechanisms;
@@ -100,6 +101,7 @@ public final class SecurityConfig {
         this.zkAuthScheme = zkAuthScheme;
         this.zkAuthCredentials = zkAuthCredentials;
         this.zkAclEnabled = zkAclEnabled;
+        this.metricsAuthToken = metricsAuthToken;
     }
 
     /** Everything off — the dev/test default. */
@@ -158,9 +160,14 @@ public final class SecurityConfig {
         // (digest credentials here, or a JAAS Client section for SASL — flagged explicitly).
         boolean zkAclEnabled = bool(get, "zookeeper.acl.enabled", zkScheme != null);
 
+        String metricsToken = get.apply("metrics.auth.token").orElseGet(
+                () -> get.apply("metrics.auth.token.file").map(SecurityConfig::readSecret)
+                        .orElse(null));
+
         return new SecurityConfig(authEnabled, authRequired, mechanisms, credentialsFile,
                 superUsers, clientMechanism, clientUsername, clientPassword, tlsEnabled, certPath,
-                keyPath, caPath, clientAuth, verifyEndpoint, zkScheme, zkCredentials, zkAclEnabled);
+                keyPath, caPath, clientAuth, verifyEndpoint, zkScheme, zkCredentials, zkAclEnabled,
+                metricsToken);
     }
 
     private static boolean bool(Function<String, Optional<String>> get, String key,
@@ -232,6 +239,11 @@ public final class SecurityConfig {
 
     public boolean zkAclEnabled() {
         return zkAclEnabled;
+    }
+
+    /** When set, node/gateway {@code /metrics} demand {@code Authorization: Bearer <token>}. */
+    public String metricsAuthToken() {
+        return metricsAuthToken;
     }
 
     /** The listener-side TLS context, or null when TLS is off. */

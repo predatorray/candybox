@@ -735,4 +735,34 @@ class AdminApiServerTest {
         return http.send(HttpRequest.newBuilder(URI.create(url)).GET().build(),
                 BodyHandlers.ofString());
     }
+
+    @Test
+    void bearerTokenGuardsTheApiButNotProbesOrUi() throws Exception {
+        AdminApiConfig config = new AdminApiConfig(0, "127.0.0.1", "*", true);
+        try (AdminApiServer server = new AdminApiServer(config, () -> true,
+                new EmptyDashboardData(), null, "sekret", null)) {
+            server.start();
+            HttpClient http = HttpClient.newHttpClient();
+            String base = "http://127.0.0.1:" + server.port();
+
+            // Probes and the SPA shell stay open for orchestration / the login redirect.
+            assertThat(get(http, base + "/healthz").statusCode()).isEqualTo(200);
+            assertThat(get(http, base + "/readyz").statusCode()).isEqualTo(200);
+
+            // /api/* without (or with a wrong) token is 401; the right token passes.
+            assertThat(get(http, base + "/api/cluster").statusCode()).isEqualTo(401);
+            HttpResponse<String> wrong = http.send(HttpRequest.newBuilder(
+                            URI.create(base + "/api/cluster"))
+                    .header("Authorization", "Bearer nope").GET().build(), BodyHandlers.ofString());
+            assertThat(wrong.statusCode()).isEqualTo(401);
+            HttpResponse<String> ok = http.send(HttpRequest.newBuilder(
+                            URI.create(base + "/api/cluster"))
+                    .header("Authorization", "Bearer sekret").GET().build(),
+                    BodyHandlers.ofString());
+            assertThat(ok.statusCode()).isEqualTo(200);
+            // CORS must allow the Authorization header for cross-origin dashboards.
+            assertThat(ok.headers().firstValue("Access-Control-Allow-Headers"))
+                    .hasValueSatisfying(v -> assertThat(v).contains("Authorization"));
+        }
+    }
 }

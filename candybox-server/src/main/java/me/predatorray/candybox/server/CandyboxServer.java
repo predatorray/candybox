@@ -100,7 +100,7 @@ public final class CandyboxServer {
 
         AtomicBoolean ready = new AtomicBoolean(true);
         HealthServer health = new HealthServer(config.healthPort(), config.nodeId(), ready::get,
-                node::ownedBoxStats);
+                node::ownedBoxStats, security.metricsAuthToken());
         health.start();
 
         LOG.info("Candybox node {} is up: serving on {}, health on {}", config.nodeId(),
