@@ -218,6 +218,34 @@ public sealed interface Message {
         }
     }
 
+    // ---- ACLs --------------------------------------------------------------------------------
+
+    record GetBoxAclRequest(String box) implements Message {
+        public Opcode opcode() {
+            return Opcode.GET_BOX_ACL;
+        }
+    }
+
+    /** Replaces the Box's ACL document. {@code grants} use the text form {@code grantee:OP[+OP]}. */
+    record SetBoxAclRequest(String box, String owner, List<String> grants) implements Message {
+        public Opcode opcode() {
+            return Opcode.SET_BOX_ACL;
+        }
+    }
+
+    record BoxAclResponse(String owner, List<String> grants) implements Message {
+        public Opcode opcode() {
+            return Opcode.RESPONSE_BOX_ACL;
+        }
+    }
+
+    /** Authenticated but not authorized (maps to S3 AccessDenied / HTTP 403). */
+    record AccessDeniedResponse(String message) implements Message {
+        public Opcode opcode() {
+            return Opcode.RESPONSE_ACCESS_DENIED;
+        }
+    }
+
     // ---- SASL authentication (see protocol.auth) ---------------------------------------------
 
     /** Selects the SASL mechanism for this connection. Must be the first request when the server

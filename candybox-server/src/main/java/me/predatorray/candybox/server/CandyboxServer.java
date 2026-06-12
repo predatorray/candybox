@@ -23,6 +23,7 @@ import me.predatorray.candybox.bookkeeper.bk.BookKeeperLedgerStore;
 import me.predatorray.candybox.common.SystemClock;
 import me.predatorray.candybox.common.auth.AuthenticationProviders;
 import me.predatorray.candybox.common.auth.FileCredentialStore;
+import me.predatorray.candybox.common.auth.StandardAuthorizer;
 import me.predatorray.candybox.common.config.SecurityConfig;
 import me.predatorray.candybox.coordination.CoordinationService;
 import me.predatorray.candybox.coordination.zk.ZooKeeperCoordinationService;
@@ -85,6 +86,8 @@ public final class CandyboxServer {
                 SystemClock.INSTANCE, config.advertisedAddress());
         RequestHandler handler = node.requestHandler();
         if (security.authEnabled()) {
+            node.authorizer(new StandardAuthorizer(security.superUsers(),
+                    box -> node.aclStore().get(box)));
             handler = new AuthenticatingRequestHandler(handler,
                     AuthenticationProviders.forMechanisms(security.saslMechanisms()),
                     new FileCredentialStore(security.credentialsFile()), security.authRequired());

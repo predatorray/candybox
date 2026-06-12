@@ -21,6 +21,11 @@ import java.util.List;
 import java.util.Optional;
 import me.predatorray.candybox.common.BoxName;
 import me.predatorray.candybox.common.CandyKey;
+import me.predatorray.candybox.common.auth.BoxAcl;
+import me.predatorray.candybox.common.auth.Grant;
+import me.predatorray.candybox.common.auth.Operation;
+import me.predatorray.candybox.common.auth.Principal;
+import me.predatorray.candybox.common.auth.Resource;
 import me.predatorray.candybox.common.exception.BoxNotFoundException;
 import me.predatorray.candybox.common.exception.BusyException;
 import me.predatorray.candybox.common.exception.CandyNotFoundException;
@@ -38,6 +43,7 @@ import me.predatorray.candybox.lsm.manifest.MultipartUploadState;
 import me.predatorray.candybox.protocol.Frame;
 import me.predatorray.candybox.protocol.Message;
 import me.predatorray.candybox.protocol.MessageCodec;
+import me.predatorray.candybox.protocol.transport.ConnectionContext;
 import me.predatorray.candybox.protocol.transport.RequestHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -65,14 +71,27 @@ final class NodeRequestHandler implements RequestHandler {
 
     @Override
     public Frame handle(Frame request) {
+        return handle(new ConnectionContext(), request);
+    }
+
+    @Override
+    public Frame handle(ConnectionContext context, Frame request) {
         Message message;
         try {
             message = codec.decode(request);
         } catch (RuntimeException e) {
             return codec.encode(new Message.ErrorResponse("ProtocolError", safe(e.getMessage())));
         }
+        Principal principal = context.principalOrAnonymous();
         try {
-            return codec.encode(dispatch(message));
+            Access access = requiredAccess(message);
+            if (access != null
+                    && !node.authorizer().authorize(principal, access.operation(), access.resource())) {
+                return codec.encode(new Message.AccessDeniedResponse(
+                        principal + " is not allowed " + access.operation() + " on "
+                                + access.resource()));
+            }
+            return codec.encode(dispatch(message, principal));
         } catch (BusyException e) {
             return codec.encode(new Message.BusyResponse(100));
         } catch (CandyNotFoundException e) {
@@ -86,6 +105,45 @@ final class NodeRequestHandler implements RequestHandler {
             LOG.warn("Unexpected error handling request", e);
             return codec.encode(new Message.ErrorResponse("InternalError", safe(e.getMessage())));
         }
+    }
+
+    /** What a request needs the caller to be allowed to do, or {@code null} for SASL frames. */
+    private record Access(Operation operation, Resource resource) {
+    }
+
+    private static Access requiredAccess(Message message) {
+        // Cluster-level requests first; everything Box-scoped derives from boxOf().
+        if (message instanceof Message.CreateBoxRequest) {
+            return new Access(Operation.WRITE, Resource.CLUSTER);
+        }
+        if (message instanceof Message.ListBoxesRequest) {
+            return new Access(Operation.READ, Resource.CLUSTER);
+        }
+        if (message instanceof Message.DeleteBoxRequest m) {
+            return new Access(Operation.ADMIN, Resource.box(m.box()));
+        }
+        if (message instanceof Message.GetBoxAclRequest m) {
+            return new Access(Operation.READ_ACP, Resource.box(m.box()));
+        }
+        if (message instanceof Message.SetBoxAclRequest m) {
+            return new Access(Operation.WRITE_ACP, Resource.box(m.box()));
+        }
+        if (message instanceof Message.HeadBoxRequest m) {
+            return new Access(Operation.READ, Resource.box(m.box()));
+        }
+        if (message instanceof Message.BoxInfoRequest m) {
+            return new Access(Operation.READ, Resource.box(m.box()));
+        }
+        String box = boxOf(message);
+        if (box == null) {
+            return null; // SASL frames are consumed by the authentication gate before this handler
+        }
+        Operation operation = switch (message.opcode()) {
+            case GET_CANDY, RANGE_GET_CANDY, HEAD_CANDY, LIST_CANDIES, LIST_MULTIPART_UPLOADS,
+                    LIST_PARTS -> Operation.READ;
+            default -> Operation.WRITE;
+        };
+        return new Access(operation, Resource.box(box));
     }
 
     private Message movedOrNotFound(Message message, RuntimeException cause) {
@@ -208,9 +266,35 @@ final class NodeRequestHandler implements RequestHandler {
         return null;
     }
 
-    private Message dispatch(Message message) {
+    private Message dispatch(Message message, Principal principal) {
         if (message instanceof Message.CreateBoxRequest m) {
             node.createBox(BoxName.of(m.box()), m.partitionCount());
+            // The creator owns the Box (private by default). An anonymous create (auth disabled)
+            // seeds nothing: a Box with no ACL falls back to authenticated-full-access.
+            if (!principal.isAnonymous()) {
+                node.aclStore().seed(m.box(), BoxAcl.privateTo(principal));
+            }
+            return new Message.OkResponse();
+        } else if (message instanceof Message.GetBoxAclRequest m) {
+            if (!node.boxExists(BoxName.of(m.box()))) {
+                return new Message.NotFoundResponse();
+            }
+            return node.aclStore().get(m.box())
+                    .<Message>map(acl -> new Message.BoxAclResponse(acl.owner().toString(),
+                            acl.grants().stream().map(Grant::toText).toList()))
+                    .orElseGet(Message.NotFoundResponse::new);
+        } else if (message instanceof Message.SetBoxAclRequest m) {
+            if (!node.boxExists(BoxName.of(m.box()))) {
+                return new Message.NotFoundResponse();
+            }
+            BoxAcl acl;
+            try {
+                acl = new BoxAcl(Principal.parse(m.owner()),
+                        m.grants().stream().map(Grant::parse).toList());
+            } catch (IllegalArgumentException e) {
+                throw new ValidationException("Invalid ACL: " + e.getMessage());
+            }
+            node.aclStore().set(m.box(), acl);
             return new Message.OkResponse();
         } else if (message instanceof Message.BoxInfoRequest m) {
             BoxName box = BoxName.of(m.box());
@@ -285,7 +369,12 @@ final class NodeRequestHandler implements RequestHandler {
             }
             return new Message.ListCandiesResponse(entries, result.nextStartAfter());
         } else if (message instanceof Message.ListBoxesRequest) {
-            return new Message.ListBoxesResponse(node.listBoxes());
+            // Box names are only revealed to principals allowed to READ them.
+            List<String> visible = node.listBoxes().stream()
+                    .filter(box -> node.authorizer().authorize(principal, Operation.READ,
+                            Resource.box(box)))
+                    .toList();
+            return new Message.ListBoxesResponse(visible);
         } else if (message instanceof Message.HeadBoxRequest m) {
             return node.boxExists(BoxName.of(m.box()))
                     ? new Message.OkResponse()

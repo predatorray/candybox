@@ -194,6 +194,23 @@ public final class MessageCodec {
             for (String box : m.boxes()) {
                 w.writeString(box);
             }
+        } else if (message instanceof Message.GetBoxAclRequest m) {
+            w.writeString(m.box());
+        } else if (message instanceof Message.SetBoxAclRequest m) {
+            w.writeString(m.box());
+            w.writeString(m.owner());
+            w.writeVarInt(m.grants().size());
+            for (String grant : m.grants()) {
+                w.writeString(grant);
+            }
+        } else if (message instanceof Message.BoxAclResponse m) {
+            w.writeString(m.owner());
+            w.writeVarInt(m.grants().size());
+            for (String grant : m.grants()) {
+                w.writeString(grant);
+            }
+        } else if (message instanceof Message.AccessDeniedResponse m) {
+            w.writeString(m.message());
         } else if (message instanceof Message.SaslHandshakeRequest m) {
             w.writeString(m.mechanism());
         } else if (message instanceof Message.SaslHandshakeResponse m) {
@@ -272,6 +289,17 @@ public final class MessageCodec {
             case RESPONSE_MOVED -> new Message.MovedResponse(r.readInt());
             case RESPONSE_BOX_INFO -> new Message.BoxInfoResponse(r.readVarInt());
             case RESPONSE_BOX_LIST -> decodeBoxList(r);
+            case GET_BOX_ACL -> new Message.GetBoxAclRequest(r.readString());
+            case SET_BOX_ACL -> {
+                String box = r.readString();
+                String owner = r.readString();
+                yield new Message.SetBoxAclRequest(box, owner, readStrings(r));
+            }
+            case RESPONSE_BOX_ACL -> {
+                String owner = r.readString();
+                yield new Message.BoxAclResponse(owner, readStrings(r));
+            }
+            case RESPONSE_ACCESS_DENIED -> new Message.AccessDeniedResponse(r.readString());
             case SASL_HANDSHAKE -> new Message.SaslHandshakeRequest(r.readString());
             case RESPONSE_SASL_HANDSHAKE -> decodeSaslHandshakeResponse(r);
             case SASL_AUTHENTICATE -> new Message.SaslAuthenticateRequest(r.readBytes());
@@ -283,12 +311,16 @@ public final class MessageCodec {
 
     private static Message decodeSaslHandshakeResponse(BinaryReader r) {
         boolean ok = r.readBoolean();
+        return new Message.SaslHandshakeResponse(ok, readStrings(r));
+    }
+
+    private static List<String> readStrings(BinaryReader r) {
         int count = r.readVarInt();
-        List<String> mechanisms = new ArrayList<>(count);
+        List<String> strings = new ArrayList<>(count);
         for (int i = 0; i < count; i++) {
-            mechanisms.add(r.readString());
+            strings.add(r.readString());
         }
-        return new Message.SaslHandshakeResponse(ok, mechanisms);
+        return strings;
     }
 
     private static Message decodeBoxList(BinaryReader r) {

@@ -26,7 +26,10 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import javax.net.ssl.SSLContext;
+import me.predatorray.candybox.common.auth.BoxAcl;
+import me.predatorray.candybox.common.auth.Grant;
 import me.predatorray.candybox.common.auth.Passwords;
+import me.predatorray.candybox.common.auth.Principal;
 import me.predatorray.candybox.common.auth.ScramCredential;
 import me.predatorray.candybox.common.exception.CandyboxException;
 import me.predatorray.candybox.common.tls.PemTls;
@@ -240,6 +243,9 @@ public final class CandyboxCli {
                 out.println(exists ? "exists" : "absent");
                 return exists ? 0 : 1;
             }
+            case "acl" -> {
+                return acl(args, client, out, err);
+            }
             case "put" -> {
                 return put(args, client, err);
             }
@@ -397,6 +403,70 @@ public final class CandyboxCli {
         return value;
     }
 
+    /**
+     * {@code acl get <box>} prints the document; {@code acl set <box> <owner> [grant...]} replaces
+     * it ({@code grant} = {@code <grantee>:<OP[+OP...]>}, e.g. {@code AllUsers:READ});
+     * {@code acl grant <box> <grant>} / {@code acl revoke <box> <grantee>} edit incrementally.
+     */
+    private static int acl(List<String> args, CandyboxClient client, PrintStream out,
+                           PrintStream err) {
+        if (args.isEmpty()) {
+            err.println("usage: candybox acl get|set|grant|revoke <box> ...");
+            return 2;
+        }
+        String sub = args.remove(0);
+        String box = requireArg(args, 0, "box");
+        args.remove(0);
+        switch (sub) {
+            case "get" -> {
+                java.util.Optional<BoxAcl> acl = client.getBoxAcl(box);
+                if (acl.isEmpty()) {
+                    out.println("# no ACL document (any authenticated principal has full access)");
+                    return 0;
+                }
+                out.println("owner=" + acl.get().owner());
+                for (Grant grant : acl.get().grants()) {
+                    out.println("grant=" + grant.toText());
+                }
+                return 0;
+            }
+            case "set" -> {
+                String owner = requireArg(args, 0, "owner");
+                args.remove(0);
+                List<Grant> grants = args.stream().map(Grant::parse).toList();
+                client.setBoxAcl(box, new BoxAcl(Principal.parse(owner), grants));
+                return 0;
+            }
+            case "grant" -> {
+                Grant grant = Grant.parse(requireArg(args, 0, "grant (<grantee>:<OP[+OP...]>)"));
+                BoxAcl current = client.getBoxAcl(box).orElseThrow(() -> new IllegalArgumentException(
+                        "Box " + box + " has no ACL document yet; set one first: "
+                                + "candybox acl set " + box + " <owner> [grant...]"));
+                List<Grant> grants = new ArrayList<>(current.grants());
+                grants.removeIf(g -> g.grantee().equals(grant.grantee()));
+                grants.add(grant);
+                client.setBoxAcl(box, new BoxAcl(current.owner(), grants));
+                return 0;
+            }
+            case "revoke" -> {
+                String grantee = requireArg(args, 0, "grantee");
+                BoxAcl current = client.getBoxAcl(box).orElseThrow(() -> new IllegalArgumentException(
+                        "Box " + box + " has no ACL document"));
+                List<Grant> grants = new ArrayList<>(current.grants());
+                if (!grants.removeIf(g -> g.grantee().equals(grantee))) {
+                    err.println("No grant for " + grantee);
+                    return 1;
+                }
+                client.setBoxAcl(box, new BoxAcl(current.owner(), grants));
+                return 0;
+            }
+            default -> {
+                err.println("Unknown acl subcommand: " + sub);
+                return 2;
+            }
+        }
+    }
+
     private static String firstNonBlank(String a, String b) {
         return (a != null && !a.isBlank()) ? a : b;
     }
@@ -423,6 +493,10 @@ public final class CandyboxCli {
                   delete-range <box> [prefix] [--start K] [--end K]   single range tombstone
                   list         <box> [prefix] [--max N] [--start-after K] [--start K] [--end K] [--reverse]
                   make-credentials <username> [--password P]   print credential-file lines (or pipe stdin)
+                  acl get <box>                                print the Box ACL document
+                  acl set <box> <owner> [grant...]             replace it (grant = grantee:OP[+OP...])
+                  acl grant <box> <grantee>:<OP[+OP...]>       add/replace one grant
+                  acl revoke <box> <grantee>                   remove one grantee's grant
 
                 Security (flags override the matching environment variables):
                   -u/--user U --password P | --password-file F   SASL login (CANDYBOX_AUTH_USERNAME/_PASSWORD)
