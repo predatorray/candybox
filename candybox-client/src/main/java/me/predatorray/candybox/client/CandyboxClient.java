@@ -31,6 +31,10 @@ import me.predatorray.candybox.common.SystemClock;
 import me.predatorray.candybox.common.Validation;
 import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.config.SizeLimits;
+import me.predatorray.candybox.common.auth.BoxAcl;
+import me.predatorray.candybox.common.auth.Grant;
+import me.predatorray.candybox.common.auth.Principal;
+import me.predatorray.candybox.common.exception.AccessDeniedException;
 import me.predatorray.candybox.common.exception.AuthenticationException;
 import me.predatorray.candybox.common.exception.BoxNotFoundException;
 import me.predatorray.candybox.common.exception.BusyException;
@@ -217,6 +221,33 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
             return false;
         }
         throw mapResponse(response);
+    }
+
+    /**
+     * The Box's ACL document, or empty when the Box predates authorization (no document: any
+     * authenticated principal has full access).
+     *
+     * @throws me.predatorray.candybox.common.exception.BoxNotFoundException if the Box is absent
+     */
+    public java.util.Optional<BoxAcl> getBoxAcl(String box) {
+        Message response = router.callAny(new Message.GetBoxAclRequest(BoxName.of(box).value()));
+        if (response instanceof Message.BoxAclResponse acl) {
+            return java.util.Optional.of(new BoxAcl(Principal.parse(acl.owner()),
+                    acl.grants().stream().map(Grant::parse).toList()));
+        }
+        if (response instanceof Message.NotFoundResponse) {
+            if (!headBox(box)) {
+                throw new BoxNotFoundException(box);
+            }
+            return java.util.Optional.empty();
+        }
+        throw mapResponse(response);
+    }
+
+    /** Replaces the Box's ACL document (owner + grants). Requires WRITE_ACP on the Box. */
+    public void setBoxAcl(String box, BoxAcl acl) {
+        expectOk(router.callAny(new Message.SetBoxAclRequest(BoxName.of(box).value(),
+                acl.owner().toString(), acl.grants().stream().map(Grant::toText).toList())));
     }
 
     public void deleteCandy(String box, String key) {
@@ -495,6 +526,9 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
         }
         if (response instanceof Message.AuthFailedResponse failed) {
             return new AuthenticationException(failed.message());
+        }
+        if (response instanceof Message.AccessDeniedResponse denied) {
+            return new AccessDeniedException(denied.message());
         }
         if (response instanceof Message.ErrorResponse err) {
             return new CandyboxException(err.errorType() + ": " + err.message());

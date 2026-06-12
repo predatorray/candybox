@@ -42,6 +42,8 @@ public enum Opcode {
     LIST_PARTS(34),
     UPLOAD_PART_COPY(35),
     BOX_INFO(36),
+    GET_BOX_ACL(37),
+    SET_BOX_ACL(38),
 
     /** Selects the SASL mechanism for this connection; must precede {@link #SASL_AUTHENTICATE}. */
     SASL_HANDSHAKE(50),
@@ -70,7 +72,10 @@ public enum Opcode {
      */
     RESPONSE_AUTH_FAILED(52),
     RESPONSE_SASL_HANDSHAKE(53),
-    RESPONSE_SASL_AUTHENTICATE(54);
+    RESPONSE_SASL_AUTHENTICATE(54),
+    /** Authenticated but not authorized for the operation (S3 AccessDenied / HTTP 403). */
+    RESPONSE_ACCESS_DENIED(55),
+    RESPONSE_BOX_ACL(56);
 
     private final int code;
 

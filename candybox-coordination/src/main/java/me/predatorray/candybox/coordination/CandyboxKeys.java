@@ -48,4 +48,9 @@ public final class CandyboxKeys {
     public static String manifestKey(String boxName, int partition) {
         return BOXES_ROOT + "/" + boxName + "/partitions/" + partition + "/manifest";
     }
+
+    /** The versioned key holding a Box's ACL document (owner + grants). */
+    public static String boxAclKey(String boxName) {
+        return "acls/" + boxName;
+    }
 }

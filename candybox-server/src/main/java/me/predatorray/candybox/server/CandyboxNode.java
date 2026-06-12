@@ -28,6 +28,7 @@ import me.predatorray.candybox.bookkeeper.LedgerStore;
 import me.predatorray.candybox.common.BoxName;
 import me.predatorray.candybox.common.Clock;
 import me.predatorray.candybox.common.SystemClock;
+import me.predatorray.candybox.common.auth.Authorizer;
 import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.exception.BoxAlreadyExistsException;
 import me.predatorray.candybox.common.exception.BoxNotEmptyException;
@@ -63,6 +64,8 @@ public final class CandyboxNode implements AutoCloseable {
     private final LedgerStore ledgerStore;
     private final CoordinationService coordination;
     private final Clock clock;
+    private final BoxAclStore aclStore;
+    private volatile Authorizer authorizer = Authorizer.ALLOW_ALL;
     private final ConcurrentMap<BoxPartition, PartitionOwnership> partitions =
             new ConcurrentHashMap<>();
     private final ConcurrentMap<String, BoxDescriptor> descriptorCache = new ConcurrentHashMap<>();
@@ -97,6 +100,7 @@ public final class CandyboxNode implements AutoCloseable {
         this.ledgerStore = ledgerStore;
         this.coordination = coordination;
         this.clock = clock;
+        this.aclStore = new BoxAclStore(coordination, clock);
         coordination.registerMember(nodeId, advertisedAddress.getBytes(StandardCharsets.UTF_8));
         this.compactionService = new CompactionService(ledgerStore, config, clock);
         this.garbageCollector = new GarbageCollector(ledgerStore, config.ledgerGcGraceMillis(), clock);
@@ -150,6 +154,22 @@ public final class CandyboxNode implements AutoCloseable {
 
     public int nodeId() {
         return nodeId;
+    }
+
+    /**
+     * Installs the {@link Authorizer} consulted on every request (default {@code ALLOW_ALL} when
+     * authentication is disabled). The composition root calls this before serving traffic.
+     */
+    public void authorizer(Authorizer authorizer) {
+        this.authorizer = authorizer;
+    }
+
+    Authorizer authorizer() {
+        return authorizer;
+    }
+
+    BoxAclStore aclStore() {
+        return aclStore;
     }
 
     /** Creates a Box with the configured default partition count and owns all partitions here. */
@@ -277,6 +297,7 @@ public final class CandyboxNode implements AutoCloseable {
         }
         descriptorCache.remove(box.value());
         deleteMetaQuietly(box);
+        aclStore.delete(box.value());
         // TODO(phase-3): reference-counted GC of the Box's SSTable/Syrup/WAL/manifest ledgers.
     }
 
