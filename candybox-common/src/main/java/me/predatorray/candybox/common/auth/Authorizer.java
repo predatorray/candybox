@@ -24,7 +24,25 @@ package me.predatorray.candybox.common.auth;
 public interface Authorizer {
 
     /** Permits everything — the behavior when authentication/authorization is disabled. */
-    Authorizer ALLOW_ALL = (principal, operation, resource) -> true;
+    Authorizer ALLOW_ALL = new Authorizer() {
+        @Override
+        public boolean authorize(Principal principal, Operation operation, Resource resource) {
+            return true;
+        }
+
+        @Override
+        public boolean isSuperUser(Principal principal) {
+            return true; // with authorization off, owner overrides are trusted from anyone
+        }
+    };
 
     boolean authorize(Principal principal, Operation operation, Resource resource);
+
+    /**
+     * Whether {@code principal} bypasses ACLs entirely. Super-principals (the S3 gateway, ops
+     * tooling) may also stamp object <em>ownership</em> on behalf of their authenticated end users.
+     */
+    default boolean isSuperUser(Principal principal) {
+        return false;
+    }
 }

@@ -38,6 +38,7 @@ import me.predatorray.candybox.common.BoxName;
 import me.predatorray.candybox.common.CandyKey;
 import me.predatorray.candybox.common.CandyLocator;
 import me.predatorray.candybox.common.Clock;
+import me.predatorray.candybox.common.auth.ObjectAcl;
 import me.predatorray.candybox.common.Hlc;
 import me.predatorray.candybox.common.HybridLogicalClock;
 import me.predatorray.candybox.common.LocatorType;
@@ -248,6 +249,16 @@ public final class BoxEngine implements AutoCloseable {
      */
     public CandyMetadata putCandy(CandyKey key, InputStream data, String contentType,
                                   Map<String, String> userMetadata, String idempotencyToken) {
+        return putCandy(key, data, contentType, userMetadata, idempotencyToken, ObjectAcl.NONE);
+    }
+
+    /**
+     * {@link #putCandy(CandyKey, InputStream, String, Map, String)} stamping the object's owner and
+     * ACL grants into the locator (format v3). Pass {@link ObjectAcl#NONE} for unowned writes.
+     */
+    public CandyMetadata putCandy(CandyKey key, InputStream data, String contentType,
+                                  Map<String, String> userMetadata, String idempotencyToken,
+                                  ObjectAcl acl) {
         Validation.checkCandyKey(key, config.sizeLimits());
         Validation.checkUserMetadata(userMetadata, config.sizeLimits());
         if (idempotencyToken != null) {
@@ -267,7 +278,7 @@ public final class BoxEngine implements AutoCloseable {
             Hlc stamp = hlc.tick();
             CandyLocator locator = CandyLocator.singlePart(stamp, written.contentLength(),
                     config.sizeLimits().chunkSizeBytes(), contentType, metadata, written.crc32c(),
-                    clock.currentTimeMillis(), written.segments());
+                    clock.currentTimeMillis(), written.segments(), acl);
             Mutation mutation = new Mutation(key, locator);
             wal.append(mutation);
             active.put(mutation);
@@ -440,6 +451,12 @@ public final class BoxEngine implements AutoCloseable {
      */
     public CandyMetadata completeMultipartUpload(String uploadId, java.util.List<PartCompletion> expectedParts,
                                                  String idempotencyToken) {
+        return completeMultipartUpload(uploadId, expectedParts, idempotencyToken, ObjectAcl.NONE);
+    }
+
+    /** {@link #completeMultipartUpload(String, java.util.List, String)} stamping owner/grants. */
+    public CandyMetadata completeMultipartUpload(String uploadId, java.util.List<PartCompletion> expectedParts,
+                                                 String idempotencyToken, ObjectAcl acl) {
         if (uploadId == null || uploadId.isEmpty()) {
             throw new ValidationException("uploadId is required");
         }
@@ -487,7 +504,7 @@ public final class BoxEngine implements AutoCloseable {
             Hlc stamp = hlc.tick();
             CandyKey targetKey = CandyKey.of(upload.key());
             CandyLocator locator = new CandyLocator(stamp, LocatorType.PUT, upload.contentType(),
-                    upload.userMetadata(), clock.currentTimeMillis(), ordered);
+                    upload.userMetadata(), clock.currentTimeMillis(), ordered, acl);
             Mutation mutation = new Mutation(targetKey, locator);
             // Validate that the assembled locator stays within the configured cap before we write
             // anything irrevocable. (Re-serialized by SSTableWriter later anyway.)
@@ -611,7 +628,17 @@ public final class BoxEngine implements AutoCloseable {
      * @throws CandyNotFoundException if there is no live Candy at {@code src}
      */
     public CandyMetadata copyCandy(CandyKey src, CandyKey dst, String idempotencyToken) {
-        return copyOrRename(src, dst, idempotencyToken, false);
+        return copyCandy(src, dst, idempotencyToken, ObjectAcl.NONE);
+    }
+
+    /**
+     * {@link #copyCandy(CandyKey, CandyKey, String)} stamping the destination's owner/grants. Per
+     * S3 CopyObject semantics the destination does <em>not</em> inherit the source's ACL — the
+     * requester owns the copy (the caller passes that identity here).
+     */
+    public CandyMetadata copyCandy(CandyKey src, CandyKey dst, String idempotencyToken,
+                                   ObjectAcl dstAcl) {
+        return copyOrRename(src, dst, idempotencyToken, false, dstAcl);
     }
 
     /**
@@ -622,11 +649,13 @@ public final class BoxEngine implements AutoCloseable {
      * @throws CandyNotFoundException if there is no live Candy at {@code src}
      */
     public CandyMetadata renameCandy(CandyKey src, CandyKey dst, String idempotencyToken) {
-        return copyOrRename(src, dst, idempotencyToken, true);
+        // A rename is a move: the object keeps its identity, so owner + grants travel with it.
+        return copyOrRename(src, dst, idempotencyToken, true, null);
     }
 
+    /** {@code dstAcl == null} ⇒ keep the source's owner/grants (rename); else stamp it (copy). */
     private CandyMetadata copyOrRename(CandyKey src, CandyKey dst, String idempotencyToken,
-                                       boolean tombstoneSource) {
+                                       boolean tombstoneSource, ObjectAcl dstAcl) {
         Validation.checkCandyKey(src, config.sizeLimits());
         Validation.checkCandyKey(dst, config.sizeLimits());
         if (src.equals(dst)) {
@@ -649,7 +678,8 @@ public final class BoxEngine implements AutoCloseable {
             // copy with identical Syrup references.
             Hlc stamp = hlc.tick();
             CandyLocator dstLocator = new CandyLocator(stamp, LocatorType.PUT, source.contentType(),
-                    source.userMetadata(), clock.currentTimeMillis(), source.parts());
+                    source.userMetadata(), clock.currentTimeMillis(), source.parts(),
+                    dstAcl == null ? source.acl() : dstAcl);
             Mutation dstMutation = new Mutation(dst, dstLocator);
             wal.append(dstMutation);
 
@@ -716,6 +746,46 @@ public final class BoxEngine implements AutoCloseable {
         CandyKey start = CandyKey.of(prefix);
         byte[] successor = me.predatorray.candybox.common.util.Bytes.prefixSuccessor(start.utf8Bytes());
         deleteRange(start, successor == null ? null : CandyKey.ofUtf8(successor));
+    }
+
+    // ---- object ACLs -------------------------------------------------------------------------
+
+    /**
+     * The live Candy's owner + grants (possibly {@link ObjectAcl#NONE} for pre-auth objects).
+     *
+     * @throws CandyNotFoundException if there is no live Candy at {@code key}
+     */
+    public ObjectAcl getCandyAcl(CandyKey key) {
+        CandyLocator locator = resolveLive(key)
+                .orElseThrow(() -> new CandyNotFoundException(box.value(), key.value()));
+        return locator.acl();
+    }
+
+    /**
+     * Replaces the live Candy's owner/grants with a metadata-only locator rewrite: the new locator
+     * reuses the parts verbatim (the zero-copy trick), gets a fresh HLC, and goes through the normal
+     * WAL + memtable path — so it is fenced, durable, and replayed on handover like any write. The
+     * shadowed locator shares the same segments, so GC's reference counting is undisturbed.
+     *
+     * @throws CandyNotFoundException if there is no live Candy at {@code key}
+     */
+    public CandyMetadata setCandyAcl(CandyKey key, ObjectAcl acl) {
+        Validation.checkCandyKey(key, config.sizeLimits());
+        lock.writeLock().lock();
+        try {
+            rejectIfStalled();
+            CandyLocator current = resolveLiveLocked(key)
+                    .orElseThrow(() -> new CandyNotFoundException(box.value(), key.value()));
+            CandyLocator updated = current.withAcl(hlc.tick(), acl);
+            Mutation mutation = new Mutation(key, updated);
+            wal.append(mutation);
+            active.put(mutation);
+            maybeFlushLocked();
+            putCount.incrementAndGet();
+            return CandyMetadata.from(updated);
+        } finally {
+            lock.writeLock().unlock();
+        }
     }
 
     // ---- reads -----------------------------------------------------------------------------

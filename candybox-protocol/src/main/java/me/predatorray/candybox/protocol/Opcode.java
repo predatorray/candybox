@@ -44,6 +44,9 @@ public enum Opcode {
     BOX_INFO(36),
     GET_BOX_ACL(37),
     SET_BOX_ACL(38),
+    GET_CANDY_ACL(39),
+    /** Metadata-only locator rewrite replacing one object's owner/grants. */
+    SET_CANDY_ACL(45),
 
     /** Selects the SASL mechanism for this connection; must precede {@link #SASL_AUTHENTICATE}. */
     SASL_HANDSHAKE(50),
@@ -75,7 +78,8 @@ public enum Opcode {
     RESPONSE_SASL_AUTHENTICATE(54),
     /** Authenticated but not authorized for the operation (S3 AccessDenied / HTTP 403). */
     RESPONSE_ACCESS_DENIED(55),
-    RESPONSE_BOX_ACL(56);
+    RESPONSE_BOX_ACL(56),
+    RESPONSE_CANDY_ACL(57);
 
     private final int code;
 

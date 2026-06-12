@@ -21,6 +21,8 @@ import java.util.List;
 import java.util.Map;
 import me.predatorray.candybox.common.CandyLocator;
 import me.predatorray.candybox.common.Hlc;
+import me.predatorray.candybox.common.auth.Grant;
+import me.predatorray.candybox.common.auth.ObjectAcl;
 import me.predatorray.candybox.common.LocatorType;
 import me.predatorray.candybox.common.Part;
 import me.predatorray.candybox.common.SegmentRef;
@@ -29,11 +31,11 @@ import me.predatorray.candybox.common.exception.LimitExceededException;
 import me.predatorray.candybox.common.exception.SerializationException;
 
 /**
- * Versioned binary codec for {@link CandyLocator}. <b>v2 layout</b> (big-endian; varints where
- * noted):
+ * Versioned binary codec for {@link CandyLocator}. <b>v3 layout</b> (big-endian; varints where
+ * noted) — v3 appends the object's owner principal and ACL grants after the part list:
  *
  * <pre>
- *   byte    formatVersion (= 2)
+ *   byte    formatVersion (= 3)
  *   byte    locator type code (PUT=1, DELETE=2)
  *   long    hlc.physicalMillis
  *   varint  hlc.logicalCounter
@@ -47,6 +49,8 @@ import me.predatorray.candybox.common.exception.SerializationException;
  *       varint  chunkSize
  *       int     crc32c
  *       varint  segment count         [+ {varlong syrupId, varlong firstEntryId, varlong lastEntryId}]
+ *   byte    owner present?            [+ string "Type:name"]
+ *   varint  grant count               [+ string "grantee:OP[+OP...]"]
  * </pre>
  *
  * <p>A {@code DELETE} tombstone serializes with {@code part count = 0}. A v1 single-part Candy is the
@@ -57,7 +61,7 @@ import me.predatorray.candybox.common.exception.SerializationException;
  */
 public final class CandyLocatorSerializer {
 
-    public static final byte FORMAT_VERSION = 2;
+    public static final byte FORMAT_VERSION = 3;
 
     private CandyLocatorSerializer() {
     }
@@ -105,6 +109,18 @@ public final class CandyLocatorSerializer {
             }
         }
 
+        ObjectAcl acl = locator.acl();
+        if (acl.owner() == null) {
+            w.writeBoolean(false);
+        } else {
+            w.writeBoolean(true);
+            w.writeString(acl.owner());
+        }
+        w.writeVarInt(acl.grants().size());
+        for (Grant grant : acl.grants()) {
+            w.writeString(grant.toText());
+        }
+
         byte[] out = w.toByteArray();
         if (out.length > maxLocatorBytes) {
             throw new LimitExceededException("Serialized CandyLocator is " + out.length
@@ -150,6 +166,14 @@ public final class CandyLocatorSerializer {
             parts.add(new Part(partLength, chunkSize, crc32c, segments));
         }
 
-        return new CandyLocator(hlc, type, contentType, md, createdAtMillis, parts);
+        String owner = r.readBoolean() ? r.readString() : null;
+        int grantCount = r.readVarInt();
+        List<Grant> grants = new ArrayList<>(grantCount);
+        for (int i = 0; i < grantCount; i++) {
+            grants.add(Grant.parse(r.readString()));
+        }
+
+        return new CandyLocator(hlc, type, contentType, md, createdAtMillis, parts,
+                new ObjectAcl(owner, grants));
     }
 }

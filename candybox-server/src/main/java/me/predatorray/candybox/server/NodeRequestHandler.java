@@ -23,6 +23,7 @@ import me.predatorray.candybox.common.BoxName;
 import me.predatorray.candybox.common.CandyKey;
 import me.predatorray.candybox.common.auth.BoxAcl;
 import me.predatorray.candybox.common.auth.Grant;
+import me.predatorray.candybox.common.auth.ObjectAcl;
 import me.predatorray.candybox.common.auth.Operation;
 import me.predatorray.candybox.common.auth.Principal;
 import me.predatorray.candybox.common.auth.Resource;
@@ -86,7 +87,8 @@ final class NodeRequestHandler implements RequestHandler {
         try {
             Access access = requiredAccess(message);
             if (access != null
-                    && !node.authorizer().authorize(principal, access.operation(), access.resource())) {
+                    && !node.authorizer().authorize(principal, access.operation(), access.resource())
+                    && !objectGrantPermits(message, principal, access.operation())) {
                 return codec.encode(new Message.AccessDeniedResponse(
                         principal + " is not allowed " + access.operation() + " on "
                                 + access.resource()));
@@ -111,6 +113,31 @@ final class NodeRequestHandler implements RequestHandler {
     private record Access(Operation operation, Resource resource) {
     }
 
+    /**
+     * The S3 union rule: a READ / READ_ACP / WRITE_ACP the Box ACL denies is still allowed when the
+     * <em>object's own</em> grants (locator v3) permit it. Only single-object read-side requests
+     * qualify; resolution failures (no such object, partition moved) deny rather than leak
+     * existence — the box-level outcome stands.
+     */
+    private boolean objectGrantPermits(Message message, Principal principal, Operation operation) {
+        String box = boxOf(message);
+        String key = switch (message.opcode()) {
+            case GET_CANDY, RANGE_GET_CANDY, HEAD_CANDY -> routingKeyOf(message);
+            case GET_CANDY_ACL -> ((Message.GetCandyAclRequest) message).key();
+            case SET_CANDY_ACL -> ((Message.SetCandyAclRequest) message).key();
+            default -> null;
+        };
+        if (box == null || key == null) {
+            return false;
+        }
+        try {
+            ObjectAcl acl = node.engine(BoxName.of(box), key).getCandyAcl(CandyKey.of(key));
+            return acl.permits(principal, operation);
+        } catch (CandyboxException | IllegalArgumentException resolveFailed) {
+            return false;
+        }
+    }
+
     private static Access requiredAccess(Message message) {
         // Cluster-level requests first; everything Box-scoped derives from boxOf().
         if (message instanceof Message.CreateBoxRequest) {
@@ -126,6 +153,12 @@ final class NodeRequestHandler implements RequestHandler {
             return new Access(Operation.READ_ACP, Resource.box(m.box()));
         }
         if (message instanceof Message.SetBoxAclRequest m) {
+            return new Access(Operation.WRITE_ACP, Resource.box(m.box()));
+        }
+        if (message instanceof Message.GetCandyAclRequest m) {
+            return new Access(Operation.READ_ACP, Resource.box(m.box()));
+        }
+        if (message instanceof Message.SetCandyAclRequest m) {
             return new Access(Operation.WRITE_ACP, Resource.box(m.box()));
         }
         if (message instanceof Message.HeadBoxRequest m) {
@@ -197,6 +230,10 @@ final class NodeRequestHandler implements RequestHandler {
             return m.box();
         } else if (message instanceof Message.UploadPartCopyRequest m) {
             return m.box();
+        } else if (message instanceof Message.GetCandyAclRequest m) {
+            return m.box();
+        } else if (message instanceof Message.SetCandyAclRequest m) {
+            return m.box();
         }
         return null;
     }
@@ -262,6 +299,10 @@ final class NodeRequestHandler implements RequestHandler {
             return m.key();
         } else if (message instanceof Message.UploadPartCopyRequest m) {
             return m.key();
+        } else if (message instanceof Message.GetCandyAclRequest m) {
+            return m.key();
+        } else if (message instanceof Message.SetCandyAclRequest m) {
+            return m.key();
         }
         return null;
     }
@@ -307,8 +348,10 @@ final class NodeRequestHandler implements RequestHandler {
             return new Message.OkResponse();
         } else if (message instanceof Message.PutCandyRequest m) {
             BoxEngine engine = node.engine(BoxName.of(m.box()), m.key());
-            engine.putCandy(CandyKey.of(m.key()), m.data(), m.contentType(), m.userMetadata(),
-                    m.idempotencyToken());
+            engine.putCandy(CandyKey.of(m.key()),
+                    new java.io.ByteArrayInputStream(m.data() == null ? new byte[0] : m.data()),
+                    m.contentType(), m.userMetadata(), m.idempotencyToken(),
+                    effectiveAcl(principal, m.owner(), m.grants()));
             return new Message.OkResponse();
         } else if (message instanceof Message.GetCandyRequest m) {
             BoxEngine engine = node.engine(BoxName.of(m.box()), m.key());
@@ -340,7 +383,7 @@ final class NodeRequestHandler implements RequestHandler {
         } else if (message instanceof Message.CopyCandyRequest m) {
             CandyMetadata meta = samePartitionEngine(m.box(), m.srcKey(), m.dstKey())
                     .copyCandy(CandyKey.of(m.srcKey()), CandyKey.of(m.dstKey()),
-                            m.idempotencyToken());
+                            m.idempotencyToken(), effectiveAcl(principal, m.owner(), m.grants()));
             return new Message.HeadCandyResponse(meta.contentLength(), meta.contentType(),
                     meta.userMetadata(), meta.crc32c(), meta.createdAtMillis());
         } else if (message instanceof Message.RenameCandyRequest m) {
@@ -394,7 +437,8 @@ final class NodeRequestHandler implements RequestHandler {
             for (Message.CompletedPart p : m.parts()) {
                 parts.add(new BoxEngine.PartCompletion(p.partNumber(), p.crc32c()));
             }
-            CandyMetadata meta = engine.completeMultipartUpload(m.uploadId(), parts, m.idempotencyToken());
+            CandyMetadata meta = engine.completeMultipartUpload(m.uploadId(), parts,
+                    m.idempotencyToken(), effectiveAcl(principal, m.owner(), m.grants()));
             return new Message.HeadCandyResponse(meta.contentLength(), meta.contentType(),
                     meta.userMetadata(), meta.crc32c(), meta.createdAtMillis());
         } else if (message instanceof Message.AbortMultipartUploadRequest m) {
@@ -450,6 +494,22 @@ final class NodeRequestHandler implements RequestHandler {
                 rows.add(new Message.UploadedPart(pn, p.partLength(), p.crc32c()));
             }
             return new Message.ListPartsResponse(rows, next);
+        } else if (message instanceof Message.GetCandyAclRequest m) {
+            ObjectAcl acl = node.engine(BoxName.of(m.box()), m.key())
+                    .getCandyAcl(CandyKey.of(m.key()));
+            return new Message.CandyAclResponse(acl.owner(),
+                    acl.grants().stream().map(Grant::toText).toList());
+        } else if (message instanceof Message.SetCandyAclRequest m) {
+            ObjectAcl acl;
+            try {
+                acl = new ObjectAcl(
+                        m.owner() == null ? null : Principal.parse(m.owner()).toString(),
+                        m.grants().stream().map(Grant::parse).toList());
+            } catch (IllegalArgumentException e) {
+                throw new ValidationException("Invalid object ACL: " + e.getMessage());
+            }
+            node.engine(BoxName.of(m.box()), m.key()).setCandyAcl(CandyKey.of(m.key()), acl);
+            return new Message.OkResponse();
         } else if (message instanceof Message.UploadPartCopyRequest m) {
             BoxEngine engine = samePartitionEngine(m.box(), m.srcKey(), m.key());
             try {
@@ -479,6 +539,27 @@ final class NodeRequestHandler implements RequestHandler {
                     + "); the client must byte-copy");
         }
         return node.enginePartition(BoxName.of(box), dstPartition);
+    }
+
+    /**
+     * The owner/grants a write stamps into the locator. The owner is the connection's principal
+     * (null when anonymous); a request-supplied owner is honored only from super-principals — the
+     * S3 gateway writing on behalf of its authenticated end user. Request grants (the S3 canned-ACL
+     * path) are accepted from any writer.
+     */
+    private ObjectAcl effectiveAcl(Principal principal, String requestedOwner,
+                                   List<String> grantTexts) {
+        List<Grant> grants;
+        try {
+            grants = grantTexts == null ? List.of()
+                    : grantTexts.stream().map(Grant::parse).toList();
+            String owner = requestedOwner != null && node.authorizer().isSuperUser(principal)
+                    ? Principal.parse(requestedOwner).toString()
+                    : (principal.isAnonymous() ? null : principal.toString());
+            return new ObjectAcl(owner, grants);
+        } catch (IllegalArgumentException e) {
+            throw new ValidationException("Invalid object ACL: " + e.getMessage());
+        }
     }
 
     private static ScanQuery toScanQuery(Message.ListCandiesRequest m) {

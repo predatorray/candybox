@@ -33,6 +33,7 @@ import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.config.SizeLimits;
 import me.predatorray.candybox.common.auth.BoxAcl;
 import me.predatorray.candybox.common.auth.Grant;
+import me.predatorray.candybox.common.auth.ObjectAcl;
 import me.predatorray.candybox.common.auth.Principal;
 import me.predatorray.candybox.common.exception.AccessDeniedException;
 import me.predatorray.candybox.common.exception.AuthenticationException;
@@ -248,6 +249,26 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
     public void setBoxAcl(String box, BoxAcl acl) {
         expectOk(router.callAny(new Message.SetBoxAclRequest(BoxName.of(box).value(),
                 acl.owner().toString(), acl.grants().stream().map(Grant::toText).toList())));
+    }
+
+    /** One object's owner + grants (owner null for objects written before authorization). */
+    public ObjectAcl getCandyAcl(String box, String key) {
+        Message response = callKey(box, key,
+                new Message.GetCandyAclRequest(BoxName.of(box).value(), CandyKey.of(key).value()));
+        if (response instanceof Message.CandyAclResponse acl) {
+            return new ObjectAcl(acl.owner(), acl.grants().stream().map(Grant::parse).toList());
+        }
+        throw mapUnexpected(response, box, key);
+    }
+
+    /** Replaces one object's owner/grants (a metadata-only locator rewrite on the server). */
+    public void setCandyAcl(String box, String key, ObjectAcl acl) {
+        Message response = callKey(box, key,
+                new Message.SetCandyAclRequest(BoxName.of(box).value(), CandyKey.of(key).value(),
+                        acl.owner(), acl.grants().stream().map(Grant::toText).toList()));
+        if (!(response instanceof Message.OkResponse)) {
+            throw mapUnexpected(response, box, key);
+        }
     }
 
     public void deleteCandy(String box, String key) {
