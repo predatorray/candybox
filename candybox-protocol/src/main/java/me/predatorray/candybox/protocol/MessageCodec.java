@@ -52,6 +52,8 @@ public final class MessageCodec {
             writeMetadata(w, m.userMetadata());
             writeNullable(w, m.idempotencyToken());
             w.writeBytes(m.data() == null ? new byte[0] : m.data());
+            writeNullable(w, m.owner());
+            writeStrings(w, m.grants());
         } else if (message instanceof Message.GetCandyRequest m) {
             writeBoxKey(w, m.box(), m.key());
         } else if (message instanceof Message.RangeGetCandyRequest m) {
@@ -67,6 +69,8 @@ public final class MessageCodec {
             w.writeString(m.srcKey());
             w.writeString(m.dstKey());
             writeNullable(w, m.idempotencyToken());
+            writeNullable(w, m.owner());
+            writeStrings(w, m.grants());
         } else if (message instanceof Message.RenameCandyRequest m) {
             w.writeString(m.box());
             w.writeString(m.srcKey());
@@ -99,6 +103,8 @@ public final class MessageCodec {
                 w.writeInt(p.crc32c());
             }
             writeNullable(w, m.idempotencyToken());
+            writeNullable(w, m.owner());
+            writeStrings(w, m.grants());
         } else if (message instanceof Message.AbortMultipartUploadRequest m) {
             w.writeString(m.box());
             w.writeString(m.key());
@@ -211,6 +217,17 @@ public final class MessageCodec {
             }
         } else if (message instanceof Message.AccessDeniedResponse m) {
             w.writeString(m.message());
+        } else if (message instanceof Message.GetCandyAclRequest m) {
+            w.writeString(m.box());
+            w.writeString(m.key());
+        } else if (message instanceof Message.SetCandyAclRequest m) {
+            w.writeString(m.box());
+            w.writeString(m.key());
+            writeNullable(w, m.owner());
+            writeStrings(w, m.grants());
+        } else if (message instanceof Message.CandyAclResponse m) {
+            writeNullable(w, m.owner());
+            writeStrings(w, m.grants());
         } else if (message instanceof Message.SaslHandshakeRequest m) {
             w.writeString(m.mechanism());
         } else if (message instanceof Message.SaslHandshakeResponse m) {
@@ -245,14 +262,15 @@ public final class MessageCodec {
             case LIST_BOXES -> new Message.ListBoxesRequest();
             case HEAD_BOX -> new Message.HeadBoxRequest(r.readString());
             case PUT_CANDY -> new Message.PutCandyRequest(r.readString(), r.readString(),
-                    readNullable(r), readMetadata(r), readNullable(r), r.readBytes());
+                    readNullable(r), readMetadata(r), readNullable(r), r.readBytes(),
+                    readNullable(r), readStrings(r));
             case GET_CANDY -> new Message.GetCandyRequest(r.readString(), r.readString());
             case RANGE_GET_CANDY -> new Message.RangeGetCandyRequest(r.readString(), r.readString(),
                     r.readLong(), r.readLong());
             case HEAD_CANDY -> new Message.HeadCandyRequest(r.readString(), r.readString());
             case DELETE_CANDY -> new Message.DeleteCandyRequest(r.readString(), r.readString());
             case COPY_CANDY -> new Message.CopyCandyRequest(r.readString(), r.readString(),
-                    r.readString(), readNullable(r));
+                    r.readString(), readNullable(r), readNullable(r), readStrings(r));
             case RENAME_CANDY -> new Message.RenameCandyRequest(r.readString(), r.readString(),
                     r.readString(), readNullable(r));
             case DELETE_RANGE -> new Message.DeleteRangeRequest(r.readString(), r.readVarInt(),
@@ -300,6 +318,14 @@ public final class MessageCodec {
                 yield new Message.BoxAclResponse(owner, readStrings(r));
             }
             case RESPONSE_ACCESS_DENIED -> new Message.AccessDeniedResponse(r.readString());
+            case GET_CANDY_ACL -> new Message.GetCandyAclRequest(r.readString(), r.readString());
+            case SET_CANDY_ACL -> {
+                String box = r.readString();
+                String key = r.readString();
+                yield new Message.SetCandyAclRequest(box, key, readNullable(r), readStrings(r));
+            }
+            case RESPONSE_CANDY_ACL ->
+                    new Message.CandyAclResponse(readNullable(r), readStrings(r));
             case SASL_HANDSHAKE -> new Message.SaslHandshakeRequest(r.readString());
             case RESPONSE_SASL_HANDSHAKE -> decodeSaslHandshakeResponse(r);
             case SASL_AUTHENTICATE -> new Message.SaslAuthenticateRequest(r.readBytes());
@@ -342,7 +368,16 @@ public final class MessageCodec {
             parts.add(new Message.CompletedPart(r.readVarInt(), r.readInt()));
         }
         String idempotency = readNullable(r);
-        return new Message.CompleteMultipartUploadRequest(box, key, uploadId, parts, idempotency);
+        return new Message.CompleteMultipartUploadRequest(box, key, uploadId, parts, idempotency,
+                readNullable(r), readStrings(r));
+    }
+
+    private static void writeStrings(BinaryWriter w, List<String> strings) {
+        List<String> list = strings == null ? List.of() : strings;
+        w.writeVarInt(list.size());
+        for (String s : list) {
+            w.writeString(s);
+        }
     }
 
     private static Message decodeListMultipart(BinaryReader r) {

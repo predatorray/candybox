@@ -81,6 +81,29 @@ class CandyLocatorSerializerTest {
     }
 
     @Test
+    void roundTripsOwnerAndObjectGrants() {
+        CandyLocator locator = CandyLocator.singlePart(new Hlc(7, 1, 2), 10, 4, "text/plain",
+                Map.of(), 123, 99L, List.of(new SegmentRef(5, 0, 2)),
+                new me.predatorray.candybox.common.auth.ObjectAcl("User:alice", List.of(
+                        me.predatorray.candybox.common.auth.Grant.parse("AllUsers:READ"),
+                        me.predatorray.candybox.common.auth.Grant.parse("User:bob:READ+WRITE_ACP"))));
+        CandyLocator decoded =
+                CandyLocatorSerializer.deserialize(CandyLocatorSerializer.serialize(locator));
+
+        assertThat(decoded.acl().owner()).isEqualTo("User:alice");
+        assertThat(decoded.acl().grants()).hasSize(2);
+        assertThat(decoded).isEqualTo(locator);
+
+        // An unowned locator (the v2-shaped constructor) round-trips to ObjectAcl.NONE.
+        CandyLocator unowned = CandyLocator.singlePart(new Hlc(7, 1, 2), 10, 4, null, Map.of(),
+                123, 99L, List.of(new SegmentRef(5, 0, 2)));
+        CandyLocator decodedUnowned =
+                CandyLocatorSerializer.deserialize(CandyLocatorSerializer.serialize(unowned));
+        assertThat(decodedUnowned.acl().owner()).isNull();
+        assertThat(decodedUnowned.acl().grants()).isEmpty();
+    }
+
+    @Test
     void enforcesMaxLocatorSize() {
         // Build a large metadata map that overflows a tiny cap.
         StringBuilder big = new StringBuilder();

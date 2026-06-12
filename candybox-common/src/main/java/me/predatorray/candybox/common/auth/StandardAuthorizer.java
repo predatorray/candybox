@@ -62,6 +62,7 @@ public final class StandardAuthorizer implements Authorizer {
         return acl.get().permits(principal, operation);
     }
 
+    @Override
     public boolean isSuperUser(Principal principal) {
         return superUsers.contains(principal.toString())
                 || superUsers.contains(principal.type() + ":*");

@@ -17,6 +17,7 @@ package me.predatorray.candybox.common;
 
 import java.util.List;
 import java.util.Map;
+import me.predatorray.candybox.common.auth.ObjectAcl;
 
 /**
  * The compact LSM value: a pointer to where a Candy's bytes live (in Syrups), plus the metadata the
@@ -46,7 +47,8 @@ public record CandyLocator(
         String contentType,
         Map<String, String> userMetadata,
         long createdAtMillis,
-        List<Part> parts) {
+        List<Part> parts,
+        ObjectAcl acl) {
 
     public CandyLocator {
         if (hlc == null || type == null) {
@@ -54,9 +56,23 @@ public record CandyLocator(
         }
         userMetadata = userMetadata == null ? Map.of() : Map.copyOf(userMetadata);
         parts = parts == null ? List.of() : List.copyOf(parts);
+        acl = acl == null ? ObjectAcl.NONE : acl;
         if (type == LocatorType.DELETE && !parts.isEmpty()) {
             throw new IllegalArgumentException("DELETE tombstone must carry no parts");
         }
+    }
+
+    /** v2-shaped constructor: no owner / object grants ({@link ObjectAcl#NONE}). */
+    public CandyLocator(Hlc hlc, LocatorType type, String contentType,
+                        Map<String, String> userMetadata, long createdAtMillis, List<Part> parts) {
+        this(hlc, type, contentType, userMetadata, createdAtMillis, parts, ObjectAcl.NONE);
+    }
+
+    /** The same locator with a different ACL — the metadata-only PutObjectAcl rewrite reuses the
+     * parts verbatim, so no bytes move and GC's segment refcounts are undisturbed. */
+    public CandyLocator withAcl(Hlc newHlc, ObjectAcl newAcl) {
+        return new CandyLocator(newHlc, type, contentType, userMetadata, createdAtMillis, parts,
+                newAcl);
     }
 
     public boolean isTombstone() {
@@ -125,8 +141,17 @@ public record CandyLocator(
     public static CandyLocator singlePart(Hlc hlc, long contentLength, int chunkSize, String contentType,
                                           Map<String, String> userMetadata, int crc32c,
                                           long createdAtMillis, List<SegmentRef> segments) {
+        return singlePart(hlc, contentLength, chunkSize, contentType, userMetadata, crc32c,
+                createdAtMillis, segments, ObjectAcl.NONE);
+    }
+
+    /** {@link #singlePart} with the owner/grants the write path stamps (locator format v3). */
+    public static CandyLocator singlePart(Hlc hlc, long contentLength, int chunkSize, String contentType,
+                                          Map<String, String> userMetadata, int crc32c,
+                                          long createdAtMillis, List<SegmentRef> segments,
+                                          ObjectAcl acl) {
         Part part = new Part(contentLength, chunkSize, crc32c, segments);
         return new CandyLocator(hlc, LocatorType.PUT, contentType, userMetadata, createdAtMillis,
-                List.of(part));
+                List.of(part), acl);
     }
 }

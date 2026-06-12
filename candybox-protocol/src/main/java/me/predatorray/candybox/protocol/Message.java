@@ -72,11 +72,22 @@ public sealed interface Message {
 
     // ---- Candy requests --------------------------------------------------------------------
 
+    /**
+     * {@code owner}/{@code grants} stamp the object's ACL (locator v3). {@code owner} non-null is
+     * only honored from super-principals (the S3 gateway writing on behalf of its authenticated
+     * user); for everyone else the node stamps the connection's own principal.
+     */
     record PutCandyRequest(String box, String key, String contentType,
                            Map<String, String> userMetadata, String idempotencyToken,
-                           byte[] data) implements Message {
+                           byte[] data, String owner, List<String> grants) implements Message {
         public Opcode opcode() {
             return Opcode.PUT_CANDY;
+        }
+
+        public PutCandyRequest(String box, String key, String contentType,
+                               Map<String, String> userMetadata, String idempotencyToken,
+                               byte[] data) {
+            this(box, key, contentType, userMetadata, idempotencyToken, data, null, List.of());
         }
     }
 
@@ -111,10 +122,15 @@ public sealed interface Message {
         }
     }
 
-    record CopyCandyRequest(String box, String srcKey, String dstKey, String idempotencyToken)
-            implements Message {
+    /** Owner/grants semantics as in {@link PutCandyRequest}: the copy belongs to the requester. */
+    record CopyCandyRequest(String box, String srcKey, String dstKey, String idempotencyToken,
+                            String owner, List<String> grants) implements Message {
         public Opcode opcode() {
             return Opcode.COPY_CANDY;
+        }
+
+        public CopyCandyRequest(String box, String srcKey, String dstKey, String idempotencyToken) {
+            this(box, srcKey, dstKey, idempotencyToken, null, List.of());
         }
     }
 
@@ -158,11 +174,17 @@ public sealed interface Message {
     record CompletedPart(int partNumber, int crc32c) {
     }
 
+    /** Owner/grants semantics as in {@link PutCandyRequest}. */
     record CompleteMultipartUploadRequest(String box, String key, String uploadId,
-                                          List<CompletedPart> parts, String idempotencyToken)
-            implements Message {
+                                          List<CompletedPart> parts, String idempotencyToken,
+                                          String owner, List<String> grants) implements Message {
         public Opcode opcode() {
             return Opcode.COMPLETE_MULTIPART_UPLOAD;
+        }
+
+        public CompleteMultipartUploadRequest(String box, String key, String uploadId,
+                                              List<CompletedPart> parts, String idempotencyToken) {
+            this(box, key, uploadId, parts, idempotencyToken, null, List.of());
         }
     }
 
@@ -236,6 +258,27 @@ public sealed interface Message {
     record BoxAclResponse(String owner, List<String> grants) implements Message {
         public Opcode opcode() {
             return Opcode.RESPONSE_BOX_ACL;
+        }
+    }
+
+    record GetCandyAclRequest(String box, String key) implements Message {
+        public Opcode opcode() {
+            return Opcode.GET_CANDY_ACL;
+        }
+    }
+
+    /** Replaces one object's owner/grants ({@code owner} nullable = unowned). */
+    record SetCandyAclRequest(String box, String key, String owner, List<String> grants)
+            implements Message {
+        public Opcode opcode() {
+            return Opcode.SET_CANDY_ACL;
+        }
+    }
+
+    /** {@code owner} is null for objects written before authorization existed. */
+    record CandyAclResponse(String owner, List<String> grants) implements Message {
+        public Opcode opcode() {
+            return Opcode.RESPONSE_CANDY_ACL;
         }
     }
 

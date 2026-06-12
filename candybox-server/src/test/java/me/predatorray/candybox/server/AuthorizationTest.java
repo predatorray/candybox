@@ -202,6 +202,137 @@ class AuthorizationTest {
     }
 
     @Test
+    void writesStampTheConnectionPrincipalAsObjectOwner() {
+        try (CandyboxNode node = newAuthorizedNode()) {
+            RequestHandler handler = node.requestHandler();
+            call(handler, ALICE, new Message.CreateBoxRequest("owned", 1));
+            call(handler, ALICE, put("owned", "k"));
+            Message.CandyAclResponse acl = (Message.CandyAclResponse)
+                    call(handler, ALICE, new Message.GetCandyAclRequest("owned", "k"));
+            assertThat(acl.owner()).isEqualTo("User:alice");
+            assertThat(acl.grants()).isEmpty();
+        }
+    }
+
+    @Test
+    void objectGrantsOpenSingleObjectsInAPrivateBox() {
+        try (CandyboxNode node = newAuthorizedNode()) {
+            RequestHandler handler = node.requestHandler();
+            call(handler, ALICE, new Message.CreateBoxRequest("mostly-private", 1));
+            call(handler, ALICE, put("mostly-private", "secret"));
+            // A PUT carrying grants — the S3 `x-amz-acl: public-read` shape.
+            call(handler, ALICE, new Message.PutCandyRequest("mostly-private", "public", null,
+                    null, null, "v".getBytes(StandardCharsets.UTF_8), null,
+                    List.of("AllUsers:READ")));
+
+            // The granted object is readable by bob and by anonymous; the other is not.
+            assertThat(call(handler, BOB, new Message.GetCandyRequest("mostly-private", "public")))
+                    .isInstanceOf(Message.CandyDataResponse.class);
+            assertThat(call(handler, null, new Message.GetCandyRequest("mostly-private", "public")))
+                    .isInstanceOf(Message.CandyDataResponse.class);
+            assertThat(call(handler, BOB, new Message.GetCandyRequest("mostly-private", "secret")))
+                    .isInstanceOf(Message.AccessDeniedResponse.class);
+            // Object grants never open writes (bucket WRITE governs).
+            assertThat(call(handler, BOB, put("mostly-private", "public")))
+                    .isInstanceOf(Message.AccessDeniedResponse.class);
+            // And a missing object resolves to AccessDenied, not NotFound (no existence leak).
+            assertThat(call(handler, BOB, new Message.GetCandyRequest("mostly-private", "nope")))
+                    .isInstanceOf(Message.AccessDeniedResponse.class);
+        }
+    }
+
+    @Test
+    void setCandyAclRewritesGrantsWithoutMovingBytes() {
+        try (CandyboxNode node = newAuthorizedNode()) {
+            RequestHandler handler = node.requestHandler();
+            call(handler, ALICE, new Message.CreateBoxRequest("flip", 1));
+            call(handler, ALICE, put("flip", "k"));
+            assertThat(call(handler, BOB, new Message.GetCandyRequest("flip", "k")))
+                    .isInstanceOf(Message.AccessDeniedResponse.class);
+
+            assertThat(call(handler, ALICE, new Message.SetCandyAclRequest("flip", "k",
+                    "User:alice", List.of("AllUsers:READ"))))
+                    .isInstanceOf(Message.OkResponse.class);
+            Message.CandyDataResponse data = (Message.CandyDataResponse)
+                    call(handler, BOB, new Message.GetCandyRequest("flip", "k"));
+            assertThat(data.data()).isEqualTo("v".getBytes(StandardCharsets.UTF_8));
+
+            // Revoking flips it back (the locator rewrite is LWW-newer).
+            call(handler, ALICE, new Message.SetCandyAclRequest("flip", "k", "User:alice",
+                    List.of()));
+            assertThat(call(handler, BOB, new Message.GetCandyRequest("flip", "k")))
+                    .isInstanceOf(Message.AccessDeniedResponse.class);
+        }
+    }
+
+    @Test
+    void objectOwnerCanManageItsAclEvenWithoutBoxAcp() {
+        try (CandyboxNode node = newAuthorizedNode()) {
+            RequestHandler handler = node.requestHandler();
+            call(handler, ALICE, new Message.CreateBoxRequest("shared-writes", 1));
+            call(handler, ALICE, new Message.SetBoxAclRequest("shared-writes", "User:alice",
+                    List.of("User:bob:READ+WRITE")));
+            // bob writes his own object; he owns it, so he can read/replace its ACL even though
+            // the Box grants him no READ_ACP/WRITE_ACP.
+            call(handler, BOB, put("shared-writes", "bobs"));
+            Message.CandyAclResponse acl = (Message.CandyAclResponse)
+                    call(handler, BOB, new Message.GetCandyAclRequest("shared-writes", "bobs"));
+            assertThat(acl.owner()).isEqualTo("User:bob");
+            assertThat(call(handler, BOB, new Message.SetCandyAclRequest("shared-writes", "bobs",
+                    "User:bob", List.of("AllUsers:READ")))).isInstanceOf(Message.OkResponse.class);
+        }
+    }
+
+    @Test
+    void copyBelongsToTheRequesterWhileRenameKeepsTheAcl() {
+        try (CandyboxNode node = newAuthorizedNode()) {
+            RequestHandler handler = node.requestHandler();
+            call(handler, ALICE, new Message.CreateBoxRequest("movers", 1));
+            call(handler, ALICE, new Message.SetBoxAclRequest("movers", "User:alice",
+                    List.of("User:bob:READ+WRITE")));
+            call(handler, ALICE, new Message.PutCandyRequest("movers", "src", null, null, null,
+                    "v".getBytes(StandardCharsets.UTF_8), null, List.of("AllUsers:READ")));
+
+            // bob's copy: owner=bob, source grants NOT inherited (S3 CopyObject semantics).
+            call(handler, BOB, new Message.CopyCandyRequest("movers", "src", "bobs-copy", null));
+            Message.CandyAclResponse copyAcl = (Message.CandyAclResponse)
+                    call(handler, BOB, new Message.GetCandyAclRequest("movers", "bobs-copy"));
+            assertThat(copyAcl.owner()).isEqualTo("User:bob");
+            assertThat(copyAcl.grants()).isEmpty();
+
+            // alice's rename: the object moves with its owner + grants intact.
+            call(handler, ALICE, new Message.RenameCandyRequest("movers", "src", "moved", null));
+            Message.CandyAclResponse movedAcl = (Message.CandyAclResponse)
+                    call(handler, ALICE, new Message.GetCandyAclRequest("movers", "moved"));
+            assertThat(movedAcl.owner()).isEqualTo("User:alice");
+            assertThat(movedAcl.grants()).hasSize(1);
+        }
+    }
+
+    @Test
+    void ownerOverrideIsOnlyHonoredFromSuperPrincipals() {
+        try (CandyboxNode node = newAuthorizedNode()) {
+            RequestHandler handler = node.requestHandler();
+            Principal gateway = new Principal(Principal.TYPE_ADMIN, "ops"); // super in this setup
+            call(handler, ALICE, new Message.CreateBoxRequest("fronted", 1));
+
+            // The super-principal writes on behalf of bob: bob owns the object.
+            call(handler, gateway, new Message.PutCandyRequest("fronted", "via-gw", null, null,
+                    null, "v".getBytes(StandardCharsets.UTF_8), "User:bob", List.of()));
+            Message.CandyAclResponse viaGw = (Message.CandyAclResponse)
+                    call(handler, ALICE, new Message.GetCandyAclRequest("fronted", "via-gw"));
+            assertThat(viaGw.owner()).isEqualTo("User:bob");
+
+            // A regular user claiming someone else's identity is ignored: they own it themselves.
+            call(handler, ALICE, new Message.PutCandyRequest("fronted", "spoofed", null, null,
+                    null, "v".getBytes(StandardCharsets.UTF_8), "User:bob", List.of()));
+            Message.CandyAclResponse spoofed = (Message.CandyAclResponse)
+                    call(handler, ALICE, new Message.GetCandyAclRequest("fronted", "spoofed"));
+            assertThat(spoofed.owner()).isEqualTo("User:alice");
+        }
+    }
+
+    @Test
     void withoutAnAuthorizerEverythingStaysOpen() {
         try (CandyboxNode node = new CandyboxNode(1, config(), new InMemoryLedgerStore(),
                 new InMemoryCoordinationService(), new ManualClock(1000))) {

@@ -28,6 +28,7 @@ import java.util.Map;
 import javax.net.ssl.SSLContext;
 import me.predatorray.candybox.common.auth.BoxAcl;
 import me.predatorray.candybox.common.auth.Grant;
+import me.predatorray.candybox.common.auth.ObjectAcl;
 import me.predatorray.candybox.common.auth.Passwords;
 import me.predatorray.candybox.common.auth.Principal;
 import me.predatorray.candybox.common.auth.ScramCredential;
@@ -417,6 +418,19 @@ public final class CandyboxCli {
         String sub = args.remove(0);
         String box = requireArg(args, 0, "box");
         args.remove(0);
+        // An `--object <key>` option switches every subcommand to the object-level ACL.
+        String objectKey = null;
+        for (int i = 0; i < args.size() - 1; i++) {
+            if (args.get(i).equals("--object")) {
+                objectKey = args.get(i + 1);
+                args.remove(i + 1);
+                args.remove(i);
+                break;
+            }
+        }
+        if (objectKey != null) {
+            return objectAcl(sub, box, objectKey, args, client, out, err);
+        }
         switch (sub) {
             case "get" -> {
                 java.util.Optional<BoxAcl> acl = client.getBoxAcl(box);
@@ -467,6 +481,53 @@ public final class CandyboxCli {
         }
     }
 
+    /** Object-level ACL subcommands ({@code acl ... <box> --object <key>}). */
+    private static int objectAcl(String sub, String box, String key, List<String> args,
+                                 CandyboxClient client, PrintStream out, PrintStream err) {
+        switch (sub) {
+            case "get" -> {
+                ObjectAcl acl = client.getCandyAcl(box, key);
+                out.println("owner=" + (acl.owner() == null ? "(none)" : acl.owner()));
+                for (Grant grant : acl.grants()) {
+                    out.println("grant=" + grant.toText());
+                }
+                return 0;
+            }
+            case "set" -> {
+                String owner = requireArg(args, 0, "owner ('-' keeps it unowned)");
+                args.remove(0);
+                List<Grant> grants = args.stream().map(Grant::parse).toList();
+                client.setCandyAcl(box, key, new ObjectAcl(
+                        owner.equals("-") ? null : Principal.parse(owner).toString(), grants));
+                return 0;
+            }
+            case "grant" -> {
+                Grant grant = Grant.parse(requireArg(args, 0, "grant (<grantee>:<OP[+OP...]>)"));
+                ObjectAcl current = client.getCandyAcl(box, key);
+                List<Grant> grants = new ArrayList<>(current.grants());
+                grants.removeIf(g -> g.grantee().equals(grant.grantee()));
+                grants.add(grant);
+                client.setCandyAcl(box, key, new ObjectAcl(current.owner(), grants));
+                return 0;
+            }
+            case "revoke" -> {
+                String grantee = requireArg(args, 0, "grantee");
+                ObjectAcl current = client.getCandyAcl(box, key);
+                List<Grant> grants = new ArrayList<>(current.grants());
+                if (!grants.removeIf(g -> g.grantee().equals(grantee))) {
+                    err.println("No grant for " + grantee);
+                    return 1;
+                }
+                client.setCandyAcl(box, key, new ObjectAcl(current.owner(), grants));
+                return 0;
+            }
+            default -> {
+                err.println("Unknown acl subcommand: " + sub);
+                return 2;
+            }
+        }
+    }
+
     private static String firstNonBlank(String a, String b) {
         return (a != null && !a.isBlank()) ? a : b;
     }
@@ -497,6 +558,7 @@ public final class CandyboxCli {
                   acl set <box> <owner> [grant...]             replace it (grant = grantee:OP[+OP...])
                   acl grant <box> <grantee>:<OP[+OP...]>       add/replace one grant
                   acl revoke <box> <grantee>                   remove one grantee's grant
+                  acl ... <box> --object <key>                 same subcommands on one object's ACL
 
                 Security (flags override the matching environment variables):
                   -u/--user U --password P | --password-file F   SASL login (CANDYBOX_AUTH_USERNAME/_PASSWORD)
