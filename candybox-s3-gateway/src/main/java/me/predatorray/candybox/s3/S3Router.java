@@ -38,6 +38,9 @@ final class S3Router {
         GET_BUCKET_LOCATION,
         GET_BUCKET_VERSIONING,
         GET_BUCKET_ACL,
+        PUT_BUCKET_ACL,
+        GET_OBJECT_ACL,
+        PUT_OBJECT_ACL,
         LIST_MULTIPART_UPLOADS,
         PUT_OBJECT,
         GET_OBJECT,
@@ -74,11 +77,17 @@ final class S3Router {
                 if (queries.contains("partnumber") && queries.contains("uploadid")) {
                     yield S3Action.UPLOAD_PART;
                 }
+                if (queries.contains("acl")) {
+                    yield S3Action.PUT_OBJECT_ACL;
+                }
                 yield S3Action.PUT_OBJECT;
             }
             case "GET" -> {
                 if (queries.contains("uploadid")) {
                     yield S3Action.LIST_PARTS;
+                }
+                if (queries.contains("acl")) {
+                    yield S3Action.GET_OBJECT_ACL;
                 }
                 yield S3Action.GET_OBJECT;
             }
@@ -104,7 +113,7 @@ final class S3Router {
 
     private static S3Action routeBucket(String method, Set<String> queries) {
         return switch (method) {
-            case "PUT" -> S3Action.CREATE_BUCKET;
+            case "PUT" -> queries.contains("acl") ? S3Action.PUT_BUCKET_ACL : S3Action.CREATE_BUCKET;
             case "DELETE" -> S3Action.DELETE_BUCKET;
             case "HEAD" -> S3Action.HEAD_BUCKET;
             case "POST" -> queries.contains("delete") ? S3Action.DELETE_OBJECTS : S3Action.UNSUPPORTED;

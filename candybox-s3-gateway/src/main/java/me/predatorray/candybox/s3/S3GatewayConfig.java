@@ -51,6 +51,8 @@ public final class S3GatewayConfig {
     private final int workerThreads;
     private final long routerCacheTtlMillis;
     private final SecurityConfig security;
+    private final boolean s3AuthEnabled;
+    private final boolean s3AllowAnonymous;
 
     private S3GatewayConfig(Builder b) {
         this.bindHost = b.bindHost;
@@ -62,6 +64,8 @@ public final class S3GatewayConfig {
         this.workerThreads = b.workerThreads;
         this.routerCacheTtlMillis = b.routerCacheTtlMillis;
         this.security = b.security;
+        this.s3AuthEnabled = b.s3AuthEnabled;
+        this.s3AllowAnonymous = b.s3AllowAnonymous;
     }
 
     public static S3GatewayConfig load(Path propertiesFile) {
@@ -88,6 +92,9 @@ public final class S3GatewayConfig {
                         .orElse(Math.max(4, Runtime.getRuntime().availableProcessors() * 2)))
                 .routerCacheTtlMillis(r.getLong("s3.router-cache-ttl-ms").orElse(5_000L))
                 .security(SecurityConfig.resolve(r::get))
+                .s3AuthEnabled(r.get("s3.auth.enabled").map(Boolean::parseBoolean).orElse(false))
+                .s3AllowAnonymous(r.get("s3.auth.allow-anonymous").map(Boolean::parseBoolean)
+                        .orElse(true))
                 .build();
     }
 
@@ -126,6 +133,17 @@ public final class S3GatewayConfig {
     /** The shared {@code auth.*} / {@code tls.*} surface: how this gateway dials the nodes. */
     public SecurityConfig security() {
         return security;
+    }
+
+    /** SigV4 verification on; unsigned requests become the anonymous principal (or are blocked). */
+    public boolean s3AuthEnabled() {
+        return s3AuthEnabled;
+    }
+
+    /** The kill switch (AWS "Block Public Access"-style): {@code false} rejects all unsigned
+     * requests regardless of ACL grants. */
+    public boolean s3AllowAnonymous() {
+        return s3AllowAnonymous;
     }
 
     private record HostPort(String host, int port) {
@@ -181,6 +199,8 @@ public final class S3GatewayConfig {
         private String region = "us-east-1";
         private long maxObjectBytes = DEFAULT_MAX_OBJECT_BYTES;
         private SecurityConfig security = SecurityConfig.disabled();
+        private boolean s3AuthEnabled = false;
+        private boolean s3AllowAnonymous = true;
         private int workerThreads = 8;
         private long routerCacheTtlMillis = 5_000L;
 
@@ -226,6 +246,16 @@ public final class S3GatewayConfig {
 
         Builder security(SecurityConfig v) {
             this.security = v;
+            return this;
+        }
+
+        Builder s3AuthEnabled(boolean v) {
+            this.s3AuthEnabled = v;
+            return this;
+        }
+
+        Builder s3AllowAnonymous(boolean v) {
+            this.s3AllowAnonymous = v;
             return this;
         }
 

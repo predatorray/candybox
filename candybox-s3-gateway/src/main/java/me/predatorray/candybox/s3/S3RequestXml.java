@@ -132,6 +132,70 @@ final class S3RequestXml {
         }
     }
 
+    /** One parsed {@code <Grant>}: group-URI XOR canonical-id grantee plus the permission name. */
+    record AclGrant(String groupUri, String canonicalId, String permission) {
+    }
+
+    /** A parsed {@code <AccessControlPolicy>} body (PUT ?acl): owner id + grant rows. */
+    record AccessControlPolicyBody(String ownerId, List<AclGrant> grants) {
+    }
+
+    static AccessControlPolicyBody parseAccessControlPolicy(byte[] body) {
+        XMLStreamReader reader = null;
+        try {
+            reader = INPUT_FACTORY.createXMLStreamReader(new ByteArrayInputStream(body));
+            String ownerId = null;
+            List<AclGrant> grants = new ArrayList<>();
+            boolean inOwner = false;
+            boolean inGrantee = false;
+            String uri = null;
+            String id = null;
+            String permission = null;
+            while (reader.hasNext()) {
+                int event = reader.next();
+                if (event == XMLStreamConstants.START_ELEMENT) {
+                    switch (reader.getLocalName()) {
+                        case "Owner" -> inOwner = true;
+                        case "Grantee" -> inGrantee = true;
+                        case "ID" -> {
+                            String text = reader.getElementText().trim();
+                            if (inGrantee) {
+                                id = text;
+                            } else if (inOwner) {
+                                ownerId = text;
+                            }
+                        }
+                        case "URI" -> uri = reader.getElementText().trim();
+                        case "Permission" -> permission = reader.getElementText().trim();
+                        default -> { /* containers / DisplayName: ignore */ }
+                    }
+                } else if (event == XMLStreamConstants.END_ELEMENT) {
+                    switch (reader.getLocalName()) {
+                        case "Owner" -> inOwner = false;
+                        case "Grantee" -> inGrantee = false;
+                        case "Grant" -> {
+                            if (permission == null || (uri == null && id == null)) {
+                                throw new S3Exception(S3ErrorCode.MALFORMED_XML,
+                                        "<Grant> needs a Grantee and a Permission");
+                            }
+                            grants.add(new AclGrant(uri, id, permission));
+                            uri = null;
+                            id = null;
+                            permission = null;
+                        }
+                        default -> { /* ignore */ }
+                    }
+                }
+            }
+            return new AccessControlPolicyBody(ownerId, grants);
+        } catch (XMLStreamException e) {
+            throw new S3Exception(S3ErrorCode.MALFORMED_XML, "Malformed AccessControlPolicy body",
+                    e);
+        } finally {
+            closeQuietly(reader);
+        }
+    }
+
     private static void closeQuietly(XMLStreamReader reader) {
         if (reader != null) {
             try {

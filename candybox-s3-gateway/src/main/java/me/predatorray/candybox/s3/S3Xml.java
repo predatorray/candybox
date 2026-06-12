@@ -342,22 +342,38 @@ final class S3Xml {
     }
 
     static String accessControlPolicy() {
+        return accessControlPolicy(ANON_ID, List.of(new AclGrant(null, ANON_ID, "FULL_CONTROL")));
+    }
+
+    /** One {@code <Grant>} row: a group URI grantee or a canonical-user id, plus the permission. */
+    record AclGrant(String groupUri, String canonicalId, String permission) {
+    }
+
+    /** The standard {@code AccessControlPolicy} document for an owner + grant rows. */
+    static String accessControlPolicy(String ownerId, List<AclGrant> grants) {
         return doc(w -> {
             root(w, "AccessControlPolicy");
             w.writeStartElement("Owner");
-            el(w, "ID", ANON_ID);
-            el(w, "DisplayName", ANON_ID);
+            el(w, "ID", ownerId);
+            el(w, "DisplayName", ownerId);
             w.writeEndElement();
             w.writeStartElement("AccessControlList");
-            w.writeStartElement("Grant");
-            w.writeStartElement("Grantee");
-            w.writeNamespace("xsi", XSI_NS);
-            w.writeAttribute(XSI_NS, "type", "CanonicalUser");
-            el(w, "ID", ANON_ID);
-            el(w, "DisplayName", ANON_ID);
-            w.writeEndElement();
-            el(w, "Permission", "FULL_CONTROL");
-            w.writeEndElement();
+            for (AclGrant grant : grants) {
+                w.writeStartElement("Grant");
+                w.writeStartElement("Grantee");
+                w.writeNamespace("xsi", XSI_NS);
+                if (grant.groupUri() != null) {
+                    w.writeAttribute(XSI_NS, "type", "Group");
+                    el(w, "URI", grant.groupUri());
+                } else {
+                    w.writeAttribute(XSI_NS, "type", "CanonicalUser");
+                    el(w, "ID", grant.canonicalId());
+                    el(w, "DisplayName", grant.canonicalId());
+                }
+                w.writeEndElement();
+                el(w, "Permission", grant.permission());
+                w.writeEndElement();
+            }
             w.writeEndElement();
             w.writeEndElement();
         });

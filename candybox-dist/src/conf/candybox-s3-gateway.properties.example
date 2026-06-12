@@ -41,3 +41,16 @@ s3.region=us-east-1
 # auth.client.password=...            # or auth.client.password.file=/etc/candybox/s3-gw.password
 # tls.enabled=true
 # tls.ca.path=/etc/candybox/tls/ca.crt
+
+# ---------------------------------------------------------------------------
+# S3-facing authentication: AWS Signature Version 4 over the access keys in the credentials file
+# (s3.key.<accessKeyId>.secret / .principal entries). Unsigned requests map to the anonymous
+# principal and per-bucket/object ACLs decide (S3 semantics: public-read works, private is 403);
+# s3.auth.allow-anonymous=false hard-blocks all unsigned requests regardless of ACL grants
+# (the AWS "Block Public Access" analog). Presigned URLs, the aws-chunked signed-streaming and
+# checksum-trailer payload modes are supported. Serve HTTPS by setting the tls.* keys (PEM).
+# ---------------------------------------------------------------------------
+
+# s3.auth.enabled=true
+# s3.auth.allow-anonymous=true
+# auth.credentials.file=/etc/candybox/credentials.properties

@@ -46,6 +46,8 @@ final class S3GatewayServer implements AutoCloseable {
 
     private final S3GatewayConfig config;
     private final CandyStore store;
+    private final S3Authenticator authenticator;
+    private final S3AccessControl access;
 
     private EventLoopGroup boss;
     private EventLoopGroup workers;
@@ -55,6 +57,21 @@ final class S3GatewayServer implements AutoCloseable {
     S3GatewayServer(S3GatewayConfig config, CandyStore store) {
         this.config = config;
         this.store = store;
+        boolean authEnabled = config.s3AuthEnabled();
+        me.predatorray.candybox.common.auth.S3KeyStore keys;
+        if (authEnabled) {
+            if (config.security().credentialsFile() == null) {
+                throw new IllegalArgumentException(
+                        "s3.auth.enabled=true requires auth.credentials.file (the s3.key.* entries)");
+            }
+            keys = new me.predatorray.candybox.common.auth.FileCredentialStore(
+                    config.security().credentialsFile());
+        } else {
+            keys = accessKeyId -> java.util.Optional.empty();
+        }
+        this.authenticator = new S3Authenticator(authEnabled, config.s3AllowAnonymous(), keys,
+                config.region(), me.predatorray.candybox.common.SystemClock.INSTANCE);
+        this.access = new S3AccessControl(authEnabled, store);
     }
 
     void start() {
@@ -62,6 +79,7 @@ final class S3GatewayServer implements AutoCloseable {
         boss = new NioEventLoopGroup(1);
         workers = new NioEventLoopGroup();
         blockingGroup = new DefaultEventExecutorGroup(config.workerThreads());
+        javax.net.ssl.SSLContext sslContext = config.security().serverSslContext();
 
         ServerBootstrap bootstrap = new ServerBootstrap()
                 .group(boss, workers)
@@ -70,10 +88,16 @@ final class S3GatewayServer implements AutoCloseable {
                 .childHandler(new ChannelInitializer<SocketChannel>() {
                     @Override
                     protected void initChannel(SocketChannel ch) {
+                        if (sslContext != null) {
+                            javax.net.ssl.SSLEngine engine = sslContext.createSSLEngine();
+                            engine.setUseClientMode(false);
+                            ch.pipeline().addLast(new io.netty.handler.ssl.SslHandler(engine));
+                        }
                         ch.pipeline().addLast(new HttpServerCodec());
                         ch.pipeline().addLast(new HttpObjectAggregator(maxContent));
                         // Run the (blocking) handler off the I/O event loop.
-                        ch.pipeline().addLast(blockingGroup, new S3Handler(store, config));
+                        ch.pipeline().addLast(blockingGroup,
+                                new S3Handler(store, config, authenticator, access));
                     }
                 });
 

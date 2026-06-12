@@ -65,6 +65,47 @@ final class CandyboxClientStore implements CandyStore, AutoCloseable {
     }
 
     @Override
+    public void putCandy(String box, String key, byte[] data, String contentType,
+                         Map<String, String> userMetadata, String owner,
+                         List<String> grants) {
+        client.putCandy(box, key, data, contentType, userMetadata, null, owner, grants);
+    }
+
+    @Override
+    public CandyInfo copyCandy(String box, String srcKey, String dstKey, String owner,
+                               List<String> grants) {
+        return client.copyCandy(box, srcKey, dstKey, null, owner, grants);
+    }
+
+    @Override
+    public CandyInfo completeMultipartUpload(String box, String key, String uploadId,
+                                             List<PartUploadInfo> parts, String owner,
+                                             List<String> grants) {
+        return client.completeMultipartUpload(box, key, uploadId, parts, null, owner, grants);
+    }
+
+    @Override
+    public java.util.Optional<me.predatorray.candybox.common.auth.BoxAcl> getBoxAcl(String box) {
+        return client.getBoxAcl(box);
+    }
+
+    @Override
+    public void setBoxAcl(String box, me.predatorray.candybox.common.auth.BoxAcl acl) {
+        client.setBoxAcl(box, acl);
+    }
+
+    @Override
+    public me.predatorray.candybox.common.auth.ObjectAcl getCandyAcl(String box, String key) {
+        return client.getCandyAcl(box, key);
+    }
+
+    @Override
+    public void setCandyAcl(String box, String key,
+                            me.predatorray.candybox.common.auth.ObjectAcl acl) {
+        client.setCandyAcl(box, key, acl);
+    }
+
+    @Override
     public byte[] getCandy(String box, String key) {
         return client.getCandy(box, key);
     }

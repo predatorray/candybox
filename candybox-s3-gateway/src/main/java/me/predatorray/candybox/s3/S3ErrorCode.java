@@ -21,6 +21,17 @@ package me.predatorray.candybox.s3;
  * {@code S3_GATEWAY_PLAN.md} §9.
  */
 enum S3ErrorCode {
+    ACCESS_DENIED(403, "AccessDenied", "Access Denied"),
+    INVALID_ACCESS_KEY_ID(403, "InvalidAccessKeyId",
+            "The AWS access key Id you provided does not exist in our records."),
+    SIGNATURE_DOES_NOT_MATCH(403, "SignatureDoesNotMatch",
+            "The request signature we calculated does not match the signature you provided."),
+    REQUEST_TIME_TOO_SKEWED(403, "RequestTimeTooSkewed",
+            "The difference between the request time and the server's time is too large."),
+    AUTHORIZATION_REGION_MISMATCH(400, "AuthorizationHeaderMalformed",
+            "The authorization header is malformed; the region is wrong."),
+    X_AMZ_CONTENT_SHA256_MISMATCH(400, "XAmzContentSHA256Mismatch",
+            "The provided 'x-amz-content-sha256' header does not match what was computed."),
     NO_SUCH_KEY(404, "NoSuchKey", "The specified key does not exist."),
     NO_SUCH_BUCKET(404, "NoSuchBucket", "The specified bucket does not exist."),
     BUCKET_ALREADY_OWNED_BY_YOU(409, "BucketAlreadyOwnedByYou",

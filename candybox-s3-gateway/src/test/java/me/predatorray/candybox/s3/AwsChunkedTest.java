@@ -33,36 +33,40 @@ class AwsChunkedTest {
     @Test
     void decodesSignedChunks() {
         String framed = "5;chunk-signature=abc123\r\nhello\r\n0;chunk-signature=def456\r\n\r\n";
-        byte[] out = AwsChunked.decode(framed.getBytes(StandardCharsets.UTF_8), 5);
-        assertThat(new String(out, StandardCharsets.UTF_8)).isEqualTo("hello");
+        AwsChunked.Decoded out = AwsChunked.decode(framed.getBytes(StandardCharsets.UTF_8));
+        assertThat(new String(out.payload(), StandardCharsets.UTF_8)).isEqualTo("hello");
+        // The signatures are surfaced for the signed-streaming verification chain.
+        assertThat(out.chunks()).hasSize(2);
+        assertThat(out.chunks().get(0).signature()).isEqualTo("abc123");
+        assertThat(out.chunks().get(1).signature()).isEqualTo("def456");
     }
 
     @Test
     void decodesUnsignedChunksAcrossMultipleChunks() {
         String framed = "3\r\nfoo\r\n3\r\nbar\r\n0\r\n\r\n";
-        byte[] out = AwsChunked.decode(framed.getBytes(StandardCharsets.UTF_8), 6);
+        byte[] out = AwsChunked.decode(framed.getBytes(StandardCharsets.UTF_8)).payload();
         assertThat(new String(out, StandardCharsets.UTF_8)).isEqualTo("foobar");
     }
 
     @Test
     void terminatorOnlyBodyDecodesToEmpty() {
-        byte[] out = AwsChunked.decode("0\r\n\r\n".getBytes(StandardCharsets.UTF_8), 0);
+        byte[] out = AwsChunked.decode("0\r\n\r\n".getBytes(StandardCharsets.UTF_8)).payload();
         assertThat(out).isEmpty();
-        assertThat(AwsChunked.decode(new byte[0], -1)).isEmpty();
+        assertThat(AwsChunked.decode(new byte[0]).payload()).isEmpty();
     }
 
     @Test
     void toleratesMissingCrlfBeforeTerminator() {
         // Data chunk not followed by the optional CRLF, then the 0-terminator.
-        byte[] out = AwsChunked.decode("3\r\nfoo0\r\n\r\n".getBytes(StandardCharsets.UTF_8), 3);
+        byte[] out = AwsChunked.decode("3\r\nfoo0\r\n\r\n".getBytes(StandardCharsets.UTF_8)).payload();
         assertThat(new String(out, StandardCharsets.UTF_8)).isEqualTo("foo");
     }
 
     @Test
     void rejectsTruncatedChunk() {
-        String framed = "10\r\nonly-a-few\r\n"; // declares 16 bytes, far fewer present
+        String framed = "20\r\nonly-a-few\r\n"; // declares 32 bytes, far fewer present
         org.assertj.core.api.Assertions.assertThatThrownBy(
-                        () -> AwsChunked.decode(framed.getBytes(StandardCharsets.UTF_8), -1))
+                        () -> AwsChunked.decode(framed.getBytes(StandardCharsets.UTF_8)))
                 .isInstanceOf(S3Exception.class);
     }
 }
