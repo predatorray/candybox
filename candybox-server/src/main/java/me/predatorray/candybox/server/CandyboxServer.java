@@ -26,6 +26,7 @@ import me.predatorray.candybox.common.auth.FileCredentialStore;
 import me.predatorray.candybox.common.auth.StandardAuthorizer;
 import me.predatorray.candybox.common.config.SecurityConfig;
 import me.predatorray.candybox.coordination.CoordinationService;
+import me.predatorray.candybox.coordination.zk.ZkAuth;
 import me.predatorray.candybox.coordination.zk.ZooKeeperCoordinationService;
 import me.predatorray.candybox.protocol.FrameCodec;
 import me.predatorray.candybox.protocol.auth.AuthenticatingRequestHandler;
@@ -78,10 +79,12 @@ public final class CandyboxServer {
                 config.zookeeperConnect(), security.tlsEnabled(),
                 security.authEnabled() ? security.saslMechanisms() : "off");
 
-        LedgerStore ledgerStore =
-                BookKeeperLedgerStore.create(config.metadataServiceUri(), config.ledgerPassword());
-        CoordinationService coordination =
-                new ZooKeeperCoordinationService(config.coordinationConnect(), SystemClock.INSTANCE);
+        LedgerStore ledgerStore = BookKeeperLedgerStore.create(config.metadataServiceUri(),
+                config.ledgerPassword(), config.bookkeeperClientProps());
+        CoordinationService coordination = new ZooKeeperCoordinationService(
+                config.coordinationConnect(), SystemClock.INSTANCE,
+                new ZkAuth(security.zkAuthScheme(), security.zkAuthCredentials(),
+                        security.zkAclEnabled()));
         CandyboxNode node = new CandyboxNode(config.nodeId(), config.tuning(), ledgerStore, coordination,
                 SystemClock.INSTANCE, config.advertisedAddress());
         RequestHandler handler = node.requestHandler();

@@ -150,3 +150,29 @@ balancer.interval.millis=5000
 # tls.key.path=/etc/candybox/tls/tls.key
 # tls.ca.path=/etc/candybox/tls/ca.crt
 # tls.client.auth=false
+
+# ---------------------------------------------------------------------------
+# ZooKeeper authentication + znode ACLs.
+# digest auth needs no ZooKeeper-side setup; SASL (Kerberos / DIGEST-MD5) is configured through a
+# JAAS file instead (set CANDYBOX_JAAS_CONF — its `Client` section also covers BookKeeper's
+# internal ZooKeeper connection). With ACLs on, every znode candybox creates is CREATOR_ALL —
+# all candybox processes of one cluster (nodes, s3-gateway, admin-api) must then use the SAME
+# ZooKeeper identity. acl.enabled defaults to true once an auth scheme is set.
+# ---------------------------------------------------------------------------
+
+# zookeeper.auth.scheme=digest
+# zookeeper.auth.credentials=candybox:change-me      # or zookeeper.auth.credentials.file=...
+# zookeeper.acl.enabled=true
+
+# ---------------------------------------------------------------------------
+# BookKeeper client passthrough: every `bookkeeper.client.<key>` is handed verbatim to the raw
+# BookKeeper ClientConfiguration (keys are BK's own camelCase names, case-sensitive — via env use
+# e.g. CANDYBOX_BOOKKEEPER_CLIENT_tlsProvider). This enables BK auth and client<->bookie TLS with
+# no candybox release. The bookie side is configured in the bookies' own bookkeeper.conf.
+# ---------------------------------------------------------------------------
+
+# bookkeeper.client.clientAuthProviderFactoryClass=org.apache.bookkeeper.sasl.SASLClientProviderFactory
+# bookkeeper.client.tlsProvider=OpenSSL
+# bookkeeper.client.tlsClientAuthentication=true
+# bookkeeper.client.tlsTrustStoreType=PEM
+# bookkeeper.client.tlsTrustStore=/etc/candybox/tls/ca.crt

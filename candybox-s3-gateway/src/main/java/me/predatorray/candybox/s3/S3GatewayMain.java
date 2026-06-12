@@ -23,6 +23,7 @@ import me.predatorray.candybox.common.SystemClock;
 import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.config.SecurityConfig;
 import me.predatorray.candybox.coordination.CoordinationService;
+import me.predatorray.candybox.coordination.zk.ZkAuth;
 import me.predatorray.candybox.coordination.zk.ZooKeeperCoordinationService;
 import me.predatorray.candybox.protocol.FrameCodec;
 import me.predatorray.candybox.protocol.auth.AuthenticatingTransport;
@@ -75,8 +76,10 @@ public final class S3GatewayMain {
         Transport transport = security.clientUsername() == null ? tcp
                 : new AuthenticatingTransport(tcp, security.clientMechanism(),
                         security.clientUsername(), security.clientPassword());
-        CoordinationService coordination =
-                new ZooKeeperCoordinationService(config.zookeeperConnect(), SystemClock.INSTANCE);
+        CoordinationService coordination = new ZooKeeperCoordinationService(
+                config.zookeeperConnect(), SystemClock.INSTANCE,
+                new ZkAuth(security.zkAuthScheme(), security.zkAuthCredentials(),
+                        security.zkAclEnabled()));
         CandyboxConfig clientConfig = CandyboxConfig.builder()
                 .routerCacheTtlMillis(config.routerCacheTtlMillis())
                 .build();

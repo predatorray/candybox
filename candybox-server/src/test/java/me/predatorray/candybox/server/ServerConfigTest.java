@@ -137,6 +137,45 @@ class ServerConfigTest {
     }
 
     @Test
+    void collectsBookkeeperClientPassthroughFromFileAndEnv() {
+        ServerConfig config = ServerConfig.fromProperties(
+                props("zookeeper.connect", "zk:2181", "node.id", "1",
+                        "bookkeeper.client.tlsProvider", "OpenSSL",
+                        "bookkeeper.client.clientAuthProviderFactoryClass",
+                        "org.apache.bookkeeper.sasl.SASLClientProviderFactory"),
+                Map.of("CANDYBOX_BOOKKEEPER_CLIENT_tlsTrustStore", "/tls/ca.crt",
+                        // env wins over the file for the same BK key
+                        "CANDYBOX_BOOKKEEPER_CLIENT_tlsProvider", "JDK"));
+
+        assertThat(config.bookkeeperClientProps())
+                .containsEntry("tlsProvider", "JDK")
+                .containsEntry("clientAuthProviderFactoryClass",
+                        "org.apache.bookkeeper.sasl.SASLClientProviderFactory")
+                .containsEntry("tlsTrustStore", "/tls/ca.crt")
+                .hasSize(3);
+        // non-passthrough keys stay out of it
+        assertThat(config.bookkeeperClientProps()).doesNotContainKey("metadataServiceUri");
+    }
+
+    @Test
+    void parsesZookeeperAuthKeys() {
+        ServerConfig config = ServerConfig.fromProperties(
+                props("zookeeper.connect", "zk:2181", "node.id", "1",
+                        "zookeeper.auth.scheme", "digest",
+                        "zookeeper.auth.credentials", "candybox:pw"),
+                Map.of());
+        assertThat(config.security().zkAuthScheme()).isEqualTo("digest");
+        assertThat(config.security().zkAuthCredentials()).isEqualTo("candybox:pw");
+        // ACLs default on once a scheme is configured.
+        assertThat(config.security().zkAclEnabled()).isTrue();
+
+        ServerConfig open = ServerConfig.fromProperties(
+                props("zookeeper.connect", "zk:2181", "node.id", "1"), Map.of());
+        assertThat(open.security().zkAuthScheme()).isNull();
+        assertThat(open.security().zkAclEnabled()).isFalse();
+    }
+
+    @Test
     void rendersPrometheusMetricsWithBoxAndNodeLabels() {
         String text = HealthServer.renderMetrics(3, Map.of("alpha",
                 new me.predatorray.candybox.lsm.engine.BoxEngineStats(5, 1, 9, 2, 0, 1, 0, 0)));

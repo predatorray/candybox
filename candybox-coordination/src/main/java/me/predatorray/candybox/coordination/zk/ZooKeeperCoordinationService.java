@@ -31,8 +31,11 @@ import me.predatorray.candybox.coordination.LeaseInfo;
 import me.predatorray.candybox.coordination.VersionedValue;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
+import org.apache.curator.framework.api.ACLProvider;
 import org.apache.curator.retry.ExponentialBackoffRetry;
 import org.apache.zookeeper.KeeperException;
+import org.apache.zookeeper.ZooDefs;
+import org.apache.zookeeper.data.ACL;
 import org.apache.zookeeper.data.Stat;
 
 /**
@@ -63,9 +66,22 @@ public final class ZooKeeperCoordinationService implements CoordinationService {
     private final Clock clock;
     private final boolean ownsClient;
 
-    /** Builds and owns a Curator client connected to {@code connectString}. */
+    /** Builds and owns a Curator client connected to {@code connectString}, unauthenticated. */
     public ZooKeeperCoordinationService(String connectString, Clock clock) {
-        this(buildClient(connectString), clock, true);
+        this(connectString, clock, ZkAuth.NONE);
+    }
+
+    /**
+     * Builds and owns a Curator client with ZooKeeper authentication / znode ACLs per
+     * {@code auth}. With {@link ZkAuth#aclEnabled()} every znode this process creates carries
+     * {@code CREATOR_ALL_ACL}, so it is only touchable by the same authenticated identity —
+     * every Candybox process of one cluster (nodes, S3 gateway, admin API, CLI in cluster mode)
+     * must therefore authenticate as the <em>same</em> ZooKeeper identity. SASL (Kerberos/digest
+     * via a JAAS {@code Client} section) needs no credentials here — the JVM-global JAAS config
+     * drives it, conveniently shared with BookKeeper's internal ZooKeeper client.
+     */
+    public ZooKeeperCoordinationService(String connectString, Clock clock, ZkAuth auth) {
+        this(buildClient(connectString, auth), clock, true);
         try {
             client.blockUntilConnected();
         } catch (InterruptedException e) {
@@ -85,14 +101,31 @@ public final class ZooKeeperCoordinationService implements CoordinationService {
         this.ownsClient = ownsClient;
     }
 
-    private static CuratorFramework buildClient(String connectString) {
-        CuratorFramework c = CuratorFrameworkFactory.builder()
+    private static CuratorFramework buildClient(String connectString, ZkAuth auth) {
+        CuratorFrameworkFactory.Builder builder = CuratorFrameworkFactory.builder()
                 .connectString(connectString)
                 .namespace("candybox")
                 .retryPolicy(new ExponentialBackoffRetry(100, 3))
                 .sessionTimeoutMs(15_000)
-                .connectionTimeoutMs(15_000)
-                .build();
+                .connectionTimeoutMs(15_000);
+        if (auth.scheme() != null && auth.credentials() != null) {
+            builder.authorization(auth.scheme(),
+                    auth.credentials().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        }
+        if (auth.aclEnabled()) {
+            builder.aclProvider(new ACLProvider() {
+                @Override
+                public List<ACL> getDefaultAcl() {
+                    return ZooDefs.Ids.CREATOR_ALL_ACL;
+                }
+
+                @Override
+                public List<ACL> getAclForPath(String path) {
+                    return ZooDefs.Ids.CREATOR_ALL_ACL;
+                }
+            });
+        }
+        CuratorFramework c = builder.build();
         c.start();
         return c;
     }
