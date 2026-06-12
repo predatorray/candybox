@@ -75,7 +75,17 @@ public final class AdminApiMain {
             stack.push(scraper);
             scraper.start();
         }
-        AdminApiServer server = new AdminApiServer(config, () -> true, data, scraper);
+        String authToken = orDefault(System.getenv("CANDYBOX_ADMIN_AUTH_TOKEN"), null);
+        SecurityConfig listenerSecurity = SecurityConfig.resolve(key -> java.util.Optional
+                .ofNullable(System.getenv("CANDYBOX_" + key.toUpperCase().replace('.', '_')))
+                .filter(v -> !v.isBlank()).map(String::trim));
+        AdminApiServer server = new AdminApiServer(config, () -> true, data, scraper, authToken,
+                listenerSecurity.serverSslContext());
+        if (authToken == null) {
+            LOG.warn("CANDYBOX_ADMIN_AUTH_TOKEN is not set — the admin API (including box "
+                    + "browsing and uploads) is open to anyone who can reach port {}",
+                    config.port());
+        }
         stack.push(server);
         Runtime.getRuntime().addShutdownHook(new Thread(() -> closeAll(stack), "admin-api-shutdown"));
         server.start();
@@ -115,7 +125,8 @@ public final class AdminApiMain {
         }
         long interval = parseIntOr(env.get("CANDYBOX_ADMIN_SCRAPE_INTERVAL_MS"), 5000);
         int window = parseIntOr(env.get("CANDYBOX_ADMIN_SCRAPE_WINDOW"), 60);
-        return new MetricsScraper(targets, interval, window);
+        return new MetricsScraper(targets, interval, window,
+                orDefault(env.get("CANDYBOX_ADMIN_SCRAPE_TOKEN"), null));
     }
 
     private static DashboardData buildDataSource(String zk, Deque<AutoCloseable> closeStack,

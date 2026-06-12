@@ -16,8 +16,44 @@ export function apiBase(): string {
   return '';
 }
 
+// ---- Admin bearer token ------------------------------------------------------
+//
+// When the admin API runs with CANDYBOX_ADMIN_AUTH_TOKEN, every /api/* call needs
+// `Authorization: Bearer <token>`. The SPA captures the token once from a `?token=...` query
+// parameter (open the dashboard as /ui/?token=SECRET), stores it in localStorage, and strips it
+// from the address bar; clear it by visiting /ui/?token= (empty value).
+
+const TOKEN_STORAGE_KEY = 'candybox-admin-token';
+
+function captureTokenFromUrl(): void {
+  if (typeof window === 'undefined') return;
+  const url = new URL(window.location.href);
+  const token = url.searchParams.get('token');
+  if (token === null) return;
+  if (token === '') {
+    window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+  } else {
+    window.localStorage.setItem(TOKEN_STORAGE_KEY, token);
+  }
+  url.searchParams.delete('token');
+  window.history.replaceState(null, '', url.toString());
+}
+captureTokenFromUrl();
+
+export function adminToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  return window.localStorage.getItem(TOKEN_STORAGE_KEY);
+}
+
+function authHeaders(): Record<string, string> {
+  const token = adminToken();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
 export async function apiGet<T>(path: string, schema: z.ZodType<T>): Promise<T> {
-  const res = await fetch(`${apiBase()}${path}`, { headers: { Accept: 'application/json' } });
+  const res = await fetch(`${apiBase()}${path}`, {
+    headers: { Accept: 'application/json', ...authHeaders() },
+  });
   if (!res.ok) {
     throw await readApiError(res);
   }
@@ -38,7 +74,7 @@ export async function apiSend(
   path: string,
   init?: { jsonBody?: unknown; bodyBytes?: BodyInit; contentType?: string },
 ): Promise<unknown> {
-  const headers: Record<string, string> = { Accept: 'application/json' };
+  const headers: Record<string, string> = { Accept: 'application/json', ...authHeaders() };
   let body: BodyInit | undefined;
   if (init?.jsonBody !== undefined) {
     headers['Content-Type'] = 'application/json';

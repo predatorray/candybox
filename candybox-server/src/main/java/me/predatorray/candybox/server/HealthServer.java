@@ -54,6 +54,17 @@ public final class HealthServer implements AutoCloseable {
      */
     public HealthServer(int port, int nodeId, BooleanSupplier ready,
                         java.util.function.Supplier<Map<String, BoxEngineStats>> statsSource) {
+        this(port, nodeId, ready, statsSource, null);
+    }
+
+    /**
+     * @param metricsToken when non-null, {@code /metrics} demands {@code Authorization: Bearer
+     *                     <token>} (the probes stay open — metrics leak Box names and workload
+     *                     shape, the probes only a boolean)
+     */
+    public HealthServer(int port, int nodeId, BooleanSupplier ready,
+                        java.util.function.Supplier<Map<String, BoxEngineStats>> statsSource,
+                        String metricsToken) {
         try {
             this.http = HttpServer.create(new InetSocketAddress(port), 0);
         } catch (IOException e) {
@@ -64,9 +75,23 @@ public final class HealthServer implements AutoCloseable {
             boolean ok = ready.getAsBoolean();
             respond(exchange, ok ? 200 : 503, ok ? "ready\n" : "not ready\n");
         });
-        http.createContext("/metrics", exchange ->
-                respond(exchange, 200, renderMetrics(nodeId, statsSource.get())));
+        http.createContext("/metrics", exchange -> {
+            if (metricsToken != null && !bearerMatches(exchange, metricsToken)) {
+                respond(exchange, 401, "metrics require Authorization: Bearer <token>\n");
+                return;
+            }
+            respond(exchange, 200, renderMetrics(nodeId, statsSource.get()));
+        });
         http.setExecutor(null); // default executor (a small internal pool)
+    }
+
+    static boolean bearerMatches(com.sun.net.httpserver.HttpExchange exchange, String token) {
+        String header = exchange.getRequestHeaders().getFirst("Authorization");
+        String presented = header != null && header.startsWith("Bearer ")
+                ? header.substring("Bearer ".length()).trim() : "";
+        return java.security.MessageDigest.isEqual(
+                presented.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                token.getBytes(java.nio.charset.StandardCharsets.UTF_8));
     }
 
     public void start() {

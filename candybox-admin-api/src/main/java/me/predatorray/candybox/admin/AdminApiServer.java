@@ -74,6 +74,7 @@ public final class AdminApiServer implements AutoCloseable {
     private final AdminApiConfig config;
     private final DashboardData data;
     private final MetricsScraper metrics;
+    private final String authToken;
 
     public AdminApiServer(AdminApiConfig config, BooleanSupplier ready, DashboardData data) {
         this(config, ready, data, null);
@@ -81,11 +82,33 @@ public final class AdminApiServer implements AutoCloseable {
 
     public AdminApiServer(AdminApiConfig config, BooleanSupplier ready, DashboardData data,
                           MetricsScraper metrics) {
+        this(config, ready, data, metrics, null, null);
+    }
+
+    /**
+     * @param authToken when non-null, every {@code /api/*} route demands
+     *                  {@code Authorization: Bearer <token>} (health probes and the static SPA
+     *                  stay open); the SPA stores the token after a one-time {@code /ui/?token=...}
+     * @param ssl       when non-null, the listener serves HTTPS with this context (PEM via
+     *                  {@code tls.*})
+     */
+    public AdminApiServer(AdminApiConfig config, BooleanSupplier ready, DashboardData data,
+                          MetricsScraper metrics, String authToken,
+                          javax.net.ssl.SSLContext ssl) {
         this.config = config;
         this.data = data;
         this.metrics = metrics;
+        this.authToken = authToken;
         try {
-            this.http = HttpServer.create(new InetSocketAddress(config.bindAddress(), config.port()), 0);
+            if (ssl != null) {
+                com.sun.net.httpserver.HttpsServer https = com.sun.net.httpserver.HttpsServer
+                        .create(new InetSocketAddress(config.bindAddress(), config.port()), 0);
+                https.setHttpsConfigurator(new com.sun.net.httpserver.HttpsConfigurator(ssl));
+                this.http = https;
+            } else {
+                this.http = HttpServer.create(
+                        new InetSocketAddress(config.bindAddress(), config.port()), 0);
+            }
         } catch (IOException e) {
             throw new UncheckedIOException(
                     "Failed to bind admin API on " + config.bindAddress() + ":" + config.port(), e);
@@ -111,7 +134,28 @@ public final class AdminApiServer implements AutoCloseable {
     }
 
     private void register(String path, HttpHandler handler) {
-        http.createContext(path, withCors(handler));
+        http.createContext(path, withCors(withAuth(path, handler)));
+    }
+
+    /** The bearer-token guard on {@code /api/*}; probes and the static SPA shell stay open. */
+    private HttpHandler withAuth(String path, HttpHandler delegate) {
+        if (authToken == null || !path.startsWith("/api")) {
+            return delegate;
+        }
+        return exchange -> {
+            String header = exchange.getRequestHeaders().getFirst("Authorization");
+            String presented = header != null && header.startsWith("Bearer ")
+                    ? header.substring("Bearer ".length()).trim() : null;
+            if (presented == null || !java.security.MessageDigest.isEqual(
+                    presented.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                    authToken.getBytes(java.nio.charset.StandardCharsets.UTF_8))) {
+                jsonRespond(exchange, 401, JsonWriter.write(Map.of(
+                        "error", "Unauthorized",
+                        "message", "This admin API requires Authorization: Bearer <token>")));
+                return;
+            }
+            delegate.handle(exchange);
+        };
     }
 
     public void start() {
@@ -527,7 +571,7 @@ public final class AdminApiServer implements AutoCloseable {
         }
         headers.set("Access-Control-Allow-Origin", config.corsAllowOrigin());
         headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-        headers.set("Access-Control-Allow-Headers", "Content-Type, If-Match, If-None-Match");
+        headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization, If-Match, If-None-Match");
         headers.set("Access-Control-Max-Age", "600");
     }
 

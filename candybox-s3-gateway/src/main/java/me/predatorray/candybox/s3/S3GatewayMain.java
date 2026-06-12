@@ -89,7 +89,8 @@ public final class S3GatewayMain {
         gateway.start();
 
         AtomicBoolean ready = new AtomicBoolean(true);
-        GatewayHealthServer health = new GatewayHealthServer(config.healthPort(), ready::get);
+        GatewayHealthServer health = new GatewayHealthServer(config.healthPort(), ready::get,
+                security.metricsAuthToken());
         health.start();
 
         LOG.info("Candybox S3 gateway is up: S3 on {}, health on {}", gateway.port(), health.port());

@@ -1,6 +1,14 @@
 # Candybox Authentication & Authorization — Implementation Plan
 
-Status: **design locked, not yet implemented** · Last updated: 2026-06-12
+Status: **implemented** (phases A–E on this branch) · Last updated: 2026-06-12
+
+> Implementation notes / deviations from the locked design: password hashing uses **PBKDF2-SHA256**
+> (JDK-built-in) rather than bcrypt — no new dependency; the SASL SPI uses candybox-native
+> interfaces with RFC-exact wire formats (PLAIN RFC 4616, SCRAM-SHA-256 RFC 5802/7677) instead of
+> `javax.security.sasl` plumbing; node/gateway `/healthz`/`/readyz` probes stay plain-HTTP with the
+> data-bearing `/metrics` guarded by an optional bearer token instead of TLS on the health
+> listener; the ceph/s3-tests allowlist recalibration against the now-SigV4-enabled CI compose is
+> the remaining follow-up (the harness and credentials are wired).
 
 This document is the concrete implementation plan for **authentication, authorization, and
 transport encryption** across every Candybox channel. It follows the SASL-with-pluggable-mechanisms

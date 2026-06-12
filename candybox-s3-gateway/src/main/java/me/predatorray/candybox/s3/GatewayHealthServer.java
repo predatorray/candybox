@@ -44,6 +44,11 @@ final class GatewayHealthServer implements AutoCloseable {
     private final HttpServer http;
 
     GatewayHealthServer(int port, BooleanSupplier ready) {
+        this(port, ready, null);
+    }
+
+    /** @param metricsToken when non-null, {@code /metrics} demands a Bearer token (probes stay open) */
+    GatewayHealthServer(int port, BooleanSupplier ready, String metricsToken) {
         try {
             this.http = HttpServer.create(new InetSocketAddress(port), 0);
         } catch (IOException e) {
@@ -54,11 +59,27 @@ final class GatewayHealthServer implements AutoCloseable {
             boolean ok = ready.getAsBoolean();
             respond(exchange, ok ? 200 : 503, ok ? "ready\n" : "not ready\n");
         });
-        http.createContext("/metrics", exchange -> respond(exchange, 200,
-                "# HELP candybox_s3_gateway_up Gateway process up.\n"
-                        + "# TYPE candybox_s3_gateway_up gauge\n"
-                        + "candybox_s3_gateway_up 1\n"));
+        http.createContext("/metrics", exchange -> {
+            if (metricsToken != null && !bearerMatches(exchange, metricsToken)) {
+                respond(exchange, 401, "metrics require Authorization: Bearer <token>\n");
+                return;
+            }
+            respond(exchange, 200,
+                    "# HELP candybox_s3_gateway_up Gateway process up.\n"
+                            + "# TYPE candybox_s3_gateway_up gauge\n"
+                            + "candybox_s3_gateway_up 1\n");
+        });
         http.setExecutor(null);
+    }
+
+    private static boolean bearerMatches(com.sun.net.httpserver.HttpExchange exchange,
+                                         String token) {
+        String header = exchange.getRequestHeaders().getFirst("Authorization");
+        String presented = header != null && header.startsWith("Bearer ")
+                ? header.substring("Bearer ".length()).trim() : "";
+        return java.security.MessageDigest.isEqual(
+                presented.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                token.getBytes(java.nio.charset.StandardCharsets.UTF_8));
     }
 
     void start() {
