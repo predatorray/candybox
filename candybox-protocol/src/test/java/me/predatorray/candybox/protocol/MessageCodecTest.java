@@ -372,4 +372,34 @@ class MessageCodecTest {
         assertThat(parts.parts().get(1).partLength()).isEqualTo(2048);
         assertThat(parts.nextPartNumberMarker()).isEqualTo(7);
     }
+
+    @Test
+    void saslMessagesRoundTrip() {
+        Message.SaslHandshakeRequest handshake = (Message.SaslHandshakeRequest) roundTrip(
+                new Message.SaslHandshakeRequest("SCRAM-SHA-256"));
+        assertThat(handshake.mechanism()).isEqualTo("SCRAM-SHA-256");
+
+        Message.SaslHandshakeResponse handshakeResponse =
+                (Message.SaslHandshakeResponse) roundTrip(
+                        new Message.SaslHandshakeResponse(false, List.of("PLAIN", "SCRAM-SHA-256")));
+        assertThat(handshakeResponse.ok()).isFalse();
+        assertThat(handshakeResponse.enabledMechanisms())
+                .containsExactly("PLAIN", "SCRAM-SHA-256");
+
+        byte[] token = {0, 1, 2, (byte) 0xFF};
+        Message.SaslAuthenticateRequest authenticate = (Message.SaslAuthenticateRequest) roundTrip(
+                new Message.SaslAuthenticateRequest(token));
+        assertThat(authenticate.token()).isEqualTo(token);
+        assertThat(((Message.SaslAuthenticateRequest) roundTrip(
+                new Message.SaslAuthenticateRequest(null))).token()).isEmpty();
+
+        Message.SaslAuthenticateResponse challenge = (Message.SaslAuthenticateResponse) roundTrip(
+                new Message.SaslAuthenticateResponse(true, token));
+        assertThat(challenge.complete()).isTrue();
+        assertThat(challenge.challenge()).isEqualTo(token);
+
+        Message.AuthFailedResponse failed = (Message.AuthFailedResponse) roundTrip(
+                new Message.AuthFailedResponse("Authentication failed"));
+        assertThat(failed.message()).isEqualTo("Authentication failed");
+    }
 }

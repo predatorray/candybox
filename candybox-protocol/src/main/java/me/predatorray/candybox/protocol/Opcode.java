@@ -43,6 +43,11 @@ public enum Opcode {
     UPLOAD_PART_COPY(35),
     BOX_INFO(36),
 
+    /** Selects the SASL mechanism for this connection; must precede {@link #SASL_AUTHENTICATE}. */
+    SASL_HANDSHAKE(50),
+    /** One step of the SASL exchange: an opaque, mechanism-defined client token. */
+    SASL_AUTHENTICATE(51),
+
     RESPONSE_OK(20),
     RESPONSE_ERROR(21),
     RESPONSE_BUSY(22),
@@ -57,7 +62,15 @@ public enum Opcode {
     RESPONSE_UPLOAD_PART(41),
     RESPONSE_LIST_MULTIPART_UPLOADS(42),
     RESPONSE_LIST_PARTS(43),
-    RESPONSE_BOX_INFO(44);
+    RESPONSE_BOX_INFO(44),
+
+    /**
+     * Authentication failed, or a request arrived on a connection that has not authenticated.
+     * Terminal — unlike {@link #RESPONSE_BUSY} the client must not retry with the same credentials.
+     */
+    RESPONSE_AUTH_FAILED(52),
+    RESPONSE_SASL_HANDSHAKE(53),
+    RESPONSE_SASL_AUTHENTICATE(54);
 
     private final int code;
 

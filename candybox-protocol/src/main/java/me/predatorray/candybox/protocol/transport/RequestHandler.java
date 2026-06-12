@@ -28,4 +28,18 @@ public interface RequestHandler {
      * @return the response frame
      */
     Frame handle(Frame request);
+
+    /**
+     * Handles one request with its connection's state. Transports always invoke this form, with one
+     * {@link ConnectionContext} per accepted connection; handlers that care about the caller's
+     * identity (the SASL gate, the authorizing dispatcher) override it, while plain handlers and
+     * test lambdas only implement {@link #handle(Frame)}.
+     *
+     * @param context the per-connection state (authentication progress + principal)
+     * @param request the decoded request frame
+     * @return the response frame
+     */
+    default Frame handle(ConnectionContext context, Frame request) {
+        return handle(request);
+    }
 }

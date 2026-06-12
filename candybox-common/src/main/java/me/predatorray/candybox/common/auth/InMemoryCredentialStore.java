@@ -1,0 +1,59 @@
+/*
+ * Copyright (c) 2026 the original author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package me.predatorray.candybox.common.auth;
+
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * The in-memory {@link CredentialStore} used by tests and embedded setups: {@link #addUser} hashes
+ * the password into both a PLAIN verifier and a SCRAM credential, so any mechanism works.
+ */
+public final class InMemoryCredentialStore implements CredentialStore {
+
+    private final Map<String, String> plainVerifiers = new ConcurrentHashMap<>();
+    private final Map<String, ScramCredential> scramCredentials = new ConcurrentHashMap<>();
+    private final Map<String, Principal> principals = new ConcurrentHashMap<>();
+
+    /** Provisions a user for all mechanisms, mapped to the default {@code User:<name>} principal. */
+    public InMemoryCredentialStore addUser(String username, String password) {
+        return addUser(username, password, Principal.user(username));
+    }
+
+    /** Provisions a user for all mechanisms with an explicit principal mapping. */
+    public InMemoryCredentialStore addUser(String username, String password, Principal principal) {
+        plainVerifiers.put(username, Passwords.hash(password));
+        scramCredentials.put(username, ScramCredential.fromPassword(password));
+        principals.put(username, principal);
+        return this;
+    }
+
+    @Override
+    public Optional<String> plainVerifier(String username) {
+        return Optional.ofNullable(plainVerifiers.get(username));
+    }
+
+    @Override
+    public Optional<ScramCredential> scramCredential(String username) {
+        return Optional.ofNullable(scramCredentials.get(username));
+    }
+
+    @Override
+    public Principal principalOf(String username) {
+        return principals.getOrDefault(username, Principal.user(username));
+    }
+}

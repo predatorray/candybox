@@ -18,14 +18,22 @@ package me.predatorray.candybox.client;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.PrintStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import javax.net.ssl.SSLContext;
+import me.predatorray.candybox.common.auth.Passwords;
+import me.predatorray.candybox.common.auth.ScramCredential;
 import me.predatorray.candybox.common.exception.CandyboxException;
+import me.predatorray.candybox.common.tls.PemTls;
+import me.predatorray.candybox.protocol.FrameCodec;
+import me.predatorray.candybox.protocol.auth.AuthenticatingTransport;
 import me.predatorray.candybox.protocol.transport.TcpTransport;
+import me.predatorray.candybox.protocol.transport.Transport;
 
 /**
  * A thin command-line front end over {@link CandyboxClient}, talking directly to a single node
@@ -67,18 +75,63 @@ public final class CandyboxCli {
         List<String> args = new ArrayList<>(List.of(argv));
 
         String server = firstNonBlank(System.getenv("CANDYBOX_SERVER"), "127.0.0.1:" + DEFAULT_PORT);
-        // Pull out the global -s/--server option wherever it appears.
+        // Security options default from the environment (CI/k8s friendly), overridable by flags.
+        String username = blankToNull(System.getenv("CANDYBOX_AUTH_USERNAME"));
+        String password = blankToNull(System.getenv("CANDYBOX_AUTH_PASSWORD"));
+        String mechanism = firstNonBlank(System.getenv("CANDYBOX_AUTH_MECHANISM"), "PLAIN");
+        boolean tls = Boolean.parseBoolean(firstNonBlank(System.getenv("CANDYBOX_TLS"), "false"));
+        String tlsCa = blankToNull(System.getenv("CANDYBOX_TLS_CA"));
+        boolean tlsVerifyEndpoint = !Boolean.parseBoolean(
+                firstNonBlank(System.getenv("CANDYBOX_TLS_INSECURE_NO_VERIFY"), "false"));
+        // Pull out the global options wherever they appear.
         for (int i = 0; i < args.size(); i++) {
             String a = args.get(i);
-            if (a.equals("-s") || a.equals("--server")) {
+            boolean takesValue = switch (a) {
+                case "-s", "--server", "-u", "--user", "--password", "--password-file",
+                        "--mechanism", "--tls-ca" -> true;
+                case "--tls", "--tls-insecure-no-verify" -> false;
+                default -> false;
+            };
+            boolean global = takesValue || a.equals("--tls") || a.equals("--tls-insecure-no-verify");
+            if (!global) {
+                continue;
+            }
+            String value = null;
+            if (takesValue) {
                 if (i + 1 >= args.size()) {
                     err.println("Missing value for " + a);
                     return 2;
                 }
-                server = args.remove(i + 1);
-                args.remove(i);
-                i--;
+                value = args.remove(i + 1);
             }
+            args.remove(i);
+            i--;
+            switch (a) {
+                case "-s", "--server" -> server = value;
+                case "-u", "--user" -> username = value;
+                case "--password" -> password = value;
+                case "--password-file" -> {
+                    try {
+                        password = Files.readString(Path.of(value)).trim();
+                    } catch (IOException e) {
+                        err.println("Failed to read --password-file: " + e.getMessage());
+                        return 2;
+                    }
+                }
+                case "--mechanism" -> mechanism = value;
+                case "--tls" -> tls = true;
+                case "--tls-ca" -> {
+                    tls = true;
+                    tlsCa = value;
+                }
+                case "--tls-insecure-no-verify" -> tlsVerifyEndpoint = false;
+                default -> {
+                }
+            }
+        }
+        if (username != null && password == null) {
+            err.println("--user requires --password, --password-file or CANDYBOX_AUTH_PASSWORD");
+            return 2;
         }
 
         if (args.isEmpty() || args.get(0).equals("-h") || args.get(0).equals("--help")
@@ -102,8 +155,24 @@ public final class CandyboxCli {
         }
 
         String command = args.remove(0);
-        try (TcpTransport transport = new TcpTransport();
-             CandyboxClient client = new CandyboxClient(transport, host, port)) {
+        if (command.equals("make-credentials")) {
+            return makeCredentials(args, out, err);
+        }
+        SSLContext sslContext = null;
+        if (tls) {
+            try {
+                sslContext = PemTls.clientContext(tlsCa == null ? null : Path.of(tlsCa), null, null);
+            } catch (IllegalArgumentException e) {
+                err.println("TLS setup failed: " + e.getMessage());
+                return 2;
+            }
+        }
+        Transport transport = new TcpTransport(new FrameCodec(), sslContext, tlsVerifyEndpoint);
+        if (username != null) {
+            transport = new AuthenticatingTransport(transport, mechanism, username, password);
+        }
+        try (Transport t = transport;
+             CandyboxClient client = new CandyboxClient(t, host, port)) {
             return dispatch(command, args, client, out, err);
         } catch (CandyboxException e) {
             err.println("error: " + e.getMessage());
@@ -112,6 +181,40 @@ public final class CandyboxCli {
             err.println(e.getMessage());
             return 2;
         }
+    }
+
+    /**
+     * Prints the credential-file lines for a user — the PBKDF2 PLAIN verifier and the
+     * SCRAM-SHA-256 credential — reading the password from {@code --password}, or stdin.
+     */
+    private static int makeCredentials(List<String> args, PrintStream out, PrintStream err) {
+        if (args.isEmpty()) {
+            err.println("usage: candybox make-credentials <username> [--password <password>]");
+            return 2;
+        }
+        String username = args.remove(0);
+        String password = null;
+        for (int i = 0; i < args.size() - 1; i++) {
+            if (args.get(i).equals("--password")) {
+                password = args.get(i + 1);
+            }
+        }
+        if (password == null) {
+            try {
+                password = new String(System.in.readAllBytes(), StandardCharsets.UTF_8).trim();
+            } catch (IOException e) {
+                err.println("Failed to read password from stdin: " + e.getMessage());
+                return 2;
+            }
+        }
+        if (password.isEmpty()) {
+            err.println("Password must not be empty (pass --password or pipe it on stdin)");
+            return 2;
+        }
+        out.println("sasl.user." + username + " = " + Passwords.hash(password));
+        out.println("sasl.scram-sha-256." + username + " = "
+                + ScramCredential.fromPassword(password).toFileString());
+        return 0;
     }
 
     private static int dispatch(String command, List<String> args, CandyboxClient client,
@@ -298,6 +401,10 @@ public final class CandyboxCli {
         return (a != null && !a.isBlank()) ? a : b;
     }
 
+    private static String blankToNull(String s) {
+        return (s == null || s.isBlank()) ? null : s.trim();
+    }
+
     private static void printUsage(PrintStream out) {
         out.println("""
                 Usage: candybox [-s host:port] <command> [args]
@@ -315,6 +422,13 @@ public final class CandyboxCli {
                   rename       <box> <src> <dst>     zero-copy move, same Box
                   delete-range <box> [prefix] [--start K] [--end K]   single range tombstone
                   list         <box> [prefix] [--max N] [--start-after K] [--start K] [--end K] [--reverse]
+                  make-credentials <username> [--password P]   print credential-file lines (or pipe stdin)
+
+                Security (flags override the matching environment variables):
+                  -u/--user U --password P | --password-file F   SASL login (CANDYBOX_AUTH_USERNAME/_PASSWORD)
+                  --mechanism PLAIN|SCRAM-SHA-256                default PLAIN (CANDYBOX_AUTH_MECHANISM)
+                  --tls [--tls-ca ca.pem]                        TLS; trust a private CA (CANDYBOX_TLS, CANDYBOX_TLS_CA)
+                  --tls-insecure-no-verify                       skip server-SAN verification (dev certs only)
 
                 Server defaults to 127.0.0.1:9709 (override with -s/--server or CANDYBOX_SERVER).""");
     }

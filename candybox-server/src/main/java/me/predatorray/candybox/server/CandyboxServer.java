@@ -21,9 +21,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import me.predatorray.candybox.bookkeeper.LedgerStore;
 import me.predatorray.candybox.bookkeeper.bk.BookKeeperLedgerStore;
 import me.predatorray.candybox.common.SystemClock;
+import me.predatorray.candybox.common.auth.AuthenticationProviders;
+import me.predatorray.candybox.common.auth.FileCredentialStore;
+import me.predatorray.candybox.common.config.SecurityConfig;
 import me.predatorray.candybox.coordination.CoordinationService;
 import me.predatorray.candybox.coordination.zk.ZooKeeperCoordinationService;
 import me.predatorray.candybox.protocol.FrameCodec;
+import me.predatorray.candybox.protocol.auth.AuthenticatingRequestHandler;
+import me.predatorray.candybox.protocol.transport.RequestHandler;
 import me.predatorray.candybox.protocol.transport.TcpTransportServer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -66,9 +71,11 @@ public final class CandyboxServer {
 
     /** Wires the node, installs the shutdown hook, and blocks the calling thread until shutdown. */
     static void run(ServerConfig config) {
-        LOG.info("Starting Candybox node {} (bind={}:{}, advertised={}, zk={})", config.nodeId(),
-                config.bindHost(), config.bindPort(), config.advertisedAddress(),
-                config.zookeeperConnect());
+        SecurityConfig security = config.security();
+        LOG.info("Starting Candybox node {} (bind={}:{}, advertised={}, zk={}, tls={}, auth={})",
+                config.nodeId(), config.bindHost(), config.bindPort(), config.advertisedAddress(),
+                config.zookeeperConnect(), security.tlsEnabled(),
+                security.authEnabled() ? security.saslMechanisms() : "off");
 
         LedgerStore ledgerStore =
                 BookKeeperLedgerStore.create(config.metadataServiceUri(), config.ledgerPassword());
@@ -76,8 +83,14 @@ public final class CandyboxServer {
                 new ZooKeeperCoordinationService(config.coordinationConnect(), SystemClock.INSTANCE);
         CandyboxNode node = new CandyboxNode(config.nodeId(), config.tuning(), ledgerStore, coordination,
                 SystemClock.INSTANCE, config.advertisedAddress());
-        TcpTransportServer transport =
-                new TcpTransportServer(config.bindPort(), node.requestHandler(), new FrameCodec());
+        RequestHandler handler = node.requestHandler();
+        if (security.authEnabled()) {
+            handler = new AuthenticatingRequestHandler(handler,
+                    AuthenticationProviders.forMechanisms(security.saslMechanisms()),
+                    new FileCredentialStore(security.credentialsFile()), security.authRequired());
+        }
+        TcpTransportServer transport = new TcpTransportServer(config.bindPort(), handler,
+                new FrameCodec(), security.serverSslContext(), security.tlsClientAuth());
 
         AtomicBoolean ready = new AtomicBoolean(true);
         HealthServer health = new HealthServer(config.healthPort(), config.nodeId(), ready::get,

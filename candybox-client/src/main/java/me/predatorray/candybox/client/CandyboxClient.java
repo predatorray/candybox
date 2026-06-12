@@ -31,6 +31,7 @@ import me.predatorray.candybox.common.SystemClock;
 import me.predatorray.candybox.common.Validation;
 import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.config.SizeLimits;
+import me.predatorray.candybox.common.exception.AuthenticationException;
 import me.predatorray.candybox.common.exception.BoxNotFoundException;
 import me.predatorray.candybox.common.exception.BusyException;
 import me.predatorray.candybox.common.exception.CandyNotFoundException;
@@ -491,6 +492,9 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
     private CandyboxException mapResponse(Message response) {
         if (response instanceof Message.BusyResponse busy) {
             return new BusyException("Server busy; retry after " + busy.retryAfterMillis() + "ms");
+        }
+        if (response instanceof Message.AuthFailedResponse failed) {
+            return new AuthenticationException(failed.message());
         }
         if (response instanceof Message.ErrorResponse err) {
             return new CandyboxException(err.errorType() + ": " + err.message());

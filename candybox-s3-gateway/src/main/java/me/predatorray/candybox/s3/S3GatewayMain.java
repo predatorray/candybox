@@ -21,9 +21,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import me.predatorray.candybox.client.CandyboxClient;
 import me.predatorray.candybox.common.SystemClock;
 import me.predatorray.candybox.common.config.CandyboxConfig;
+import me.predatorray.candybox.common.config.SecurityConfig;
 import me.predatorray.candybox.coordination.CoordinationService;
 import me.predatorray.candybox.coordination.zk.ZooKeeperCoordinationService;
+import me.predatorray.candybox.protocol.FrameCodec;
+import me.predatorray.candybox.protocol.auth.AuthenticatingTransport;
 import me.predatorray.candybox.protocol.transport.TcpTransport;
+import me.predatorray.candybox.protocol.transport.Transport;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -61,10 +65,16 @@ public final class S3GatewayMain {
     }
 
     static void run(S3GatewayConfig config) {
-        LOG.info("Starting Candybox S3 gateway (bind={}:{}, zk={}, region={})", config.bindHost(),
-                config.bindPort(), config.zookeeperConnect(), config.region());
+        SecurityConfig security = config.security();
+        LOG.info("Starting Candybox S3 gateway (bind={}:{}, zk={}, region={}, node-tls={}, node-auth={})",
+                config.bindHost(), config.bindPort(), config.zookeeperConnect(), config.region(),
+                security.tlsEnabled(), security.clientUsername() != null);
 
-        TcpTransport transport = new TcpTransport();
+        Transport tcp = new TcpTransport(new FrameCodec(), security.clientSslContext(),
+                security.tlsVerifyEndpoint());
+        Transport transport = security.clientUsername() == null ? tcp
+                : new AuthenticatingTransport(tcp, security.clientMechanism(),
+                        security.clientUsername(), security.clientPassword());
         CoordinationService coordination =
                 new ZooKeeperCoordinationService(config.zookeeperConnect(), SystemClock.INSTANCE);
         CandyboxConfig clientConfig = CandyboxConfig.builder()

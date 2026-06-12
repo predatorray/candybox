@@ -25,6 +25,9 @@ import java.net.Socket;
 import java.net.SocketException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLException;
+import javax.net.ssl.SSLServerSocket;
 import me.predatorray.candybox.protocol.Frame;
 import me.predatorray.candybox.protocol.FrameCodec;
 import me.predatorray.candybox.protocol.ProtocolException;
@@ -33,7 +36,9 @@ import org.slf4j.LoggerFactory;
 
 /**
  * A blocking TCP {@link TransportServer}: one accept loop, one handler thread per connection, each
- * reading framed requests and writing framed responses until the peer closes.
+ * reading framed requests and writing framed responses until the peer closes. With an
+ * {@link SSLContext} the listener speaks TLS ({@code SSLServerSocket} — same blocking model),
+ * optionally demanding a client certificate (mTLS).
  *
  * <p>TODO(phase-2): replace per-connection threads with NIO/Netty, add request pipelining,
  * backpressure, and graceful shutdown draining. This is correct and sufficient for early wiring/tests.
@@ -49,11 +54,30 @@ public final class TcpTransportServer implements TransportServer {
     private final RequestHandler handler;
     private volatile boolean running = true;
 
+    /** A plaintext listener. */
     public TcpTransportServer(int port, RequestHandler handler, FrameCodec codec) {
+        this(port, handler, codec, null, false);
+    }
+
+    /**
+     * A listener that speaks TLS when {@code sslContext} is non-null.
+     *
+     * @param sslContext        the server TLS context (key material loaded), or null for plaintext
+     * @param needClientAuth    require a client certificate (mTLS); only meaningful with TLS
+     */
+    public TcpTransportServer(int port, RequestHandler handler, FrameCodec codec,
+                              SSLContext sslContext, boolean needClientAuth) {
         this.handler = handler;
         this.codec = codec;
         try {
-            this.serverSocket = new ServerSocket(port);
+            if (sslContext != null) {
+                SSLServerSocket ssl = (SSLServerSocket) sslContext.getServerSocketFactory()
+                        .createServerSocket(port);
+                ssl.setNeedClientAuth(needClientAuth);
+                this.serverSocket = ssl;
+            } else {
+                this.serverSocket = new ServerSocket(port);
+            }
         } catch (IOException e) {
             throw new ProtocolException("Failed to bind server socket on port " + port, e);
         }
@@ -82,6 +106,7 @@ public final class TcpTransportServer implements TransportServer {
     }
 
     private void serve(Socket socket) {
+        ConnectionContext context = new ConnectionContext();
         try (socket;
              DataInputStream in = new DataInputStream(socket.getInputStream());
              OutputStream out = new BufferedOutputStream(socket.getOutputStream())) {
@@ -91,8 +116,11 @@ public final class TcpTransportServer implements TransportServer {
                     request = codec.read(in);
                 } catch (EOFException | SocketException closed) {
                     return; // peer disconnected
+                } catch (SSLException handshakeOrRecord) {
+                    LOG.debug("TLS error on connection", handshakeOrRecord);
+                    return;
                 }
-                Frame response = handler.handle(request);
+                Frame response = handler.handle(context, request);
                 codec.write(out, response);
             }
         } catch (IOException e) {
