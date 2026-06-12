@@ -17,12 +17,15 @@ package me.predatorray.candybox.s3;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import me.predatorray.candybox.client.CandyboxClient.CandyInfo;
 import me.predatorray.candybox.client.CandyboxClient.Listing;
 import me.predatorray.candybox.client.CandyboxClient.MultipartListing;
 import me.predatorray.candybox.client.CandyboxClient.PartListing;
 import me.predatorray.candybox.client.CandyboxClient.PartUploadInfo;
 import me.predatorray.candybox.client.CandyboxClient.RangeBytes;
+import me.predatorray.candybox.common.auth.BoxAcl;
+import me.predatorray.candybox.common.auth.ObjectAcl;
 
 /**
  * The narrow seam the gateway's request handling depends on, exactly the subset of the Candybox client
@@ -44,6 +47,13 @@ interface CandyStore {
     void putCandy(String box, String key, byte[] data, String contentType,
                   Map<String, String> userMetadata);
 
+    /** {@code putCandy} stamping owner/grants (grants in the text form {@code grantee:OP[+OP...]});
+     * the default ignores them so auth-unaware fakes keep working. */
+    default void putCandy(String box, String key, byte[] data, String contentType,
+                          Map<String, String> userMetadata, String owner, List<String> grants) {
+        putCandy(box, key, data, contentType, userMetadata);
+    }
+
     byte[] getCandy(String box, String key);
 
     /**
@@ -59,7 +69,31 @@ interface CandyStore {
     /** Same-Box server-side copy; returns the destination's metadata. */
     CandyInfo copyCandy(String box, String srcKey, String dstKey);
 
+    default CandyInfo copyCandy(String box, String srcKey, String dstKey, String owner,
+                                List<String> grants) {
+        return copyCandy(box, srcKey, dstKey);
+    }
+
     Listing listCandies(String box, String prefix, String startAfter, int maxKeys);
+
+    // ---- ACLs ---------------------------------------------------------------------------------
+
+    /** The Box's ACL document, empty when none exists (legacy Box / auth-unaware fake). */
+    default Optional<BoxAcl> getBoxAcl(String box) {
+        return Optional.empty();
+    }
+
+    default void setBoxAcl(String box, BoxAcl acl) {
+        throw new UnsupportedOperationException("ACLs are not supported by this store");
+    }
+
+    default ObjectAcl getCandyAcl(String box, String key) {
+        return ObjectAcl.NONE;
+    }
+
+    default void setCandyAcl(String box, String key, ObjectAcl acl) {
+        throw new UnsupportedOperationException("ACLs are not supported by this store");
+    }
 
     // ---- multipart upload -------------------------------------------------------------------
 
@@ -73,6 +107,12 @@ interface CandyStore {
 
     CandyInfo completeMultipartUpload(String box, String key, String uploadId,
                                       List<PartUploadInfo> parts);
+
+    default CandyInfo completeMultipartUpload(String box, String key, String uploadId,
+                                              List<PartUploadInfo> parts, String owner,
+                                              List<String> grants) {
+        return completeMultipartUpload(box, key, uploadId, parts);
+    }
 
     void abortMultipartUpload(String box, String key, String uploadId);
 

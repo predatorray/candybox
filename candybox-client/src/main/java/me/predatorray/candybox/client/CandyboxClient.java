@@ -137,13 +137,24 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
 
     public void putCandy(String box, String key, byte[] data, String contentType,
                          Map<String, String> userMetadata, String idempotencyToken) {
+        putCandy(box, key, data, contentType, userMetadata, idempotencyToken, null, List.of());
+    }
+
+    /**
+     * {@code putCandy} stamping the object's owner / ACL grants (text form
+     * {@code grantee:OP[+OP...]}). A non-null {@code owner} is only honored by the node when this
+     * client authenticates as a super-principal (the S3 gateway); see {@code Message.PutCandyRequest}.
+     */
+    public void putCandy(String box, String key, byte[] data, String contentType,
+                         Map<String, String> userMetadata, String idempotencyToken, String owner,
+                         List<String> grants) {
         CandyKey candyKey = CandyKey.of(key);
         Validation.checkCandyKey(candyKey, limits);
         Validation.checkUserMetadata(userMetadata, limits);
         Validation.checkCandySize(data.length, limits);
         expectOk(callKey(box, key, new Message.PutCandyRequest(BoxName.of(box).value(),
                 candyKey.value(), contentType, userMetadata == null ? Map.of() : userMetadata,
-                idempotencyToken, data)));
+                idempotencyToken, data, owner, grants == null ? List.of() : grants)));
     }
 
     /** Streaming put (buffers the stream in memory for now — TODO(phase-2): true streaming). */
@@ -317,6 +328,14 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
      */
     public CandyInfo completeMultipartUpload(String box, String key, String uploadId,
                                              List<PartUploadInfo> parts, String idempotencyToken) {
+        return completeMultipartUpload(box, key, uploadId, parts, idempotencyToken, null,
+                List.of());
+    }
+
+    /** {@code completeMultipartUpload} stamping the assembled object's owner/grants. */
+    public CandyInfo completeMultipartUpload(String box, String key, String uploadId,
+                                             List<PartUploadInfo> parts, String idempotencyToken,
+                                             String owner, List<String> grants) {
         CandyKey candyKey = CandyKey.of(key);
         Validation.checkCandyKey(candyKey, limits);
         List<Message.CompletedPart> wire = new ArrayList<>(parts.size());
@@ -324,7 +343,8 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
             wire.add(new Message.CompletedPart(p.partNumber(), p.crc32c()));
         }
         Message response = callKey(box, key, new Message.CompleteMultipartUploadRequest(
-                BoxName.of(box).value(), candyKey.value(), uploadId, wire, idempotencyToken));
+                BoxName.of(box).value(), candyKey.value(), uploadId, wire, idempotencyToken, owner,
+                grants == null ? List.of() : grants));
         if (response instanceof Message.HeadCandyResponse head) {
             return new CandyInfo(head.contentLength(), head.contentType(), head.userMetadata(),
                     head.crc32c(), head.createdAtMillis());
@@ -419,11 +439,19 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
      * partitions it degrades to a client-side byte copy. Returns the destination's metadata.
      */
     public CandyInfo copyCandy(String box, String srcKey, String dstKey, String idempotencyToken) {
+        return copyCandy(box, srcKey, dstKey, idempotencyToken, null, List.of());
+    }
+
+    /** {@code copyCandy} stamping the destination's owner/grants (S3: the requester owns a copy). */
+    public CandyInfo copyCandy(String box, String srcKey, String dstKey, String idempotencyToken,
+                               String owner, List<String> grants) {
+        List<String> g = grants == null ? List.of() : grants;
         if (partitionFor(box, srcKey) == partitionFor(box, dstKey)) {
             return copyOrRename(box, srcKey, new Message.CopyCandyRequest(BoxName.of(box).value(),
-                    CandyKey.of(srcKey).value(), CandyKey.of(dstKey).value(), idempotencyToken));
+                    CandyKey.of(srcKey).value(), CandyKey.of(dstKey).value(), idempotencyToken,
+                    owner, g));
         }
-        return byteCopy(box, srcKey, dstKey, idempotencyToken);
+        return byteCopy(box, srcKey, dstKey, idempotencyToken, owner, g);
     }
 
     /**
@@ -453,12 +481,18 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
 
     /** The cross-partition copy fallback: read the source whole, re-put it at the destination. */
     private CandyInfo byteCopy(String box, String srcKey, String dstKey, String idempotencyToken) {
+        return byteCopy(box, srcKey, dstKey, idempotencyToken, null, List.of());
+    }
+
+    private CandyInfo byteCopy(String box, String srcKey, String dstKey, String idempotencyToken,
+                               String owner, List<String> grants) {
         Message response = callKey(box, srcKey, new Message.GetCandyRequest(BoxName.of(box).value(),
                 CandyKey.of(srcKey).value()));
         if (!(response instanceof Message.CandyDataResponse data)) {
             throw mapUnexpected(response, box, srcKey);
         }
-        putCandy(box, dstKey, data.data(), data.contentType(), data.userMetadata(), idempotencyToken);
+        putCandy(box, dstKey, data.data(), data.contentType(), data.userMetadata(),
+                idempotencyToken, owner, grants);
         return headCandy(box, dstKey);
     }
 

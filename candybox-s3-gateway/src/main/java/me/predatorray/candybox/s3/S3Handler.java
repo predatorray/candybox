@@ -45,6 +45,10 @@ import me.predatorray.candybox.client.CandyboxClient.PartListing;
 import me.predatorray.candybox.client.CandyboxClient.PartUploadInfo;
 import me.predatorray.candybox.client.CandyboxClient.RangeBytes;
 import me.predatorray.candybox.client.CandyboxClient.UploadEntry;
+import me.predatorray.candybox.common.auth.BoxAcl;
+import me.predatorray.candybox.common.auth.Grant;
+import me.predatorray.candybox.common.auth.ObjectAcl;
+import me.predatorray.candybox.common.auth.Principal;
 import me.predatorray.candybox.common.checksum.Crc32c;
 import me.predatorray.candybox.s3.S3Router.S3Action;
 import org.slf4j.Logger;
@@ -68,10 +72,23 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
 
     private final CandyStore store;
     private final S3GatewayConfig config;
+    private final S3Authenticator authenticator;
+    private final S3AccessControl access;
 
+    /** Auth-disabled handler (anonymous full access) — the pre-SigV4 behavior, used by tests. */
     S3Handler(CandyStore store, S3GatewayConfig config) {
+        this(store, config,
+                new S3Authenticator(false, true, key -> java.util.Optional.empty(),
+                        config.region(), me.predatorray.candybox.common.SystemClock.INSTANCE),
+                new S3AccessControl(false, store));
+    }
+
+    S3Handler(CandyStore store, S3GatewayConfig config, S3Authenticator authenticator,
+              S3AccessControl access) {
         this.store = store;
         this.config = config;
+        this.authenticator = authenticator;
+        this.access = access;
     }
 
     @Override
@@ -85,8 +102,10 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
         String resource = decoder.rawPath();
 
         try {
+            S3Authenticator.S3Auth auth = authenticator.authenticate(request);
             S3Action action = S3Router.route(method, parts.bucket(), parts.key(), queryNames);
-            dispatch(ctx, request, action, parts, decoder, requestId);
+            access.authorize(action, parts, auth.principal());
+            dispatch(ctx, request, action, parts, decoder, requestId, auth);
         } catch (S3Exception e) {
             sendError(ctx, request, e.error(), e.getMessage(), resource, requestId);
         } catch (RuntimeException e) {
@@ -99,12 +118,28 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
     }
 
     private void dispatch(ChannelHandlerContext ctx, FullHttpRequest request, S3Action action,
-                          PathParts parts, QueryStringDecoder decoder, String requestId) {
+                          PathParts parts, QueryStringDecoder decoder, String requestId,
+                          S3Authenticator.S3Auth auth) {
+        Principal principal = auth.principal();
         switch (action) {
-            case LIST_BUCKETS -> sendXml(ctx, request, HttpResponseStatus.OK,
-                    S3Xml.listAllMyBuckets(store.listBoxes()), requestId);
+            case LIST_BUCKETS -> {
+                // Anonymous sees an empty list (RGW-compatible); others see their READable Boxes.
+                List<String> visible = principal.isAnonymous() && access.enabled() ? List.of()
+                        : store.listBoxes().stream()
+                                .filter(box -> access.mayRead(box, principal)).toList();
+                sendXml(ctx, request, HttpResponseStatus.OK, S3Xml.listAllMyBuckets(visible),
+                        requestId);
+            }
             case CREATE_BUCKET -> {
                 store.createBox(parts.bucket());
+                // The S3 creator owns the bucket; the node seeded the gateway's own principal, so
+                // overwrite with the end user + any canned ACL. Best-effort consistency: a crash
+                // in between leaves a gateway-owned bucket an operator can re-own.
+                if (access.enabled() && !principal.isAnonymous()) {
+                    store.setBoxAcl(parts.bucket(), new BoxAcl(principal,
+                            S3AccessControl.cannedGrants(request.headers().get("x-amz-acl"))));
+                    access.invalidate(parts.bucket());
+                }
                 FullHttpResponse r = empty(HttpResponseStatus.OK);
                 r.headers().set(HttpHeaderNames.LOCATION, "/" + parts.bucket());
                 send(ctx, request, r, requestId);
@@ -123,19 +158,22 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
             case LIST_OBJECTS -> listObjects(ctx, request, parts.bucket(), decoder, requestId);
             case LIST_MULTIPART_UPLOADS -> listMultipartUploads(ctx, request, parts.bucket(), decoder, requestId);
             case CREATE_MULTIPART_UPLOAD -> createMultipartUpload(ctx, request, parts, requestId);
-            case UPLOAD_PART -> uploadPart(ctx, request, parts, decoder, requestId);
-            case COMPLETE_MULTIPART_UPLOAD -> completeMultipartUpload(ctx, request, parts, decoder, requestId);
+            case UPLOAD_PART -> uploadPart(ctx, request, parts, decoder, requestId, auth);
+            case COMPLETE_MULTIPART_UPLOAD ->
+                    completeMultipartUpload(ctx, request, parts, decoder, requestId, auth);
             case ABORT_MULTIPART_UPLOAD -> abortMultipartUpload(ctx, request, parts, decoder, requestId);
             case LIST_PARTS -> listParts(ctx, request, parts, decoder, requestId);
             case LIST_OBJECT_VERSIONS -> listObjectVersions(ctx, request, parts.bucket(), decoder, requestId);
-            case DELETE_OBJECTS -> deleteObjects(ctx, request, parts.bucket(), requestId);
+            case DELETE_OBJECTS -> deleteObjects(ctx, request, parts.bucket(), requestId, auth);
             case GET_BUCKET_LOCATION -> sendXml(ctx, request, HttpResponseStatus.OK,
                     S3Xml.locationConstraint(config.region()), requestId);
             case GET_BUCKET_VERSIONING -> sendXml(ctx, request, HttpResponseStatus.OK,
                     S3Xml.versioningConfiguration(), requestId);
-            case GET_BUCKET_ACL -> sendXml(ctx, request, HttpResponseStatus.OK,
-                    S3Xml.accessControlPolicy(), requestId);
-            case PUT_OBJECT -> putOrCopy(ctx, request, parts, requestId);
+            case GET_BUCKET_ACL -> getBucketAcl(ctx, request, parts, requestId);
+            case PUT_BUCKET_ACL -> putBucketAcl(ctx, request, parts, requestId, auth);
+            case GET_OBJECT_ACL -> getObjectAcl(ctx, request, parts, requestId);
+            case PUT_OBJECT_ACL -> putObjectAcl(ctx, request, parts, requestId, auth);
+            case PUT_OBJECT -> putOrCopy(ctx, request, parts, requestId, auth);
             case GET_OBJECT -> getObject(ctx, request, parts, requestId);
             case HEAD_OBJECT -> headObject(ctx, request, parts, requestId);
             case DELETE_OBJECT -> {
@@ -148,16 +186,106 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
         }
     }
 
+    // ---- ACLs --------------------------------------------------------------------------------
+
+    private void getBucketAcl(ChannelHandlerContext ctx, FullHttpRequest request, PathParts parts,
+                              String requestId) {
+        if (!store.headBox(parts.bucket())) {
+            throw new S3Exception(S3ErrorCode.NO_SUCH_BUCKET, null);
+        }
+        String xml = store.getBoxAcl(parts.bucket())
+                .map(acl -> renderPolicy(acl.owner().toString(), acl.grants()))
+                .orElseGet(S3Xml::accessControlPolicy); // legacy Box: the canned full-control doc
+        sendXml(ctx, request, HttpResponseStatus.OK, xml, requestId);
+    }
+
+    private void putBucketAcl(ChannelHandlerContext ctx, FullHttpRequest request, PathParts parts,
+                              String requestId, S3Authenticator.S3Auth auth) {
+        if (!store.headBox(parts.bucket())) {
+            throw new S3Exception(S3ErrorCode.NO_SUCH_BUCKET, null);
+        }
+        java.util.Optional<BoxAcl> current = store.getBoxAcl(parts.bucket());
+        Principal owner = current.map(BoxAcl::owner)
+                .orElseGet(() -> auth.principal().isAnonymous() ? null : auth.principal());
+        if (owner == null) {
+            throw new S3Exception(S3ErrorCode.ACCESS_DENIED,
+                    "This bucket has no owner; an authenticated principal must set the ACL");
+        }
+        store.setBoxAcl(parts.bucket(),
+                new BoxAcl(owner, requestedGrants(request, auth)));
+        access.invalidate(parts.bucket());
+        send(ctx, request, empty(HttpResponseStatus.OK), requestId);
+    }
+
+    private void getObjectAcl(ChannelHandlerContext ctx, FullHttpRequest request, PathParts parts,
+                              String requestId) {
+        requireKey(parts);
+        ObjectAcl acl = store.getCandyAcl(parts.bucket(), parts.key());
+        String ownerId = acl.owner() != null ? acl.owner()
+                : store.getBoxAcl(parts.bucket()).map(b -> b.owner().toString()).orElse("candybox");
+        sendXml(ctx, request, HttpResponseStatus.OK, renderPolicy(ownerId, acl.grants()),
+                requestId);
+    }
+
+    private void putObjectAcl(ChannelHandlerContext ctx, FullHttpRequest request, PathParts parts,
+                              String requestId, S3Authenticator.S3Auth auth) {
+        requireKey(parts);
+        ObjectAcl current = store.getCandyAcl(parts.bucket(), parts.key());
+        String owner = current.owner() != null ? current.owner()
+                : (auth.principal().isAnonymous() ? null : auth.principal().toString());
+        store.setCandyAcl(parts.bucket(), parts.key(),
+                new ObjectAcl(owner, requestedGrants(request, auth)));
+        send(ctx, request, empty(HttpResponseStatus.OK), requestId);
+    }
+
+    /** The grants a PUT ?acl asks for: the {@code x-amz-acl} canned header, else the XML body. */
+    private List<Grant> requestedGrants(FullHttpRequest request, S3Authenticator.S3Auth auth) {
+        String canned = request.headers().get("x-amz-acl");
+        if (canned != null && !canned.isBlank()) {
+            return S3AccessControl.cannedGrants(canned);
+        }
+        byte[] body = bodyBytes(request, auth);
+        if (body.length == 0) {
+            return List.of();
+        }
+        S3RequestXml.AccessControlPolicyBody parsed =
+                S3RequestXml.parseAccessControlPolicy(body);
+        List<Grant> grants = new ArrayList<>();
+        for (S3RequestXml.AclGrant g : parsed.grants()) {
+            String grantee = S3AccessControl.granteeFromS3(g.groupUri(), g.canonicalId());
+            grants.add(new Grant(grantee, S3AccessControl.s3Permission(g.permission())));
+        }
+        return grants;
+    }
+
+    private static String renderPolicy(String ownerId, List<Grant> grants) {
+        List<S3Xml.AclGrant> rows = new ArrayList<>();
+        // The owner always renders as FULL_CONTROL, like S3.
+        rows.add(new S3Xml.AclGrant(null, ownerId, "FULL_CONTROL"));
+        for (Grant grant : grants) {
+            String groupUri = switch (grant.grantee()) {
+                case Grant.ALL_USERS -> S3AccessControl.ALL_USERS_URI;
+                case Grant.AUTHENTICATED_USERS -> S3AccessControl.AUTHENTICATED_USERS_URI;
+                default -> null;
+            };
+            String canonicalId = groupUri == null ? grant.grantee() : null;
+            for (String permission : S3AccessControl.s3PermissionNames(grant)) {
+                rows.add(new S3Xml.AclGrant(groupUri, canonicalId, permission));
+            }
+        }
+        return S3Xml.accessControlPolicy(ownerId, rows);
+    }
+
     // ---- objects ---------------------------------------------------------------------------
 
     private void putOrCopy(ChannelHandlerContext ctx, FullHttpRequest request, PathParts parts,
-                           String requestId) {
+                           String requestId, S3Authenticator.S3Auth auth) {
         String copySource = request.headers().get("x-amz-copy-source");
         if (copySource != null && !copySource.isBlank()) {
-            copyObject(ctx, request, parts, copySource, requestId);
+            copyObject(ctx, request, parts, copySource, requestId, auth);
             return;
         }
-        byte[] body = bodyBytes(request);
+        byte[] body = bodyBytes(request, auth);
         if (body.length > config.maxObjectBytes()) {
             throw new S3Exception(S3ErrorCode.ENTITY_TOO_LARGE,
                     "Object exceeds the configured maximum of " + config.maxObjectBytes() + " bytes");
@@ -167,15 +295,27 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
             contentType = "application/octet-stream";
         }
         Map<String, String> userMeta = userMetadata(request);
-        store.putCandy(parts.bucket(), parts.key(), body, contentType, userMeta);
+        store.putCandy(parts.bucket(), parts.key(), body, contentType, userMeta,
+                ownerOf(auth), cannedGrantTexts(request));
 
         FullHttpResponse r = empty(HttpResponseStatus.OK);
         r.headers().set(HttpHeaderNames.ETAG, Etag.of(Crc32c.of(body)));
         send(ctx, request, r, requestId);
     }
 
+    /** The owner a write stamps: the authenticated S3 user, or null when anonymous. */
+    private static String ownerOf(S3Authenticator.S3Auth auth) {
+        return auth.principal().isAnonymous() ? null : auth.principal().toString();
+    }
+
+    /** The {@code x-amz-acl} canned grants in the wire text form. */
+    private static List<String> cannedGrantTexts(FullHttpRequest request) {
+        return S3AccessControl.cannedGrants(request.headers().get("x-amz-acl")).stream()
+                .map(Grant::toText).toList();
+    }
+
     private void copyObject(ChannelHandlerContext ctx, FullHttpRequest request, PathParts parts,
-                            String copySource, String requestId) {
+                            String copySource, String requestId, S3Authenticator.S3Auth auth) {
         PathParts src = PathParts.parse(stripLeadingSlash(uriDecode(copySource)));
         if (src.bucket() == null || src.key() == null || src.key().isEmpty()) {
             throw new S3Exception(S3ErrorCode.INVALID_ARGUMENT, "Malformed x-amz-copy-source");
@@ -184,7 +324,13 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
             // Candybox copyCandy is intra-Box only; cross-bucket copy is deferred (plan §16).
             throw new S3Exception(S3ErrorCode.NOT_IMPLEMENTED, "Cross-bucket copy is not supported");
         }
-        CandyInfo info = store.copyCandy(parts.bucket(), src.key(), parts.key());
+        // Per S3 the requester owns the copy; check READ on the source (Box ACL or object grant).
+        if (access.enabled()) {
+            access.authorize(S3Action.GET_OBJECT, new PathParts(src.bucket(), src.key()),
+                    auth.principal());
+        }
+        CandyInfo info = store.copyCandy(parts.bucket(), src.key(), parts.key(), ownerOf(auth),
+                cannedGrantTexts(request));
         sendXml(ctx, request, HttpResponseStatus.OK,
                 S3Xml.copyObjectResult(Etag.unquoted(info.crc32c()), info.createdAtMillis()), requestId);
     }
@@ -349,7 +495,8 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
     }
 
     private void uploadPart(ChannelHandlerContext ctx, FullHttpRequest request, PathParts parts,
-                            QueryStringDecoder decoder, String requestId) {
+                            QueryStringDecoder decoder, String requestId,
+                            S3Authenticator.S3Auth auth) {
         requireKey(parts);
         String uploadId = requiredQuery(decoder, "uploadId");
         int partNumber = parseIntQuery(decoder, "partNumber");
@@ -361,7 +508,7 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
             uploadPartCopy(ctx, request, parts, uploadId, partNumber, copySource, requestId);
             return;
         }
-        byte[] body = bodyBytes(request);
+        byte[] body = bodyBytes(request, auth);
         if (body.length > config.maxObjectBytes()) {
             // Per-part size: tracks the configured single-object cap until streaming lands.
             throw new S3Exception(S3ErrorCode.ENTITY_TOO_LARGE,
@@ -415,10 +562,10 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
 
     private void completeMultipartUpload(ChannelHandlerContext ctx, FullHttpRequest request,
                                          PathParts parts, QueryStringDecoder decoder,
-                                         String requestId) {
+                                         String requestId, S3Authenticator.S3Auth auth) {
         requireKey(parts);
         String uploadId = requiredQuery(decoder, "uploadId");
-        byte[] body = bodyBytes(request);
+        byte[] body = bodyBytes(request, auth);
         S3RequestXml.CompleteMultipartUploadBody parsed = S3RequestXml.parseCompleteMultipart(body);
         List<PartUploadInfo> partList = new ArrayList<>(parsed.parts().size());
         for (S3RequestXml.CompletePart p : parsed.parts()) {
@@ -426,7 +573,7 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
             partList.add(new PartUploadInfo(p.partNumber(), crc, 0)); // length is server-known
         }
         CandyInfo info = store.completeMultipartUpload(parts.bucket(), parts.key(), uploadId,
-                partList);
+                partList, ownerOf(auth), cannedGrantTexts(request));
         String location = "/" + parts.bucket() + "/" + parts.key();
         String etag = multipartEtag(partList.size(), info.crc32c());
         sendXml(ctx, request, HttpResponseStatus.OK,
@@ -627,8 +774,8 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
     }
 
     private void deleteObjects(ChannelHandlerContext ctx, FullHttpRequest request, String bucket,
-                               String requestId) {
-        S3RequestXml.DeleteRequest req = S3RequestXml.parseDelete(bodyBytes(request));
+                               String requestId, S3Authenticator.S3Auth auth) {
+        S3RequestXml.DeleteRequest req = S3RequestXml.parseDelete(bodyBytes(request, auth));
         List<String> deleted = new ArrayList<>();
         List<String[]> errors = new ArrayList<>();
         for (String key : req.keys()) {
@@ -647,16 +794,13 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
 
     // ---- request parsing helpers -----------------------------------------------------------
 
-    private byte[] bodyBytes(FullHttpRequest request) {
+    /** The verified raw object bytes: unframes aws-chunked bodies and enforces the request's
+     * payload-integrity mode (literal sha256, chunk-signature chain, checksum trailers). */
+    private byte[] bodyBytes(FullHttpRequest request, S3Authenticator.S3Auth auth) {
         byte[] raw = new byte[request.content().readableBytes()];
         request.content().getBytes(request.content().readerIndex(), raw);
         String encoding = request.headers().get(HttpHeaderNames.CONTENT_ENCODING);
-        String sha256 = request.headers().get("x-amz-content-sha256");
-        if (AwsChunked.isChunked(encoding, sha256)) {
-            long decodedLen = parseLong(request.headers().get("x-amz-decoded-content-length"), -1);
-            return AwsChunked.decode(raw, decodedLen);
-        }
-        return raw;
+        return authenticator.verifiedBody(auth, raw, encoding);
     }
 
     private static Map<String, String> userMetadata(FullHttpRequest request) {

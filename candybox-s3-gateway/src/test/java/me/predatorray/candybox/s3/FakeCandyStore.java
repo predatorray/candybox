@@ -27,6 +27,9 @@ import me.predatorray.candybox.client.CandyboxClient.PartListing;
 import me.predatorray.candybox.client.CandyboxClient.PartUploadInfo;
 import me.predatorray.candybox.client.CandyboxClient.RangeBytes;
 import me.predatorray.candybox.client.CandyboxClient.UploadEntry;
+import me.predatorray.candybox.common.auth.BoxAcl;
+import me.predatorray.candybox.common.auth.Grant;
+import me.predatorray.candybox.common.auth.ObjectAcl;
 import me.predatorray.candybox.common.checksum.Crc32c;
 import me.predatorray.candybox.common.exception.BoxAlreadyExistsException;
 import me.predatorray.candybox.common.exception.BoxNotEmptyException;
@@ -44,6 +47,49 @@ final class FakeCandyStore implements CandyStore {
     }
 
     private final Map<String, TreeMap<String, Obj>> boxes = new LinkedHashMap<>();
+
+    // ---- ACL state (simple maps, mirroring the node-side stores) ----------------------------
+    private final Map<String, BoxAcl> boxAcls = new LinkedHashMap<>();
+    private final Map<String, ObjectAcl> objectAcls = new LinkedHashMap<>();
+
+    @Override
+    public java.util.Optional<BoxAcl> getBoxAcl(String box) {
+        return java.util.Optional.ofNullable(boxAcls.get(box));
+    }
+
+    @Override
+    public void setBoxAcl(String box, BoxAcl acl) {
+        boxAcls.put(box, acl);
+    }
+
+    @Override
+    public ObjectAcl getCandyAcl(String box, String key) {
+        obj(box, key); // throws CandyNotFound when absent, like the engine
+        return objectAcls.getOrDefault(box + "/" + key, ObjectAcl.NONE);
+    }
+
+    @Override
+    public void setCandyAcl(String box, String key, ObjectAcl acl) {
+        obj(box, key);
+        objectAcls.put(box + "/" + key, acl);
+    }
+
+    @Override
+    public void putCandy(String box, String key, byte[] data, String contentType,
+                         Map<String, String> userMetadata, String owner, List<String> grants) {
+        putCandy(box, key, data, contentType, userMetadata);
+        objectAcls.put(box + "/" + key,
+                new ObjectAcl(owner, grants.stream().map(Grant::parse).toList()));
+    }
+
+    @Override
+    public CandyInfo copyCandy(String box, String srcKey, String dstKey, String owner,
+                               List<String> grants) {
+        CandyInfo info = copyCandy(box, srcKey, dstKey);
+        objectAcls.put(box + "/" + dstKey,
+                new ObjectAcl(owner, grants.stream().map(Grant::parse).toList()));
+        return info;
+    }
 
     /** Per-Box in-flight uploads: box → uploadId → upload. */
     private final Map<String, LinkedHashMap<String, PendingUpload>> uploads = new LinkedHashMap<>();

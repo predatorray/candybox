@@ -40,15 +40,19 @@ import org.slf4j.LoggerFactory;
  *   sasl.scram-sha-256.alice = salt=&lt;b64&gt;,iterations=4096,storedKey=&lt;b64&gt;,serverKey=&lt;b64&gt;
  *   # Optional principal mapping (default User:&lt;username&gt;)
  *   sasl.principal.s3-gw = Gateway:s3-gw
+ *   # S3 access keys (SigV4 needs the actual secret — protect this file)
+ *   s3.key.AKIAEXAMPLE.secret = wJalr...
+ *   s3.key.AKIAEXAMPLE.principal = User:alice
  * </pre>
  */
-public final class FileCredentialStore implements CredentialStore {
+public final class FileCredentialStore implements CredentialStore, S3KeyStore {
 
     private static final Logger LOG = LoggerFactory.getLogger(FileCredentialStore.class);
 
     private static final String PLAIN_PREFIX = "sasl.user.";
     private static final String SCRAM_PREFIX = "sasl.scram-sha-256.";
     private static final String PRINCIPAL_PREFIX = "sasl.principal.";
+    private static final String S3_KEY_PREFIX = "s3.key.";
     private static final long RECHECK_INTERVAL_MILLIS = 1000;
 
     private final Path file;
@@ -74,6 +78,11 @@ public final class FileCredentialStore implements CredentialStore {
     @Override
     public Principal principalOf(String username) {
         return current().principals.getOrDefault(username, Principal.user(username));
+    }
+
+    @Override
+    public Optional<S3Key> s3Key(String accessKeyId) {
+        return Optional.ofNullable(current().s3Keys.get(accessKeyId));
     }
 
     private Snapshot current() {
@@ -106,7 +115,7 @@ public final class FileCredentialStore implements CredentialStore {
 
     private record Snapshot(Instant mtime, Map<String, String> plainVerifiers,
                             Map<String, ScramCredential> scramCredentials,
-                            Map<String, Principal> principals) {
+                            Map<String, Principal> principals, Map<String, S3Key> s3Keys) {
 
         static Snapshot load(Path file) {
             Properties props = new Properties();
@@ -120,6 +129,8 @@ public final class FileCredentialStore implements CredentialStore {
             Map<String, String> plain = new LinkedHashMap<>();
             Map<String, ScramCredential> scram = new LinkedHashMap<>();
             Map<String, Principal> principals = new LinkedHashMap<>();
+            Map<String, String> s3Secrets = new LinkedHashMap<>();
+            Map<String, Principal> s3Principals = new LinkedHashMap<>();
             for (String key : props.stringPropertyNames()) {
                 String value = props.getProperty(key).trim();
                 if (key.startsWith(PLAIN_PREFIX)) {
@@ -129,12 +140,25 @@ public final class FileCredentialStore implements CredentialStore {
                 } else if (key.startsWith(PRINCIPAL_PREFIX)) {
                     principals.put(key.substring(PRINCIPAL_PREFIX.length()),
                             Principal.parse(value));
+                } else if (key.startsWith(S3_KEY_PREFIX)) {
+                    String rest = key.substring(S3_KEY_PREFIX.length());
+                    if (rest.endsWith(".secret")) {
+                        s3Secrets.put(rest.substring(0, rest.length() - ".secret".length()), value);
+                    } else if (rest.endsWith(".principal")) {
+                        s3Principals.put(rest.substring(0, rest.length() - ".principal".length()),
+                                Principal.parse(value));
+                    }
                 }
-                // Unknown prefixes (e.g. the S3 key entries used by the gateway) are not an error:
-                // one file serves every credential kind.
+                // Unknown prefixes are not an error: one file serves every credential kind.
+            }
+            Map<String, S3Key> s3Keys = new LinkedHashMap<>();
+            for (Map.Entry<String, String> e : s3Secrets.entrySet()) {
+                Principal principal = s3Principals.getOrDefault(e.getKey(),
+                        Principal.user(e.getKey()));
+                s3Keys.put(e.getKey(), new S3Key(e.getKey(), e.getValue(), principal));
             }
             return new Snapshot(mtime, Map.copyOf(plain), Map.copyOf(scram),
-                    Map.copyOf(principals));
+                    Map.copyOf(principals), Map.copyOf(s3Keys));
         }
     }
 }

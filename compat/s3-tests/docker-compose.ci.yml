@@ -128,6 +128,11 @@ services:
       CANDYBOX_S3_BIND: 0.0.0.0:9711
       CANDYBOX_HEALTH_PORT: "9712"
       CANDYBOX_HEAP_OPTS: "-Xms256m -Xmx512m"
+      # Real SigV4 + ACL enforcement against the s3tests accounts (see s3tests.conf.in).
+      CANDYBOX_S3_AUTH_ENABLED: "true"
+      CANDYBOX_AUTH_CREDENTIALS_FILE: /etc/candybox/gateway-credentials.properties
+    volumes:
+      - ./gateway-credentials.properties:/etc/candybox/gateway-credentials.properties:ro
     ports:
       - "9711:9711"   # S3 HTTP API
       - "9712:9712"   # health/metrics
