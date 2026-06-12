@@ -149,6 +149,104 @@ v1 has **no authentication** (matching the rest of candybox today); the deploy a
 trusted network. The single mutating dashboard operation in v1 — deleting an object — goes through
 the S3 gateway from the browser, not through this API. See `WEB_DASHBOARD_PLAN.md`.
 
+## Security
+
+Candybox secures every channel with SASL authentication, per-Box/per-object ACLs, and in-process
+TLS. The full design lives in [`AUTH_PLAN.md`](AUTH_PLAN.md); this section is the operator view.
+All keys below follow the usual convention: any key can come from the environment as
+`CANDYBOX_<KEY>` (dots to underscores, upper-cased).
+
+### Clients / S3 gateway / admin API → storage nodes (SASL + TLS)
+
+On each node:
+
+```properties
+auth.enabled=true                  # SASL on the TCP listener
+auth.required=true                 # false = unauthenticated connections pass as anonymous
+auth.sasl.mechanisms=PLAIN,SCRAM-SHA-256
+auth.credentials.file=/etc/candybox/credentials.properties
+auth.super.users=Gateway:s3-gw,Admin:admin-api
+
+tls.enabled=true                   # PEM paths; the key must be UNENCRYPTED PKCS#8
+tls.cert.path=/etc/candybox/tls/tls.crt
+tls.key.path=/etc/candybox/tls/tls.key
+tls.ca.path=/etc/candybox/tls/ca.crt
+tls.client.auth=false              # true = demand a client certificate (mTLS)
+```
+
+Generate credential-file entries with `candybox make-credentials <user>`; the file is reloaded on
+change (rotation needs no restart), and `plain:` verifiers are accepted for dev fixtures. Choose
+**PLAIN only on TLS listeners** (the password crosses the wire; the server stores a one-way hash);
+**SCRAM-SHA-256** never sends the password and mutually authenticates, so it is the safer choice
+when TLS terminates elsewhere. Dev certificates: `examples/security/gen-dev-certs.sh`.
+
+Anything dialing the nodes uses the client side of the same surface (gateway, admin API, CLI):
+
+```properties
+auth.client.mechanism=PLAIN
+auth.client.username=s3-gw
+auth.client.password.file=/etc/candybox/s3-gw.password
+tls.enabled=true
+tls.ca.path=/etc/candybox/tls/ca.crt
+```
+
+The CLI takes the same via `--user/--password-file/--mechanism/--tls/--tls-ca` or
+`CANDYBOX_AUTH_*`/`CANDYBOX_TLS*` env vars.
+
+### Authorization (ACLs)
+
+Every request is authorized against the caller's principal (`User:alice`, `Gateway:s3-gw`, ...).
+A Box's ACL document (owner + additive grants, stored in ZooKeeper) governs READ / WRITE /
+READ_ACP / WRITE_ACP / ADMIN; the creator owns the Box, and `ListBoxes` only reveals READable
+Boxes. Objects additionally carry their own owner + grants inside the `CandyLocator` (the S3
+union rule: an object grant can open READ on a single object inside a private Box). Manage with:
+
+```
+candybox acl get|set|grant|revoke <box> [--object <key>]
+e.g. candybox acl grant photos AllUsers:READ          # public-read Box
+```
+
+`auth.super.users` principals bypass ACLs entirely — list the S3 gateway and admin API service
+accounts there. A Box created before authorization (no document) falls back to
+authenticated-full-access.
+
+### Candybox → ZooKeeper
+
+```properties
+zookeeper.auth.scheme=digest
+zookeeper.auth.credentials=candybox:change-me
+zookeeper.acl.enabled=true         # defaults to true once a scheme is set
+```
+
+With ACLs on, every znode candybox creates is `CREATOR_ALL` — so **all candybox processes of one
+cluster must authenticate as the same ZooKeeper identity**. For SASL (Kerberos/DIGEST-MD5) set
+`CANDYBOX_JAAS_CONF` to a JAAS file with a `Client` section (see
+`examples/security/jaas.conf.example`); that one section also authenticates BookKeeper's internal
+ZooKeeper client. ZooKeeper client TLS uses ZooKeeper's standard system properties via
+`CANDYBOX_EXTRA_OPTS` (`-Dzookeeper.client.secure=true ...`).
+
+### Candybox → BookKeeper
+
+Everything goes through the verbatim `bookkeeper.client.*` passthrough (BK's own camelCase keys —
+via env, the suffix keeps its case: `CANDYBOX_BOOKKEEPER_CLIENT_tlsProvider`):
+
+```properties
+bookkeeper.client.clientAuthProviderFactoryClass=org.apache.bookkeeper.sasl.SASLClientProviderFactory
+bookkeeper.client.tlsProvider=OpenSSL
+bookkeeper.client.tlsTrustStoreType=PEM
+bookkeeper.client.tlsTrustStore=/etc/candybox/tls/ca.crt
+```
+
+The bookie side (`bookieAuthProviderFactoryClass`, bookie TLS, the bookies' own ZooKeeper auth) is
+configured in each bookie's `bookkeeper.conf` per the BookKeeper security docs — Candybox only
+brings the client half.
+
+### Ledger password vs. authentication
+
+`ledger.password` predates all of the above: it is BookKeeper's per-ledger access password, a
+shared secret among the candybox nodes — keep it secret, but do not mistake it for user
+authentication.
+
 ## Known limitations / deferred work
 
 - **Streaming on the wire (Phase 2.5):** large objects are buffered in a single frame (≤ 16 MiB);

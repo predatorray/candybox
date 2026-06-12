@@ -73,11 +73,16 @@ public final class SecurityConfig {
     private final boolean tlsClientAuth;
     private final boolean tlsVerifyEndpoint;
 
+    private final String zkAuthScheme;
+    private final String zkAuthCredentials;
+    private final boolean zkAclEnabled;
+
     private SecurityConfig(boolean authEnabled, boolean authRequired, List<String> saslMechanisms,
                            Path credentialsFile, List<String> superUsers, String clientMechanism,
                            String clientUsername, String clientPassword, boolean tlsEnabled,
                            Path tlsCertPath, Path tlsKeyPath, Path tlsCaPath, boolean tlsClientAuth,
-                           boolean tlsVerifyEndpoint) {
+                           boolean tlsVerifyEndpoint, String zkAuthScheme, String zkAuthCredentials,
+                           boolean zkAclEnabled) {
         this.authEnabled = authEnabled;
         this.authRequired = authRequired;
         this.saslMechanisms = saslMechanisms;
@@ -92,6 +97,9 @@ public final class SecurityConfig {
         this.tlsCaPath = tlsCaPath;
         this.tlsClientAuth = tlsClientAuth;
         this.tlsVerifyEndpoint = tlsVerifyEndpoint;
+        this.zkAuthScheme = zkAuthScheme;
+        this.zkAuthCredentials = zkAuthCredentials;
+        this.zkAclEnabled = zkAclEnabled;
     }
 
     /** Everything off — the dev/test default. */
@@ -138,9 +146,21 @@ public final class SecurityConfig {
         boolean clientAuth = bool(get, "tls.client.auth", false);
         boolean verifyEndpoint = bool(get, "tls.verify.endpoint", true);
 
+        String zkScheme = get.apply("zookeeper.auth.scheme").orElse(null);
+        String zkCredentials = get.apply("zookeeper.auth.credentials").orElseGet(
+                () -> get.apply("zookeeper.auth.credentials.file")
+                        .map(SecurityConfig::readSecret).orElse(null));
+        if (zkScheme != null && zkCredentials == null) {
+            throw new IllegalArgumentException("zookeeper.auth.scheme is set but neither "
+                    + "zookeeper.auth.credentials nor zookeeper.auth.credentials.file is");
+        }
+        // ACLs default on as soon as the process has a ZK identity to own the znodes with
+        // (digest credentials here, or a JAAS Client section for SASL — flagged explicitly).
+        boolean zkAclEnabled = bool(get, "zookeeper.acl.enabled", zkScheme != null);
+
         return new SecurityConfig(authEnabled, authRequired, mechanisms, credentialsFile,
                 superUsers, clientMechanism, clientUsername, clientPassword, tlsEnabled, certPath,
-                keyPath, caPath, clientAuth, verifyEndpoint);
+                keyPath, caPath, clientAuth, verifyEndpoint, zkScheme, zkCredentials, zkAclEnabled);
     }
 
     private static boolean bool(Function<String, Optional<String>> get, String key,
@@ -199,6 +219,19 @@ public final class SecurityConfig {
 
     public boolean tlsVerifyEndpoint() {
         return tlsVerifyEndpoint;
+    }
+
+    /** The ZooKeeper {@code addAuth} scheme (e.g. {@code digest}), or null for none/SASL-via-JAAS. */
+    public String zkAuthScheme() {
+        return zkAuthScheme;
+    }
+
+    public String zkAuthCredentials() {
+        return zkAuthCredentials;
+    }
+
+    public boolean zkAclEnabled() {
+        return zkAclEnabled;
     }
 
     /** The listener-side TLS context, or null when TLS is off. */

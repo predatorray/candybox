@@ -76,8 +76,29 @@ public final class BookKeeperLedgerStore implements LedgerStore {
      * invariant.
      */
     public static BookKeeperLedgerStore create(String metadataServiceUri, byte[] password) {
+        return create(metadataServiceUri, password, java.util.Map.of());
+    }
+
+    /**
+     * {@link #create(String, byte[])} with a verbatim passthrough of raw BookKeeper client
+     * properties — the {@code bookkeeper.client.<key>} config surface. This is how deployments
+     * enable BK's own pluggable authentication ({@code clientAuthProviderFactoryClass}, e.g. the
+     * SASL provider with a JAAS login), client↔bookie TLS ({@code tlsProvider},
+     * {@code tlsTrustStore}, …) or any other {@link ClientConfiguration} setting without a
+     * Candybox release. Keys are BK's own names, case-sensitive; values are uninterpreted strings.
+     */
+    public static BookKeeperLedgerStore create(String metadataServiceUri, byte[] password,
+                                               java.util.Map<String, String> clientProperties) {
         ClientConfiguration conf = new ClientConfiguration();
         conf.setMetadataServiceUri(metadataServiceUri);
+        for (java.util.Map.Entry<String, String> e : clientProperties.entrySet()) {
+            conf.setProperty(e.getKey(), e.getValue());
+        }
+        if (!clientProperties.isEmpty()) {
+            LOG.info("Applied {} passthrough BookKeeper client propert{}: {}",
+                    clientProperties.size(), clientProperties.size() == 1 ? "y" : "ies",
+                    clientProperties.keySet());
+        }
         return new BookKeeperLedgerStore(conf, password);
     }
 

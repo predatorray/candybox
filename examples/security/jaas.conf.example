@@ -1,0 +1,20 @@
+// Example JAAS login configuration (set CANDYBOX_JAAS_CONF=/path/to/jaas.conf).
+//
+// The `Client` section authenticates every ZooKeeper connection made by this JVM — both
+// candybox's coordination client and BookKeeper's internal metadata client — using ZooKeeper's
+// SASL/DIGEST-MD5. Pair it with the matching Server section / users on the ZooKeeper ensemble
+// and set zookeeper.acl.enabled=true.
+Client {
+  org.apache.zookeeper.server.auth.DigestLoginModule required
+  username="candybox"
+  password="change-me";
+};
+
+// The `BookKeeper` section drives BK's SASL client auth provider
+// (bookkeeper.client.clientAuthProviderFactoryClass=org.apache.bookkeeper.sasl.SASLClientProviderFactory).
+// For Kerberos deployments replace the login module with Krb5LoginModule on both sections.
+BookKeeper {
+  org.apache.zookeeper.server.auth.DigestLoginModule required
+  username="candybox"
+  password="change-me";
+};

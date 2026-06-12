@@ -70,6 +70,7 @@ public final class ServerConfig {
     private final Path logDir;
     private final CandyboxConfig tuning;
     private final SecurityConfig security;
+    private final java.util.Map<String, String> bookkeeperClientProps;
 
     private ServerConfig(Builder b) {
         this.nodeId = b.nodeId;
@@ -85,6 +86,7 @@ public final class ServerConfig {
         this.logDir = b.logDir;
         this.tuning = b.tuning;
         this.security = b.security;
+        this.bookkeeperClientProps = b.bookkeeperClientProps;
     }
 
     /** Loads configuration from a properties file, layering environment-variable overrides on top. */
@@ -130,7 +132,34 @@ public final class ServerConfig {
                 .logDir(Path.of(r.get("log.dir").orElse("./logs")))
                 .tuning(r.buildTuning())
                 .security(SecurityConfig.resolve(r::get))
+                .bookkeeperClientProps(collectBookkeeperClientProps(props, env))
                 .build();
+    }
+
+    /**
+     * The verbatim {@code bookkeeper.client.<key>} passthrough: every such file property — and
+     * every {@code CANDYBOX_BOOKKEEPER_CLIENT_<key>} environment variable (env wins) — is handed
+     * untouched to the raw BookKeeper {@link org.apache.bookkeeper.conf.ClientConfiguration
+     * ClientConfiguration}. BK's keys are camelCase and case-sensitive, so the environment form
+     * must preserve the case of the suffix (environment names may be mixed-case on Linux), e.g.
+     * {@code CANDYBOX_BOOKKEEPER_CLIENT_clientAuthProviderFactoryClass}.
+     */
+    private static java.util.Map<String, String> collectBookkeeperClientProps(
+            Properties props, java.util.Map<String, String> env) {
+        String filePrefix = "bookkeeper.client.";
+        String envPrefix = ENV_PREFIX + "BOOKKEEPER_CLIENT_";
+        java.util.Map<String, String> out = new java.util.LinkedHashMap<>();
+        for (String key : props.stringPropertyNames()) {
+            if (key.startsWith(filePrefix) && !props.getProperty(key).isBlank()) {
+                out.put(key.substring(filePrefix.length()), props.getProperty(key).trim());
+            }
+        }
+        for (java.util.Map.Entry<String, String> e : env.entrySet()) {
+            if (e.getKey().startsWith(envPrefix) && !e.getValue().isBlank()) {
+                out.put(e.getKey().substring(envPrefix.length()), e.getValue().trim());
+            }
+        }
+        return java.util.Map.copyOf(out);
     }
 
     public int nodeId() {
@@ -183,6 +212,11 @@ public final class ServerConfig {
 
     public SecurityConfig security() {
         return security;
+    }
+
+    /** Raw BookKeeper client properties passed through verbatim (auth providers, TLS, tuning). */
+    public java.util.Map<String, String> bookkeeperClientProps() {
+        return bookkeeperClientProps;
     }
 
     /** A {@code host:port} pair. */
@@ -326,6 +360,7 @@ public final class ServerConfig {
         private Path logDir = Path.of("./logs");
         private CandyboxConfig tuning = CandyboxConfig.defaults();
         private SecurityConfig security = SecurityConfig.disabled();
+        private java.util.Map<String, String> bookkeeperClientProps = java.util.Map.of();
 
         Builder nodeId(int v) {
             this.nodeId = v;
@@ -389,6 +424,11 @@ public final class ServerConfig {
 
         Builder security(SecurityConfig v) {
             this.security = v;
+            return this;
+        }
+
+        Builder bookkeeperClientProps(java.util.Map<String, String> v) {
+            this.bookkeeperClientProps = java.util.Map.copyOf(v);
             return this;
         }
 

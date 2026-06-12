@@ -23,9 +23,13 @@ import java.util.List;
 import me.predatorray.candybox.client.CandyboxClient;
 import me.predatorray.candybox.common.SystemClock;
 import me.predatorray.candybox.common.config.CandyboxConfig;
+import me.predatorray.candybox.common.config.SecurityConfig;
 import me.predatorray.candybox.coordination.CoordinationService;
+import me.predatorray.candybox.coordination.zk.ZkAuth;
 import me.predatorray.candybox.coordination.zk.ZooKeeperCoordinationService;
+import me.predatorray.candybox.protocol.auth.AuthenticatingTransport;
 import me.predatorray.candybox.protocol.transport.TcpTransport;
+import me.predatorray.candybox.protocol.transport.Transport;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -63,7 +67,8 @@ public final class AdminApiMain {
         AdminApiConfig config = fromEnv(System.getenv());
         // LIFO close: every component pushes itself; the shutdown hook pops them in reverse.
         Deque<AutoCloseable> stack = new ArrayDeque<>();
-        DashboardData data = buildDataSource(System.getenv("CANDYBOX_ADMIN_ZK"), stack);
+        DashboardData data =
+                buildDataSource(System.getenv("CANDYBOX_ADMIN_ZK"), stack, System.getenv());
 
         MetricsScraper scraper = buildScraper(System.getenv());
         if (scraper != null) {
@@ -113,15 +118,27 @@ public final class AdminApiMain {
         return new MetricsScraper(targets, interval, window);
     }
 
-    private static DashboardData buildDataSource(String zk, Deque<AutoCloseable> closeStack) {
+    private static DashboardData buildDataSource(String zk, Deque<AutoCloseable> closeStack,
+                                                 java.util.Map<String, String> env) {
         if (zk == null || zk.isBlank()) {
             LOG.info("No CANDYBOX_ADMIN_ZK set — running with empty data source (UI-only demo).");
             return new EmptyDashboardData();
         }
         LOG.info("Wiring live data source against ZooKeeper {}", zk);
-        TcpTransport transport = new TcpTransport();
+        // The shared auth.*/tls.*/zookeeper.auth.* surface, resolved from CANDYBOX_* env vars
+        // (the admin API is env-configured) — how this process dials nodes and ZooKeeper.
+        SecurityConfig security = SecurityConfig.resolve(key -> java.util.Optional
+                .ofNullable(env.get("CANDYBOX_" + key.toUpperCase().replace('.', '_')))
+                .filter(s -> !s.isBlank()).map(String::trim));
+        Transport tcp = new TcpTransport(new me.predatorray.candybox.protocol.FrameCodec(),
+                security.clientSslContext(), security.tlsVerifyEndpoint());
+        Transport transport = security.clientUsername() == null ? tcp
+                : new AuthenticatingTransport(tcp, security.clientMechanism(),
+                        security.clientUsername(), security.clientPassword());
         closeStack.push(transport);
-        CoordinationService coordination = new ZooKeeperCoordinationService(zk, SystemClock.INSTANCE);
+        CoordinationService coordination = new ZooKeeperCoordinationService(zk,
+                SystemClock.INSTANCE, new ZkAuth(security.zkAuthScheme(),
+                        security.zkAuthCredentials(), security.zkAclEnabled()));
         closeStack.push(coordination);
         CandyboxClient client =
                 new CandyboxClient(transport, coordination, CandyboxConfig.builder().build());
