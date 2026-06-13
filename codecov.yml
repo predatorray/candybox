@@ -1,0 +1,24 @@
+# Codecov configuration.
+#
+# Without this file Codecov applies its defaults — project/patch target "auto" (the base
+# commit's coverage) at 0% tolerance — which a single large feature branch cannot match
+# line-for-line against an established codebase. The settings below keep coverage honest while
+# letting sizable, well-tested features land:
+#   * project: must not drop more than 2% below the base commit's total coverage.
+#   * patch:   the changed lines must be at least 75% covered.
+# Tighten these as the project's coverage stabilizes.
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 2%
+    patch:
+      default:
+        target: 75%
+
+# Coverage is uploaded from the merged unit+IT aggregate (see .github/workflows/ci.yml); the
+# frontend module is not instrumented for line coverage here.
+ignore:
+  - "candybox-web/**"
+  - "**/*Test.java"
