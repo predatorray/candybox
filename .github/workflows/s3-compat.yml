@@ -57,16 +57,30 @@ jobs:
         run: docker compose up -d --no-build
 
       # Drive a real PUT bucket through the gateway until the full path (gateway -> node -> bookies)
-      # answers, so the suite never races a not-yet-serving cluster.
+      # answers, so the suite never races a not-yet-serving cluster. The gateway verifies SigV4 in
+      # CI, so the probe signs with the provisioned `candybox` account (the runner's preinstalled
+      # AWS CLI); if the CLI is ever missing, an unsigned probe answering 403 still proves the
+      # gateway is up and authenticating (the suite itself covers the signed path).
       - name: Wait for the gateway to serve
+        env:
+          AWS_ACCESS_KEY_ID: candybox
+          AWS_SECRET_ACCESS_KEY: candybox
+          AWS_DEFAULT_REGION: us-east-1
         run: |
           for i in $(seq 1 60); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$S3_ENDPOINT/ci-preflight" || true)
-            if [ "$code" = "200" ]; then
-              curl -s -o /dev/null -X DELETE "$S3_ENDPOINT/ci-preflight" || true
-              echo "gateway is serving (PUT bucket -> $code)"; exit 0
+            if command -v aws >/dev/null; then
+              if aws --endpoint-url "$S3_ENDPOINT" s3api create-bucket --bucket ci-preflight >/dev/null 2>&1; then
+                aws --endpoint-url "$S3_ENDPOINT" s3api delete-bucket --bucket ci-preflight >/dev/null 2>&1 || true
+                echo "gateway is serving (signed PUT bucket succeeded)"; exit 0
+              fi
+              echo "attempt $i: signed PUT bucket failed; retrying"; sleep 5
+            else
+              code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$S3_ENDPOINT/ci-preflight" || true)
+              if [ "$code" = "200" ] || [ "$code" = "403" ]; then
+                echo "gateway is serving (unsigned PUT bucket -> $code)"; exit 0
+              fi
+              echo "attempt $i: PUT bucket -> ${code:-no-response}; retrying"; sleep 5
             fi
-            echo "attempt $i: PUT bucket -> ${code:-no-response}; retrying"; sleep 5
           done
           echo "gateway did not become ready in time"; exit 1
 

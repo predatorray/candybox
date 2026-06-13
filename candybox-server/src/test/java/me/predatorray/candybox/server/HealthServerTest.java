@@ -101,4 +101,29 @@ class HealthServerTest {
         // The counter HELP/TYPE headers are present even with no series rows.
         assertThat(rendered).contains("# TYPE candybox_compactions_total counter");
     }
+
+    @Test
+    void metricsTokenGuardsMetricsButNotProbes() throws Exception {
+        try (HealthServer server = new HealthServer(0, 1, () -> true, Map::of, "sekret")) {
+            server.start();
+            HttpClient http = HttpClient.newHttpClient();
+            String base = "http://127.0.0.1:" + server.port();
+
+            // Probes stay open (boolean-only, Kubernetes hits them directly).
+            assertThat(http.send(HttpRequest.newBuilder(URI.create(base + "/healthz")).build(),
+                    BodyHandlers.ofString()).statusCode()).isEqualTo(200);
+
+            // Metrics demand the bearer token; wrong/missing is 401.
+            assertThat(http.send(HttpRequest.newBuilder(URI.create(base + "/metrics")).build(),
+                    BodyHandlers.ofString()).statusCode()).isEqualTo(401);
+            assertThat(http.send(HttpRequest.newBuilder(URI.create(base + "/metrics"))
+                            .header("Authorization", "Bearer nope").build(),
+                    BodyHandlers.ofString()).statusCode()).isEqualTo(401);
+            var ok = http.send(HttpRequest.newBuilder(URI.create(base + "/metrics"))
+                            .header("Authorization", "Bearer sekret").build(),
+                    BodyHandlers.ofString());
+            assertThat(ok.statusCode()).isEqualTo(200);
+            assertThat(ok.body()).contains("candybox_owned_boxes");
+        }
+    }
 }
