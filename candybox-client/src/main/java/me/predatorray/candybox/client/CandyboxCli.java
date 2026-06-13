@@ -160,7 +160,9 @@ public final class CandyboxCli {
 
         String command = args.remove(0);
         if (command.equals("make-credentials")) {
-            return makeCredentials(args, out, err);
+            // The global option parser above already consumed any `--password <value>`, so hand the
+            // resolved value through; makeCredentials only falls back to stdin when none was given.
+            return makeCredentials(args, password, out, err);
         }
         SSLContext sslContext = null;
         if (tls) {
@@ -191,18 +193,14 @@ public final class CandyboxCli {
      * Prints the credential-file lines for a user — the PBKDF2 PLAIN verifier and the
      * SCRAM-SHA-256 credential — reading the password from {@code --password}, or stdin.
      */
-    private static int makeCredentials(List<String> args, PrintStream out, PrintStream err) {
+    private static int makeCredentials(List<String> args, String passwordFromOptions,
+                                       PrintStream out, PrintStream err) {
         if (args.isEmpty()) {
             err.println("usage: candybox make-credentials <username> [--password <password>]");
             return 2;
         }
         String username = args.remove(0);
-        String password = null;
-        for (int i = 0; i < args.size() - 1; i++) {
-            if (args.get(i).equals("--password")) {
-                password = args.get(i + 1);
-            }
-        }
+        String password = passwordFromOptions;
         if (password == null) {
             try {
                 password = new String(System.in.readAllBytes(), StandardCharsets.UTF_8).trim();

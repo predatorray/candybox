@@ -80,4 +80,55 @@ class CandyboxCliTest {
         assertThat(run("-h")).isEqualTo(0);
         assertThat(stdout()).contains("Usage: candybox");
     }
+
+    // ---- security options (resolved before any network call) --------------------------------
+
+    @Test
+    void userWithoutAPasswordIsRejected() {
+        assertThat(run("-u", "alice", "list-boxes")).isEqualTo(2);
+        assertThat(stderr()).contains("--password");
+    }
+
+    @Test
+    void missingValuesForSecurityFlagsAreRejected() {
+        assertThat(run("list-boxes", "--user")).isEqualTo(2);
+        assertThat(run("list-boxes", "--password")).isEqualTo(2);
+        assertThat(run("list-boxes", "--mechanism")).isEqualTo(2);
+        assertThat(run("list-boxes", "--tls-ca")).isEqualTo(2);
+    }
+
+    @Test
+    void unreadablePasswordFileIsRejected() {
+        assertThat(run("-u", "alice", "--password-file", "/no/such/file", "list-boxes"))
+                .isEqualTo(2);
+        assertThat(stderr()).contains("--password-file");
+    }
+
+    @Test
+    void missingTlsCaIsRejectedBeforeConnecting() {
+        assertThat(run("--tls-ca", "/no/such/ca.pem", "list-boxes")).isEqualTo(2);
+        assertThat(stderr()).contains("TLS setup failed");
+    }
+
+    // ---- make-credentials ---------------------------------------------------------------------
+
+    @Test
+    void makeCredentialsPrintsBothVerifierForms() {
+        assertThat(run("make-credentials", "alice", "--password", "wonderland")).isEqualTo(0);
+        String output = stdout();
+        assertThat(output).contains("sasl.user.alice = pbkdf2-sha256:");
+        assertThat(output).contains("sasl.scram-sha-256.alice = salt=");
+        // The printed PLAIN verifier actually verifies the password.
+        String verifier = output.lines()
+                .filter(l -> l.startsWith("sasl.user.alice = ")).findFirst().orElseThrow()
+                .substring("sasl.user.alice = ".length());
+        assertThat(me.predatorray.candybox.common.auth.Passwords.verify("wonderland", verifier))
+                .isTrue();
+    }
+
+    @Test
+    void makeCredentialsNeedsAUsernameAndANonEmptyPassword() {
+        assertThat(run("make-credentials")).isEqualTo(2);
+        assertThat(run("make-credentials", "alice", "--password", "")).isEqualTo(2);
+    }
 }

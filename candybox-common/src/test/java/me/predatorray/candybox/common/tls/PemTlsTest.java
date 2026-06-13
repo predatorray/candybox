@@ -58,4 +58,22 @@ class PemTlsTest {
         Path keyOnly = resource("server.key");
         assertThrows(IllegalArgumentException.class, () -> PemTls.readCertificates(keyOnly));
     }
+
+    @Test
+    void encryptedKeysAreRejectedWithAClearMessage() throws Exception {
+        Path encrypted = resource("encrypted.key");
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> PemTls.readPrivateKey(encrypted));
+        assertTrue(e.getMessage().contains("unencrypted PKCS#8"));
+    }
+
+    @Test
+    void certWithoutAKeyAndUnreadablePathsAreRejected() throws Exception {
+        Path cert = resource("server.pem");
+        assertThrows(IllegalArgumentException.class, () -> PemTls.serverContext(cert, null, null));
+        assertThrows(IllegalArgumentException.class,
+                () -> PemTls.readCertificates(Path.of("/no/such/file.pem")));
+        assertThrows(IllegalArgumentException.class,
+                () -> PemTls.readPrivateKey(Path.of("/no/such/key.pem")));
+    }
 }

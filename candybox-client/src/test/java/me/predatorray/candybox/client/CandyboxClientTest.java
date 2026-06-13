@@ -107,4 +107,80 @@ class CandyboxClientTest {
                     .hasMessageContaining("node 9");
         }
     }
+
+    // ---- ACL round trips + auth error mapping ------------------------------------------------
+
+    /** Echoes ACL requests back as responses so both wire directions are exercised. */
+    private static final RequestHandler ACL_HANDLER = request -> {
+        Message message = CODEC.decode(request);
+        Message response;
+        if (message instanceof Message.BoxInfoRequest) {
+            response = new Message.BoxInfoResponse(1);
+        } else if (message instanceof Message.GetBoxAclRequest g) {
+            response = g.box().equals("legacy-box")
+                    ? new Message.NotFoundResponse()
+                    : new Message.BoxAclResponse("User:alice",
+                            List.of("AllUsers:READ", "User:bob:READ+WRITE"));
+        } else if (message instanceof Message.HeadBoxRequest) {
+            response = new Message.OkResponse();
+        } else if (message instanceof Message.SetBoxAclRequest s) {
+            response = s.owner().equals("User:alice")
+                    ? new Message.OkResponse()
+                    : new Message.AccessDeniedResponse("User:mallory is not allowed WRITE_ACP");
+        } else if (message instanceof Message.GetCandyAclRequest) {
+            response = new Message.CandyAclResponse("User:alice", List.of("AllUsers:READ"));
+        } else if (message instanceof Message.SetCandyAclRequest) {
+            response = new Message.OkResponse();
+        } else if (message instanceof Message.GetCandyRequest) {
+            response = new Message.AuthFailedResponse("Not authenticated");
+        } else {
+            response = new Message.OkResponse();
+        }
+        return CODEC.encode(response);
+    };
+
+    @Test
+    void boxAclRoundTripsThroughTheCodec() {
+        try (CandyboxClient client = new CandyboxClient(new LoopbackTransport(ACL_HANDLER),
+                "ignored", 0)) {
+            me.predatorray.candybox.common.auth.BoxAcl acl =
+                    client.getBoxAcl("my-box").orElseThrow();
+            assertThat(acl.owner().toString()).isEqualTo("User:alice");
+            assertThat(acl.grants()).hasSize(2);
+            assertThat(acl.permits(me.predatorray.candybox.common.auth.Principal.ANONYMOUS,
+                    me.predatorray.candybox.common.auth.Operation.READ)).isTrue();
+
+            // A Box that exists but has no document is the legacy empty Optional.
+            assertThat(client.getBoxAcl("legacy-box")).isEmpty();
+
+            client.setBoxAcl("my-box", acl);
+        }
+    }
+
+    @Test
+    void candyAclRoundTripsThroughTheCodec() {
+        try (CandyboxClient client = new CandyboxClient(new LoopbackTransport(ACL_HANDLER),
+                "ignored", 0)) {
+            me.predatorray.candybox.common.auth.ObjectAcl acl = client.getCandyAcl("my-box", "k");
+            assertThat(acl.owner()).isEqualTo("User:alice");
+            assertThat(acl.grants()).hasSize(1);
+            client.setCandyAcl("my-box", "k", acl);
+        }
+    }
+
+    @Test
+    void accessDeniedAndAuthFailedMapToTypedExceptions() {
+        try (CandyboxClient client = new CandyboxClient(new LoopbackTransport(ACL_HANDLER),
+                "ignored", 0)) {
+            assertThatThrownBy(() -> client.setBoxAcl("my-box",
+                    me.predatorray.candybox.common.auth.BoxAcl.privateTo(
+                            me.predatorray.candybox.common.auth.Principal.user("mallory"))))
+                    .isInstanceOf(me.predatorray.candybox.common.exception.AccessDeniedException.class)
+                    .hasMessageContaining("WRITE_ACP");
+            assertThatThrownBy(() -> client.getCandy("my-box", "k"))
+                    .isInstanceOf(
+                            me.predatorray.candybox.common.exception.AuthenticationException.class)
+                    .hasMessageContaining("Not authenticated");
+        }
+    }
 }
