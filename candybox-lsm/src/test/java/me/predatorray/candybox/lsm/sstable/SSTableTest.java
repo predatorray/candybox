@@ -150,6 +150,41 @@ class SSTableTest {
     }
 
     @Test
+    void openingAnEmptyLedgerIsRejected() {
+        // A ledger with no entries has no footer to parse — the reader must fail loudly.
+        long emptyLedgerId = store.createLedger(config).ledgerId();
+        assertThat(emptyLedgerId).isGreaterThanOrEqualTo(0);
+        org.assertj.core.api.Assertions
+                .assertThatThrownBy(() -> new SSTableReader(store, emptyLedgerId))
+                .isInstanceOf(me.predatorray.candybox.common.exception.SerializationException.class)
+                .hasMessageContaining("empty");
+    }
+
+    @Test
+    void forwardScanFromKeyBeyondMaxIsEmptyAndExhaustsCleanly() {
+        SSTableMeta meta = writeKeys(10);
+        try (SSTableReader reader = new SSTableReader(store, meta.ledgerId())) {
+            var it = reader.scan(CandyKey.of("zzz")); // beyond the table's max key
+            assertThat(it.hasNext()).isFalse();
+            org.assertj.core.api.Assertions.assertThatThrownBy(it::next)
+                    .isInstanceOf(java.util.NoSuchElementException.class);
+        }
+    }
+
+    @Test
+    void reverseScanNextPastEndThrows() {
+        SSTableMeta meta = writeKeys(3);
+        try (SSTableReader reader = new SSTableReader(store, meta.ledgerId())) {
+            var it = reader.scanReverse(null);
+            while (it.hasNext()) {
+                it.next();
+            }
+            org.assertj.core.api.Assertions.assertThatThrownBy(it::next)
+                    .isInstanceOf(java.util.NoSuchElementException.class);
+        }
+    }
+
+    @Test
     void fullScanReturnsEverythingInOrder() {
         SSTableMeta meta = writeKeys(50);
         try (SSTableReader reader = new SSTableReader(store, meta.ledgerId())) {

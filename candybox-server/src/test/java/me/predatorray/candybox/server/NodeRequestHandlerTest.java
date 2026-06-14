@@ -304,4 +304,125 @@ class NodeRequestHandlerTest {
                     .isInstanceOf(Message.OkResponse.class);
         }
     }
+
+    @Test
+    void listMultipartUploadsHonoursPrefixMarkersAndPaging() {
+        try (CandyboxNode node = new CandyboxNode(1, config(), new InMemoryLedgerStore(),
+                new InMemoryCoordinationService(), new ManualClock(1000))) {
+            RequestHandler handler = node.requestHandler();
+            roundTrip(handler, new Message.CreateBoxRequest("mpu-box", 1));
+            // Uploads on three keys, plus two on the same key to exercise the uploadId tie-break.
+            roundTrip(handler, new Message.CreateMultipartUploadRequest("mpu-box", "p/a", null, Map.of()));
+            roundTrip(handler, new Message.CreateMultipartUploadRequest("mpu-box", "p/b", null, Map.of()));
+            roundTrip(handler, new Message.CreateMultipartUploadRequest("mpu-box", "q/a", null, Map.of()));
+
+            // Prefix narrows to the "p/" keys only.
+            Message prefixed = roundTrip(handler, new Message.ListMultipartUploadsRequest(
+                    "mpu-box", 0, "p/", null, null, 100));
+            assertThat(((Message.ListMultipartUploadsResponse) prefixed).uploads())
+                    .extracting(Message.InProgressUpload::key).containsExactlyInAnyOrder("p/a", "p/b");
+
+            // keyMarker drops uploads whose key sorts before it.
+            Message afterMarker = roundTrip(handler, new Message.ListMultipartUploadsRequest(
+                    "mpu-box", 0, null, "p/b", null, 100));
+            assertThat(((Message.ListMultipartUploadsResponse) afterMarker).uploads())
+                    .extracting(Message.InProgressUpload::key).doesNotContain("p/a");
+
+            // maxUploads forces truncation and a continuation marker.
+            Message page = roundTrip(handler, new Message.ListMultipartUploadsRequest(
+                    "mpu-box", 0, null, null, null, 1));
+            Message.ListMultipartUploadsResponse paged = (Message.ListMultipartUploadsResponse) page;
+            assertThat(paged.uploads()).hasSize(1);
+            assertThat(paged.nextKeyMarker()).isNotNull();
+            assertThat(paged.nextUploadIdMarker()).isNotNull();
+        }
+    }
+
+    @Test
+    void listPartsHonoursMarkerAndPaging() {
+        try (CandyboxNode node = new CandyboxNode(1, config(), new InMemoryLedgerStore(),
+                new InMemoryCoordinationService(), new ManualClock(1000))) {
+            RequestHandler handler = node.requestHandler();
+            roundTrip(handler, new Message.CreateBoxRequest("lp-box", 1));
+            Message created = roundTrip(handler, new Message.CreateMultipartUploadRequest(
+                    "lp-box", "obj", null, Map.of()));
+            String uploadId = ((Message.CreateMultipartUploadResponse) created).uploadId();
+            for (int pn = 1; pn <= 3; pn++) {
+                roundTrip(handler, new Message.UploadPartRequest("lp-box", "obj", uploadId, pn,
+                        bytes("part" + pn)));
+            }
+            // partNumberMarker skips part 1; maxParts=1 truncates and yields a next cursor.
+            Message page = roundTrip(handler,
+                    new Message.ListPartsRequest("lp-box", "obj", uploadId, 1, 1));
+            Message.ListPartsResponse parts = (Message.ListPartsResponse) page;
+            assertThat(parts.parts()).extracting(Message.UploadedPart::partNumber).containsExactly(2);
+            assertThat(parts.nextPartNumberMarker()).isEqualTo(2);
+
+            // ListParts on an unknown upload is NotFound.
+            assertThat(roundTrip(handler, new Message.ListPartsRequest("lp-box", "obj", "no-upload", 0, 10)))
+                    .isInstanceOf(Message.NotFoundResponse.class);
+        }
+    }
+
+    @Test
+    void objectAclGetSetRoundTripsAndRejectsMalformedGrants() {
+        try (CandyboxNode node = new CandyboxNode(1, config(), new InMemoryLedgerStore(),
+                new InMemoryCoordinationService(), new ManualClock(1000))) {
+            RequestHandler handler = node.requestHandler();
+            roundTrip(handler, new Message.CreateBoxRequest("acl-box", 1));
+            roundTrip(handler, new Message.PutCandyRequest("acl-box", "k", null, Map.of(), null,
+                    bytes("v")));
+
+            // Set a valid owner + grant, then read it back.
+            assertThat(roundTrip(handler, new Message.SetCandyAclRequest("acl-box", "k", "User:alice",
+                    List.of("AllUsers:READ")))).isInstanceOf(Message.OkResponse.class);
+            Message acl = roundTrip(handler, new Message.GetCandyAclRequest("acl-box", "k"));
+            Message.CandyAclResponse aclResp = (Message.CandyAclResponse) acl;
+            assertThat(aclResp.owner()).isEqualTo("User:alice");
+            assertThat(aclResp.grants()).isNotEmpty();
+
+            // A malformed grant string is a validation error, not a crash.
+            assertThat(roundTrip(handler, new Message.SetCandyAclRequest("acl-box", "k", "User:alice",
+                    List.of("this-is-not-a-grant")))).isInstanceOf(Message.ErrorResponse.class);
+        }
+    }
+
+    @Test
+    void putWithMalformedGrantIsAValidationError() {
+        try (CandyboxNode node = new CandyboxNode(1, config(), new InMemoryLedgerStore(),
+                new InMemoryCoordinationService(), new ManualClock(1000))) {
+            RequestHandler handler = node.requestHandler();
+            roundTrip(handler, new Message.CreateBoxRequest("put-acl-box", 1));
+            // The 8-arg PutCandyRequest carries request grants; a malformed one trips effectiveAcl.
+            Message response = roundTrip(handler, new Message.PutCandyRequest("put-acl-box", "k", null,
+                    Map.of(), null, bytes("v"), null, List.of("bogus-grant")));
+            assertThat(response).isInstanceOf(Message.ErrorResponse.class);
+        }
+    }
+
+    @Test
+    void uploadPartCopySamePartitionCopiesAByteRange() {
+        try (CandyboxNode node = new CandyboxNode(1, config(), new InMemoryLedgerStore(),
+                new InMemoryCoordinationService(), new ManualClock(1000))) {
+            RequestHandler handler = node.requestHandler();
+            roundTrip(handler, new Message.CreateBoxRequest("upc-box", 1)); // single partition
+            roundTrip(handler, new Message.PutCandyRequest("upc-box", "src", null, Map.of(), null,
+                    bytes("hello candybox")));
+            Message created = roundTrip(handler, new Message.CreateMultipartUploadRequest(
+                    "upc-box", "dst", null, Map.of()));
+            String uploadId = ((Message.CreateMultipartUploadResponse) created).uploadId();
+
+            Message copied = roundTrip(handler, new Message.UploadPartCopyRequest(
+                    "upc-box", "dst", uploadId, 1, "src", 6, 13)); // "candybox"
+            Message.UploadPartResponse part = (Message.UploadPartResponse) copied;
+            assertThat(part.partLength()).isEqualTo(8);
+
+            Message done = roundTrip(handler, new Message.CompleteMultipartUploadRequest("upc-box", "dst",
+                    uploadId, List.of(new Message.CompletedPart(1, part.crc32c())), null));
+            assertThat(done).isInstanceOf(Message.HeadCandyResponse.class);
+            Message get = roundTrip(handler, new Message.GetCandyRequest("upc-box", "dst"));
+            assertThat(new String(((Message.CandyDataResponse) get).data(), StandardCharsets.UTF_8))
+                    .isEqualTo("candybox");
+        }
+    }
 }

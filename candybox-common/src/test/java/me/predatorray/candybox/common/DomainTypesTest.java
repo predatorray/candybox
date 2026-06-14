@@ -54,4 +54,36 @@ class DomainTypesTest {
         assertThat(restored).isEqualTo(original);
         assertThat(restored.value()).isEqualTo("片/路径/✓");
     }
+
+    @Test
+    void candyKeyOfUtf8RejectsEmptyAndExposesHashAndString() {
+        assertThatThrownBy(() -> CandyKey.ofUtf8(new byte[0])).isInstanceOf(ValidationException.class);
+        CandyKey key = CandyKey.of("k");
+        assertThat(key.toString()).isEqualTo("k");
+        assertThat(key.hashCode()).isEqualTo(CandyKey.of("k").hashCode());
+    }
+
+    @Test
+    void tombstoneLocatorCarriesNoBytesAndZeroAccessors() {
+        CandyLocator tombstone = CandyLocator.tombstone(new Hlc(1, 0, 1), 1000L);
+        assertThat(tombstone.isTombstone()).isTrue();
+        assertThat(tombstone.contentLength()).isZero();
+        assertThat(tombstone.chunkSize()).isZero();
+        assertThat(tombstone.crc32c()).isZero();
+        assertThat(tombstone.parts()).isEmpty();
+    }
+
+    @Test
+    void candyLocatorRejectsNullRequiredFieldsAndPartsOnDelete() {
+        assertThatThrownBy(() -> new CandyLocator(null, LocatorType.PUT, null, java.util.Map.of(),
+                0L, List.of(), null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("hlc and type are required");
+        // A DELETE tombstone must not carry any parts.
+        Part part = new Part(1, 16, 0, List.of(new SegmentRef(1, 0, 0)));
+        assertThatThrownBy(() -> new CandyLocator(new Hlc(1, 0, 1), LocatorType.DELETE, null,
+                java.util.Map.of(), 0L, List.of(part), null))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("DELETE tombstone must carry no parts");
+    }
 }
