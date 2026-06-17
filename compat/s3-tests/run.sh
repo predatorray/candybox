@@ -32,6 +32,7 @@ SUITE="$WORK/s3-tests"
 VENV="$WORK/venv"
 CONF="$WORK/s3tests.conf"
 ALLOWLIST="$HERE/allowlist.txt"
+BADGE="$HERE/badge.json"
 
 S3_ENDPOINT="${S3_ENDPOINT:-http://127.0.0.1:9711}"
 S3TESTS_REF="${S3TESTS_REF:-master}"
@@ -139,5 +140,31 @@ case "$MODE" in
     } > "$ALLOWLIST"
     PASSES="$(grep -vcE '^\s*(#|$)' "$ALLOWLIST" || true)"
     log "wrote $PASSES passing tests to $ALLOWLIST"
+
+    # --- shields.io endpoint badge -------------------------------------------------------------
+    # Emit badge.json (Shields "endpoint" schema) so the README badge tracks the calibration
+    # automatically: percentage = passed / collected, the same "X / N tests pass" metric the docs
+    # quote. Regenerated on every --calibrate, committed alongside allowlist.txt.
+    COLLECTED="$(grep -oE 'collected [0-9]+ item' "$REPORT" | grep -oE '[0-9]+' | head -1)"
+    COLLECTED="${COLLECTED:-0}"
+    if [[ "$COLLECTED" -gt 0 ]]; then
+      PCT=$(( PASSES * 100 / COLLECTED ))
+    else
+      PCT=0
+    fi
+    if   [[ "$PCT" -ge 75 ]]; then COLOR="brightgreen"
+    elif [[ "$PCT" -ge 50 ]]; then COLOR="green"
+    elif [[ "$PCT" -ge 25 ]]; then COLOR="yellow"
+    else                           COLOR="orange"
+    fi
+    cat > "$BADGE" <<JSON
+{
+  "schemaVersion": 1,
+  "label": "S3 compatibility",
+  "message": "${PCT}% (${PASSES}/${COLLECTED})",
+  "color": "${COLOR}"
+}
+JSON
+    log "wrote badge $PCT% ($PASSES/$COLLECTED) to $BADGE"
     ;;
 esac

@@ -12,22 +12,29 @@ throwaway virtualenv, and points it at a gateway endpoint. Everything it generat
 
 ## What can pass
 
-The v1 gateway is **anonymous** (the `Authorization` header is accepted and ignored) and
-**path-style only**, and it implements a deliberately small slice of S3:
+The suite calibrates the gateway with **SigV4 auth + S3 ACL enforcement enabled** (Phase D/E) — the
+`docker-compose.ci.yml` stack signs every request as the `s3tests` accounts (see
+`gateway-credentials.properties` / `s3tests.conf.in`), so the multi-user, ACL, and cross-account
+access tests are reachable. The gateway is **path-style only** and implements a deliberately small
+slice of S3:
 
 | Supported (allowlist candidates)        | Not supported in v1 (excluded)                          |
 |------------------------------------------|---------------------------------------------------------|
 | Bucket create / head / delete            | Versioning                                              |
-| ListObjectsV2: prefix, delimiter,        | ACLs / bucket policy / ownership                        |
+| ListObjectsV2: prefix, delimiter,        | Bucket policy / public-access block                     |
 | max-keys, continuation-token, start-after| Conditional GET (If-Match / If-None-Match / If-*-Since) |
 | Object PUT / GET / HEAD / DELETE         | Tagging, lifecycle, CORS, SSE                           |
 | Multi-object delete                      | POST object (browser-style form upload)                 |
 | Range GET (Phase 5)                      | Object Lock / retention / legal hold (3 trivial passes) |
 | Multipart upload — create / parts / complete / abort / list (Phase 5) | `UploadPartCopy` / multipart-copy        |
-| `x-amz-meta-*` user metadata, CRC32C ETag| Per-user auth / multi-account isolation                 |
+| `x-amz-meta-*` user metadata, CRC32C ETag| Object attributes / checksums (SHA-256, CRC*)           |
+| **SigV4 auth + canned/grant ACLs, multi-user isolation, cross-account access** | Lifecycle / inventory / replication |
 
-Because auth is ignored, the suite's `[s3 alt]` / `[s3 tenant]` accounts all collapse onto one
-anonymous namespace — multi-user tests can't pass and aren't in the allowlist.
+> **ListBuckets is ownership-scoped.** `ListAllMyBuckets` returns only the buckets a principal owns,
+> never buckets merely granted READ — without that, a `public-read` bucket from one account leaks
+> into every account's listing and the suite's cross-account teardown cascades into errors. Earlier
+> auth-enabled calibration attempts hit exactly this; the fix (gateway `S3AccessControl.owns`) is
+> what makes a clean 0-error auth-mode run possible.
 
 ## Running
 
@@ -93,58 +100,67 @@ suite and pip-install boto3/pytest the first time.
 
 ## Latest calibration
 
-Last calibrated against ceph/s3-tests `master` @ `5522d1c` on **2026-06-01**, after the Phase 5
-gateway additions (multipart upload + Range GET) landed (full suite path
-`s3tests/functional/test_s3.py`, 10m 25s wall on an Apple-Silicon laptop — slower than the
-pre-Phase-5 7m 52s because the new multipart / range tests actually push MBs through instead of
-failing fast on the first PUT). The result is reproducible — re-running `--calibrate` against the
+Last calibrated against ceph/s3-tests `master` @ `5522d1c` on **2026-06-17**, against the gateway with
+**SigV4 auth + S3 ACLs enabled** over a single-node, single-bookie in-JVM stack (full suite path
+`s3tests/functional/test_s3.py`, all 838 items, **0 errors** — every test ran to a clean pass/fail
+with no fixture/teardown breakage). The result is reproducible: re-running `--calibrate` against the
 same source produces a byte-identical `allowlist.txt` apart from the timestamp header.
 
-| Outcome | Count | Δ vs pre-Phase-5 | Notes |
+| Outcome | Count | Δ vs prev | Notes |
 |---|---:|---:|---|
-| **Passed** (in `allowlist.txt`) | **164** | +15 | The compatibility gate. |
-| Failed | 580 | −15 | Features the v1 gateway doesn't yet implement (breakdown below). |
+| **Passed** (in `allowlist.txt`) | **192** | +28 | The compatibility gate. |
+| Failed | 552 | −28 | Features the v1 gateway doesn't yet implement (breakdown below). |
 | Skipped | 94 | — | Suite-level `pytest.mark` opt-outs — never executed (bucket logging, cloud-tier lifecycle, restore-status). |
 | Collected | 838 | — | All of `s3tests/functional/test_s3.py`. |
 
-What Phase 5 added to the allowlist (no previously-passing test regressed):
+What changed since the previous calibration (164 passes, after Phase 5's multipart + Range GET):
+turning **SigV4 auth + S3 ACLs** on (Phase D/E) — plus the `ListBuckets` ownership-scoping fix that
+makes a clean auth-mode run possible — brought a **net +28**, **28 newly passing, 0 regressions**.
+The new passes are exactly the tests real authentication unlocks:
 
-- **Range GET (6 new passes):** the `test_ranged_request_*` response-code family, including the
-  invalid-range path and the empty-object / trailing-bytes / skip-leading-bytes edges.
-- **Multipart upload (7 new passes):** `test_abort_multipart_upload`,
-  `test_atomic_multipart_upload_write`, `test_list_multipart_upload`,
-  `test_multipart_upload_empty`, `test_multipart_upload_multiple_sizes`,
-  `test_multipart_upload_overwrite_existing_object`,
-  `test_upload_part_copy_percent_encoded_key`.
-- **SSE-KMS × multipart (2 new passes):** `test_sse_kms_multipart_invalid_chunks_{1,2}`. The
-  gateway still ignores `x-amz-server-side-encryption-*`, so once multipart works these
-  SSE-negative-path tests fall through to plain multipart and pass.
+- **ACLs (`bucket_acl_*`, `object_acl_*`, `*_canned_*`):** default ACLs, canned-ACL round-trips,
+  full-control attribute checks, concurrent canned-ACL sets.
+- **Cross-account access (`access_bucket_private_*`, `object_copy_not_owned_*`):** a private
+  bucket/object correctly denies another account; public-read/-write grants correctly allow it.
+- **Auth negatives (`list_buckets_bad_auth`, `list_buckets_invalid_auth`):** bad/garbage SigV4
+  credentials are rejected with the right error.
+- **Anonymous access (`bucket_list*_objects_anonymous*`, `object_anon_put`):** unsigned requests are
+  allowed or denied per ACL.
+- Plus the not-found / error-response-shape edges (`bucket_notexist`, `object_copy_bucket_not_found`,
+  `object_write_to_nonexist_bucket`, …).
 
-The 580 remaining failures are the **growth surface** — implementing any of these would expand the
-allowlist on the next `--calibrate`:
+The 552 remaining failures are the **growth surface** — implementing any of these would expand the
+allowlist on the next `--calibrate`. Each failing test is counted once (first matching family):
 
 | Failures | Feature family |
 |---:|---|
-| 104 | Server-side encryption — SSE-C / SSE-S3 / SSE-KMS (incl. the 64-test `copy_enc[…]` matrix) |
-| 44 | Multipart upload edges still unimplemented — `copy_part` / `multipart_copy`, checksum-on-complete, resume / list-parts pagination |
-| 40 | ACLs / ownership controls (`object_acl`, `bucket_acl`, `access_bucket_*`) |
-| 38 | Versioning (`versioning_*`, `delete_marker_*`, `*_versioned`) |
-| 36 | Object Lock / retention / legal hold (beyond the 3 that already pass) |
-| 36 | POST object (browser-style form uploads) |
-| 33 | Lifecycle / expiration / non-current-version rules |
-| 29 | Bucket policy / block-public-access |
-| 29 | Bucket logging (the bits not behind the `pytest.mark` skip) |
-| 25 | `ListObjects(V2)` edge cases — encoding-type, exotic keys, sort order |
-| 13 | CORS preflight + actual cross-origin |
-| 13 | Anonymous raw-HTTP negative tests |
-| 11 | Object copy edge (metadata-directive, content-type override, ACL on copy) |
-| 9 | Bucket create / naming negative + target-bucket setup |
-| 8 | Tagging beyond the basic put/get already in the allowlist |
-| 4 | Range GET + `If-Match` / `If-Modified-Since` matrix (conditional-GET headers still TODO) |
-| 67 | Other — object attributes (checksum SHA-256, CRC64NVMe), public-access-block, `expected_bucket_owner`, bucket-recreate ACL, account-usage, misc PUT/GET/HEAD/DELETE response-shape edges |
+| 133 | Server-side encryption — SSE-C / SSE-S3 / SSE-KMS (incl. the `copy_enc[…]` matrix) |
+| 51 | Versioning (`versioning_*`, `delete_marker_*`, `*_versioned`) |
+| 43 | ACLs / grants / ownership edges still unimplemented (beyond the basics now passing) |
+| 43 | Lifecycle / expiration / non-current-version rules |
+| 41 | Bucket policy / block-public-access |
+| 36 | Object Lock / retention / legal hold / governance bypass (beyond the few that pass) |
+| 31 | POST object (browser-style form uploads) |
+| 28 | Bucket logging (the bits not behind the `pytest.mark` skip) |
+| 22 | Conditional GET/PUT — `If-Match` / `If-None-Match` / `If-*-Since` |
+| 20 | `ListObjects(V2)` edge cases — encoding-type, exotic keys, sort order, markers |
+| 18 | Bucket create / naming negative + misc bucket-level |
+| 14 | CORS preflight + actual cross-origin |
+| 14 | Tagging beyond the basic put/get already in the allowlist |
+| 14 | Object attributes / checksums (SHA-256, CRC*) |
+| 13 | Object copy edges (metadata-directive, content-type override, ACL on copy) |
+| 12 | Multipart upload edges — `copy_part` / `multipart_copy`, checksum-on-complete, resume / list-parts pagination |
+| 19 | Other — `expected_bucket_owner`, account-usage, raw-HTTP negatives, misc PUT/GET/HEAD/DELETE response-shape edges |
 
 The headers in `allowlist.txt` always record the exact suite SHA + endpoint a result was calibrated
 against, so the table above can be reproduced verbatim from the checked-in artifact.
+
+### The compatibility badge
+
+`run.sh --calibrate` also writes `badge.json` (a [Shields endpoint](https://shields.io/badges/endpoint-badge)
+payload) next to `allowlist.txt`, so the **S3 compatibility** badge in the top-level README — which
+points at `badge.json` on `main` — tracks the calibrated `passed / collected` percentage
+automatically. Re-calibrate, commit `badge.json` alongside `allowlist.txt`, and the badge follows.
 
 ## In CI
 

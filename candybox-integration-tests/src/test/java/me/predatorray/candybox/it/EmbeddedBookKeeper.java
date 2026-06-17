@@ -33,11 +33,25 @@ public final class EmbeddedBookKeeper implements AutoCloseable {
     private final LocalBookKeeper localBookKeeper;
 
     public EmbeddedBookKeeper(int numBookies) {
+        this(numBookies, 0);
+    }
+
+    /**
+     * @param numBookies    bookies to start in-JVM
+     * @param openFileLimit max open ledger-index files per bookie ({@code <= 0} keeps the BookKeeper
+     *                      default). Bounding this keeps the bookie's file-descriptor footprint flat
+     *                      when a workload churns through many ledgers, which matters in sandboxes
+     *                      with a low {@code RLIMIT_NOFILE}.
+     */
+    public EmbeddedBookKeeper(int numBookies, int openFileLimit) {
         this.zkPort = freePort();
         try {
             ServerConfiguration serverConf = new ServerConfiguration();
             serverConf.setMetadataServiceUri(metadataServiceUri());
             serverConf.setAllowLoopback(true);
+            if (openFileLimit > 0) {
+                serverConf.setOpenFileLimit(openFileLimit);
+            }
             // getLocalBookies(zkHost, zkPort, numBookies, shouldStartZK, conf) stands up the in-JVM
             // ZooKeeper and the bookies; start() launches them.
             this.localBookKeeper =

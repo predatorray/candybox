@@ -123,10 +123,11 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
         Principal principal = auth.principal();
         switch (action) {
             case LIST_BUCKETS -> {
-                // Anonymous sees an empty list (RGW-compatible); others see their READable Boxes.
+                // Anonymous sees an empty list (RGW-compatible); others see only the Boxes they own
+                // (ListAllMyBuckets is ownership-scoped, not READ-scoped).
                 List<String> visible = principal.isAnonymous() && access.enabled() ? List.of()
                         : store.listBoxes().stream()
-                                .filter(box -> access.mayRead(box, principal)).toList();
+                                .filter(box -> access.owns(box, principal)).toList();
                 sendXml(ctx, request, HttpResponseStatus.OK, S3Xml.listAllMyBuckets(visible),
                         requestId);
             }

@@ -15,6 +15,7 @@
   <a href="https://github.com/predatorray/candybox/actions/workflows/ci.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/predatorray/candybox/ci.yml?branch=main"></a>
   <a href="https://github.com/predatorray/candybox/actions/workflows/docker-publish.yml"><img alt="Docker" src="https://img.shields.io/github/actions/workflow/status/predatorray/candybox/docker-publish.yml?branch=main&label=deploy"></a>
   <a href="https://codecov.io/github/predatorray/candybox" ><img src="https://codecov.io/github/predatorray/candybox/graph/badge.svg?token=L1FZZY3569"/></a>
+  <a href="compat/s3-tests/README.md"><img alt="S3 compatibility" src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/predatorray/candybox/main/compat/s3-tests/badge.json"></a>
 </p>
 
 ---
@@ -77,12 +78,14 @@ operators at the right command.
 The gateway's S3 compatibility is verified against the industry-standard
 [`ceph/s3-tests`](https://github.com/ceph/s3-tests) suite — see
 [`compat/s3-tests/`](compat/s3-tests/) (`compat/s3-tests/run.sh --calibrate` against the running
-gateway). The latest calibration was taken after the Phase 5 additions (multipart upload, Range
-GET) landed: **164 / 838 boto3 functional tests pass** (up from 149 pre-Phase-5). The remaining
-gaps the v1 gateway does not yet implement are versioning, ACLs, SSE, POST object, lifecycle,
-CORS — see
-[`compat/s3-tests/README.md`](compat/s3-tests/README.md#latest-calibration) for the family-by-family
-breakdown.
+gateway). The latest calibration (the **S3 compatibility** badge above tracks it automatically) runs
+the gateway with **SigV4 auth + S3 ACLs enabled**: **192 / 838 boto3 functional tests pass** (up from
+164 pre-auth, and 149 pre-Phase-5), zero suite errors. The extra passes are the multi-user / ACL /
+cross-account-access tests that real authentication unlocks (`bucket_acl_*`, `object_acl_*`,
+`access_bucket_*`, anonymous-access and bad-auth checks). The remaining gaps the v1 gateway does not
+yet implement are versioning, SSE, POST object, lifecycle, bucket policy, CORS, and conditional GET —
+see [`compat/s3-tests/README.md`](compat/s3-tests/README.md#latest-calibration) for the
+family-by-family breakdown.
 
 ## Storing and retrieving objects
 
@@ -289,7 +292,7 @@ hard fencing/handover scenarios. No mocking frameworks are used anywhere.
 | `candybox-protocol` | The framed TCP wire protocol and transport. |
 | `candybox-server` | The storage node: wires the engine behind the protocol, plus the runnable entrypoint, health/metrics, and ownership. |
 | `candybox-client` | The thin client library and the `candybox` command-line tool. |
-| `candybox-s3-gateway` | An anonymous, path-style, S3-compatible HTTP gateway (Netty) that translates the S3 REST/XML API onto the client. Stateless; runs behind an HTTP(S) load balancer. See `S3_GATEWAY_PLAN.md`. |
+| `candybox-s3-gateway` | A path-style, S3-compatible HTTP gateway (Netty) with optional SigV4 auth + S3 ACL enforcement that translates the S3 REST/XML API onto the client. Stateless; runs behind an HTTP(S) load balancer. See `S3_GATEWAY_PLAN.md`. |
 | `candybox-admin-api` | A stateless HTTP service exposing cluster / boxes / LSM / metrics as JSON, plus the static SPA mount. See `WEB_DASHBOARD_PLAN.md`. |
 | `candybox-web` | React + TypeScript + MUI dashboard, built by `frontend-maven-plugin` under `-Pfrontend` and packaged into a jar so the admin API serves it from the classpath. |
 | `candybox-dist` | Packages the runnable distribution (`bin/ lib/ conf/`) and the Docker/Kubernetes assets. |
