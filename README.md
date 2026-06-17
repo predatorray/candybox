@@ -1,11 +1,11 @@
 <div align="center">
     <img src="https://raw.githubusercontent.com/predatorray/candybox/assets/logo.svg" alt="Candybox" height="120" />
     <h1>Candybox</h1>
-    <h3><em>Distributed Object Store</em></h3>
+    <h3><em>A self-hosted, distributed object store with a sorted LSM-tree index on Apache BookKeeper</em></h3>
 </div>
 
 <p align="center">
-    <i>LSM tree</i> built on Apache BookKeeper
+    <i>Listing, Prefix Search, and Directory-walk workloads are sequential range scans,<br>with durability delegated to BookKeeper.</i>
 </p>
 
 <p align="center">
