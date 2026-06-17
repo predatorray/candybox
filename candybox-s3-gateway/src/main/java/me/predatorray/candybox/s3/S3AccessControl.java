@@ -118,9 +118,14 @@ final class S3AccessControl {
         }
     }
 
-    /** True when {@code principal} may READ the Box (for ListBuckets filtering). */
-    boolean mayRead(String box, Principal principal) {
-        return !enabled || authorizer.authorize(principal, Operation.READ, Resource.box(box));
+    /** True when {@code principal} owns the Box. {@code ListAllMyBuckets} lists owned buckets only —
+     * never buckets merely granted READ (e.g. a {@code public-read} bucket owned by someone else),
+     * matching AWS/RGW, so one account's public bucket can't leak into another account's listing. */
+    boolean owns(String box, Principal principal) {
+        if (!enabled) {
+            return true;
+        }
+        return boxAcl(box).map(acl -> acl.owner().equals(principal)).orElse(false);
     }
 
     private void require(Principal principal, Operation operation, Resource resource,
