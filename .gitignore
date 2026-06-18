@@ -4,3 +4,8 @@ target/
 
 # OS / editor cruft
 .DS_Store
+
+# Hugo documentation build output (docs/)
+docs/public/
+docs/resources/
+.hugo_build.lock

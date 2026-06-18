@@ -1,0 +1,52 @@
+# Hugo configuration for the Candybox documentation site.
+#
+# The site is built with Hugo (https://gohugo.io) and the hugo-book theme
+# (https://github.com/alex-shpak/hugo-book), vendored as a git submodule under
+# themes/hugo-book. See README.md in this directory for how to build and preview.
+#
+# baseURL is the GitHub Pages project URL. The publish workflow overrides it with
+# --baseURL when needed, but keep it correct here so local `hugo` produces working
+# links too.
+baseURL = 'https://predatorray.github.io/candybox/'
+title = 'Candybox'
+languageCode = 'en-us'
+theme = 'hugo-book'
+
+# hugo-book renders the section tree as the left navigation, so a deep, ordered
+# content/docs tree is all that is needed for the sidebar.
+enableGitInfo = true
+
+# Use a clean URL layout (/docs/getting-started/ rather than .../index.html).
+[markup]
+  [markup.goldmark.renderer]
+    unsafe = true          # allow raw HTML in markdown (badges, the landing hero)
+  [markup.highlight]
+    noClasses = false
+    style = 'github'
+  [markup.tableOfContents]
+    startLevel = 2
+    endLevel = 3
+
+[params]
+  # hugo-book options — see https://github.com/alex-shpak/hugo-book#configuration
+  BookTheme = 'auto'                 # light / dark / auto
+  BookToC = true                     # per-page table of contents
+  BookRepo = 'https://github.com/predatorray/candybox'
+  BookEditPath = 'edit/main/docs'    # "Edit this page" points back at the source
+  BookSearch = true                  # client-side search box
+  BookComments = false
+  # Only pages under content/docs become part of the manual's menu; the landing
+  # page (content/_index.md) stays out of the sidebar tree.
+  BookSection = 'docs'
+
+[menu]
+  # A couple of fixed links pinned under the sidebar nav.
+  [[menu.before]]
+  [[menu.after]]
+    name = "GitHub"
+    url = "https://github.com/predatorray/candybox"
+    weight = 10
+  [[menu.after]]
+    name = "Docker Hub"
+    url = "https://hub.docker.com/r/zetaplusae/candybox"
+    weight = 20
