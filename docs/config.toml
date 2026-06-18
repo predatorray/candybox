@@ -29,6 +29,8 @@ enableGitInfo = true
 
 [params]
   # hugo-book options — see https://github.com/alex-shpak/hugo-book#configuration
+  BookLogo = 'logo.svg'              # sidebar brand logo (served from static/logo.svg)
+  BookFavicon = 'logo.svg'           # browser-tab favicon (same SVG)
   BookTheme = 'auto'                 # light / dark / auto
   BookToC = true                     # per-page table of contents
   BookRepo = 'https://github.com/predatorray/candybox'
