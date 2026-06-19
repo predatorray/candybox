@@ -34,6 +34,8 @@ import me.predatorray.candybox.common.exception.CandyNotFoundException;
 import me.predatorray.candybox.coordination.fake.InMemoryCoordinationService;
 import me.predatorray.candybox.protocol.Frame;
 import me.predatorray.candybox.protocol.FrameCodec;
+import me.predatorray.candybox.protocol.Message;
+import me.predatorray.candybox.protocol.MessageCodec;
 import me.predatorray.candybox.protocol.transport.Connection;
 import me.predatorray.candybox.protocol.transport.RequestHandler;
 import me.predatorray.candybox.protocol.transport.Transport;
@@ -45,8 +47,9 @@ import org.junit.jupiter.api.Test;
 /**
  * End-to-end behaviour of a hash-partitioned Box whose partitions are owned by <em>two different
  * nodes</em>, driven through the cluster-aware {@link CandyboxClient}: keyed routing, scatter-gather
- * listing with pagination, fanned-out range deletes, cross-partition copy/rename byte-copy
- * fallbacks, and multipart uploads. Runs entirely on the in-memory fakes (no BookKeeper/ZooKeeper /
+ * listing with pagination, fanned-out range deletes, cross-partition zero-copy copy/rename (and its
+ * crash-and-resume convergence), and multipart uploads. Runs entirely on the in-memory fakes (no
+ * BookKeeper/ZooKeeper /
  * sockets) with a port-routing in-JVM transport, so it is fast yet exercises the real codec, request
  * handler, and routing stack.
  */
@@ -54,6 +57,7 @@ class PartitionedBoxIT {
 
     private static final int PARTITIONS = 4;
     private static final String BOX = "parted-box";
+    private static final MessageCodec MSG_CODEC = new MessageCodec();
 
     /** An in-JVM {@link Transport} that routes by port to the matching node's request handler. */
     private static final class RoutingTransport implements Transport {
@@ -195,23 +199,57 @@ class PartitionedBoxIT {
     }
 
     @Test
-    void crossPartitionCopyAndRenameFallBackToByteCopy() {
+    void crossPartitionCopyAndRenameAreZeroCopy() {
         String src = keyIn(0, "src");        // owned by node 1
         String dstCopy = keyIn(3, "copy");   // owned by node 2
         String dstMove = keyIn(2, "move");   // owned by node 2
         client.putCandy(BOX, src, bytes("payload"), "text/plain", Map.of("m", "x"), null);
 
+        // Copy: the destination (on the other node) reads the very bytes the source stored.
         CandyboxClient.CandyInfo copied = client.copyCandy(BOX, src, dstCopy, null);
         assertThat(copied.contentLength()).isEqualTo(7);
         assertThat(client.getCandy(BOX, dstCopy)).isEqualTo(bytes("payload"));
         assertThat(client.headCandy(BOX, dstCopy).userMetadata()).containsEntry("m", "x");
         assertThat(client.getCandy(BOX, src)).isEqualTo(bytes("payload")); // copy keeps the source
 
+        // Rename converges to destination-present, source-gone across the two owners.
         CandyboxClient.CandyInfo moved = client.renameCandy(BOX, src, dstMove, null);
         assertThat(moved.contentLength()).isEqualTo(7);
         assertThat(client.getCandy(BOX, dstMove)).isEqualTo(bytes("payload"));
         assertThatThrownBy(() -> client.getCandy(BOX, src))
                 .isInstanceOf(CandyNotFoundException.class); // rename removed the source
+    }
+
+    @Test
+    void crashedCrossPartitionRenameConvergesViaTheMaintenanceSweep() {
+        String src = keyIn(0, "rsrc");       // owned by node 1
+        String dst = keyIn(2, "rdst");       // owned by node 2
+        client.putCandy(BOX, src, bytes("payload"), "text/plain", Map.of(), null);
+        String token = "it-rename-token";
+
+        // Drive the rename's first two steps by hand, then "crash" before the finalize:
+        // 1. prepare on the source owner (records the intent + returns the locator parts)
+        Message prepared = send(nodeA, new Message.PrepareRenameRequest(BOX, src, dst, 2, token));
+        Message.CandyLocatorResponse loc = (Message.CandyLocatorResponse) prepared;
+        // 2. zero-copy put on the destination owner (writes the rendezvous marker)
+        Message put = send(nodeB, new Message.ZeroCopyPutRequest(BOX, dst, loc.parts(),
+                loc.contentType(), loc.userMetadata(), loc.owner(), loc.grants(), token, token,
+                src, 0, loc.hlc()));
+        assertThat(put).isInstanceOf(Message.HeadCandyResponse.class);
+
+        // The finalize (step 3) is lost: both keys are live (the transient W2 state).
+        assertThat(client.getCandy(BOX, src)).isEqualTo(bytes("payload"));
+        assertThat(client.getCandy(BOX, dst)).isEqualTo(bytes("payload"));
+
+        // The source owner's maintenance sweep finds the marker and finalizes the rename.
+        assertThat(nodeA.finalizeRenameIntentsOnce()).isEqualTo(1);
+        assertThatThrownBy(() -> client.getCandy(BOX, src))
+                .isInstanceOf(CandyNotFoundException.class);
+        assertThat(client.getCandy(BOX, dst)).isEqualTo(bytes("payload"));
+    }
+
+    private Message send(CandyboxNode node, Message message) {
+        return MSG_CODEC.decode(node.requestHandler().handle(MSG_CODEC.encode(message)));
     }
 
     @Test
