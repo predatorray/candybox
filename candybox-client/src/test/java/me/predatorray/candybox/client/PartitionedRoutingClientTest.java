@@ -32,8 +32,8 @@ import org.junit.jupiter.api.Test;
 /**
  * Pins {@link CandyboxClient}'s partition-aware behaviour against a recording two-partition stub
  * node: descriptor caching, scatter-gather list merging (order, truncation, reverse), fanned-out
- * range deletes, merged multipart-upload listings, and the cross-partition byte-copy fallbacks for
- * copy/rename/uploadPartCopy.
+ * range deletes, merged multipart-upload listings, the cross-partition zero-copy relay for
+ * copy/rename, and the (still byte-copy) uploadPartCopy fallback.
  */
 class PartitionedRoutingClientTest {
 
@@ -92,6 +92,16 @@ class PartitionedRoutingClientTest {
             } else if (message instanceof Message.CopyCandyRequest
                     || message instanceof Message.RenameCandyRequest) {
                 return new Message.HeadCandyResponse(7, "text/plain", Map.of(), 9, 1);
+            } else if (message instanceof Message.GetCandyLocatorRequest
+                    || message instanceof Message.PrepareRenameRequest) {
+                me.predatorray.candybox.common.Part part = new me.predatorray.candybox.common.Part(
+                        7, 1 << 20, 9,
+                        List.of(new me.predatorray.candybox.common.SegmentRef(1, 0, 0)));
+                return new Message.CandyLocatorResponse(List.of(part), "text/plain", Map.of("m", "x"),
+                        new me.predatorray.candybox.common.Hlc(1000, 0, 1), 1, "User:alice",
+                        List.of());
+            } else if (message instanceof Message.ZeroCopyPutRequest) {
+                return new Message.HeadCandyResponse(7, "text/plain", Map.of("m", "x"), 9, 1);
             }
             return new Message.OkResponse();
         }
@@ -196,26 +206,39 @@ class PartitionedRoutingClientTest {
     }
 
     @Test
-    void crossPartitionCopyAndRenameFallBackToGetPutDelete() {
+    void crossPartitionCopyAndRenameStayZeroCopyViaTheLocatorRelay() {
         String src = keyIn(0, "src");
         String dst = keyIn(1, "dst");
         StubNode node = new StubNode();
         try (CandyboxClient client = new CandyboxClient(new LoopbackTransport(node), "x", 0)) {
             CandyboxClient.CandyInfo copied = client.copyCandy("box", src, dst, "tok");
             assertThat(copied.contentLength()).isEqualTo(7);
-            // No server-side copy was attempted; the bytes and metadata were re-put at dst.
-            assertThat(node.recorded(Message.CopyCandyRequest.class)).isEmpty();
-            Message.PutCandyRequest put = node.recorded(Message.PutCandyRequest.class).get(0);
-            assertThat(put.key()).isEqualTo(dst);
-            assertThat(put.contentType()).isEqualTo("text/plain");
-            assertThat(put.userMetadata()).containsEntry("m", "x");
-            assertThat(put.idempotencyToken()).isEqualTo("tok");
-            assertThat(node.recorded(Message.DeleteCandyRequest.class)).isEmpty();
+            // No byte copy: the source's locator parts were relayed and reused at the destination.
+            assertThat(node.recorded(Message.GetCandyRequest.class)).isEmpty();
+            assertThat(node.recorded(Message.PutCandyRequest.class)).isEmpty();
+            Message.GetCandyLocatorRequest gl =
+                    node.recorded(Message.GetCandyLocatorRequest.class).get(0);
+            assertThat(gl.key()).isEqualTo(src);
+            Message.ZeroCopyPutRequest copyPut = node.recorded(Message.ZeroCopyPutRequest.class).get(0);
+            assertThat(copyPut.dstKey()).isEqualTo(dst);
+            assertThat(copyPut.idempotencyToken()).isEqualTo("tok");
+            assertThat(copyPut.renameToken()).isNull(); // a plain copy carries no rename intent
 
-            client.renameCandy("box", src, dst, null);
-            assertThat(node.recorded(Message.RenameCandyRequest.class)).isEmpty();
-            Message.DeleteCandyRequest deleted = node.recorded(Message.DeleteCandyRequest.class).get(0);
-            assertThat(deleted.key()).isEqualTo(src); // rename = copy + delete source
+            client.renameCandy("box", src, dst, "rtok");
+            // Rename = prepare-intent on the source, zero-copy put on the destination, finalize delete.
+            Message.PrepareRenameRequest pr = node.recorded(Message.PrepareRenameRequest.class).get(0);
+            assertThat(pr.srcKey()).isEqualTo(src);
+            assertThat(pr.renameToken()).isEqualTo("rtok");
+            Message.ZeroCopyPutRequest renamePut =
+                    node.recorded(Message.ZeroCopyPutRequest.class).get(1);
+            assertThat(renamePut.renameToken()).isEqualTo("rtok");
+            assertThat(renamePut.srcKey()).isEqualTo(src);
+            Message.CompleteRenameRequest cr =
+                    node.recorded(Message.CompleteRenameRequest.class).get(0);
+            assertThat(cr.srcKey()).isEqualTo(src);
+            assertThat(cr.renameToken()).isEqualTo("rtok");
+            // Still no whole-object byte copy anywhere.
+            assertThat(node.recorded(Message.PutCandyRequest.class)).isEmpty();
         }
     }
 
