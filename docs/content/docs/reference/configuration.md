@@ -21,6 +21,7 @@ and configure each instance through the environment.
 | `health.port` | HTTP port for `/healthz`, `/readyz`, `/metrics`. | `9710` |
 | `quorum.*` | BookKeeper replication per ledger role (`E/Qw/Qa`). | `3/3/2` (WAL, manifest), `3/2/2` (data) |
 | `multipart.upload.ttl.millis` | How long an abandoned multipart upload is kept before a background sweep aborts it. | 7 days |
+| `rename.intent.abandon.millis` | Cross-partition rename: how long the source owner keeps a rename intent whose destination rendezvous marker never appears before dropping it (the source stays live). | 60000 (60 s) |
 
 ## Full reference
 

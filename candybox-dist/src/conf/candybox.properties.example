@@ -88,11 +88,17 @@ data.dir=./data
 #     balancer — partitions then stay where they were created until moved manually.
 #   balancer.max.moves.per.round: at most this many partitions are migrated away from live owners
 #     per round (failover of a dead node's partitions is never rate-limited).
+#   rename.intent.abandon.millis: how long a source-side cross-partition rename intent may sit
+#     without its destination completion marker before it is abandoned (the rename never reached the
+#     destination; the source stays live). Roll-forward otherwise: a present marker finalizes the
+#     source delete. Cross-partition copy/rename are zero-copy (no bytes are moved); rename is
+#     eventually atomic — see CROSS_PARTITION_ZERO_COPY_PLAN.md.
 # ---------------------------------------------------------------------------
 
 # partitions.per.box.default=8
 balancer.interval.millis=5000
 # balancer.max.moves.per.round=4
+# rename.intent.abandon.millis=60000
 
 # ---------------------------------------------------------------------------
 # Multipart upload tuning (S3-style):
