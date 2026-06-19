@@ -48,6 +48,7 @@ public final class CandyboxConfig {
     private final int partitionsPerBoxDefault;
     private final long balancerIntervalMillis;
     private final int balancerMaxMovesPerRound;
+    private final long renameIntentAbandonMillis;
 
     private CandyboxConfig(Builder b) {
         this.sizeLimits = b.sizeLimits;
@@ -72,6 +73,7 @@ public final class CandyboxConfig {
         this.partitionsPerBoxDefault = b.partitionsPerBoxDefault;
         this.balancerIntervalMillis = b.balancerIntervalMillis;
         this.balancerMaxMovesPerRound = b.balancerMaxMovesPerRound;
+        this.renameIntentAbandonMillis = b.renameIntentAbandonMillis;
     }
 
     public static CandyboxConfig defaults() {
@@ -183,6 +185,15 @@ public final class CandyboxConfig {
         return balancerMaxMovesPerRound;
     }
 
+    /**
+     * How long a source-side cross-partition rename intent may sit without its destination completion
+     * marker appearing before it is abandoned (the rename never reached the destination; the source
+     * stays live). Roll-forward otherwise: a present marker finalizes the source delete.
+     */
+    public long renameIntentAbandonMillis() {
+        return renameIntentAbandonMillis;
+    }
+
     public static final class Builder {
         private SizeLimits sizeLimits = SizeLimits.defaults();
         private Map<LedgerRole, QuorumConfig> quorums = new EnumMap<>(QuorumConfig.defaults());
@@ -206,6 +217,7 @@ public final class CandyboxConfig {
         private int partitionsPerBoxDefault = 8;                        // write spread vs. per-engine cost
         private long balancerIntervalMillis = 0L;                       // balancing round; 0 disables
         private int balancerMaxMovesPerRound = 4;                       // migration rate limit
+        private long renameIntentAbandonMillis = 60_000L;               // abandon a stuck rename intent
 
         public Builder sizeLimits(SizeLimits v) {
             this.sizeLimits = v;
@@ -314,6 +326,11 @@ public final class CandyboxConfig {
 
         public Builder balancerMaxMovesPerRound(int v) {
             this.balancerMaxMovesPerRound = v;
+            return this;
+        }
+
+        public Builder renameIntentAbandonMillis(long v) {
+            this.renameIntentAbandonMillis = v;
             return this;
         }
 

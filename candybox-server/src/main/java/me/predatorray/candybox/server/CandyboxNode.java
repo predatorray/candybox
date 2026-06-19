@@ -17,8 +17,10 @@ package me.predatorray.candybox.server;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executors;
@@ -26,7 +28,9 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import me.predatorray.candybox.bookkeeper.LedgerStore;
 import me.predatorray.candybox.common.BoxName;
+import me.predatorray.candybox.common.CandyKey;
 import me.predatorray.candybox.common.Clock;
+import me.predatorray.candybox.common.Hlc;
 import me.predatorray.candybox.common.SystemClock;
 import me.predatorray.candybox.common.auth.Authorizer;
 import me.predatorray.candybox.common.config.CandyboxConfig;
@@ -40,7 +44,10 @@ import me.predatorray.candybox.coordination.CandyboxKeys;
 import me.predatorray.candybox.coordination.CasConflictException;
 import me.predatorray.candybox.coordination.CoordinationService;
 import me.predatorray.candybox.coordination.VersionedValue;
+import me.predatorray.candybox.common.serial.BinaryReader;
+import me.predatorray.candybox.common.serial.BinaryWriter;
 import me.predatorray.candybox.lsm.engine.BoxEngine;
+import me.predatorray.candybox.lsm.manifest.RenameIntent;
 import me.predatorray.candybox.protocol.transport.RequestHandler;
 import me.predatorray.candybox.server.PartitionAssignment.BoxPartition;
 import org.slf4j.Logger;
@@ -142,6 +149,7 @@ public final class CandyboxNode implements AutoCloseable {
         compactOwnedBoxesOnce();
         collectGarbageOnce();
         sweepStaleMultipartUploadsOnce();
+        finalizeRenameIntentsOnce();
     }
 
     private static ScheduledExecutorService daemonScheduler(String name) {
@@ -509,13 +517,23 @@ public final class CandyboxNode implements AutoCloseable {
      * @return the number of ledgers deleted
      */
     public int collectGarbageOnce() {
+        // Publish every owned partition's referenced-Syrup set first, so this pass's Box-global gate
+        // sees up-to-date references from this node's partitions (cross-node freshness rides the other
+        // owners' own publishes plus the GC grace period).
+        for (PartitionOwnership ownership : partitions.values()) {
+            if (ownership.isOwner()) {
+                publishPartitionRefs(ownership);
+            }
+        }
         int deleted = 0;
         for (PartitionOwnership ownership : partitions.values()) {
             if (!ownership.isOwner()) {
                 continue;
             }
             try {
-                deleted += garbageCollector.collect(ownership.engine());
+                Set<Long> foreign = syrupsReferencedByOtherPartitions(ownership.box().value(),
+                        ownership.partition());
+                deleted += garbageCollector.collect(ownership.engine(), foreign);
             } catch (NotOwnerException lostOwnership) {
                 LOG.info("Skipping GC of a partition on node {}: {}", nodeId,
                         lostOwnership.getMessage());
@@ -524,6 +542,50 @@ public final class CandyboxNode implements AutoCloseable {
             }
         }
         return deleted;
+    }
+
+    /**
+     * Finalizes (or abandons) the cross-partition rename intents owed by every partition this node
+     * owns: a present coordination rendezvous marker ⇒ LWW-conditioned delete of the source key, then
+     * clear the intent and the marker; no marker past {@code renameIntentAbandonMillis} ⇒ drop the
+     * intent (the rename never reached the destination — the source stays live). Idempotent; also runs
+     * after a handover replays an intent. Exposed for manual/operational triggering and tests.
+     *
+     * @return the number of intents finalized (source actually tombstoned)
+     */
+    public int finalizeRenameIntentsOnce() {
+        long abandon = config.renameIntentAbandonMillis();
+        int finalized = 0;
+        for (PartitionOwnership ownership : partitions.values()) {
+            if (!ownership.isOwner()) {
+                continue;
+            }
+            BoxEngine engine;
+            String box = ownership.box().value();
+            try {
+                engine = ownership.engine();
+            } catch (NotOwnerException lost) {
+                continue;
+            }
+            for (RenameIntent intent : engine.listRenameIntents()) {
+                try {
+                    if (renameMarkerPresent(box, intent.token())) {
+                        engine.deleteCandyConditional(CandyKey.of(intent.srcKey()), intent.srcHlc());
+                        engine.clearRenameIntent(intent.token());
+                        deleteRenameMarker(box, intent.token());
+                        finalized++;
+                    } else if (clock.currentTimeMillis() - intent.createdAtMillis() > abandon) {
+                        engine.clearRenameIntent(intent.token());
+                    }
+                } catch (NotOwnerException lost) {
+                    break;
+                } catch (RuntimeException e) {
+                    LOG.warn("Rename-intent finalize error on node {} for token {}: {}", nodeId,
+                            intent.token(), e.getMessage());
+                }
+            }
+        }
+        return finalized;
     }
 
     /**
@@ -560,6 +622,118 @@ public final class CandyboxNode implements AutoCloseable {
             }
         }
         return aborted;
+    }
+
+    // ---- Box-global GC support + cross-partition rename rendezvous ---------------------------
+
+    long currentTimeMillis() {
+        return clock.currentTimeMillis();
+    }
+
+    /** Publishes one owned partition's referenced-Syrup set to coordination (Box-global GC input). */
+    void publishPartitionRefs(BoxName box, int partition) {
+        PartitionOwnership ownership = partitions.get(new BoxPartition(box.value(), partition));
+        if (ownership != null && ownership.isOwner()) {
+            publishPartitionRefs(ownership);
+        }
+    }
+
+    private void publishPartitionRefs(PartitionOwnership ownership) {
+        Set<Long> refs;
+        try {
+            refs = ownership.engine().referencedSyrups();
+        } catch (NotOwnerException lost) {
+            return;
+        }
+        casPut(CandyboxKeys.partitionRefsKey(ownership.box().value(), ownership.partition()),
+                encodeLongSet(refs));
+    }
+
+    /** The union of every <em>other</em> partition's published referenced-Syrup set for a Box. */
+    private Set<Long> syrupsReferencedByOtherPartitions(String box, int excludePartition) {
+        BoxDescriptor descriptor;
+        try {
+            descriptor = descriptor(BoxName.of(box));
+        } catch (BoxNotFoundException gone) {
+            return Set.of();
+        }
+        Set<Long> referenced = new HashSet<>();
+        for (int p = 0; p < descriptor.partitionCount(); p++) {
+            if (p == excludePartition) {
+                continue;
+            }
+            coordination.get(CandyboxKeys.partitionRefsKey(box, p))
+                    .ifPresent(v -> referenced.addAll(decodeLongSet(v.value())));
+        }
+        return referenced;
+    }
+
+    /**
+     * Writes the rendezvous marker telling the source partition's owner that a cross-partition
+     * rename's destination put is durable. Idempotent (a retried write is a no-op).
+     */
+    void writeRenameMarker(String box, String token, String srcKey, int srcPartition, Hlc srcHlc,
+                           String dstKey) {
+        BinaryWriter w = new BinaryWriter(64);
+        w.writeString(srcKey);
+        w.writeVarInt(srcPartition);
+        w.writeVarLong(srcHlc == null ? 0L : srcHlc.physicalMillis());
+        w.writeVarInt(srcHlc == null ? 0 : srcHlc.logicalCounter());
+        w.writeInt(srcHlc == null ? 0 : srcHlc.nodeId());
+        w.writeString(dstKey == null ? "" : dstKey);
+        String key = CandyboxKeys.renameMarkerKey(box, token);
+        try {
+            coordination.create(key, w.toByteArray());
+        } catch (CasConflictException alreadyThere) {
+            // Idempotent: the marker is already present.
+        }
+    }
+
+    boolean renameMarkerPresent(String box, String token) {
+        return coordination.get(CandyboxKeys.renameMarkerKey(box, token)).isPresent();
+    }
+
+    void deleteRenameMarker(String box, String token) {
+        String key = CandyboxKeys.renameMarkerKey(box, token);
+        coordination.get(key).ifPresent(v -> {
+            try {
+                coordination.delete(key, v.version());
+            } catch (CasConflictException raced) {
+                // Already deleted (or rewritten); nothing to do.
+            }
+        });
+    }
+
+    private void casPut(String key, byte[] value) {
+        Optional<VersionedValue> current = coordination.get(key);
+        try {
+            if (current.isEmpty()) {
+                coordination.create(key, value);
+            } else {
+                coordination.compareAndSet(key, value, current.get().version());
+            }
+        } catch (CasConflictException raced) {
+            // A concurrent writer won; the next pass republishes.
+        }
+    }
+
+    private static byte[] encodeLongSet(Set<Long> values) {
+        BinaryWriter w = new BinaryWriter(Math.max(16, values.size() * 2));
+        w.writeVarInt(values.size());
+        for (long v : values) {
+            w.writeVarLong(v);
+        }
+        return w.toByteArray();
+    }
+
+    private static Set<Long> decodeLongSet(byte[] data) {
+        BinaryReader r = new BinaryReader(data);
+        int count = r.readVarInt();
+        Set<Long> values = new HashSet<>(Math.max(4, count * 2));
+        for (int i = 0; i < count; i++) {
+            values.add(r.readVarLong());
+        }
+        return values;
     }
 
     @Override

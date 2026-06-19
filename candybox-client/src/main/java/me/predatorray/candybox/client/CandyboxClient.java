@@ -434,9 +434,10 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
     }
 
     /**
-     * Server-side copy of {@code srcKey} to {@code dstKey} within the same Box. When both keys hash
-     * to the same partition the copy is zero-copy (the new key reuses the stored bytes); across
-     * partitions it degrades to a client-side byte copy. Returns the destination's metadata.
+     * Server-side copy of {@code srcKey} to {@code dstKey} within the same Box. Zero-copy in both
+     * cases: a same-partition copy reuses the stored bytes via one server-side call; a cross-partition
+     * copy relays the source's locator parts to the destination owner, which points the new key at the
+     * very same Syrup segments (no bytes are moved). Returns the destination's metadata.
      */
     public CandyInfo copyCandy(String box, String srcKey, String dstKey, String idempotencyToken) {
         return copyCandy(box, srcKey, dstKey, idempotencyToken, null, List.of());
@@ -451,23 +452,47 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
                     CandyKey.of(srcKey).value(), CandyKey.of(dstKey).value(), idempotencyToken,
                     owner, g));
         }
-        return byteCopy(box, srcKey, dstKey, idempotencyToken, owner, g);
+        // Cross-partition zero-copy: resolve the source's parts, then point the destination at them.
+        Message.CandyLocatorResponse loc = resolveLocator(box, srcKey,
+                new Message.GetCandyLocatorRequest(BoxName.of(box).value(),
+                        CandyKey.of(srcKey).value()));
+        return zeroCopyPut(box, dstKey, new Message.ZeroCopyPutRequest(BoxName.of(box).value(),
+                CandyKey.of(dstKey).value(), loc.parts(), loc.contentType(), loc.userMetadata(),
+                owner, g, idempotencyToken, null, null, 0, null));
     }
 
     /**
-     * Rename/move of {@code srcKey} to {@code dstKey} within the same Box. Same-partition renames
-     * are zero-copy and atomic; a cross-partition rename is a byte copy followed by a delete of the
-     * source (not atomic — a failure in between can leave both keys live). Returns the destination's
-     * metadata.
+     * Rename/move of {@code srcKey} to {@code dstKey} within the same Box. A same-partition rename is
+     * zero-copy and atomic. A cross-partition rename is zero-copy and <em>eventually</em> atomic: it
+     * prepares a durable intent on the source owner, writes the destination via a zero-copy put, then
+     * finalizes the source delete (LWW-conditioned on the source's HLC). If the final step is lost,
+     * the source owner's maintenance sweep finalizes it via the coordination rendezvous marker — so a
+     * crash converges to "destination present, source gone" rather than leaving both keys live
+     * forever. Returns the destination's metadata.
      */
     public CandyInfo renameCandy(String box, String srcKey, String dstKey, String idempotencyToken) {
         if (partitionFor(box, srcKey) == partitionFor(box, dstKey)) {
             return copyOrRename(box, srcKey, new Message.RenameCandyRequest(BoxName.of(box).value(),
                     CandyKey.of(srcKey).value(), CandyKey.of(dstKey).value(), idempotencyToken));
         }
-        CandyInfo copied = byteCopy(box, srcKey, dstKey, idempotencyToken);
-        deleteCandy(box, srcKey);
-        return copied;
+        int srcPartition = partitionFor(box, srcKey);
+        int dstPartition = partitionFor(box, dstKey);
+        String token = idempotencyToken != null ? idempotencyToken
+                : java.util.UUID.randomUUID().toString();
+
+        // 1. Prepare on the source owner: resolve the locator and durably record the rename intent.
+        Message.CandyLocatorResponse loc = resolveLocator(box, srcKey,
+                new Message.PrepareRenameRequest(BoxName.of(box).value(), CandyKey.of(srcKey).value(),
+                        CandyKey.of(dstKey).value(), dstPartition, token));
+        // 2. Zero-copy put on the destination owner (preserves the source's owner/grants).
+        CandyInfo result = zeroCopyPut(box, dstKey, new Message.ZeroCopyPutRequest(
+                BoxName.of(box).value(), CandyKey.of(dstKey).value(), loc.parts(), loc.contentType(),
+                loc.userMetadata(), loc.owner(), loc.grants(), token, token,
+                CandyKey.of(srcKey).value(), srcPartition, loc.hlc()));
+        // 3. Finalize the source delete (best-effort fast path; the maintenance sweep is the backstop).
+        router.callPartition(box, srcPartition, new Message.CompleteRenameRequest(
+                BoxName.of(box).value(), CandyKey.of(srcKey).value(), srcPartition, token, loc.hlc()));
+        return result;
     }
 
     private CandyInfo copyOrRename(String box, String srcKey, Message request) {
@@ -479,21 +504,23 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
         throw mapUnexpected(response, box, srcKey);
     }
 
-    /** The cross-partition copy fallback: read the source whole, re-put it at the destination. */
-    private CandyInfo byteCopy(String box, String srcKey, String dstKey, String idempotencyToken) {
-        return byteCopy(box, srcKey, dstKey, idempotencyToken, null, List.of());
+    /** Sends a locator-resolving request to the source's partition owner and unwraps the response. */
+    private Message.CandyLocatorResponse resolveLocator(String box, String srcKey, Message request) {
+        Message response = router.callPartition(box, partitionFor(box, srcKey), request);
+        if (response instanceof Message.CandyLocatorResponse loc) {
+            return loc;
+        }
+        throw mapUnexpected(response, box, srcKey);
     }
 
-    private CandyInfo byteCopy(String box, String srcKey, String dstKey, String idempotencyToken,
-                               String owner, List<String> grants) {
-        Message response = callKey(box, srcKey, new Message.GetCandyRequest(BoxName.of(box).value(),
-                CandyKey.of(srcKey).value()));
-        if (!(response instanceof Message.CandyDataResponse data)) {
-            throw mapUnexpected(response, box, srcKey);
+    /** Sends a zero-copy put to the destination's partition owner and unwraps the head response. */
+    private CandyInfo zeroCopyPut(String box, String dstKey, Message.ZeroCopyPutRequest request) {
+        Message response = router.callPartition(box, partitionFor(box, dstKey), request);
+        if (response instanceof Message.HeadCandyResponse head) {
+            return new CandyInfo(head.contentLength(), head.contentType(), head.userMetadata(),
+                    head.crc32c(), head.createdAtMillis());
         }
-        putCandy(box, dstKey, data.data(), data.contentType(), data.userMetadata(),
-                idempotencyToken, owner, grants);
-        return headCandy(box, dstKey);
+        throw mapUnexpected(response, box, dstKey);
     }
 
     /**

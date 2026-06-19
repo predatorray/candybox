@@ -36,7 +36,9 @@ import me.predatorray.candybox.common.exception.ValidationException;
 import me.predatorray.candybox.coordination.BoxDescriptor;
 import me.predatorray.candybox.lsm.engine.BoxEngine;
 import me.predatorray.candybox.lsm.engine.CandyMetadata;
+import me.predatorray.candybox.common.CandyLocator;
 import me.predatorray.candybox.common.Part;
+import me.predatorray.candybox.lsm.manifest.RenameIntent;
 import me.predatorray.candybox.lsm.engine.ListResult;
 import me.predatorray.candybox.lsm.engine.ScanDirection;
 import me.predatorray.candybox.lsm.engine.ScanQuery;
@@ -212,6 +214,14 @@ final class NodeRequestHandler implements RequestHandler {
             return m.box();
         } else if (message instanceof Message.RenameCandyRequest m) {
             return m.box();
+        } else if (message instanceof Message.GetCandyLocatorRequest m) {
+            return m.box();
+        } else if (message instanceof Message.PrepareRenameRequest m) {
+            return m.box();
+        } else if (message instanceof Message.ZeroCopyPutRequest m) {
+            return m.box();
+        } else if (message instanceof Message.CompleteRenameRequest m) {
+            return m.box();
         } else if (message instanceof Message.DeleteRangeRequest m) {
             return m.box();
         } else if (message instanceof Message.ListCandiesRequest m) {
@@ -287,6 +297,14 @@ final class NodeRequestHandler implements RequestHandler {
             return m.dstKey();
         } else if (message instanceof Message.RenameCandyRequest m) {
             return m.dstKey();
+        } else if (message instanceof Message.GetCandyLocatorRequest m) {
+            return m.key();
+        } else if (message instanceof Message.PrepareRenameRequest m) {
+            return m.srcKey();
+        } else if (message instanceof Message.ZeroCopyPutRequest m) {
+            return m.dstKey();
+        } else if (message instanceof Message.CompleteRenameRequest m) {
+            return m.srcKey();
         } else if (message instanceof Message.CreateMultipartUploadRequest m) {
             return m.key();
         } else if (message instanceof Message.UploadPartRequest m) {
@@ -392,6 +410,46 @@ final class NodeRequestHandler implements RequestHandler {
                             m.idempotencyToken());
             return new Message.HeadCandyResponse(meta.contentLength(), meta.contentType(),
                     meta.userMetadata(), meta.crc32c(), meta.createdAtMillis());
+        } else if (message instanceof Message.GetCandyLocatorRequest m) {
+            CandyLocator locator = node.engine(BoxName.of(m.box()), m.key())
+                    .resolveLocator(CandyKey.of(m.key()));
+            return toCandyLocatorResponse(locator);
+        } else if (message instanceof Message.PrepareRenameRequest m) {
+            // The source partition's owner: resolve the locator (relayed to the destination) and
+            // durably record the rename intent so the owed source delete survives a crash/handover.
+            BoxEngine engine = node.engine(BoxName.of(m.box()), m.srcKey());
+            CandyLocator locator = engine.resolveLocator(CandyKey.of(m.srcKey()));
+            engine.recordRenameIntent(new RenameIntent(m.renameToken(), m.srcKey(), locator.hlc(),
+                    m.dstKey(), m.dstPartition(), node.currentTimeMillis()));
+            return toCandyLocatorResponse(locator);
+        } else if (message instanceof Message.ZeroCopyPutRequest m) {
+            BoxEngine engine = node.engine(BoxName.of(m.box()), m.dstKey());
+            boolean isRename = m.renameToken() != null;
+            // A rename keeps the object's identity, so the source's owner/grants travel verbatim; a
+            // copy belongs to the requester (effectiveAcl applies the super-user owner rule).
+            ObjectAcl acl = isRename
+                    ? parseObjectAcl(m.owner(), m.grants())
+                    : effectiveAcl(principal, m.owner(), m.grants());
+            CandyMetadata meta = engine.zeroCopyPut(CandyKey.of(m.dstKey()), m.parts(),
+                    m.contentType(), m.userMetadata(), 0L, acl, m.idempotencyToken());
+            // Publish this partition's refs before the source delete can run, so the Box-global GC
+            // already sees the new cross-partition reference (no premature reclaim of the shared Syrup).
+            node.publishPartitionRefs(BoxName.of(m.box()),
+                    node.descriptor(BoxName.of(m.box())).partitionOf(m.dstKey()));
+            if (isRename) {
+                node.writeRenameMarker(m.box(), m.renameToken(), m.srcKey(), m.srcPartition(),
+                        m.srcHlc(), m.dstKey());
+            }
+            return new Message.HeadCandyResponse(meta.contentLength(), meta.contentType(),
+                    meta.userMetadata(), meta.crc32c(), meta.createdAtMillis());
+        } else if (message instanceof Message.CompleteRenameRequest m) {
+            // The source partition's owner finalizes the rename (also reachable via the maintenance
+            // sweep / after handover): LWW-conditioned delete of the source, then clear intent + marker.
+            BoxEngine engine = node.engine(BoxName.of(m.box()), m.srcKey());
+            engine.deleteCandyConditional(CandyKey.of(m.srcKey()), m.srcHlc());
+            engine.clearRenameIntent(m.renameToken());
+            node.deleteRenameMarker(m.box(), m.renameToken());
+            return new Message.OkResponse();
         } else if (message instanceof Message.DeleteRangeRequest m) {
             BoxEngine engine = node.enginePartition(BoxName.of(m.box()), m.partition());
             if (m.prefix() != null) {
@@ -547,6 +605,23 @@ final class NodeRequestHandler implements RequestHandler {
      * S3 gateway writing on behalf of its authenticated end user. Request grants (the S3 canned-ACL
      * path) are accepted from any writer.
      */
+    private static Message.CandyLocatorResponse toCandyLocatorResponse(CandyLocator locator) {
+        return new Message.CandyLocatorResponse(locator.parts(), locator.contentType(),
+                locator.userMetadata(), locator.hlc(), locator.createdAtMillis(),
+                locator.acl().owner(), locator.acl().grants().stream().map(Grant::toText).toList());
+    }
+
+    /** Parses an object ACL from its wire text form verbatim (rename preserves the source's ACL). */
+    private static ObjectAcl parseObjectAcl(String owner, List<String> grantTexts) {
+        try {
+            List<Grant> grants = grantTexts == null ? List.of()
+                    : grantTexts.stream().map(Grant::parse).toList();
+            return new ObjectAcl(owner == null ? null : Principal.parse(owner).toString(), grants);
+        } catch (IllegalArgumentException e) {
+            throw new ValidationException("Invalid object ACL: " + e.getMessage());
+        }
+    }
+
     private ObjectAcl effectiveAcl(Principal principal, String requestedOwner,
                                    List<String> grantTexts) {
         List<Grant> grants;
