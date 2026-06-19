@@ -136,6 +136,7 @@ public final class Manifest implements AutoCloseable {
                 .addedSyrups(state.liveSyrups())
                 .newWalLedgerId(wal)
                 .addedUploads(new ArrayList<>(state.multipartUploads().values()))
+                .addedRenameIntents(new ArrayList<>(state.renameIntents().values()))
                 .build();
     }
 }

@@ -56,6 +56,7 @@ import me.predatorray.candybox.lsm.manifest.Manifest;
 import me.predatorray.candybox.lsm.manifest.ManifestEdit;
 import me.predatorray.candybox.lsm.manifest.ManifestState;
 import me.predatorray.candybox.lsm.manifest.MultipartUploadState;
+import me.predatorray.candybox.lsm.manifest.RenameIntent;
 import me.predatorray.candybox.lsm.memtable.Memtable;
 import me.predatorray.candybox.lsm.sstable.SSTableMeta;
 import me.predatorray.candybox.lsm.sstable.SSTableReader;
@@ -705,6 +706,145 @@ public final class BoxEngine implements AutoCloseable {
             return result;
         } finally {
             lock.writeLock().unlock();
+        }
+    }
+
+    // ---- cross-partition zero-copy (copy/rename across partitions) ---------------------------
+
+    /**
+     * Resolves a key to its live {@link CandyLocator}, for a cross-partition copy/rename: the client
+     * relays the returned parts to the destination partition's owner (which has no way to read this
+     * partition's manifest directly), where {@link #zeroCopyPut} reuses the segments verbatim.
+     *
+     * @throws CandyNotFoundException if there is no live Candy at {@code key}
+     */
+    public CandyLocator resolveLocator(CandyKey key) {
+        Validation.checkCandyKey(key, config.sizeLimits());
+        return resolveLive(key)
+                .orElseThrow(() -> new CandyNotFoundException(box.value(), key.value()));
+    }
+
+    /**
+     * Writes a fresh PUT at {@code dst} that reuses {@code parts} verbatim — the zero-copy trick, but
+     * across partitions: the {@code parts} were resolved from a source Candy in <em>another</em>
+     * partition (via {@link #resolveLocator} relayed by the client). No Candy bytes are read or
+     * rewritten; the destination locator points at the very same Syrup segments, which stay alive
+     * Box-globally because every partition publishes its referenced-Syrup set (see the server's
+     * Box-global GC). Same-Box only.
+     */
+    public CandyMetadata zeroCopyPut(CandyKey dst, List<Part> parts, String contentType,
+                                     Map<String, String> userMetadata, long createdAtMillis,
+                                     ObjectAcl acl, String idempotencyToken) {
+        Validation.checkCandyKey(dst, config.sizeLimits());
+        Map<String, String> metadata = userMetadata == null ? Map.of() : Map.copyOf(userMetadata);
+        if (idempotencyToken != null) {
+            CandyMetadata cached = idempotencyCache.get(idempotencyToken);
+            if (cached != null) {
+                return cached;
+            }
+        }
+        lock.writeLock().lock();
+        try {
+            rejectIfStalled();
+            Hlc stamp = hlc.tick();
+            CandyLocator dstLocator = new CandyLocator(stamp, LocatorType.PUT, contentType, metadata,
+                    createdAtMillis > 0 ? createdAtMillis : clock.currentTimeMillis(),
+                    List.copyOf(parts), acl == null ? ObjectAcl.NONE : acl);
+            Mutation mutation = new Mutation(dst, dstLocator);
+            wal.append(mutation);
+            active.put(mutation);
+            maybeFlushLocked();
+            CandyMetadata result = CandyMetadata.from(dstLocator);
+            if (idempotencyToken != null) {
+                idempotencyCache.put(idempotencyToken, result);
+            }
+            putCount.incrementAndGet();
+            return result;
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Conditionally tombstones {@code key} only if its live locator's HLC equals {@code expectedHlc}
+     * — the LWW-safe source delete that finalizes a cross-partition rename. If the source was already
+     * deleted, or legitimately re-{@code put} after the rename began (a strictly newer HLC), the
+     * delete is a no-op so a delayed/duplicated finalize can never clobber a newer value.
+     *
+     * @return {@code true} if a tombstone was written, {@code false} if the condition did not hold
+     */
+    public boolean deleteCandyConditional(CandyKey key, Hlc expectedHlc) {
+        Validation.checkCandyKey(key, config.sizeLimits());
+        lock.writeLock().lock();
+        try {
+            rejectIfStalled();
+            CandyLocator live = resolveLiveLocked(key).orElse(null);
+            if (live == null || expectedHlc == null || !live.hlc().equals(expectedHlc)) {
+                return false;
+            }
+            Hlc stamp = hlc.tick();
+            Mutation mutation = new Mutation(key, CandyLocator.tombstone(stamp,
+                    clock.currentTimeMillis()));
+            wal.append(mutation);
+            active.put(mutation);
+            maybeFlushLocked();
+            deleteCount.incrementAndGet();
+            return true;
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /** Records a cross-partition {@link RenameIntent} this (source) partition owes a delete for. */
+    public void recordRenameIntent(RenameIntent intent) {
+        lock.writeLock().lock();
+        try {
+            manifest.apply(ManifestEdit.builder().addRenameIntent(intent).build());
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /** Clears a recorded rename intent once it has been finalized or abandoned. */
+    public void clearRenameIntent(String token) {
+        lock.writeLock().lock();
+        try {
+            manifest.apply(ManifestEdit.builder()
+                    .removedRenameIntents(java.util.Set.of(token)).build());
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /** The cross-partition rename intents this partition still owes a source delete for. */
+    public List<RenameIntent> listRenameIntents() {
+        return new java.util.ArrayList<>(manifest.current().renameIntents().values());
+    }
+
+    /**
+     * The set of Syrup ids this partition currently references — manifest SSTable refs, in-flight
+     * multipart parts, the memtable, and the open write Syrup. Published to coordination so the
+     * Box-global GC never reclaims a Syrup a sibling partition still points at (cross-partition
+     * zero-copy copy/rename).
+     */
+    public java.util.Set<Long> referencedSyrups() {
+        lock.readLock().lock();
+        try {
+            ManifestState current = manifest.current();
+            java.util.Set<Long> referenced = new java.util.HashSet<>(current.referencedSyrups());
+            referenced.addAll(current.multipartReferencedSyrups());
+            for (java.util.Iterator<Mutation> it = active.iterator(); it.hasNext(); ) {
+                for (SegmentRef seg : it.next().locator().segments()) {
+                    referenced.add(seg.syrupId());
+                }
+            }
+            long openSyrup = syrupManager.currentSyrupId();
+            if (openSyrup >= 0) {
+                referenced.add(openSyrup);
+            }
+            return referenced;
+        } finally {
+            lock.readLock().unlock();
         }
     }
 

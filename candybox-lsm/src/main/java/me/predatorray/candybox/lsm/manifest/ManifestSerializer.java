@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import me.predatorray.candybox.common.CandyKey;
+import me.predatorray.candybox.common.Hlc;
 import me.predatorray.candybox.common.Part;
 import me.predatorray.candybox.common.SegmentRef;
 import me.predatorray.candybox.common.exception.SerializationException;
@@ -34,12 +35,15 @@ import me.predatorray.candybox.lsm.sstable.SSTableMeta;
  * {@link SSTableMeta} they contain.
  *
  * <p><b>v2 layout</b> adds the multipart-upload tracking fields ({@code addedUploads},
- * {@code upsertParts}, {@code removedUploads}) at the end of the v1 record. Older v1 records cannot
- * be read back; this is acceptable because the project has no production data to migrate.
+ * {@code upsertParts}, {@code removedUploads}) at the end of the v1 record. <b>v3 layout</b> appends
+ * the cross-partition rename-intent fields ({@code addedRenameIntents}, {@code removedRenameIntents}).
+ * A v2 record (no rename-intent fields) still reads back as an edit with empty intent sets. Older v1
+ * records cannot be read back; this is acceptable because the project has no production data to
+ * migrate.
  */
 public final class ManifestSerializer {
 
-    public static final byte FORMAT_VERSION = 2;
+    public static final byte FORMAT_VERSION = 3;
 
     private ManifestSerializer() {
     }
@@ -79,13 +83,23 @@ public final class ManifestSerializer {
         for (String id : edit.removedUploads()) {
             w.writeString(id);
         }
+
+        // ---- cross-partition rename intents (v3) ---------------------------------------------
+        w.writeVarInt(edit.addedRenameIntents().size());
+        for (RenameIntent intent : edit.addedRenameIntents()) {
+            writeRenameIntent(w, intent);
+        }
+        w.writeVarInt(edit.removedRenameIntents().size());
+        for (String token : edit.removedRenameIntents()) {
+            w.writeString(token);
+        }
         return w.toByteArray();
     }
 
     public static ManifestEdit deserialize(byte[] data) {
         BinaryReader r = new BinaryReader(data);
         int version = r.readByte();
-        if (version != FORMAT_VERSION) {
+        if (version != 2 && version != FORMAT_VERSION) {
             throw new SerializationException("Unsupported ManifestEdit version: " + version);
         }
         int tableCount = r.readVarInt();
@@ -118,8 +132,43 @@ public final class ManifestSerializer {
             removedUploads.add(r.readString());
         }
 
+        List<RenameIntent> addedIntents = new ArrayList<>();
+        Set<String> removedIntents = new LinkedHashSet<>();
+        if (version >= 3) {
+            int addedIntentCount = r.readVarInt();
+            for (int i = 0; i < addedIntentCount; i++) {
+                addedIntents.add(readRenameIntent(r));
+            }
+            int removedIntentCount = r.readVarInt();
+            for (int i = 0; i < removedIntentCount; i++) {
+                removedIntents.add(r.readString());
+            }
+        }
+
         return new ManifestEdit(tables, removedTables, addedSyrups, removedSyrups, newWal,
-                addedUploads, upserts, removedUploads, ownerFencingToken);
+                addedUploads, upserts, removedUploads, addedIntents, removedIntents,
+                ownerFencingToken);
+    }
+
+    private static void writeRenameIntent(BinaryWriter w, RenameIntent intent) {
+        w.writeString(intent.token());
+        w.writeString(intent.srcKey());
+        w.writeVarLong(intent.srcHlc().physicalMillis());
+        w.writeVarInt(intent.srcHlc().logicalCounter());
+        w.writeInt(intent.srcHlc().nodeId());
+        w.writeString(intent.dstKey());
+        w.writeVarInt(intent.dstPartition());
+        w.writeVarLong(Math.max(0, intent.createdAtMillis()));
+    }
+
+    private static RenameIntent readRenameIntent(BinaryReader r) {
+        String token = r.readString();
+        String srcKey = r.readString();
+        Hlc srcHlc = new Hlc(r.readVarLong(), r.readVarInt(), r.readInt());
+        String dstKey = r.readString();
+        int dstPartition = r.readVarInt();
+        long createdAtMillis = r.readVarLong();
+        return new RenameIntent(token, srcKey, srcHlc, dstKey, dstPartition, createdAtMillis);
     }
 
     private static void writeTable(BinaryWriter w, SSTableMeta t) {

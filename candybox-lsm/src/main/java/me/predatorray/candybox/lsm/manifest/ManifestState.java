@@ -37,19 +37,22 @@ import me.predatorray.candybox.lsm.sstable.SSTableMeta;
 public final class ManifestState {
 
     private static final ManifestState EMPTY =
-            new ManifestState(List.of(), Set.of(), -1L, Map.of());
+            new ManifestState(List.of(), Set.of(), -1L, Map.of(), Map.of());
 
     private final List<SSTableMeta> tables;
     private final Set<Long> liveSyrups;
     private final long walLedgerId;
     private final Map<String, MultipartUploadState> multipartUploads;
+    private final Map<String, RenameIntent> renameIntents;
 
     private ManifestState(List<SSTableMeta> tables, Set<Long> liveSyrups, long walLedgerId,
-                          Map<String, MultipartUploadState> multipartUploads) {
+                          Map<String, MultipartUploadState> multipartUploads,
+                          Map<String, RenameIntent> renameIntents) {
         this.tables = List.copyOf(tables);
         this.liveSyrups = Set.copyOf(liveSyrups);
         this.walLedgerId = walLedgerId;
         this.multipartUploads = Collections.unmodifiableMap(new LinkedHashMap<>(multipartUploads));
+        this.renameIntents = Collections.unmodifiableMap(new LinkedHashMap<>(renameIntents));
     }
 
     public static ManifestState empty() {
@@ -107,6 +110,11 @@ public final class ManifestState {
         return multipartUploads;
     }
 
+    /** Snapshot of in-flight cross-partition rename intents owed by this partition, keyed by token. */
+    public Map<String, RenameIntent> renameIntents() {
+        return renameIntents;
+    }
+
     /**
      * Syrups referenced by parts of in-flight multipart uploads. These must not be GC'd while the
      * upload is pending — even though no SSTable points at them yet.
@@ -153,6 +161,14 @@ public final class ManifestState {
         for (String dropped : edit.removedUploads()) {
             newUploads.remove(dropped);
         }
-        return new ManifestState(newTables, newSyrups, newWal, newUploads);
+
+        Map<String, RenameIntent> newIntents = new LinkedHashMap<>(renameIntents);
+        for (RenameIntent intent : edit.addedRenameIntents()) {
+            newIntents.put(intent.token(), intent);
+        }
+        for (String token : edit.removedRenameIntents()) {
+            newIntents.remove(token);
+        }
+        return new ManifestState(newTables, newSyrups, newWal, newUploads, newIntents);
     }
 }

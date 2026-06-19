@@ -62,6 +62,27 @@ class ManifestTest {
     }
 
     @Test
+    void renameIntentsRoundTripThroughTheManifest() {
+        RenameIntent intent = new RenameIntent("tok-1", "src/key",
+                new me.predatorray.candybox.common.Hlc(12345L, 7, 2), "dst/key", 3, 12345L);
+        ManifestEdit addEdit = ManifestEdit.builder().addRenameIntent(intent).build();
+        byte[] ab = ManifestSerializer.serialize(addEdit);
+        assertThat(ManifestSerializer.deserialize(ab)).isEqualTo(addEdit);
+
+        ManifestEdit clearEdit = ManifestEdit.builder()
+                .removedRenameIntents(Set.of("tok-1")).build();
+        byte[] cb = ManifestSerializer.serialize(clearEdit);
+        assertThat(ManifestSerializer.deserialize(cb)).isEqualTo(clearEdit);
+
+        // An intent applied then cleared leaves the state empty.
+        Manifest m = Manifest.createNew(store, cfg, 1L);
+        m.apply(addEdit);
+        assertThat(m.current().renameIntents()).containsKey("tok-1");
+        m.apply(clearEdit);
+        assertThat(m.current().renameIntents()).isEmpty();
+    }
+
+    @Test
     void multipartUploadsRoundTripThroughTheManifest() {
         java.util.Map<Integer, me.predatorray.candybox.common.Part> initialParts = new java.util.LinkedHashMap<>();
         MultipartUploadState created = new MultipartUploadState("upl-1", "obj/key", "image/png",
