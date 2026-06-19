@@ -64,8 +64,10 @@ operations an S3-style store cannot do cheaply:
 
 - **Bounded / reverse range scans** walk a `[start, end)` window in either direction, paging with
   `--start-after`.
-- **Zero-copy `copy` / `rename`** point a new key at the *same* stored bytes — no data is moved — and
-  `rename` removes the source atomically (within a Box).
+- **Zero-copy `copy` / `rename`** point a new key at the *same* stored bytes — no data is moved, even
+  across hash partitions (the stored bytes are shared cluster-wide). A same-partition `rename` removes
+  the source atomically; a cross-partition `rename` is *eventually* atomic, converging to "source gone,
+  destination present".
 - **`delete-range`** deletes a whole prefix or key window with a single range tombstone (constant work
   regardless of how many keys it covers); the bytes are reclaimed lazily by compaction.
 

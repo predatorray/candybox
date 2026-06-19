@@ -21,6 +21,16 @@ A Candybox deployment is a set of identical storage nodes plus their dependencie
 - Optionally the **S3 gateway** and the **admin / dashboard API**, both stateless and horizontally
   scalable behind a load balancer.
 
+## Garbage collection
+
+Each Box owner reclaims obsoleted ledgers (compaction-input SSTables, dead Syrups, rotated WALs)
+against its committed manifest after a grace period. Because cross-partition zero-copy copy/rename
+lets a destination partition share a source partition's stored bytes, GC is **Box-global**: every
+partition owner publishes its referenced-Syrup set to coordination, and a shared Syrup is reclaimed
+only once **no** partition of the Box references it. See the
+[Garbage collection section of `OPERATIONS.md`](https://github.com/predatorray/candybox/blob/main/OPERATIONS.md#garbage-collection)
+for the full rules.
+
 ## Observability
 
 Each node exposes an HTTP endpoint (default port `9710`) with `/healthz`, `/readyz`, and `/metrics`.

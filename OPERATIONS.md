@@ -55,7 +55,8 @@ All knobs are configurable; pick defaults unless a workload demands otherwise.
 | `l0StallThreshold` | 12 | L0 SSTable count at which writes are rejected with `BUSY`. |
 | `maxClockSkewMillis` | 5 min | HLC skew-rejection bound on observed timestamps. |
 | `tombstoneGcGraceMillis` | 24 h | Late-write window before a bottommost tombstone may be dropped. |
-| `ledgerGcGraceMillis` | 5 min | Grace before an obsoleted ledger (compaction input, dead Syrup, rotated WAL) is deleted. |
+| `ledgerGcGraceMillis` | 5 min | Grace before an obsoleted ledger (compaction input, dead Syrup, rotated WAL) is deleted; also gates Box-global GC of cross-partition-shared Syrups. |
+| `rename.intent.abandon.millis` | 60 s | Cross-partition rename: a rename intent whose rendezvous marker never appears is dropped after this (the source stays live, the rename never reached the destination). Env `CANDYBOX_RENAME_INTENT_ABANDON_MILLIS`. |
 
 Leveled compaction also takes a per-level byte budget (`levelBaseBytes` 10 MiB, `levelMultiplier` 10):
 level N's budget is `levelBaseBytes × multiplier^(N-1)`.
@@ -72,7 +73,10 @@ level N's budget is `levelBaseBytes × multiplier^(N-1)`.
   to the highest HLC (LWW, nodeId tiebreaker). The only per-key eventual-consistency window is
   ownership handover. Cross-partition operations are weaker: listings are scatter-gather merges,
   `deleteRange` is one tombstone per partition (idempotent, not atomic), and a cross-partition
-  rename is copy-then-delete.
+  rename is copy-then-delete across two owners — only **eventually atomic**, converging to "source
+  gone, destination present" via a durable rename-intent journal plus a coordination rendezvous
+  marker (so a reader may briefly see both keys, but the rename never strands both keys forever). A
+  same-partition rename is fully atomic.
 - **Backpressure.** When a Box accumulates `l0StallThreshold` L0 SSTables, writes return a retriable
   `BUSY` (protocol `RESPONSE_BUSY`) instead of blocking. Clients should back off and retry; the stall
   clears once compaction drains L0.
@@ -88,6 +92,7 @@ level N's budget is `levelBaseBytes × multiplier^(N-1)`.
 | **Zombie owner / zombie compactor** | A fencing token on every manifest append, plus BookKeeper recover-open, reject any commit from a superseded owner. |
 | **Client hits the wrong node** | The node replies `RESPONSE_MOVED(ownerNodeId)`; the client re-resolves via coordination and retries. |
 | **Clock skew** | HLC ordering survives a regressing wall clock; an observed HLC leading local time by more than `maxClockSkewMillis` is rejected. |
+| **Crash mid cross-partition rename** | Converges by roll-forward: the source owner finalizes its durable rename intent against the destination's rendezvous marker — synchronously, on its background maintenance sweep, or after a handover replays the intent. Marker present ⇒ source tombstoned; absent past `rename.intent.abandon.millis` ⇒ intent dropped, source stays live. It never leaves both keys live forever and never loses data. |
 
 With the balancer enabled (`balancerIntervalMillis > 0`), a dead node's partitions are reassigned
 and taken over automatically within a round or two of its leases expiring. With it disabled,
@@ -103,6 +108,13 @@ Run only by a Box's owner, against the committed manifest, after `ledgerGcGraceM
   whole-ledger-deleted (v1 reclaims a Syrup only once *every* segment in it is dead — no defragmentation,
   so deletes/overwrites cause Syrup space amplification until the whole ledger dies).
 - **WAL** ledgers rotated out at flush are deleted once their mutations are durable in an SSTable.
+
+**Box-global GC.** Because cross-partition zero-copy copy/rename lets a destination partition share a
+source partition's Syrup segments, each partition owner publishes its referenced-Syrup set to
+coordination (`boxes/<box>/partitions/<p>/refs`). The creating partition's GC skips any Syrup a
+sibling partition still references, so a shared Syrup is reclaimed only once **no** partition of the
+Box references it (still gated by `ledgerGcGraceMillis`). A partial or crashed rename can therefore
+only *retain* a Syrup (a leak), never delete one another partition still points at.
 
 GC tracking is in-memory, so ledgers orphaned by a prior owner that crashed before GC leak until an
 enumeration backstop is added (future).

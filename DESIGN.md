@@ -66,7 +66,11 @@ Dependency rule: `candybox-lsm` depends **only** on the two SPIs (`bookkeeper`, 
   serve a stale memtable read, but its *writes* fail). Operations spanning partitions are weaker by
   construction: `deleteRange` is one tombstone per partition (idempotent, not atomic across them),
   listings are scatter-gather merges (each partition's page is consistent; the merged page is not a
-  snapshot), and a cross-partition `rename` is copy-then-delete (not atomic). This is the guarantee
+  snapshot), and a cross-partition `rename` is copy-then-delete across two owners and only
+  **eventually atomic** — it converges to "source gone, destination present" via a durable
+  rename-intent journal plus a coordination rendezvous marker (§6), so a reader can momentarily
+  observe both keys, but the rename never leaves both keys live forever and never loses data. A
+  same-partition `rename` is still fully atomic (one owner, one write lock). This is the guarantee
   Candybox documents — not general eventual consistency.
 
 ### HLC recovery on handover (critical correctness point)
@@ -143,14 +147,17 @@ RangeTombstone payload>`. Replay reports the max HLC across **both** kinds, so h
 
 **Syrup chunk entry**: `int crc32c | payload[<= chunkSize]`. The crc covers the payload only.
 
-**ManifestEdit** (`ManifestSerializer`, **version 2**): `version | addedTables[]
+**ManifestEdit** (`ManifestSerializer`, **version 3**): `version | addedTables[]
 | removedTableLedgerIds[] | addedSyrups[] | removedSyrups[] | (bool, varlong) newWalLedgerId
-| ownerFencingToken | addedUploads[] | upsertParts[] | removedUploads[]`, where each `SSTableMeta`
+| ownerFencingToken | addedUploads[] | upsertParts[] | removedUploads[] | addedRenameIntents[]
+| removedRenameIntents[]`, where each `SSTableMeta`
 is `varlong ledgerId | varint level | bytes minKey | bytes maxKey | varlong entryCount`. The
 multipart-tracking trailing fields (Phase 5) carry in-flight upload state: a `MultipartUploadState`
 record per `addedUpload`, a `(uploadId, partNumber, Part)` triple per `upsertParts`, and a string
-per `removedUpload`. Replayed on handover so a takeover sees the upload exactly where the prior
-owner left it.
+per `removedUpload`. The v3 trailing fields carry in-flight **rename intents** (one per cross-partition
+`rename` the partition owns the source of, each pinning the source key and its HLC); like upload
+state they are replayed on handover, so a takeover finalizes (or abandons) a rename exactly where
+the prior owner left it.
 
 **Protocol frame** (`FrameCodec`): `magic(2)=0xCB0F | version(1)=1 | opcode(1) | length(4) | payload`.
 **Message body** (`MessageCodec`): `bodyVersion(1) | <per-opcode fields>`.
@@ -202,11 +209,22 @@ consults range tombstones across all tables rather than pruning by point range.
 - **copy / rename**: when source and destination hash to the **same partition**, write a fresh PUT
   at the destination reusing the source locator's *parts* verbatim (zero byte copy and zero locator
   rebuild — a multipart source becomes a multipart-shaped copy); `rename` also tombstones the
-  source. Both commit atomically under the partition owner's write lock (same Box only). Because GC
-  is reference-counted by Syrup id *within one manifest*, several keys may share one segment set
-  safely — which is also why a **cross-partition** copy/rename cannot share segments (the source
-  partition's GC would not see the destination's references) and instead degrades to a client-side
-  byte copy (`rename`: copy then delete, not atomic).
+  source. Both commit atomically under the partition owner's write lock (same Box only). Several
+  keys may share one segment set safely because GC reference-counts Syrups by actual `SegmentRef`
+  (§9). **Cross-partition** copy/rename is **zero-copy too**: the client fetches the source's
+  `CandyLocator` parts from the source partition's owner (`GetCandyLocator` / `PrepareRename` →
+  `CandyLocatorResponse`) and relays them to the destination owner (`ZeroCopyPut`), which writes a
+  destination locator reusing the very same Syrup segments — no object bytes are ever moved or
+  re-stored. This is safe because the blob layer is physically global (a `SegmentRef` resolves bytes
+  by `syrupId` alone, no partition scoping) and because **Box-global GC** (§9) keeps a Syrup alive
+  while *any* partition references it. A cross-partition `rename` is still copy-then-delete across
+  two owners, but now **eventually atomic**: the source owner records a durable rename intent (§5),
+  the destination owner writes a rendezvous marker once its zero-copy put is durable, and the source
+  owner — synchronously via the client's `CompleteRename`, on its maintenance sweep, or after a
+  handover replays the intent — reads the marker and LWW-conditionally tombstones the source (so a
+  re-PUT source is never clobbered), then clears the intent and marker. A reader may momentarily see
+  both keys; the one residual crash window degrades to "both keys live" (the old observable outcome),
+  never data loss.
 - **range get**: `getCandyRange(key, firstByte, lastByte)` over HTTP `Range: bytes=…` semantics
   (inclusive on both ends). Prefix-sums the part lengths to find the first/last parts, then indexes
   into chunks by `byteWithinPart / part.chunkSize`. Chunks at the slice boundary are read whole —
@@ -258,6 +276,8 @@ The coordination layout:
 boxes/<box>/meta                      BoxDescriptor {partitionCount} — immutable, the routing truth
 boxes/<box>/partitions/<p>/owner      partition p's ownership lease (fenced, TTL'd)
 boxes/<box>/partitions/<p>/manifest   partition p's manifest-ledger pointer (versioned CAS)
+boxes/<box>/partitions/<p>/refs       partition p's published referenced-Syrup set (Box-global GC, §9(f))
+boxes/<box>/renames/<token>           cross-partition rename rendezvous marker (§6); cleared on finalize
 cluster/balancer                      the balancer's coordinator-election lease
 cluster/assignment                    the desired partition→node assignment table (versioned CAS)
 members/<nodeId>                      membership (advertised host:port)
@@ -334,7 +354,16 @@ The detailed rules:
   segment set (a `copyCandy`, or the in-flight state of a `renameCandy`) keep that Syrup live until
   *all* of them are gone — no per-key refcount table is needed. A range tombstone holds no segments,
   so a Candy it shadows is reclaimed only once compaction drops the covered point locator (as with a
-  point delete).
+  point delete);
+- (f) **Box-global GC** (what makes cross-partition zero-copy safe): a destination partition can now
+  reuse a source partition's Syrup segments (§6), so within-manifest reference counting is
+  generalized Box-wide. Each partition owner publishes its referenced-Syrup set to coordination at
+  `boxes/<box>/partitions/<p>/refs`; the creating partition's GC skips any Syrup a sibling partition
+  still references (consulting the published sets, gated by the same `ledgerGcGraceMillis`), so a
+  Syrup is physically reclaimed only once **no** partition of the Box references it. This supersedes
+  the prior claim (under (e)) that cross-partition copy/rename cannot share segments. Safe by
+  construction: a partial/crashed rename can only *retain* a Syrup (a leak — the accepted v1 failure
+  mode), never delete a referenced one.
 
 The full compaction-then-GC cycle is covered end-to-end by `CompactionGcCycleIT`. One gap: deleting a
 Box drops its manifest pointer but does not yet reclaim that Box's SSTable/Syrup/WAL/manifest ledgers
@@ -378,11 +407,12 @@ Per-role BK quorum (E/Qw/Qa) defaults: **WAL 3/3/2, Manifest 3/3/2, SSTable 3/2/
 | Balancer round interval / move rate | 5 s in shipped conf (0 = off, the unit-test default) / 4 moves per round | Frequent enough to converge quickly after joins/failures; the move cap keeps a node join from stampeding handovers (failover is never rate-limited). |
 | Compaction + GC worker interval | configurable; 0 disables | Background maintenance cadence on the owner. |
 | Tombstone-GC time bound | 24 h | Covers in-flight late writes before a delete is reclaimable. |
-| Ledger-GC grace | 5 min | Margin for in-flight readers / continuation tokens before a physical delete. |
+| Ledger-GC grace | 5 min | Margin for in-flight readers / continuation tokens before a physical delete; also gates Box-global GC (§9(f)). |
+| Rename-intent abandon | 60 s (`rename.intent.abandon.millis`) | A cross-partition rename intent whose rendezvous marker never appears is dropped after this (the source stays live). |
 | Client router cache TTL | 5 s | How long the client caches a Box→owner mapping before re-resolving. |
 | Continuation token | `lastKey` | `lastKey` alone resumes a range/reverse scan, exclusive in the scan direction. |
 | LWW tiebreaker | `nodeId` (locked) | Deterministic, coordination-free. |
-| TCP opcodes | incl. dedicated `RESPONSE_BUSY` and `RESPONSE_MOVED` | Backpressure and re-routing are first-class signals. |
+| TCP opcodes | incl. dedicated `RESPONSE_BUSY` and `RESPONSE_MOVED`, plus the cross-partition zero-copy ops `GET_CANDY_LOCATOR` / `PREPARE_RENAME` / `ZERO_COPY_PUT` / `COMPLETE_RENAME` and response `RESPONSE_CANDY_LOCATOR` | Backpressure, re-routing, and the cross-partition locator relay are first-class signals. |
 
 ## 12. Deliberate v1 simplifications (escape hatches)
 
@@ -391,9 +421,13 @@ Per-role BK quorum (E/Qw/Qa) defaults: **WAL 3/3/2, Manifest 3/3/2, SSTable 3/2/
   listing a scatter-gather fan-out (each page queries all partitions). Key-range partitions with
   splits, and re-partitioning, are future work. A partition is still unavailable during its own
   handover fence+replay window (shrunk by the pre-handover flush).
-- **Cross-partition copy/rename byte-copies through the client** — zero-copy segment sharing is only
-  safe within one partition's manifest (§6); a cross-partition `rename` is copy-then-delete and not
-  atomic. S3 semantics (CopyObject, no rename) are unaffected.
+- **Cross-partition copy/rename is zero-copy (resolved), but its rename is only *eventually* atomic**
+  — the former byte-copy-through-the-client simplification is gone: cross-partition copy/rename now
+  reuse the source's Syrup segments via the locator relay, kept safe by Box-global GC (§6, §9(f)). A
+  cross-partition `rename` is copy-then-delete across two owners and converges via the rename-intent
+  journal + rendezvous marker — *eventually* (not linearizably) atomic; a reader may briefly see both
+  keys. **`UploadPartCopy` across partitions still byte-copies** (out of scope, see below). S3
+  semantics (CopyObject, no rename) are unaffected.
 - **Box-level `deleteBox` needs takeover or the balancer** — the deleting node takes over partitions
   whose leases are free; partitions held by other live nodes fail a non-force delete, while a force
   delete removes the descriptor and lets each owner's balancer sweep drop its partitions.
@@ -419,7 +453,8 @@ path, range tombstones, zero-copy copy/rename); ZooKeeper-backed coordination
 ownership/handover; **hash-partitioned Boxes** — per-partition fenced ownership spread across the
 cluster by the elected-coordinator `PartitionBalancer` (sticky, failover-eager, rate-limited
 moves), with partition-aware client routing (keyed ops to the key's partition owner; scatter-gather
-listing; fanned-out range deletes; cross-partition copy fallback); cluster membership + client-side
+listing; fanned-out range deletes; cross-partition zero-copy copy/rename via the locator relay);
+cluster membership + client-side
 routing over the framed TCP protocol (`RESPONSE_MOVED`); multi-level leveled compaction on a
 background worker; reference-counted GC of SSTable/Syrup/WAL ledgers; the storage node with
 health/metrics, the `candybox` CLI, and a packaged distribution (Docker image + Compose +

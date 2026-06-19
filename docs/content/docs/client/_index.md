@@ -31,16 +31,18 @@ standard output.
 ```bash
 candybox list   photos --start a --end m --reverse   # bounded, reverse-order range scan
 candybox copy   photos cat.jpg cat-copy.jpg          # zero-copy: shares the stored bytes
-candybox rename photos cat.jpg pets/cat.jpg          # zero-copy move (same Box)
+candybox rename photos cat.jpg pets/cat.jpg          # zero-copy move (within a Box)
 candybox delete-range photos thumbnails/             # one O(1) range tombstone, not N deletes
 candybox delete-range photos --start a --end m       # delete a half-open [start, end) key window
 ```
 
 - **Bounded / reverse range scans** walk a `[start, end)` window in either direction (`list --start K
   --end K --reverse`), paging with `--start-after`.
-- **Zero-copy `copy` / `rename`** point a new key at the *same* stored bytes — no data is moved — and
-  `rename` removes the source atomically (same Box; when source and destination land in different hash
-  partitions the client transparently falls back to a byte copy, and the rename is no longer atomic).
+- **Zero-copy `copy` / `rename`** point a new key at the *same* stored bytes — no data is moved, even
+  when source and destination land in different hash partitions (the stored bytes are shared across
+  partitions). A same-partition `rename` removes the source atomically; a cross-partition `rename` is
+  *eventually* atomic — it converges to "source gone, destination present" (a reader may briefly see
+  both keys, but the rename never strands both keys forever).
 - **`delete-range`** deletes a whole prefix or key window with a single range tombstone (constant work
   regardless of how many keys it covers); the bytes are reclaimed lazily by compaction.
 
