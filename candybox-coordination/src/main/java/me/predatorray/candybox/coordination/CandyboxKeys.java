@@ -53,4 +53,21 @@ public final class CandyboxKeys {
     public static String boxAclKey(String boxName) {
         return "acls/" + boxName;
     }
+
+    /**
+     * The versioned key holding one partition's published referenced-Syrup id set, consulted by the
+     * Box-global garbage collector so a Syrup shared cross-partition (zero-copy copy/rename) is never
+     * reclaimed while any partition still points at it.
+     */
+    public static String partitionRefsKey(String boxName, int partition) {
+        return BOXES_ROOT + "/" + boxName + "/partitions/" + partition + "/refs";
+    }
+
+    /**
+     * The rendezvous marker a destination owner writes when a cross-partition rename's zero-copy put
+     * is durable; the source owner reads it to finalize (tombstone the source) the rename.
+     */
+    public static String renameMarkerKey(String boxName, String renameToken) {
+        return BOXES_ROOT + "/" + boxName + "/renames/" + renameToken;
+    }
 }

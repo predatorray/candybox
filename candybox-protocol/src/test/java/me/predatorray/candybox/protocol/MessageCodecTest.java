@@ -81,6 +81,53 @@ class MessageCodecTest {
     }
 
     @Test
+    void crossPartitionZeroCopyMessagesRoundTrip() {
+        me.predatorray.candybox.common.Part part = new me.predatorray.candybox.common.Part(
+                7L, 1 << 20, 0x1234abcd,
+                List.of(new me.predatorray.candybox.common.SegmentRef(42, 0, 3),
+                        new me.predatorray.candybox.common.SegmentRef(43, 0, 1)));
+        me.predatorray.candybox.common.Hlc hlc = new me.predatorray.candybox.common.Hlc(999, 5, 7);
+
+        Message.GetCandyLocatorRequest gl = (Message.GetCandyLocatorRequest) roundTrip(
+                new Message.GetCandyLocatorRequest("box", "src"));
+        assertThat(gl.key()).isEqualTo("src");
+
+        Message.PrepareRenameRequest pr = (Message.PrepareRenameRequest) roundTrip(
+                new Message.PrepareRenameRequest("box", "src", "dst", 3, "tok-1"));
+        assertThat(pr.dstPartition()).isEqualTo(3);
+        assertThat(pr.renameToken()).isEqualTo("tok-1");
+
+        Message.CandyLocatorResponse loc = (Message.CandyLocatorResponse) roundTrip(
+                new Message.CandyLocatorResponse(List.of(part), "text/plain", Map.of("m", "v"), hlc,
+                        12345L, "User:alice", List.of("User:bob:READ")));
+        assertThat(loc.parts()).isEqualTo(List.of(part));
+        assertThat(loc.hlc()).isEqualTo(hlc);
+        assertThat(loc.contentType()).isEqualTo("text/plain");
+        assertThat(loc.owner()).isEqualTo("User:alice");
+        assertThat(loc.grants()).containsExactly("User:bob:READ");
+
+        Message.ZeroCopyPutRequest zp = (Message.ZeroCopyPutRequest) roundTrip(
+                new Message.ZeroCopyPutRequest("box", "dst", List.of(part), "text/plain",
+                        Map.of("m", "v"), "User:alice", List.of(), "idem", "tok-1", "src", 2, hlc));
+        assertThat(zp.parts()).isEqualTo(List.of(part));
+        assertThat(zp.renameToken()).isEqualTo("tok-1");
+        assertThat(zp.srcPartition()).isEqualTo(2);
+        assertThat(zp.srcHlc()).isEqualTo(hlc);
+
+        // A plain copy carries no rename token / source HLC.
+        Message.ZeroCopyPutRequest copy = (Message.ZeroCopyPutRequest) roundTrip(
+                new Message.ZeroCopyPutRequest("box", "dst", List.of(part), null, Map.of(), null,
+                        List.of(), "idem", null, null, 0, null));
+        assertThat(copy.renameToken()).isNull();
+        assertThat(copy.srcHlc()).isNull();
+
+        Message.CompleteRenameRequest cr = (Message.CompleteRenameRequest) roundTrip(
+                new Message.CompleteRenameRequest("box", "src", 2, "tok-1", hlc));
+        assertThat(cr.srcKey()).isEqualTo("src");
+        assertThat(cr.srcHlc()).isEqualTo(hlc);
+    }
+
+    @Test
     void listCandiesRequestRoundTripsRangeAndDirection() {
         Message.ListCandiesRequest req = new Message.ListCandiesRequest("box", 2, "p/", "p/cursor", 50,
                 "p/a", "p/z", true);
