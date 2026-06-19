@@ -19,6 +19,9 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import me.predatorray.candybox.common.Hlc;
+import me.predatorray.candybox.common.Part;
+import me.predatorray.candybox.common.SegmentRef;
 import me.predatorray.candybox.common.serial.BinaryReader;
 import me.predatorray.candybox.common.serial.BinaryWriter;
 
@@ -76,6 +79,41 @@ public final class MessageCodec {
             w.writeString(m.srcKey());
             w.writeString(m.dstKey());
             writeNullable(w, m.idempotencyToken());
+        } else if (message instanceof Message.GetCandyLocatorRequest m) {
+            writeBoxKey(w, m.box(), m.key());
+        } else if (message instanceof Message.PrepareRenameRequest m) {
+            w.writeString(m.box());
+            w.writeString(m.srcKey());
+            w.writeString(m.dstKey());
+            w.writeVarInt(m.dstPartition());
+            w.writeString(m.renameToken());
+        } else if (message instanceof Message.CandyLocatorResponse m) {
+            writeParts(w, m.parts());
+            writeNullable(w, m.contentType());
+            writeMetadata(w, m.userMetadata());
+            writeHlc(w, m.hlc());
+            w.writeVarLong(Math.max(0, m.createdAtMillis()));
+            writeNullable(w, m.owner());
+            writeStrings(w, m.grants());
+        } else if (message instanceof Message.ZeroCopyPutRequest m) {
+            w.writeString(m.box());
+            w.writeString(m.dstKey());
+            writeParts(w, m.parts());
+            writeNullable(w, m.contentType());
+            writeMetadata(w, m.userMetadata());
+            writeNullable(w, m.owner());
+            writeStrings(w, m.grants());
+            writeNullable(w, m.idempotencyToken());
+            writeNullable(w, m.renameToken());
+            writeNullable(w, m.srcKey());
+            w.writeVarInt(m.srcPartition());
+            writeNullableHlc(w, m.srcHlc());
+        } else if (message instanceof Message.CompleteRenameRequest m) {
+            w.writeString(m.box());
+            w.writeString(m.srcKey());
+            w.writeVarInt(m.srcPartition());
+            w.writeString(m.renameToken());
+            writeNullableHlc(w, m.srcHlc());
         } else if (message instanceof Message.DeleteRangeRequest m) {
             w.writeString(m.box());
             w.writeVarInt(m.partition());
@@ -273,6 +311,19 @@ public final class MessageCodec {
                     r.readString(), readNullable(r), readNullable(r), readStrings(r));
             case RENAME_CANDY -> new Message.RenameCandyRequest(r.readString(), r.readString(),
                     r.readString(), readNullable(r));
+            case GET_CANDY_LOCATOR -> new Message.GetCandyLocatorRequest(r.readString(),
+                    r.readString());
+            case PREPARE_RENAME -> new Message.PrepareRenameRequest(r.readString(), r.readString(),
+                    r.readString(), r.readVarInt(), r.readString());
+            case RESPONSE_CANDY_LOCATOR -> new Message.CandyLocatorResponse(readParts(r),
+                    readNullable(r), readMetadata(r), readHlc(r), r.readVarLong(), readNullable(r),
+                    readStrings(r));
+            case ZERO_COPY_PUT -> new Message.ZeroCopyPutRequest(r.readString(), r.readString(),
+                    readParts(r), readNullable(r), readMetadata(r), readNullable(r), readStrings(r),
+                    readNullable(r), readNullable(r), readNullable(r), r.readVarInt(),
+                    readNullableHlc(r));
+            case COMPLETE_RENAME -> new Message.CompleteRenameRequest(r.readString(), r.readString(),
+                    r.readVarInt(), r.readString(), readNullableHlc(r));
             case DELETE_RANGE -> new Message.DeleteRangeRequest(r.readString(), r.readVarInt(),
                     readNullable(r), readNullable(r), readNullable(r));
             case LIST_CANDIES -> new Message.ListCandiesRequest(r.readString(), r.readVarInt(),
@@ -408,6 +459,63 @@ public final class MessageCodec {
             entries.add(new Message.ListedCandy(r.readString(), r.readVarLong(), r.readVarLong()));
         }
         return new Message.ListCandiesResponse(entries, readNullable(r));
+    }
+
+    private static void writeParts(BinaryWriter w, List<Part> parts) {
+        List<Part> list = parts == null ? List.of() : parts;
+        w.writeVarInt(list.size());
+        for (Part p : list) {
+            w.writeVarLong(p.partLength());
+            w.writeVarInt(p.chunkSize());
+            w.writeInt(p.crc32c());
+            List<SegmentRef> segs = p.segments();
+            w.writeVarInt(segs.size());
+            for (SegmentRef s : segs) {
+                w.writeVarLong(s.syrupId());
+                w.writeVarLong(s.firstEntryId());
+                w.writeVarLong(s.lastEntryId());
+            }
+        }
+    }
+
+    private static List<Part> readParts(BinaryReader r) {
+        int partCount = r.readVarInt();
+        List<Part> parts = new ArrayList<>(partCount);
+        for (int i = 0; i < partCount; i++) {
+            long partLength = r.readVarLong();
+            int chunkSize = r.readVarInt();
+            int crc32c = r.readInt();
+            int segCount = r.readVarInt();
+            List<SegmentRef> segments = new ArrayList<>(segCount);
+            for (int j = 0; j < segCount; j++) {
+                segments.add(new SegmentRef(r.readVarLong(), r.readVarLong(), r.readVarLong()));
+            }
+            parts.add(new Part(partLength, chunkSize, crc32c, segments));
+        }
+        return parts;
+    }
+
+    private static void writeHlc(BinaryWriter w, Hlc hlc) {
+        w.writeVarLong(hlc.physicalMillis());
+        w.writeVarInt(hlc.logicalCounter());
+        w.writeInt(hlc.nodeId());
+    }
+
+    private static Hlc readHlc(BinaryReader r) {
+        return new Hlc(r.readVarLong(), r.readVarInt(), r.readInt());
+    }
+
+    private static void writeNullableHlc(BinaryWriter w, Hlc hlc) {
+        if (hlc == null) {
+            w.writeBoolean(false);
+        } else {
+            w.writeBoolean(true);
+            writeHlc(w, hlc);
+        }
+    }
+
+    private static Hlc readNullableHlc(BinaryReader r) {
+        return r.readBoolean() ? readHlc(r) : null;
     }
 
     private static void writeBoxKey(BinaryWriter w, String box, String key) {

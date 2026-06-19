@@ -48,6 +48,15 @@ public enum Opcode {
     /** Metadata-only locator rewrite replacing one object's owner/grants. */
     SET_CANDY_ACL(45),
 
+    /** Resolves a key's {@code CandyLocator} parts for a cross-partition zero-copy copy/rename. */
+    GET_CANDY_LOCATOR(46),
+    /** Like {@link #GET_CANDY_LOCATOR} but also records a source-side rename intent (cross-partition). */
+    PREPARE_RENAME(47),
+    /** Writes a destination Candy reusing a source partition's segments verbatim (zero byte copy). */
+    ZERO_COPY_PUT(48),
+    /** Finalizes a cross-partition rename: LWW-conditioned delete of the source key. */
+    COMPLETE_RENAME(49),
+
     /** Selects the SASL mechanism for this connection; must precede {@link #SASL_AUTHENTICATE}. */
     SASL_HANDSHAKE(50),
     /** One step of the SASL exchange: an opaque, mechanism-defined client token. */
@@ -79,7 +88,9 @@ public enum Opcode {
     /** Authenticated but not authorized for the operation (S3 AccessDenied / HTTP 403). */
     RESPONSE_ACCESS_DENIED(55),
     RESPONSE_BOX_ACL(56),
-    RESPONSE_CANDY_ACL(57);
+    RESPONSE_CANDY_ACL(57),
+    /** A resolved {@code CandyLocator}'s parts + metadata, for a cross-partition zero-copy relay. */
+    RESPONSE_CANDY_LOCATOR(58);
 
     private final int code;
 
