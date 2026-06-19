@@ -16,6 +16,7 @@
 package me.predatorray.candybox.server;
 
 import java.util.List;
+import java.util.Set;
 import me.predatorray.candybox.bookkeeper.LedgerStore;
 import me.predatorray.candybox.common.Clock;
 import me.predatorray.candybox.common.exception.StorageException;
@@ -64,9 +65,20 @@ public final class GarbageCollector {
      * @return the number of ledgers deleted
      */
     public int collect(BoxEngine engine) {
+        return collect(engine, Set.of());
+    }
+
+    /**
+     * As {@link #collect(BoxEngine)}, but a Syrup is only physically reclaimed when it is referenced
+     * by <em>no</em> partition of the Box: {@code foreignReferencedSyrups} is the union of every
+     * sibling partition's published referenced-Syrup set, so a Syrup shared cross-partition by a
+     * zero-copy copy/rename is never deleted out from under the partition that points at it. This is
+     * the Box-global garbage collection of DESIGN §9.
+     */
+    public int collect(BoxEngine engine, Set<Long> foreignReferencedSyrups) {
         long cutoff = clock.currentTimeMillis() - graceMillis;
         int deleted = collectSSTables(engine, cutoff);
-        deleted += collectSyrups(engine, cutoff);
+        deleted += collectSyrups(engine, cutoff, foreignReferencedSyrups);
         deleted += collectWals(engine, cutoff);
         return deleted;
     }
@@ -99,8 +111,14 @@ public final class GarbageCollector {
         return deleted;
     }
 
-    private int collectSyrups(BoxEngine engine, long cutoff) {
-        List<Long> orphans = engine.reclaimableSyrups(cutoff);
+    private int collectSyrups(BoxEngine engine, long cutoff, Set<Long> foreignReferencedSyrups) {
+        List<Long> orphans = new java.util.ArrayList<>(engine.reclaimableSyrups(cutoff));
+        if (!foreignReferencedSyrups.isEmpty()) {
+            // Box-global gate: keep a Syrup alive (neither dropped from the live set nor deleted) while
+            // any sibling partition still references it — it stays a pending orphan and is retried on a
+            // later pass once the cross-partition reference is gone.
+            orphans.removeIf(foreignReferencedSyrups::contains);
+        }
         if (orphans.isEmpty()) {
             return 0;
         }

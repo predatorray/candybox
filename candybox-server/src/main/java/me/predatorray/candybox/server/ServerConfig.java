@@ -309,6 +309,7 @@ public final class ServerConfig {
             applyInt("partitions.per.box.default", b::partitionsPerBoxDefault);
             applyLong("balancer.interval.millis", b::balancerIntervalMillis);
             applyInt("balancer.max.moves.per.round", b::balancerMaxMovesPerRound);
+            applyLong("rename.intent.abandon.millis", b::renameIntentAbandonMillis);
             // Per-role BookKeeper quorum overrides, "E/Qw/Qa" (e.g. 1/1/1 for a single-bookie dev box).
             applyQuorum("quorum.wal", LedgerRole.WAL, b);
             applyQuorum("quorum.manifest", LedgerRole.MANIFEST, b);
