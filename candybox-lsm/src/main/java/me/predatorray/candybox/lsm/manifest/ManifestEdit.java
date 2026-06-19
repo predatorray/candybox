@@ -42,6 +42,8 @@ import me.predatorray.candybox.lsm.sstable.SSTableMeta;
  * @param addedUploads          new multipart uploads created by this edit (CreateMultipartUpload)
  * @param upsertParts           parts added/replaced under an existing upload (UploadPart)
  * @param removedUploads        upload ids dropped by this edit (CompleteMultipartUpload / Abort)
+ * @param addedRenameIntents    in-flight cross-partition rename intents recorded by this edit (v3)
+ * @param removedRenameIntents  rename intent tokens finalized/abandoned by this edit (v3)
  * @param ownerFencingToken     fencing token of the authoring owner ({@code 0} = "stamp at apply time")
  */
 public record ManifestEdit(
@@ -53,6 +55,8 @@ public record ManifestEdit(
         List<MultipartUploadState> addedUploads,
         List<PartUpsert> upsertParts,
         Set<String> removedUploads,
+        List<RenameIntent> addedRenameIntents,
+        Set<String> removedRenameIntents,
         long ownerFencingToken) {
 
     public ManifestEdit {
@@ -63,6 +67,8 @@ public record ManifestEdit(
         addedUploads = addedUploads == null ? List.of() : List.copyOf(addedUploads);
         upsertParts = upsertParts == null ? List.of() : List.copyOf(upsertParts);
         removedUploads = removedUploads == null ? Set.of() : Set.copyOf(removedUploads);
+        addedRenameIntents = addedRenameIntents == null ? List.of() : List.copyOf(addedRenameIntents);
+        removedRenameIntents = removedRenameIntents == null ? Set.of() : Set.copyOf(removedRenameIntents);
         if (ownerFencingToken < 0) {
             throw new IllegalArgumentException("ownerFencingToken must be non-negative");
         }
@@ -75,13 +81,14 @@ public record ManifestEdit(
     /** Convenience: a flush edit adding one table plus its syrups, optionally rotating the WAL. */
     public static ManifestEdit flush(SSTableMeta table, Set<Long> syrups, Long newWalLedgerId) {
         return new ManifestEdit(List.of(table), Set.of(), syrups, Set.of(), newWalLedgerId,
-                List.of(), List.of(), Set.of(), 0L);
+                List.of(), List.of(), Set.of(), List.of(), Set.of(), 0L);
     }
 
     /** Returns a copy with the given owner fencing token (used by {@link Manifest#apply}). */
     public ManifestEdit withOwnerFencingToken(long token) {
         return new ManifestEdit(addedTables, removedTableLedgerIds, addedSyrups, removedSyrups,
-                newWalLedgerId, addedUploads, upsertParts, removedUploads, token);
+                newWalLedgerId, addedUploads, upsertParts, removedUploads, addedRenameIntents,
+                removedRenameIntents, token);
     }
 
     /**
@@ -112,6 +119,8 @@ public record ManifestEdit(
         private List<MultipartUploadState> addedUploads = List.of();
         private List<PartUpsert> upsertParts = List.of();
         private Set<String> removedUploads = Set.of();
+        private List<RenameIntent> addedRenameIntents = List.of();
+        private Set<String> removedRenameIntents = Set.of();
         private long ownerFencingToken = 0L;
 
         public Builder addedTables(List<SSTableMeta> v) {
@@ -154,6 +163,24 @@ public record ManifestEdit(
             return this;
         }
 
+        public Builder addedRenameIntents(List<RenameIntent> v) {
+            this.addedRenameIntents = v;
+            return this;
+        }
+
+        public Builder removedRenameIntents(Set<String> v) {
+            this.removedRenameIntents = v;
+            return this;
+        }
+
+        /** Adds a single rename intent without disturbing any already-set ones. */
+        public Builder addRenameIntent(RenameIntent intent) {
+            java.util.ArrayList<RenameIntent> next = new java.util.ArrayList<>(addedRenameIntents);
+            next.add(intent);
+            this.addedRenameIntents = next;
+            return this;
+        }
+
         public Builder ownerFencingToken(long v) {
             this.ownerFencingToken = v;
             return this;
@@ -177,7 +204,8 @@ public record ManifestEdit(
 
         public ManifestEdit build() {
             return new ManifestEdit(addedTables, removedTableLedgerIds, addedSyrups, removedSyrups,
-                    newWalLedgerId, addedUploads, upsertParts, removedUploads, ownerFencingToken);
+                    newWalLedgerId, addedUploads, upsertParts, removedUploads, addedRenameIntents,
+                    removedRenameIntents, ownerFencingToken);
         }
     }
 
