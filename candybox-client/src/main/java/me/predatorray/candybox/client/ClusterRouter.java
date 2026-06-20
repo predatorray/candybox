@@ -20,6 +20,7 @@ import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import me.predatorray.candybox.common.Clock;
+import me.predatorray.candybox.common.concurrent.TtlCache;
 import me.predatorray.candybox.common.exception.CandyboxException;
 import me.predatorray.candybox.common.exception.NotOwnerException;
 import me.predatorray.candybox.coordination.CandyboxKeys;
@@ -44,19 +45,16 @@ final class ClusterRouter implements Router {
 
     private final Transport transport;
     private final CoordinationService coordination;
-    private final long cacheTtlMillis;
-    private final Clock clock;
     private final MessageCodec codec = new MessageCodec();
 
-    private final ConcurrentMap<String, CachedAddress> partitionCache = new ConcurrentHashMap<>();
+    private final TtlCache<String, NodeAddress> partitionCache;
     private final ConcurrentMap<String, Connection> connections = new ConcurrentHashMap<>();
 
     ClusterRouter(Transport transport, CoordinationService coordination, long cacheTtlMillis,
                   Clock clock) {
         this.transport = transport;
         this.coordination = coordination;
-        this.cacheTtlMillis = cacheTtlMillis;
-        this.clock = clock;
+        this.partitionCache = new TtlCache<>(clock, cacheTtlMillis);
     }
 
     @Override
@@ -67,8 +65,7 @@ final class ClusterRouter implements Router {
             Message response = send(address, request);
             if (response instanceof Message.MovedResponse moved) {
                 address = addressOfNode(moved.ownerNodeId());
-                partitionCache.put(cacheKey,
-                        new CachedAddress(address, clock.currentTimeMillis() + cacheTtlMillis));
+                partitionCache.put(cacheKey, address);
                 continue;
             }
             return response;
@@ -83,16 +80,15 @@ final class ClusterRouter implements Router {
     }
 
     private NodeAddress resolveOwner(String box, int partition, String cacheKey) {
-        CachedAddress cached = partitionCache.get(cacheKey);
-        if (cached != null && clock.currentTimeMillis() < cached.expiry()) {
-            return cached.address();
+        NodeAddress cached = partitionCache.getIfFresh(cacheKey).orElse(null);
+        if (cached != null) {
+            return cached;
         }
         LeaseInfo holder = coordination.leaseHolder(CandyboxKeys.ownerResource(box, partition))
                 .orElseThrow(() -> new NotOwnerException("box " + box + " partition " + partition
                         + " has no current owner"));
         NodeAddress address = addressOfNode(holder.ownerNodeId());
-        partitionCache.put(cacheKey,
-                new CachedAddress(address, clock.currentTimeMillis() + cacheTtlMillis));
+        partitionCache.put(cacheKey, address);
         return address;
     }
 
@@ -111,8 +107,7 @@ final class ClusterRouter implements Router {
     }
 
     private Message send(NodeAddress address, Message request) {
-        Connection connection = connections.computeIfAbsent(address.key(),
-                k -> transport.connect(address.host(), address.port()));
+        Connection connection = acquireConnection(address);
         try {
             Frame response = connection.call(codec.encode(request));
             return codec.decode(response);
@@ -128,6 +123,33 @@ final class ClusterRouter implements Router {
             }
             throw e;
         }
+    }
+
+    /**
+     * Returns a pooled connection to {@code address}, opening one on a miss. The blocking
+     * {@link Transport#connect} runs <em>outside</em> the connection map's locks: doing it inside
+     * {@link ConcurrentMap#computeIfAbsent} would hold a bin lock across network I/O (stalling
+     * unrelated keys that hash to the same bin) and is forbidden from updating the map reentrantly.
+     * The cost of this lock-free approach is that two callers racing on a cold address may both
+     * connect; the loser's surplus connection is closed and the winner's is shared.
+     */
+    private Connection acquireConnection(NodeAddress address) {
+        String key = address.key();
+        Connection existing = connections.get(key);
+        if (existing != null) {
+            return existing;
+        }
+        Connection fresh = transport.connect(address.host(), address.port());
+        Connection raced = connections.putIfAbsent(key, fresh);
+        if (raced != null) {
+            try {
+                fresh.close();
+            } catch (RuntimeException ignored) {
+                // best effort: discard the connection that lost the race
+            }
+            return raced;
+        }
+        return fresh;
     }
 
     @Override
@@ -155,8 +177,5 @@ final class ClusterRouter implements Router {
             return new NodeAddress(hostPort.substring(0, colon),
                     Integer.parseInt(hostPort.substring(colon + 1)));
         }
-    }
-
-    private record CachedAddress(NodeAddress address, long expiry) {
     }
 }

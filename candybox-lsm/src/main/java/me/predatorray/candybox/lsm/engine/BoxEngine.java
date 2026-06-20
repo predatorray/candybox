@@ -19,7 +19,6 @@ import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -47,6 +46,7 @@ import me.predatorray.candybox.common.Part;
 import me.predatorray.candybox.common.RangeTombstone;
 import me.predatorray.candybox.common.SegmentRef;
 import me.predatorray.candybox.common.Validation;
+import me.predatorray.candybox.common.concurrent.BoundedLruCache;
 import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.config.LedgerRole;
 import me.predatorray.candybox.common.exception.BusyException;
@@ -123,13 +123,8 @@ public final class BoxEngine implements AutoCloseable {
     private final AtomicLong stallRejectionCount = new AtomicLong();
 
     // Bounded idempotency cache: token -> already-applied result, so a retried put is a no-op.
-    private final Map<String, CandyMetadata> idempotencyCache = Collections.synchronizedMap(
-            new LinkedHashMap<>(16, 0.75f, true) {
-                @Override
-                protected boolean removeEldestEntry(Map.Entry<String, CandyMetadata> eldest) {
-                    return size() > IDEMPOTENCY_CACHE_SIZE;
-                }
-            });
+    private final BoundedLruCache<String, CandyMetadata> idempotencyCache =
+            new BoundedLruCache<>(IDEMPOTENCY_CACHE_SIZE);
 
     private BoxEngine(BoxName box, CandyboxConfig config, LedgerStore ledgerStore,
                       HybridLogicalClock hlc, Clock clock, Manifest manifest, WriteAheadLog wal) {
@@ -262,16 +257,18 @@ public final class BoxEngine implements AutoCloseable {
                                   ObjectAcl acl) {
         Validation.checkCandyKey(key, config.sizeLimits());
         Validation.checkUserMetadata(userMetadata, config.sizeLimits());
-        if (idempotencyToken != null) {
-            CandyMetadata cached = idempotencyCache.get(idempotencyToken);
-            if (cached != null) {
-                return cached;
-            }
+        CandyMetadata cached = idempotentResult(idempotencyToken);
+        if (cached != null) {
+            return cached;
         }
         Map<String, String> metadata = userMetadata == null ? Map.of() : Map.copyOf(userMetadata);
 
         lock.writeLock().lock();
         try {
+            CandyMetadata replay = idempotentResult(idempotencyToken);
+            if (replay != null) {
+                return replay;
+            }
             rejectIfStalled();
             SyrupWriteResult written = syrupManager.writeCandy(data);
             Validation.checkCandySize(written.contentLength(), config.sizeLimits());
@@ -464,14 +461,16 @@ public final class BoxEngine implements AutoCloseable {
         if (expectedParts == null || expectedParts.isEmpty()) {
             throw new ValidationException("CompleteMultipartUpload requires at least one part");
         }
-        if (idempotencyToken != null) {
-            CandyMetadata cached = idempotencyCache.get(idempotencyToken);
-            if (cached != null) {
-                return cached;
-            }
+        CandyMetadata cached = idempotentResult(idempotencyToken);
+        if (cached != null) {
+            return cached;
         }
         lock.writeLock().lock();
         try {
+            CandyMetadata replay = idempotentResult(idempotencyToken);
+            if (replay != null) {
+                return replay;
+            }
             rejectIfStalled();
             MultipartUploadState upload = manifest.current().multipartUploads().get(uploadId);
             if (upload == null) {
@@ -662,14 +661,16 @@ public final class BoxEngine implements AutoCloseable {
         if (src.equals(dst)) {
             throw new ValidationException("source and destination keys must differ");
         }
-        if (idempotencyToken != null) {
-            CandyMetadata cached = idempotencyCache.get(idempotencyToken);
-            if (cached != null) {
-                return cached;
-            }
+        CandyMetadata cached = idempotentResult(idempotencyToken);
+        if (cached != null) {
+            return cached;
         }
         lock.writeLock().lock();
         try {
+            CandyMetadata replay = idempotentResult(idempotencyToken);
+            if (replay != null) {
+                return replay;
+            }
             rejectIfStalled();
             CandyLocator source = resolveLiveLocked(src)
                     .orElseThrow(() -> new CandyNotFoundException(box.value(), src.value()));
@@ -737,14 +738,16 @@ public final class BoxEngine implements AutoCloseable {
                                      ObjectAcl acl, String idempotencyToken) {
         Validation.checkCandyKey(dst, config.sizeLimits());
         Map<String, String> metadata = userMetadata == null ? Map.of() : Map.copyOf(userMetadata);
-        if (idempotencyToken != null) {
-            CandyMetadata cached = idempotencyCache.get(idempotencyToken);
-            if (cached != null) {
-                return cached;
-            }
+        CandyMetadata cached = idempotentResult(idempotencyToken);
+        if (cached != null) {
+            return cached;
         }
         lock.writeLock().lock();
         try {
+            CandyMetadata replay = idempotentResult(idempotencyToken);
+            if (replay != null) {
+                return replay;
+            }
             rejectIfStalled();
             Hlc stamp = hlc.tick();
             CandyLocator dstLocator = new CandyLocator(stamp, LocatorType.PUT, contentType, metadata,
@@ -1266,6 +1269,16 @@ public final class BoxEngine implements AutoCloseable {
     }
 
     // ---- internals -------------------------------------------------------------------------
+
+    /**
+     * A previously stored idempotent result for {@code token}, or {@code null} if none (or no token).
+     * Checked both on the unlocked fast path (to skip the write lock for an obvious retry) and again
+     * under the write lock, so two concurrent retries that both miss the fast path cannot both apply
+     * the mutation — the second sees the first's cached result and returns it.
+     */
+    private CandyMetadata idempotentResult(String token) {
+        return token == null ? null : idempotencyCache.get(token);
+    }
 
     private void rejectIfStalled() {
         int l0 = manifest.current().level0().size();

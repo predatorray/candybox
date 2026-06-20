@@ -42,6 +42,7 @@ import me.predatorray.candybox.common.exception.NotOwnerException;
 import me.predatorray.candybox.coordination.BoxDescriptor;
 import me.predatorray.candybox.coordination.CandyboxKeys;
 import me.predatorray.candybox.coordination.CasConflictException;
+import me.predatorray.candybox.coordination.CoordinationCas;
 import me.predatorray.candybox.coordination.CoordinationService;
 import me.predatorray.candybox.coordination.VersionedValue;
 import me.predatorray.candybox.common.serial.BinaryReader;
@@ -694,24 +695,16 @@ public final class CandyboxNode implements AutoCloseable {
     }
 
     void deleteRenameMarker(String box, String token) {
-        String key = CandyboxKeys.renameMarkerKey(box, token);
-        coordination.get(key).ifPresent(v -> {
-            try {
-                coordination.delete(key, v.version());
-            } catch (CasConflictException raced) {
-                // Already deleted (or rewritten); nothing to do.
-            }
-        });
+        try {
+            CoordinationCas.deleteIfPresent(coordination, CandyboxKeys.renameMarkerKey(box, token), 0);
+        } catch (CasConflictException raced) {
+            // Already deleted (or rewritten); nothing to do.
+        }
     }
 
     private void casPut(String key, byte[] value) {
-        Optional<VersionedValue> current = coordination.get(key);
         try {
-            if (current.isEmpty()) {
-                coordination.create(key, value);
-            } else {
-                coordination.compareAndSet(key, value, current.get().version());
-            }
+            CoordinationCas.upsert(coordination, key, value, 0);
         } catch (CasConflictException raced) {
             // A concurrent writer won; the next pass republishes.
         }

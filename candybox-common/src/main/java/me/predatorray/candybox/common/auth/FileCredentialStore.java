@@ -25,6 +25,8 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
+import me.predatorray.candybox.common.SystemClock;
+import me.predatorray.candybox.common.concurrent.PeriodicGate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -57,12 +59,12 @@ public final class FileCredentialStore implements CredentialStore, S3KeyStore {
 
     private final Path file;
     private volatile Snapshot snapshot;
-    private volatile long nextRecheckAtMillis;
+    private final PeriodicGate recheckGate;
 
     public FileCredentialStore(Path file) {
         this.file = file;
         this.snapshot = Snapshot.load(file);
-        this.nextRecheckAtMillis = System.currentTimeMillis() + RECHECK_INTERVAL_MILLIS;
+        this.recheckGate = new PeriodicGate(SystemClock.INSTANCE, RECHECK_INTERVAL_MILLIS);
     }
 
     @Override
@@ -86,15 +88,8 @@ public final class FileCredentialStore implements CredentialStore, S3KeyStore {
     }
 
     private Snapshot current() {
-        long now = System.currentTimeMillis();
-        if (now >= nextRecheckAtMillis) {
-            synchronized (this) {
-                if (now >= nextRecheckAtMillis) {
-                    nextRecheckAtMillis = now + RECHECK_INTERVAL_MILLIS;
-                    reloadIfChanged();
-                }
-            }
-        }
+        // Re-stat the file at most once per interval (off the hot read path) and reload on change.
+        recheckGate.runIfDue(this::reloadIfChanged);
         return snapshot;
     }
 
