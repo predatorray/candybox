@@ -20,18 +20,16 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import me.predatorray.candybox.common.concurrent.KeyedSlidingWindow;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -63,7 +61,7 @@ final class MetricsScraper implements AutoCloseable {
     private final long pollIntervalMillis;
     private final HttpClient http;
     private final ScheduledExecutorService scheduler;
-    private final Map<SeriesKey, Deque<Sample>> series = new ConcurrentHashMap<>();
+    private final KeyedSlidingWindow<SeriesKey, Sample> series;
     private final String scrapeToken;
     private volatile String latestText = "";
 
@@ -78,6 +76,7 @@ final class MetricsScraper implements AutoCloseable {
         this.targets = List.copyOf(targets);
         this.pollIntervalMillis = pollIntervalMillis;
         this.windowSamples = windowSamples;
+        this.series = new KeyedSlidingWindow<>(windowSamples);
         this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build();
         this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "admin-metrics-scraper");
@@ -116,17 +115,14 @@ final class MetricsScraper implements AutoCloseable {
      */
     Map<String, List<Series>> seriesFor(Collection<String> names) {
         Map<String, List<Series>> out = new LinkedHashMap<>();
+        Map<SeriesKey, List<Sample>> snapshot = series.snapshot();
         for (String name : names) {
             List<Series> matches = new ArrayList<>();
-            for (Map.Entry<SeriesKey, Deque<Sample>> e : series.entrySet()) {
+            for (Map.Entry<SeriesKey, List<Sample>> e : snapshot.entrySet()) {
                 if (!e.getKey().name.equals(name)) {
                     continue;
                 }
-                List<Sample> snapshot;
-                synchronized (e.getValue()) {
-                    snapshot = new ArrayList<>(e.getValue());
-                }
-                matches.add(new Series(e.getKey().name, e.getKey().labels, snapshot));
+                matches.add(new Series(e.getKey().name, e.getKey().labels, e.getValue()));
             }
             out.put(name, matches);
         }
@@ -173,14 +169,7 @@ final class MetricsScraper implements AutoCloseable {
 
     private void ingest(String text, long ingestMillis) {
         for (PrometheusText.Sample s : PrometheusText.parse(text)) {
-            SeriesKey key = new SeriesKey(s.name(), s.labels());
-            Deque<Sample> window = series.computeIfAbsent(key, k -> new ArrayDeque<>(windowSamples));
-            synchronized (window) {
-                window.addLast(new Sample(ingestMillis, s.value()));
-                while (window.size() > windowSamples) {
-                    window.removeFirst();
-                }
-            }
+            series.append(new SeriesKey(s.name(), s.labels()), new Sample(ingestMillis, s.value()));
         }
     }
 

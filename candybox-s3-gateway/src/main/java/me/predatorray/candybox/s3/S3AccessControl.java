@@ -19,9 +19,8 @@ import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
+import me.predatorray.candybox.common.SystemClock;
 import me.predatorray.candybox.common.auth.BoxAcl;
 import me.predatorray.candybox.common.auth.Grant;
 import me.predatorray.candybox.common.auth.ObjectAcl;
@@ -29,6 +28,7 @@ import me.predatorray.candybox.common.auth.Operation;
 import me.predatorray.candybox.common.auth.Principal;
 import me.predatorray.candybox.common.auth.Resource;
 import me.predatorray.candybox.common.auth.StandardAuthorizer;
+import me.predatorray.candybox.common.concurrent.TtlCache;
 import me.predatorray.candybox.s3.S3Router.S3Action;
 
 /**
@@ -53,10 +53,8 @@ final class S3AccessControl {
     private final boolean enabled;
     private final StandardAuthorizer authorizer;
     private final CandyStore store;
-    private final Map<String, CachedAcl> cache = new ConcurrentHashMap<>();
-
-    private record CachedAcl(Optional<BoxAcl> acl, long expiresAtMillis) {
-    }
+    private final TtlCache<String, Optional<BoxAcl>> cache =
+            new TtlCache<>(SystemClock.INSTANCE, CACHE_TTL_MILLIS);
 
     S3AccessControl(boolean enabled, CandyStore store) {
         this.enabled = enabled;
@@ -69,18 +67,11 @@ final class S3AccessControl {
     }
 
     private Optional<BoxAcl> boxAcl(String box) {
-        long now = System.currentTimeMillis();
-        CachedAcl cached = cache.get(box);
-        if (cached != null && now < cached.expiresAtMillis) {
-            return cached.acl;
-        }
-        Optional<BoxAcl> acl = store.getBoxAcl(box);
-        cache.put(box, new CachedAcl(acl, now + CACHE_TTL_MILLIS));
-        return acl;
+        return cache.get(box, store::getBoxAcl);
     }
 
     void invalidate(String box) {
-        cache.remove(box);
+        cache.invalidate(box);
     }
 
     /** Authorizes one routed request; throws {@code AccessDenied} otherwise. */
