@@ -19,6 +19,12 @@ Decisions locked with the project owner:
 5. Cross-partition `copy`/`rename` degrade to a **client-side byte copy** (rename additionally
    deletes the source afterwards, i.e. it is no longer atomic across partitions). Same-partition
    copy/rename keep the zero-copy server-side path.
+   > **Superseded** by the cross-partition zero-copy work (see
+   > [`CROSS_PARTITION_ZERO_COPY_PLAN.md`](CROSS_PARTITION_ZERO_COPY_PLAN.md)): cross-partition
+   > copy/rename are now **zero-copy too** (the client relays the source locator's segments to the
+   > destination owner, kept safe by Box-global GC), and a cross-partition `rename` is **eventually
+   > atomic** (a durable rename-intent journal + coordination rendezvous marker converge to "source
+   > gone, destination present"). `UploadPartCopy` across partitions still byte-copies.
 6. **No migration / backward compatibility** with the pre-partitioning ZK layout or wire format
    (not in production yet).
 7. Scope is **write scaling only** — reads still go to each partition's owner; compaction still
