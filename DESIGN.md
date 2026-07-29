@@ -36,7 +36,7 @@ candybox-common         Domain types, versioned serialization, HLC, config, CRC3
 candybox-bookkeeper     LedgerStore SPI + in-memory fake + real BookKeeper impl. (only module touching raw BK)
 candybox-coordination   Coordination SPI (membership, leases w/ fencing tokens, CAS kv) + in-memory fake + real ZooKeeper impl.
 candybox-lsm            Memtable, WAL, SSTable, Syrup chunking, manifest, merge/read path, compaction. Depends only on the two SPIs.
-candybox-protocol       Framed TCP codec + message types + Transport SPI (TCP impl + loopback fake).
+candybox-protocol       Framed TCP codec + message types + Transport SPI (Netty NIO server, blocking client, loopback fake).
 candybox-server         Storage node: wires LSM behind the protocol; fenced Box ownership + handover; background compaction + GC workers; health/metrics; runnable entrypoint.
 candybox-client         Thin client over Transport, cluster-aware router, and the `candybox` command-line tool.
 candybox-dist           Packages the runnable distribution (`bin/ lib/ conf/`) + the Docker/Kubernetes assets.
@@ -161,6 +161,16 @@ the prior owner left it.
 
 **Protocol frame** (`FrameCodec`): `magic(2)=0xCB0F | version(1)=1 | opcode(1) | length(4) | payload`.
 **Message body** (`MessageCodec`): `bodyVersion(1) | <per-opcode fields>`.
+
+**Node listener** (`TcpTransportServer`): Netty NIO — an acceptor loop, a few I/O event loops doing
+the framing, and a separate handler pool the (blocking) dispatcher runs on, so ledger I/O never
+stalls an event loop. A connection costs a file descriptor rather than a thread. Netty pins each
+connection to one handler executor, which keeps that connection's responses in request order — the
+frame header carries no request id, so a client matches responses positionally. Requests are
+pipelined up to `server.max.inflight.per.connection`, beyond which (or while the peer is not
+draining responses) reads are suspended; `close()` stops accepting first and drains in-flight
+requests before cutting sockets. The client side (`TcpTransport`) stays blocking: one pooled
+connection per node, one in-flight request at a time.
 
 ### SSTable on-ledger layout (`SSTableFormat`, footer version 2)
 

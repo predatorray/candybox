@@ -80,6 +80,11 @@ level N's budget is `levelBaseBytes × multiplier^(N-1)`.
 - **Backpressure.** When a Box accumulates `l0StallThreshold` L0 SSTables, writes return a retriable
   `BUSY` (protocol `RESPONSE_BUSY`) instead of blocking. Clients should back off and retry; the stall
   clears once compaction drains L0.
+- **Connection backpressure.** Below that, the listener stops reading from a connection that has
+  `server.max.inflight.per.connection` requests already queued for the handler, or whose peer is not
+  draining the responses already written. Work and buffered output are therefore bounded per
+  connection, and a slow reader throttles itself rather than the node's heap. A node shutting down
+  stops accepting first and gives in-flight requests `server.drain.timeout.millis` to finish.
 
 ## Failure modes & recovery
 

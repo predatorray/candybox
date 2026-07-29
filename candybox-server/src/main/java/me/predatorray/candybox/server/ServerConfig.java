@@ -30,6 +30,7 @@ import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.config.LedgerRole;
 import me.predatorray.candybox.common.config.QuorumConfig;
 import me.predatorray.candybox.common.config.SecurityConfig;
+import me.predatorray.candybox.protocol.transport.TcpTransportServer;
 
 /**
  * Runtime, deployment-facing configuration for a {@link CandyboxServer} process: endpoints, ports,
@@ -70,6 +71,7 @@ public final class ServerConfig {
     private final Path logDir;
     private final CandyboxConfig tuning;
     private final SecurityConfig security;
+    private final TcpTransportServer.Options transportOptions;
     private final java.util.Map<String, String> bookkeeperClientProps;
 
     private ServerConfig(Builder b) {
@@ -86,6 +88,7 @@ public final class ServerConfig {
         this.logDir = b.logDir;
         this.tuning = b.tuning;
         this.security = b.security;
+        this.transportOptions = b.transportOptions;
         this.bookkeeperClientProps = b.bookkeeperClientProps;
     }
 
@@ -132,6 +135,7 @@ public final class ServerConfig {
                 .logDir(Path.of(r.get("log.dir").orElse("./logs")))
                 .tuning(r.buildTuning())
                 .security(SecurityConfig.resolve(r::get))
+                .transportOptions(r.buildTransportOptions())
                 .bookkeeperClientProps(collectBookkeeperClientProps(props, env))
                 .build();
     }
@@ -212,6 +216,11 @@ public final class ServerConfig {
 
     public SecurityConfig security() {
         return security;
+    }
+
+    /** Sizing and backpressure for the node's NIO listener. */
+    public TcpTransportServer.Options transportOptions() {
+        return transportOptions;
     }
 
     /** Raw BookKeeper client properties passed through verbatim (auth providers, TLS, tuning). */
@@ -318,6 +327,22 @@ public final class ServerConfig {
             return b.build();
         }
 
+        /**
+         * Maps the optional listener keys onto {@link TcpTransportServer.Options}; absent keys keep
+         * the defaults, which size the handler pool for work that blocks on BookKeeper.
+         */
+        TcpTransportServer.Options buildTransportOptions() {
+            TcpTransportServer.Options defaults = TcpTransportServer.Options.defaults();
+            return new TcpTransportServer.Options(
+                    getInt("server.io.threads").orElse(defaults.ioThreads()),
+                    getInt("server.handler.threads").orElse(defaults.handlerThreads()),
+                    getInt("server.max.inflight.per.connection")
+                            .orElse(defaults.maxInFlightPerConnection()),
+                    getLong("server.drain.timeout.millis")
+                            .map(java.time.Duration::ofMillis)
+                            .orElse(defaults.drainTimeout()));
+        }
+
         private void applyQuorum(String key, LedgerRole role, CandyboxConfig.Builder b) {
             get(key).ifPresent(v -> b.quorum(role, parseQuorum(key, v)));
         }
@@ -361,6 +386,7 @@ public final class ServerConfig {
         private Path logDir = Path.of("./logs");
         private CandyboxConfig tuning = CandyboxConfig.defaults();
         private SecurityConfig security = SecurityConfig.disabled();
+        private TcpTransportServer.Options transportOptions = TcpTransportServer.Options.defaults();
         private java.util.Map<String, String> bookkeeperClientProps = java.util.Map.of();
 
         Builder nodeId(int v) {
@@ -425,6 +451,11 @@ public final class ServerConfig {
 
         Builder security(SecurityConfig v) {
             this.security = v;
+            return this;
+        }
+
+        Builder transportOptions(TcpTransportServer.Options v) {
+            this.transportOptions = v;
             return this;
         }
 

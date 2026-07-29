@@ -95,8 +95,9 @@ public final class CandyboxServer {
                     AuthenticationProviders.forMechanisms(security.saslMechanisms()),
                     new FileCredentialStore(security.credentialsFile()), security.authRequired());
         }
-        TcpTransportServer transport = new TcpTransportServer(config.bindPort(), handler,
-                new FrameCodec(), security.serverSslContext(), security.tlsClientAuth());
+        TcpTransportServer transport = new TcpTransportServer(config.bindHost(), config.bindPort(),
+                handler, new FrameCodec(config.tuning().maxFrameSizeBytes()),
+                security.serverSslContext(), security.tlsClientAuth(), config.transportOptions());
 
         AtomicBoolean ready = new AtomicBoolean(true);
         HealthServer health = new HealthServer(config.healthPort(), config.nodeId(), ready::get,

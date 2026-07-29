@@ -15,19 +15,33 @@
  */
 package me.predatorray.candybox.protocol.transport;
 
-import java.io.BufferedOutputStream;
-import java.io.DataInputStream;
-import java.io.EOFException;
+import io.netty.bootstrap.ServerBootstrap;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelOption;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.handler.codec.CodecException;
+import io.netty.handler.ssl.SslHandler;
+import io.netty.util.concurrent.DefaultEventExecutorGroup;
+import io.netty.util.concurrent.DefaultThreadFactory;
+import io.netty.util.concurrent.EventExecutorGroup;
+import io.netty.util.concurrent.Future;
 import java.io.IOException;
-import java.io.OutputStream;
-import java.net.ServerSocket;
-import java.net.Socket;
-import java.net.SocketException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.net.InetSocketAddress;
+import java.time.Duration;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLException;
-import javax.net.ssl.SSLServerSocket;
 import me.predatorray.candybox.protocol.Frame;
 import me.predatorray.candybox.protocol.FrameCodec;
 import me.predatorray.candybox.protocol.ProtocolException;
@@ -35,114 +49,255 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * A blocking TCP {@link TransportServer}: one accept loop, one handler thread per connection, each
- * reading framed requests and writing framed responses until the peer closes. With an
- * {@link SSLContext} the listener speaks TLS ({@code SSLServerSocket} — same blocking model),
- * optionally demanding a client certificate (mTLS).
+ * A non-blocking TCP {@link TransportServer}, on Netty NIO: an acceptor event loop, a small pool of
+ * I/O event loops that do the framing, and a separate executor group on which the (blocking)
+ * {@link RequestHandler} runs, so ledger I/O never stalls an event loop. Connections are no longer
+ * paid for in threads — one event loop serves many — so a node's connection count is bounded by
+ * file descriptors rather than by stack space.
  *
- * <p>TODO(phase-2): replace per-connection threads with NIO/Netty, add request pipelining,
- * backpressure, and graceful shutdown draining. This is correct and sufficient for early wiring/tests.
+ * <p>Netty pins each connection to one handler executor for the connection's lifetime, so requests
+ * from a connection are handled, and their responses written, in arrival order. That ordering is
+ * load-bearing: the wire format carries no request id, so a client matches responses positionally.
+ *
+ * <p><strong>Pipelining and backpressure.</strong> Further requests are decoded while earlier ones
+ * are in flight, bounded per connection by {@link Options#maxInFlightPerConnection}. Reads are also
+ * suspended while the channel is unwritable, so a peer that stops draining responses stops the node
+ * from accumulating work on its behalf rather than filling the heap with queued output.
+ *
+ * <p><strong>Draining.</strong> {@link #close()} shuts the listener first so no new connection is
+ * accepted, gives in-flight requests up to {@link Options#drainTimeout} to finish and flush their
+ * responses, and only then cuts the remaining sockets.
+ *
+ * <p>With an {@link SSLContext} the listener speaks TLS, optionally demanding a client certificate
+ * (mTLS).
  */
 public final class TcpTransportServer implements TransportServer {
 
     private static final Logger LOG = LoggerFactory.getLogger(TcpTransportServer.class);
 
-    private final ServerSocket serverSocket;
-    private final ExecutorService acceptExecutor;
-    private final ExecutorService handlerExecutor;
-    private final FrameCodec codec;
-    private final RequestHandler handler;
-    private volatile boolean running = true;
+    /** Slack on top of {@link Options#drainTimeout} when awaiting the handler group's own timeout. */
+    private static final long DRAIN_SLACK_MILLIS = 1_000L;
+    /** How long {@link #close()} waits for the (by then idle) event loops to stop. */
+    private static final long EVENT_LOOP_SHUTDOWN_MILLIS = 2_000L;
 
-    /** A plaintext listener. */
+    /**
+     * Sizing and backpressure knobs.
+     *
+     * @param ioThreads                event loops doing the framing; 0 means Netty's default
+     *                                 (twice the available processors)
+     * @param handlerThreads           threads running the blocking {@link RequestHandler}; each
+     *                                 connection is pinned to one of them
+     * @param maxInFlightPerConnection requests a single connection may have decoded but not yet
+     *                                 answered before its reads are suspended
+     * @param drainTimeout             how long {@link #close()} lets in-flight requests finish
+     */
+    public record Options(int ioThreads, int handlerThreads, int maxInFlightPerConnection,
+                          Duration drainTimeout) {
+
+        public Options {
+            if (ioThreads < 0) {
+                throw new IllegalArgumentException("ioThreads must be non-negative");
+            }
+            if (handlerThreads <= 0) {
+                throw new IllegalArgumentException("handlerThreads must be positive");
+            }
+            if (maxInFlightPerConnection <= 0) {
+                throw new IllegalArgumentException("maxInFlightPerConnection must be positive");
+            }
+            if (drainTimeout == null || drainTimeout.isNegative()) {
+                throw new IllegalArgumentException("drainTimeout must be non-negative");
+            }
+        }
+
+        /**
+         * Handler threads sized for work that blocks on BookKeeper rather than on CPU, so the pool
+         * is deliberately oversubscribed relative to the core count.
+         */
+        public static Options defaults() {
+            int handlerThreads = Math.max(32, Runtime.getRuntime().availableProcessors() * 4);
+            return new Options(0, handlerThreads, 8, Duration.ofSeconds(10));
+        }
+    }
+
+    private final EventLoopGroup acceptGroup;
+    private final EventLoopGroup ioGroup;
+    private final EventExecutorGroup handlerGroup;
+    private final Set<Channel> connections = ConcurrentHashMap.newKeySet();
+    private final Duration drainTimeout;
+    private final AtomicBoolean closed = new AtomicBoolean();
+    private final Channel listener;
+    private final int port;
+
+    /** A plaintext listener on all interfaces, with {@link Options#defaults()}. */
     public TcpTransportServer(int port, RequestHandler handler, FrameCodec codec) {
         this(port, handler, codec, null, false);
     }
 
     /**
-     * A listener that speaks TLS when {@code sslContext} is non-null.
+     * A listener on all interfaces that speaks TLS when {@code sslContext} is non-null.
      *
      * @param sslContext        the server TLS context (key material loaded), or null for plaintext
      * @param needClientAuth    require a client certificate (mTLS); only meaningful with TLS
      */
     public TcpTransportServer(int port, RequestHandler handler, FrameCodec codec,
                               SSLContext sslContext, boolean needClientAuth) {
-        this.handler = handler;
-        this.codec = codec;
-        try {
-            if (sslContext != null) {
-                SSLServerSocket ssl = (SSLServerSocket) sslContext.getServerSocketFactory()
-                        .createServerSocket(port);
-                ssl.setNeedClientAuth(needClientAuth);
-                this.serverSocket = ssl;
-            } else {
-                this.serverSocket = new ServerSocket(port);
-            }
-        } catch (IOException e) {
-            throw new ProtocolException("Failed to bind server socket on port " + port, e);
+        this(null, port, handler, codec, sslContext, needClientAuth, Options.defaults());
+    }
+
+    /**
+     * The full form.
+     *
+     * @param bindHost       the interface to bind, or null for all interfaces
+     * @param port           the port to bind, 0 for an ephemeral one (see {@link #port()})
+     * @param handler        the dispatcher, invoked off the event loop and allowed to block
+     * @param codec          supplies the maximum frame size this listener will read or write
+     * @param sslContext     the server TLS context, or null for plaintext
+     * @param needClientAuth require a client certificate (mTLS); only meaningful with TLS
+     * @param options        sizing and backpressure knobs
+     */
+    public TcpTransportServer(String bindHost, int port, RequestHandler handler, FrameCodec codec,
+                              SSLContext sslContext, boolean needClientAuth, Options options) {
+        this.drainTimeout = options.drainTimeout();
+        this.acceptGroup = new NioEventLoopGroup(1, new DefaultThreadFactory("candybox-accept", true));
+        this.ioGroup = new NioEventLoopGroup(options.ioThreads(),
+                new DefaultThreadFactory("candybox-io", true));
+        this.handlerGroup = new DefaultEventExecutorGroup(options.handlerThreads(),
+                new DefaultThreadFactory("candybox-conn", true));
+
+        int maxFrameBytes = codec.maxFrameBytes();
+        int maxInFlight = options.maxInFlightPerConnection();
+        ServerBootstrap bootstrap = new ServerBootstrap()
+                .group(acceptGroup, ioGroup)
+                .channel(NioServerSocketChannel.class)
+                .option(ChannelOption.SO_REUSEADDR, true)
+                .childOption(ChannelOption.TCP_NODELAY, true)
+                .childHandler(new ChannelInitializer<SocketChannel>() {
+                    @Override
+                    protected void initChannel(SocketChannel ch) {
+                        if (sslContext != null) {
+                            SSLEngine engine = sslContext.createSSLEngine();
+                            engine.setUseClientMode(false);
+                            engine.setNeedClientAuth(needClientAuth);
+                            ch.pipeline().addLast(new SslHandler(engine));
+                        }
+                        ReadGate gate = new ReadGate(maxInFlight);
+                        ch.pipeline().addLast(new FrameDecoder(maxFrameBytes));
+                        ch.pipeline().addLast(new FrameEncoder(maxFrameBytes));
+                        ch.pipeline().addLast(gate);
+                        // The handler blocks on ledger I/O, so it runs off the event loop. Netty pins
+                        // the channel to one executor of the group, which is what keeps this
+                        // connection's responses in request order.
+                        ch.pipeline().addLast(handlerGroup, new RequestDispatcher(handler, gate));
+                        connections.add(ch);
+                        ch.closeFuture().addListener(ignored -> connections.remove(ch));
+                    }
+                });
+
+        InetSocketAddress address = bindHost == null
+                ? new InetSocketAddress(port)
+                : new InetSocketAddress(bindHost, port);
+        ChannelFuture bound = bootstrap.bind(address).awaitUninterruptibly();
+        if (!bound.isSuccess()) {
+            shutdownGroups(); // a failed bind must not leak the pools we just started
+            throw new ProtocolException("Failed to bind server socket on port " + port, bound.cause());
         }
-        this.acceptExecutor = Executors.newSingleThreadExecutor(r -> namedDaemon(r, "candybox-accept"));
-        this.handlerExecutor = Executors.newCachedThreadPool(r -> namedDaemon(r, "candybox-conn"));
-        acceptExecutor.submit(this::acceptLoop);
+        this.listener = bound.channel();
+        // Resolved once: a closed channel no longer reports its local address, and callers log the
+        // port on the way down as well as on the way up.
+        this.port = ((InetSocketAddress) listener.localAddress()).getPort();
     }
 
     @Override
     public int port() {
-        return serverSocket.getLocalPort();
-    }
-
-    private void acceptLoop() {
-        while (running) {
-            try {
-                Socket socket = serverSocket.accept();
-                handlerExecutor.submit(() -> serve(socket));
-            } catch (IOException e) {
-                if (running) {
-                    LOG.warn("Accept loop error", e);
-                }
-                return;
-            }
-        }
-    }
-
-    private void serve(Socket socket) {
-        ConnectionContext context = new ConnectionContext();
-        try (socket;
-             DataInputStream in = new DataInputStream(socket.getInputStream());
-             OutputStream out = new BufferedOutputStream(socket.getOutputStream())) {
-            while (running) {
-                Frame request;
-                try {
-                    request = codec.read(in);
-                } catch (EOFException | SocketException closed) {
-                    return; // peer disconnected
-                } catch (SSLException handshakeOrRecord) {
-                    LOG.debug("TLS error on connection", handshakeOrRecord);
-                    return;
-                }
-                Frame response = handler.handle(context, request);
-                codec.write(out, response);
-            }
-        } catch (IOException e) {
-            LOG.debug("Connection handler ended", e);
-        }
+        return port;
     }
 
     @Override
     public void close() {
-        running = false;
-        try {
-            serverSocket.close();
-        } catch (IOException e) {
-            LOG.debug("Error closing server socket", e);
+        if (!closed.compareAndSet(false, true)) {
+            return;
         }
-        acceptExecutor.shutdownNow();
-        handlerExecutor.shutdownNow();
+        long drainMillis = drainTimeout.toMillis();
+        // 1. Stop accepting. Connections already established keep serving.
+        listener.close().awaitUninterruptibly(drainMillis);
+        // 2. Let in-flight requests run to completion and their responses reach the event loop,
+        //    which is still alive to flush them.
+        handlerGroup.shutdownGracefully(0, drainMillis, TimeUnit.MILLISECONDS)
+                .awaitUninterruptibly(drainMillis + DRAIN_SLACK_MILLIS);
+        // 3. Only now cut whatever is left.
+        for (Channel connection : connections) {
+            connection.close().awaitUninterruptibly(EVENT_LOOP_SHUTDOWN_MILLIS);
+        }
+        shutdownGroups();
     }
 
-    private static Thread namedDaemon(Runnable r, String name) {
-        Thread t = new Thread(r, name);
-        t.setDaemon(true);
-        return t;
+    /**
+     * Stops all three pools and waits for their threads to go, so that a closed server holds no
+     * threads: the node's shutdown hook, and tests that start listeners in a loop, both rely on it.
+     * Shutdown is requested on all three before awaiting any, so they stop in parallel.
+     */
+    private void shutdownGroups() {
+        Future<?> handlers = handlerGroup.shutdownGracefully(
+                0, EVENT_LOOP_SHUTDOWN_MILLIS, TimeUnit.MILLISECONDS);
+        Future<?> io = ioGroup.shutdownGracefully(
+                0, EVENT_LOOP_SHUTDOWN_MILLIS, TimeUnit.MILLISECONDS);
+        Future<?> accept = acceptGroup.shutdownGracefully(
+                0, EVENT_LOOP_SHUTDOWN_MILLIS, TimeUnit.MILLISECONDS);
+        handlers.awaitUninterruptibly(EVENT_LOOP_SHUTDOWN_MILLIS);
+        io.awaitUninterruptibly(EVENT_LOOP_SHUTDOWN_MILLIS);
+        accept.awaitUninterruptibly(EVENT_LOOP_SHUTDOWN_MILLIS);
+    }
+
+    /**
+     * Runs one connection's requests through the {@link RequestHandler}, on the handler executor
+     * that Netty pinned to this channel, holding the {@link ConnectionContext} that the SASL gate
+     * stamps on authentication.
+     */
+    private static final class RequestDispatcher extends SimpleChannelInboundHandler<Frame> {
+
+        private final RequestHandler handler;
+        private final ReadGate gate;
+        private final ConnectionContext context = new ConnectionContext();
+
+        RequestDispatcher(RequestHandler handler, ReadGate gate) {
+            this.handler = handler;
+            this.gate = gate;
+        }
+
+        @Override
+        protected void channelRead0(ChannelHandlerContext ctx, Frame request) {
+            Frame response;
+            try {
+                response = handler.handle(context, request);
+            } catch (RuntimeException e) {
+                // Nothing on the wire identifies a request, so a handler that fails outright cannot
+                // be reported without desynchronising the stream: drop the connection instead.
+                LOG.warn("Closing connection {} after a handler failure on {}",
+                        ctx.channel().remoteAddress(), request.opcode(), e);
+                gate.completed();
+                ctx.close();
+                return;
+            }
+            // The request leaves the handler queue here; what is still unflushed is accounted for by
+            // the gate's writability check instead.
+            gate.completed();
+            ctx.writeAndFlush(response);
+        }
+
+        @Override
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable throwable) {
+            // The framing handlers wrap what they throw, so classify on the original.
+            Throwable cause = throwable instanceof CodecException && throwable.getCause() != null
+                    ? throwable.getCause()
+                    : throwable;
+            if (cause instanceof ProtocolException || cause instanceof SSLException
+                    || cause instanceof IOException) {
+                // Malformed framing, a TLS error, or the peer vanishing: all end the connection.
+                LOG.debug("Connection {} ended: {}", ctx.channel().remoteAddress(), cause.toString());
+            } else {
+                LOG.warn("Unexpected error on connection {}", ctx.channel().remoteAddress(), cause);
+            }
+            ctx.close();
+        }
     }
 }
