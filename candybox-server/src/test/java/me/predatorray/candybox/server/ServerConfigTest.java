@@ -18,8 +18,10 @@ package me.predatorray.candybox.server;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.time.Duration;
 import java.util.Map;
 import java.util.Properties;
+import me.predatorray.candybox.protocol.transport.TcpTransportServer;
 import me.predatorray.candybox.server.HealthServer;
 import org.junit.jupiter.api.Test;
 
@@ -106,6 +108,52 @@ class ServerConfigTest {
 
         assertThat(cfg.tuning().compactionIntervalMillis()).isEqualTo(5000L);
         assertThat(cfg.tuning().memtableFlushThresholdBytes()).isEqualTo(1048576L);
+    }
+
+    @Test
+    void appliesListenerDefaultsWhenUnset() {
+        ServerConfig cfg = ServerConfig.fromProperties(
+                props("zookeeper.connect", "zk:2181", "node.id", "1"), Map.of());
+
+        assertThat(cfg.transportOptions())
+                .isEqualTo(TcpTransportServer.Options.defaults());
+    }
+
+    /** The four listener keys, each also reachable through its CANDYBOX_ environment form. */
+    @Test
+    void mapsListenerKeysOntoTransportOptions() {
+        ServerConfig fromFile = ServerConfig.fromProperties(
+                props("zookeeper.connect", "zk:2181", "node.id", "1",
+                        "server.io.threads", "3",
+                        "server.handler.threads", "12",
+                        "server.max.inflight.per.connection", "5",
+                        "server.drain.timeout.millis", "2500"),
+                Map.of());
+
+        assertThat(fromFile.transportOptions()).isEqualTo(
+                new TcpTransportServer.Options(3, 12, 5, Duration.ofMillis(2500)));
+
+        ServerConfig fromEnv = ServerConfig.fromProperties(
+                props("zookeeper.connect", "zk:2181", "node.id", "1",
+                        "server.handler.threads", "12"),
+                Map.of("CANDYBOX_SERVER_IO_THREADS", "3",
+                        "CANDYBOX_SERVER_HANDLER_THREADS", "99",
+                        "CANDYBOX_SERVER_MAX_INFLIGHT_PER_CONNECTION", "5",
+                        "CANDYBOX_SERVER_DRAIN_TIMEOUT_MILLIS", "2500"));
+
+        assertThat(fromEnv.transportOptions()).isEqualTo(
+                new TcpTransportServer.Options(3, 99, 5, Duration.ofMillis(2500)));
+    }
+
+    /** An unusable listener size is refused at load, not at the first connection. */
+    @Test
+    void rejectsAnUnusableListenerSize() {
+        assertThatThrownBy(() -> ServerConfig.fromProperties(
+                props("zookeeper.connect", "zk:2181", "node.id", "1",
+                        "server.handler.threads", "0"),
+                Map.of()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("handlerThreads must be positive");
     }
 
     @Test

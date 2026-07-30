@@ -20,6 +20,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.WriteBufferWaterMark;
 import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.nio.NioSocketChannel;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
 /** The per-connection read gate: when it suspends reads, and that it always lets them resume. */
@@ -96,6 +100,16 @@ class ReadGateTest {
         assertThat(gate.inFlight()).isZero();
     }
 
+    /** Before the gate is wired into a pipeline there is no channel to gate; it must not throw. */
+    @Test
+    void toleratesCompletionBeforeItHasAChannel() {
+        ReadGate gate = new ReadGate(1);
+
+        gate.completed();
+
+        assertThat(gate.inFlight()).isEqualTo(-1);
+    }
+
     /** The response's write listener still fires after the peer is gone; it must not throw. */
     @Test
     void toleratesCompletionAfterTheConnectionIsGone() {
@@ -107,5 +121,26 @@ class ReadGateTest {
         gate.completed();
 
         assertThat(gate.inFlight()).isZero();
+    }
+
+    /**
+     * A request completing as the node shuts down: the gate defers its decision to the event loop,
+     * which by then refuses new work. Netty answers that with {@link RejectedExecutionException},
+     * and a shutdown must not turn into a stack trace on the handler thread.
+     */
+    @Test
+    void toleratesCompletionAfterTheEventLoopIsGone() {
+        NioEventLoopGroup group = new NioEventLoopGroup(1);
+        ReadGate gate = new ReadGate(1);
+        NioSocketChannel channel = new NioSocketChannel();
+        channel.pipeline().addLast(gate);
+        group.register(channel).syncUninterruptibly();
+        channel.close().syncUninterruptibly();
+        group.shutdownGracefully(0, 0, TimeUnit.MILLISECONDS).awaitUninterruptibly(10_000);
+        assertThat(group.isTerminated()).isTrue();
+
+        gate.completed(); // must be swallowed, not thrown at the caller
+
+        assertThat(gate.inFlight()).isEqualTo(-1);
     }
 }

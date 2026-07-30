@@ -16,6 +16,7 @@
 package me.predatorray.candybox.protocol.transport;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.DataInputStream;
 import java.io.IOException;
@@ -35,6 +36,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import me.predatorray.candybox.protocol.Frame;
 import me.predatorray.candybox.protocol.FrameCodec;
 import me.predatorray.candybox.protocol.Opcode;
+import me.predatorray.candybox.protocol.ProtocolException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -275,6 +277,74 @@ class TcpTransportServerTest {
 
             assertThat(socket.getInputStream().read()).isEqualTo(-1);
         }
+    }
+
+    /** A handler that fails outright costs the sender its connection, and nothing else. */
+    @Test
+    void aFailingHandlerClosesOnlyTheOffendingConnection() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        RequestHandler failsFirstCall = request -> {
+            if (calls.incrementAndGet() == 1) {
+                throw new IllegalStateException("handler blew up");
+            }
+            return new Frame(Opcode.RESPONSE_OK, request.payload());
+        };
+        try (TcpTransportServer server =
+                     server(failsFirstCall, TcpTransportServer.Options.defaults())) {
+            try (Socket doomed = connect(server)) {
+                doomed.getOutputStream().write(
+                        CODEC.encode(new Frame(Opcode.PUT_CANDY, "boom".getBytes())));
+                doomed.getOutputStream().flush();
+                assertThat(doomed.getInputStream().read()).isEqualTo(-1); // no answer, hung up
+            }
+
+            try (TcpTransport transport = new TcpTransport(CODEC);
+                 Connection connection = transport.connect("127.0.0.1", server.port())) {
+                assertThat(new String(connection.call(
+                        new Frame(Opcode.GET_CANDY, "after".getBytes())).payload(),
+                        StandardCharsets.UTF_8)).isEqualTo("after");
+            }
+        }
+    }
+
+    /** Binding a port already in use fails loudly — and must not leave its thread pools running. */
+    @Test
+    void aFailedBindReportsAndLeavesNoThreads() throws Exception {
+        try (TcpTransportServer taken = server(ECHO, TcpTransportServer.Options.defaults())) {
+            int occupied = taken.port();
+            int ioBefore = liveThreads("candybox-io");
+            int acceptBefore = liveThreads("candybox-accept");
+
+            assertThatThrownBy(() -> new TcpTransportServer(null, occupied, ECHO, CODEC, null, false,
+                    TcpTransportServer.Options.defaults()))
+                    .isInstanceOf(ProtocolException.class)
+                    .hasMessageContaining("Failed to bind server socket on port " + occupied);
+
+            assertThat(liveThreads("candybox-io")).isEqualTo(ioBefore);
+            assertThat(liveThreads("candybox-accept")).isEqualTo(acceptBefore);
+        }
+    }
+
+    /** The node passes its configured {@code server.bind} host through, rather than every interface. */
+    @Test
+    void bindsTheRequestedInterface() throws Exception {
+        try (TcpTransportServer server = new TcpTransportServer("127.0.0.1", 0, ECHO, CODEC, null,
+                false, TcpTransportServer.Options.defaults());
+             TcpTransport transport = new TcpTransport(CODEC);
+             Connection connection = transport.connect("127.0.0.1", server.port())) {
+            assertThat(new String(connection.call(
+                    new Frame(Opcode.GET_CANDY, "bound".getBytes())).payload(),
+                    StandardCharsets.UTF_8)).isEqualTo("bound");
+        }
+    }
+
+    /** Closing twice is what a shutdown hook racing an explicit close does; it must be harmless. */
+    @Test
+    void closingTwiceIsHarmless() {
+        TcpTransportServer server = server(ECHO, TcpTransportServer.Options.defaults());
+        server.close();
+        server.close();
+        assertThat(server.port()).isPositive(); // still reportable after the channel is gone
     }
 
     private static void sleep(long millis) {

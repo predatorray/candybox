@@ -20,6 +20,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.embedded.EmbeddedChannel;
 import java.util.Arrays;
 import me.predatorray.candybox.protocol.Frame;
@@ -166,6 +167,30 @@ class FrameCodecHandlersTest {
                 .rootCause()
                 .isInstanceOf(ProtocolException.class)
                 .hasMessageContaining("Illegal frame length -1");
+    }
+
+    /**
+     * The encoder's reason for existing: a response carrying a whole Candy lands in a buffer sized
+     * for exactly that frame, so a 16 MiB payload is neither copied into a growing buffer nor
+     * copied twice via {@link FrameCodec#encode}'s intermediate array.
+     */
+    @Test
+    void allocatesABufferSizedForExactlyOneFrame() {
+        FrameEncoder encoder = new FrameEncoder(CODEC.maxFrameBytes());
+        EmbeddedChannel channel = new EmbeddedChannel(encoder);
+        ChannelHandlerContext ctx = channel.pipeline().context(encoder);
+        Frame frame = new Frame(Opcode.RESPONSE_CANDY_DATA, new byte[4096]);
+        int expected = FrameCodec.HEADER_BYTES + 4096;
+
+        ByteBuf direct = encoder.allocateBuffer(ctx, frame, true);
+        ByteBuf heap = encoder.allocateBuffer(ctx, frame, false);
+
+        assertThat(direct.capacity()).isEqualTo(expected);
+        assertThat(heap.capacity()).isEqualTo(expected);
+        assertThat(heap.hasArray()).isTrue();
+        direct.release();
+        heap.release();
+        assertThat(channel.finish()).isFalse();
     }
 
     @Test

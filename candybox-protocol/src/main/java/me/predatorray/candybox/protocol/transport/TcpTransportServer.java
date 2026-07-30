@@ -18,21 +18,17 @@ package me.predatorray.candybox.protocol.transport;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
-import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoopGroup;
-import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
-import io.netty.handler.codec.CodecException;
 import io.netty.handler.ssl.SslHandler;
 import io.netty.util.concurrent.DefaultEventExecutorGroup;
 import io.netty.util.concurrent.DefaultThreadFactory;
 import io.netty.util.concurrent.EventExecutorGroup;
 import io.netty.util.concurrent.Future;
-import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.time.Duration;
 import java.util.Set;
@@ -41,12 +37,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
-import javax.net.ssl.SSLException;
-import me.predatorray.candybox.protocol.Frame;
 import me.predatorray.candybox.protocol.FrameCodec;
 import me.predatorray.candybox.protocol.ProtocolException;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * A non-blocking TCP {@link TransportServer}, on Netty NIO: an acceptor event loop, a small pool of
@@ -72,8 +64,6 @@ import org.slf4j.LoggerFactory;
  * (mTLS).
  */
 public final class TcpTransportServer implements TransportServer {
-
-    private static final Logger LOG = LoggerFactory.getLogger(TcpTransportServer.class);
 
     /** Slack on top of {@link Options#drainTimeout} when awaiting the handler group's own timeout. */
     private static final long DRAIN_SLACK_MILLIS = 1_000L;
@@ -246,58 +236,5 @@ public final class TcpTransportServer implements TransportServer {
         handlers.awaitUninterruptibly(EVENT_LOOP_SHUTDOWN_MILLIS);
         io.awaitUninterruptibly(EVENT_LOOP_SHUTDOWN_MILLIS);
         accept.awaitUninterruptibly(EVENT_LOOP_SHUTDOWN_MILLIS);
-    }
-
-    /**
-     * Runs one connection's requests through the {@link RequestHandler}, on the handler executor
-     * that Netty pinned to this channel, holding the {@link ConnectionContext} that the SASL gate
-     * stamps on authentication.
-     */
-    private static final class RequestDispatcher extends SimpleChannelInboundHandler<Frame> {
-
-        private final RequestHandler handler;
-        private final ReadGate gate;
-        private final ConnectionContext context = new ConnectionContext();
-
-        RequestDispatcher(RequestHandler handler, ReadGate gate) {
-            this.handler = handler;
-            this.gate = gate;
-        }
-
-        @Override
-        protected void channelRead0(ChannelHandlerContext ctx, Frame request) {
-            Frame response;
-            try {
-                response = handler.handle(context, request);
-            } catch (RuntimeException e) {
-                // Nothing on the wire identifies a request, so a handler that fails outright cannot
-                // be reported without desynchronising the stream: drop the connection instead.
-                LOG.warn("Closing connection {} after a handler failure on {}",
-                        ctx.channel().remoteAddress(), request.opcode(), e);
-                gate.completed();
-                ctx.close();
-                return;
-            }
-            // The request leaves the handler queue here; what is still unflushed is accounted for by
-            // the gate's writability check instead.
-            gate.completed();
-            ctx.writeAndFlush(response);
-        }
-
-        @Override
-        public void exceptionCaught(ChannelHandlerContext ctx, Throwable throwable) {
-            // The framing handlers wrap what they throw, so classify on the original.
-            Throwable cause = throwable instanceof CodecException && throwable.getCause() != null
-                    ? throwable.getCause()
-                    : throwable;
-            if (cause instanceof ProtocolException || cause instanceof SSLException
-                    || cause instanceof IOException) {
-                // Malformed framing, a TLS error, or the peer vanishing: all end the connection.
-                LOG.debug("Connection {} ended: {}", ctx.channel().remoteAddress(), cause.toString());
-            } else {
-                LOG.warn("Unexpected error on connection {}", ctx.channel().remoteAddress(), cause);
-            }
-            ctx.close();
-        }
     }
 }
