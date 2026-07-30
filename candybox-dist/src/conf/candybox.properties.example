@@ -31,6 +31,23 @@ server.bind=0.0.0.0:9709
 # HTTP port for /healthz, /readyz and /metrics (Prometheus). Wire k8s probes here.
 health.port=9710
 
+# Listener sizing. The node serves connections on Netty NIO event loops and runs the request
+# handler on a separate pool, so connections are not paid for in threads; leave these alone unless
+# a workload demands otherwise.
+#
+# Event loops doing the framing. 0 = Netty's default (twice the available processors).
+#server.io.threads=0
+#
+# Threads running the request handler. Handlers block on BookKeeper, so this pool is deliberately
+# oversubscribed relative to the core count; each connection is pinned to one of these threads.
+#server.handler.threads=32
+#
+# Requests one connection may have queued for the handler before the node stops reading from it.
+#server.max.inflight.per.connection=8
+#
+# How long a shutdown lets in-flight requests finish before their connections are cut.
+#server.drain.timeout.millis=10000
+
 # ---------------------------------------------------------------------------
 # External coordination & storage (ZooKeeper / BookKeeper)
 # ---------------------------------------------------------------------------

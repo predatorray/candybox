@@ -12,12 +12,22 @@
 
     <artifactId>candybox-protocol</artifactId>
     <name>Candybox :: Protocol</name>
-    <description>Versioned framed TCP message definitions and codec; Transport SPI with a TCP implementation and an in-JVM loopback fake.</description>
+    <description>Versioned framed TCP message definitions and codec; Transport SPI with a Netty NIO server, a blocking client, and an in-JVM loopback fake.</description>
 
     <dependencies>
         <dependency>
             <groupId>me.predatorray.candybox</groupId>
             <artifactId>candybox-common</artifactId>
+        </dependency>
+
+        <!-- The NIO server transport (pulls transport/codec/buffer/common transitively). Marked
+             optional, like curator in candybox-coordination, so that embedding candybox-client — which
+             only needs the blocking client socket and the codec — does not drag Netty onto its
+             classpath. Composition roots that listen (candybox-server, the ITs) declare it themselves. -->
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-handler</artifactId>
+            <optional>true</optional>
         </dependency>
     </dependencies>
 </project>

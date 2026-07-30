@@ -19,6 +19,10 @@ and configure each instance through the environment.
 | `server.bind` | Address clients connect to. | `0.0.0.0:9709` |
 | `server.advertised` | Address published to the cluster for routing (set to a reachable hostname). | bind address |
 | `health.port` | HTTP port for `/healthz`, `/readyz`, `/metrics`. | `9710` |
+| `server.io.threads` | Netty event loops framing client traffic. `0` uses Netty's default (twice the available processors). | `0` |
+| `server.handler.threads` | Threads running the request handler, off the event loops. Each connection is pinned to one of them. | `max(32, cores × 4)` |
+| `server.max.inflight.per.connection` | Requests one connection may have queued for the handler before the node stops reading from it. | `8` |
+| `server.drain.timeout.millis` | How long a shutdown lets in-flight requests finish before their connections are cut. | `10000` |
 | `quorum.*` | BookKeeper replication per ledger role (`E/Qw/Qa`). | `3/3/2` (WAL, manifest), `3/2/2` (data) |
 | `multipart.upload.ttl.millis` | How long an abandoned multipart upload is kept before a background sweep aborts it. | 7 days |
 | `rename.intent.abandon.millis` | Cross-partition rename: how long the source owner keeps a rename intent whose destination rendezvous marker never appears before dropping it (the source stays live). | 60000 (60 s) |

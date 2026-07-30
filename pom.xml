@@ -52,6 +52,7 @@
         <license.plugin.version>4.6</license.plugin.version>
         <jacoco.plugin.version>0.8.12</jacoco.plugin.version>
         <frontend.plugin.version>1.15.1</frontend.plugin.version>
+        <os.plugin.version>1.7.1</os.plugin.version>
         <node.version>v20.18.0</node.version>
         <npm.version>10.9.0</npm.version>
     </properties>
@@ -204,6 +205,21 @@
     </dependencies>
 
     <build>
+        <!-- Sets os.detected.*, the properties Netty's own POMs use to name their native artifacts.
+             netty-handler declares the optional native OpenSSL provider as
+             `netty-tcnative:${os.detected.classifier}`, and a module depending on netty-handler
+             *directly* (candybox-protocol, candybox-server) has that optional edge walked by
+             `dependency:go-offline` — the Dockerfile's dependency-warming layer — which then fails
+             on the unresolved classifier. Nothing here reaches a compile or runtime classpath: the
+             provider stays optional and pruned (we build SSLEngines from a JDK SSLContext and never
+             select SslProvider.OPENSSL), it is only now nameable. -->
+        <extensions>
+            <extension>
+                <groupId>kr.motd.maven</groupId>
+                <artifactId>os-maven-plugin</artifactId>
+                <version>${os.plugin.version}</version>
+            </extension>
+        </extensions>
         <pluginManagement>
             <plugins>
                 <plugin>
