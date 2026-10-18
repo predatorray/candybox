@@ -91,6 +91,7 @@ Safety: a Syrup referenced cross-partition was referenced by the destination (an
 the rename's source delete committed. A zero-copy put can also point a partition back at a Syrup it
 already marked as a pending orphan (rename `a`→`b`→`a`), so a re-referenced Syrup leaves the pending
 set and the claim re-validates local references; otherwise the stale entry would delete a live Syrup.
+Still open: a locator resolved before its Syrup was claimed and zero-copy-put after the delete (#65).
 Leaks are already the accepted v1 failure mode (DESIGN §9d). A partition with no live owner keeps
 its last-published refs in ZK (conservative), and a new owner republishes on takeover.
 

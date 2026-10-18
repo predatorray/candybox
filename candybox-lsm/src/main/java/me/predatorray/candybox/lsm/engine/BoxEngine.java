@@ -767,7 +767,9 @@ public final class BoxEngine implements AutoCloseable {
             Mutation mutation = new Mutation(dst, dstLocator);
             wal.append(mutation);
             active.put(mutation);
-            // The parts may point at a Syrup this partition already counts as a pending orphan.
+            // The parts may point at a Syrup this partition already counts as a pending orphan. Clear it
+            // here so its grace period restarts: flush does not recompute orphans, so a later recompute
+            // may never see it referenced, and claim-time re-validation only guards safety.
             for (SegmentRef seg : dstLocator.segments()) {
                 pendingOrphanSyrups.remove(seg.syrupId());
             }
@@ -1173,8 +1175,9 @@ public final class BoxEngine implements AutoCloseable {
      * Recomputes which live Syrups are no longer referenced by any SSTable, in-flight multipart upload,
      * the active memtable, or the currently open write Syrup, recording newly-orphaned ones with the
      * time first seen. A cross-partition zero-copy put can re-reference an orphan, so pending entries
-     * that are referenced again are dropped (their grace period restarts if they are orphaned later).
-     * Called under the write lock after a manifest change.
+     * that are referenced again are dropped; {@link #zeroCopyPut} also clears them eagerly, since a
+     * Syrup can be re-referenced and orphaned again between two recomputes. Called under the write
+     * lock after a manifest change.
      */
     private void recomputeOrphanSyrupsLocked(long now) {
         java.util.Set<Long> referenced = referencedSyrupsLocked();
