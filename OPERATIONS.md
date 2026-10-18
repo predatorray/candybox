@@ -96,7 +96,7 @@ level N's budget is `levelBaseBytes × multiplier^(N-1)`.
 | **Owner crash / lease loss** | Another node acquires the lease, **recover-opens (fences)** the prior WAL and manifest, replays them, advances its HLC past the max observed, opens fresh WAL/manifest ledgers, and CAS-advances the ZK manifest pointer. The old owner is fenced: its writes fail with `FencedException`. |
 | **Zombie owner / zombie compactor** | A fencing token on every manifest append, plus BookKeeper recover-open, reject any commit from a superseded owner. |
 | **Client hits the wrong node** | The node replies `RESPONSE_MOVED(ownerNodeId)`; the client re-resolves via coordination and retries. |
-| **Clock skew** | HLC ordering survives a regressing wall clock; an observed HLC leading local time by more than `maxClockSkewMillis` is rejected. |
+| **Clock skew** | HLC ordering survives a regressing wall clock; an observed HLC leading local time by more than `maxClockSkewMillis` is rejected. The manifest keeps the highest HLC ever flushed, so once an owner with a far-ahead clock has flushed, every later takeover fails until real time catches up; fix that clock, or temporarily raise `maxClockSkewMillis` on the recovering node. |
 | **Crash mid cross-partition rename** | Converges by roll-forward: the source owner finalizes its durable rename intent against the destination's rendezvous marker — synchronously, on its background maintenance sweep, or after a handover replays the intent. Marker present ⇒ source tombstoned; absent past `rename.intent.abandon.millis` ⇒ intent dropped, source stays live. It never leaves both keys live forever and never loses data. |
 
 With the balancer enabled (`balancerIntervalMillis > 0`), a dead node's partitions are reassigned

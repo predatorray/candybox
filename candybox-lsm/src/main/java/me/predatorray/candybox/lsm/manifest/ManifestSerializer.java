@@ -37,13 +37,14 @@ import me.predatorray.candybox.lsm.sstable.SSTableMeta;
  * <p><b>v2 layout</b> adds the multipart-upload tracking fields ({@code addedUploads},
  * {@code upsertParts}, {@code removedUploads}) at the end of the v1 record. <b>v3 layout</b> appends
  * the cross-partition rename-intent fields ({@code addedRenameIntents}, {@code removedRenameIntents}).
- * A v2 record (no rename-intent fields) still reads back as an edit with empty intent sets. Older v1
- * records cannot be read back; this is acceptable because the project has no production data to
- * migrate.
+ * A v2 record (no rename-intent fields) still reads back as an edit with empty intent sets.
+ * <b>v4 layout</b> appends the optional high-water {@code maxHlc}; v2/v3 records read back with
+ * {@link Hlc#MIN}. Older v1 records cannot be read back; this is acceptable because the project has
+ * no production data to migrate.
  */
 public final class ManifestSerializer {
 
-    public static final byte FORMAT_VERSION = 3;
+    public static final byte FORMAT_VERSION = 4;
 
     private ManifestSerializer() {
     }
@@ -93,13 +94,21 @@ public final class ManifestSerializer {
         for (String token : edit.removedRenameIntents()) {
             w.writeString(token);
         }
+
+        // ---- high-water HLC (v4) -------------------------------------------------------------
+        if (edit.maxHlc().equals(Hlc.MIN)) {
+            w.writeBoolean(false);
+        } else {
+            w.writeBoolean(true);
+            writeHlc(w, edit.maxHlc());
+        }
         return w.toByteArray();
     }
 
     public static ManifestEdit deserialize(byte[] data) {
         BinaryReader r = new BinaryReader(data);
         int version = r.readByte();
-        if (version != 2 && version != FORMAT_VERSION) {
+        if (version < 2 || version > FORMAT_VERSION) {
             throw new SerializationException("Unsupported ManifestEdit version: " + version);
         }
         int tableCount = r.readVarInt();
@@ -145,17 +154,27 @@ public final class ManifestSerializer {
             }
         }
 
+        Hlc maxHlc = version >= 4 && r.readBoolean() ? readHlc(r) : Hlc.MIN;
+
         return new ManifestEdit(tables, removedTables, addedSyrups, removedSyrups, newWal,
-                addedUploads, upserts, removedUploads, addedIntents, removedIntents,
+                addedUploads, upserts, removedUploads, addedIntents, removedIntents, maxHlc,
                 ownerFencingToken);
+    }
+
+    private static void writeHlc(BinaryWriter w, Hlc hlc) {
+        w.writeVarLong(hlc.physicalMillis());
+        w.writeVarInt(hlc.logicalCounter());
+        w.writeInt(hlc.nodeId());
+    }
+
+    private static Hlc readHlc(BinaryReader r) {
+        return new Hlc(r.readVarLong(), r.readVarInt(), r.readInt());
     }
 
     private static void writeRenameIntent(BinaryWriter w, RenameIntent intent) {
         w.writeString(intent.token());
         w.writeString(intent.srcKey());
-        w.writeVarLong(intent.srcHlc().physicalMillis());
-        w.writeVarInt(intent.srcHlc().logicalCounter());
-        w.writeInt(intent.srcHlc().nodeId());
+        writeHlc(w, intent.srcHlc());
         w.writeString(intent.dstKey());
         w.writeVarInt(intent.dstPartition());
         w.writeVarLong(Math.max(0, intent.createdAtMillis()));
@@ -164,7 +183,7 @@ public final class ManifestSerializer {
     private static RenameIntent readRenameIntent(BinaryReader r) {
         String token = r.readString();
         String srcKey = r.readString();
-        Hlc srcHlc = new Hlc(r.readVarLong(), r.readVarInt(), r.readInt());
+        Hlc srcHlc = readHlc(r);
         String dstKey = r.readString();
         int dstPartition = r.readVarInt();
         long createdAtMillis = r.readVarLong();

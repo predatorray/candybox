@@ -22,14 +22,16 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import me.predatorray.candybox.common.Hlc;
 import me.predatorray.candybox.common.Part;
 import me.predatorray.candybox.common.SegmentRef;
 import me.predatorray.candybox.lsm.sstable.SSTableMeta;
 
 /**
  * An immutable snapshot of a Box's LSM state: the SSTables that exist (with their levels and key
- * ranges), the set of live Syrups, the id of the current WAL ledger, and the in-flight multipart
- * uploads. Produced by replaying the manifest log and advanced by {@link #apply(ManifestEdit)}.
+ * ranges), the set of live Syrups, the id of the current WAL ledger, the in-flight multipart
+ * uploads, and the high-water HLC of everything committed outside the current WAL. Produced by
+ * replaying the manifest log and advanced by {@link #apply(ManifestEdit)}.
  *
  * <p>One {@code ManifestState} corresponds to one Box's single partition (v1); the structure is kept
  * partition-shaped so key-range sharding can be added later without reworking it.
@@ -37,22 +39,24 @@ import me.predatorray.candybox.lsm.sstable.SSTableMeta;
 public final class ManifestState {
 
     private static final ManifestState EMPTY =
-            new ManifestState(List.of(), Set.of(), -1L, Map.of(), Map.of());
+            new ManifestState(List.of(), Set.of(), -1L, Map.of(), Map.of(), Hlc.MIN);
 
     private final List<SSTableMeta> tables;
     private final Set<Long> liveSyrups;
     private final long walLedgerId;
     private final Map<String, MultipartUploadState> multipartUploads;
     private final Map<String, RenameIntent> renameIntents;
+    private final Hlc maxHlc;
 
     private ManifestState(List<SSTableMeta> tables, Set<Long> liveSyrups, long walLedgerId,
                           Map<String, MultipartUploadState> multipartUploads,
-                          Map<String, RenameIntent> renameIntents) {
+                          Map<String, RenameIntent> renameIntents, Hlc maxHlc) {
         this.tables = List.copyOf(tables);
         this.liveSyrups = Set.copyOf(liveSyrups);
         this.walLedgerId = walLedgerId;
         this.multipartUploads = Collections.unmodifiableMap(new LinkedHashMap<>(multipartUploads));
         this.renameIntents = Collections.unmodifiableMap(new LinkedHashMap<>(renameIntents));
+        this.maxHlc = maxHlc;
     }
 
     public static ManifestState empty() {
@@ -115,6 +119,11 @@ public final class ManifestState {
         return renameIntents;
     }
 
+    /** Highest HLC committed via manifest edits ({@link Hlc#MIN} if none); never regresses. */
+    public Hlc maxHlc() {
+        return maxHlc;
+    }
+
     /**
      * Syrups referenced by parts of in-flight multipart uploads. These must not be GC'd while the
      * upload is pending — even though no SSTable points at them yet.
@@ -169,6 +178,7 @@ public final class ManifestState {
         for (String token : edit.removedRenameIntents()) {
             newIntents.remove(token);
         }
-        return new ManifestState(newTables, newSyrups, newWal, newUploads, newIntents);
+        Hlc newMaxHlc = edit.maxHlc().isAfter(maxHlc) ? edit.maxHlc() : maxHlc;
+        return new ManifestState(newTables, newSyrups, newWal, newUploads, newIntents, newMaxHlc);
     }
 }

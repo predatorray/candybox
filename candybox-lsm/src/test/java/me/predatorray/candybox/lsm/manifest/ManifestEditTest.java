@@ -21,6 +21,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import me.predatorray.candybox.common.Hlc;
 import me.predatorray.candybox.common.Part;
 import me.predatorray.candybox.common.SegmentRef;
 import org.junit.jupiter.api.Test;
@@ -39,7 +40,8 @@ class ManifestEditTest {
     @Test
     void constructorNormalizesNullCollectionsToEmpty() {
         ManifestEdit edit = new ManifestEdit(List.of(), Set.of(), Set.of(), Set.of(), null,
-                null, null, null, null, null, 0L);
+                null, null, null, null, null, null, 0L);
+        assertThat(edit.maxHlc()).isEqualTo(Hlc.MIN);
         assertThat(edit.addedUploads()).isEmpty();
         assertThat(edit.upsertParts()).isEmpty();
         assertThat(edit.removedUploads()).isEmpty();
@@ -50,7 +52,7 @@ class ManifestEditTest {
     @Test
     void constructorRejectsNegativeFencingToken() {
         assertThatThrownBy(() -> new ManifestEdit(List.of(), Set.of(), Set.of(), Set.of(), null,
-                List.of(), List.of(), Set.of(), List.of(), Set.of(), -1L))
+                List.of(), List.of(), Set.of(), List.of(), Set.of(), null, -1L))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("ownerFencingToken");
     }
