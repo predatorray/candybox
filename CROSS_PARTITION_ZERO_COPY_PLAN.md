@@ -84,12 +84,13 @@ Changes:
   cross-partition reference is visible before the rename's source delete can run).
 - **Gate deletion globally:** `GarbageCollector` deletes an orphan Syrup `S` of partition `(box,p)`
   only if `S` is in **no** sibling partition's published refs. The local manifest live-set drop
-  (`dropSyrups`) still happens per partition; only the physical `deleteLedger` is gated by the
-  Box-global union.
+  (`claimReclaimableSyrups`) still happens per partition and re-checks the partition's own current
+  references under the write lock; only the physical `deleteLedger` is gated by the Box-global union.
 
 Safety: a Syrup referenced cross-partition was referenced by the destination (and published) before
-the rename's source delete committed; the grace period plus "delete only if globally unreferenced"
-means a partial/crashed rename can only *retain* a Syrup (a leak), never delete a referenced one.
+the rename's source delete committed. A zero-copy put can also point a partition back at a Syrup it
+already marked as a pending orphan (rename `a`→`b`→`a`), so a re-referenced Syrup leaves the pending
+set and the claim re-validates local references; otherwise the stale entry would delete a live Syrup.
 Leaks are already the accepted v1 failure mode (DESIGN §9d). A partition with no live owner keeps
 its last-published refs in ZK (conservative), and a new owner republishes on takeover.
 

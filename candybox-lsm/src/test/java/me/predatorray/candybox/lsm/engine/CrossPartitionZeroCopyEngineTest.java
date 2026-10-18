@@ -21,16 +21,24 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import me.predatorray.candybox.bookkeeper.LedgerConfig;
 import me.predatorray.candybox.bookkeeper.fake.InMemoryLedgerStore;
 import me.predatorray.candybox.common.BoxName;
 import me.predatorray.candybox.common.CandyKey;
 import me.predatorray.candybox.common.CandyLocator;
 import me.predatorray.candybox.common.Hlc;
 import me.predatorray.candybox.common.ManualClock;
+import me.predatorray.candybox.common.Part;
 import me.predatorray.candybox.common.auth.ObjectAcl;
 import me.predatorray.candybox.common.config.CandyboxConfig;
+import me.predatorray.candybox.common.config.LedgerRole;
 import me.predatorray.candybox.common.exception.CandyNotFoundException;
+import me.predatorray.candybox.lsm.compaction.CompactionTask;
+import me.predatorray.candybox.lsm.compaction.Compactor;
+import me.predatorray.candybox.lsm.compaction.LeveledCompactionStrategy;
 import me.predatorray.candybox.lsm.manifest.RenameIntent;
+import me.predatorray.candybox.lsm.sstable.SSTableWriter;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -142,12 +150,53 @@ class CrossPartitionZeroCopyEngineTest {
         src = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1, new ManualClock(1000), 1L);
         dst = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 2, new ManualClock(1000), 1L);
         src.putCandy(CandyKey.of("src"), bytes("payload"), null, Map.of(), null);
-        List<me.predatorray.candybox.common.Part> parts = src.resolveLocator(CandyKey.of("src")).parts();
+        List<Part> parts = src.resolveLocator(CandyKey.of("src")).parts();
 
         CandyMetadata first = dst.zeroCopyPut(CandyKey.of("dst"), parts, null, Map.of(), 0L,
                 ObjectAcl.NONE, "tok");
         CandyMetadata retry = dst.zeroCopyPut(CandyKey.of("dst"), parts, null, Map.of(), 0L,
                 ObjectAcl.NONE, "tok");
         assertThat(retry.hlc()).isEqualTo(first.hlc());
+    }
+
+    @Test
+    void claimReclaimableSyrupsSkipsSyrupsReferencedAgainOrByASibling() {
+        CandyboxConfig config = CandyboxConfig.builder().syrupRolloverBytes(1).build();
+        src = BoxEngine.createNew(box, config, store, 1, new ManualClock(1000), 1L);
+        dst = BoxEngine.createNew(box, config, store, 2, new ManualClock(1000), 1L);
+        src.putCandy(CandyKey.of("k"), bytes("payload"), null, Map.of(), null);
+        src.putCandy(CandyKey.of("other"), bytes("x"), null, Map.of(), null); // seals k's Syrup
+        List<Part> parts = src.resolveLocator(CandyKey.of("k")).parts();
+        long syrup = parts.get(0).segments().get(0).syrupId();
+        src.flush();
+        dst.zeroCopyPut(CandyKey.of("d"), parts, null, Map.of(), 0L, ObjectAcl.NONE, null);
+        orphan(src, CandyKey.of("k"));
+
+        // A sibling still references it.
+        assertThat(src.claimReclaimableSyrups(Long.MAX_VALUE, dst.referencedSyrups())).isEmpty();
+
+        // The pending orphan is referenced again in this partition.
+        src.zeroCopyPut(CandyKey.of("k2"), parts, null, Map.of(), 0L, ObjectAcl.NONE, null);
+        assertThat(src.claimReclaimableSyrups(Long.MAX_VALUE, Set.of())).isEmpty();
+        src.flush();
+        assertThat(src.claimReclaimableSyrups(Long.MAX_VALUE, Set.of())).isEmpty();
+
+        orphan(src, CandyKey.of("k2"));
+        assertThat(src.claimReclaimableSyrups(Long.MAX_VALUE, Set.of())).containsExactly(syrup);
+        assertThat(src.manifestState().liveSyrups()).doesNotContain(syrup);
+        assertThat(src.claimReclaimableSyrups(Long.MAX_VALUE, Set.of())).isEmpty();
+    }
+
+    /** Deletes {@code key} and compacts L0 so the Syrup it pointed at is no longer referenced. */
+    private void orphan(BoxEngine engine, CandyKey key) {
+        engine.deleteCandy(key);
+        engine.flush();
+        CandyboxConfig config = CandyboxConfig.defaults();
+        Compactor compactor = new Compactor(store, new SSTableWriter(store, config.bloomBitsPerKey()),
+                LedgerConfig.forRole(LedgerRole.SSTABLE), config.tombstoneGcGraceMillis(),
+                new ManualClock(1000));
+        CompactionTask task = new LeveledCompactionStrategy(2).pickCompaction(engine.manifestState())
+                .orElseThrow();
+        engine.applyCompaction(compactor.compact(task).edit());
     }
 }
