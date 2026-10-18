@@ -23,6 +23,7 @@ import java.util.Set;
 import me.predatorray.candybox.bookkeeper.LedgerConfig;
 import me.predatorray.candybox.bookkeeper.fake.InMemoryLedgerStore;
 import me.predatorray.candybox.common.CandyKey;
+import me.predatorray.candybox.common.Hlc;
 import me.predatorray.candybox.common.config.LedgerRole;
 import me.predatorray.candybox.common.exception.FencedException;
 import me.predatorray.candybox.lsm.sstable.SSTableMeta;
@@ -40,7 +41,7 @@ class ManifestTest {
     @Test
     void applyAdvancesInMemoryStateAndStampsOwnerToken() {
         Manifest m = Manifest.createNew(store, cfg, 1L);
-        m.apply(ManifestEdit.flush(table(100, 0), Set.of(7L, 8L), 42L));
+        m.apply(ManifestEdit.flush(table(100, 0), Set.of(7L, 8L), 42L, Hlc.MIN));
 
         assertThat(m.current().level0()).extracting(SSTableMeta::ledgerId).containsExactly(100L);
         assertThat(m.current().liveSyrups()).contains(7L, 8L);
@@ -123,7 +124,7 @@ class ManifestTest {
     @Test
     void recoverReplaysPriorManifestIntoFreshLedger() {
         Manifest a = Manifest.createNew(store, cfg, 1L);
-        a.apply(ManifestEdit.flush(table(100, 0), Set.of(7L), 9L));
+        a.apply(ManifestEdit.flush(table(100, 0), Set.of(7L), 9L, new Hlc(500, 3, 1)));
         a.apply(ManifestEdit.builder().addedTables(List.of(table(101, 0))).build());
         long priorLedger = a.ledgerId();
 
@@ -132,6 +133,7 @@ class ManifestTest {
                 .containsExactlyInAnyOrder(100L, 101L);
         assertThat(b.current().walLedgerId()).isEqualTo(9L);
         assertThat(b.current().liveSyrups()).contains(7L);
+        assertThat(b.current().maxHlc()).isEqualTo(new Hlc(500, 3, 1));
         // Fresh ledger is distinct from the (now fenced) prior one.
         assertThat(b.ledgerId()).isNotEqualTo(priorLedger);
     }
@@ -139,7 +141,7 @@ class ManifestTest {
     @Test
     void fencedOwnerCannotCommitFurtherEdits() {
         Manifest owner = Manifest.createNew(store, cfg, 1L);
-        owner.apply(ManifestEdit.flush(table(100, 0), Set.of(), 9L));
+        owner.apply(ManifestEdit.flush(table(100, 0), Set.of(), 9L, Hlc.MIN));
 
         // A new owner recover-opens (fences) the manifest ledger.
         store.recoverOpen(owner.ledgerId());
@@ -152,7 +154,7 @@ class ManifestTest {
     @Test
     void recoverRejectsAStaleOwnerToken() {
         Manifest a = Manifest.createNew(store, cfg, 5L);
-        a.apply(ManifestEdit.flush(table(100, 0), Set.of(), 9L));
+        a.apply(ManifestEdit.flush(table(100, 0), Set.of(), 9L, Hlc.MIN));
         long priorLedger = a.ledgerId();
 
         // A node whose lease token (3) is below the committed max (5) must not take over.
@@ -167,5 +169,29 @@ class ManifestTest {
         assertThatThrownBy(() -> owner.apply(ManifestEdit.builder()
                 .addedTables(List.of(table(100, 0))).ownerFencingToken(4L).build()))
                 .isInstanceOf(FencedException.class);
+    }
+
+    @Test
+    void maxHlcRoundTripsAndOlderVersionsReadBackAsMin() {
+        ManifestEdit withHlc = ManifestEdit.builder().maxHlc(new Hlc(1234, 5, 2)).build();
+        assertThat(ManifestSerializer.deserialize(ManifestSerializer.serialize(withHlc)))
+                .isEqualTo(withHlc);
+
+        // A v3 record is a v4 record without the trailing maxHlc presence flag.
+        byte[] v4 = ManifestSerializer.serialize(ManifestEdit.builder().newWalLedgerId(5L).build());
+        byte[] v3 = java.util.Arrays.copyOf(v4, v4.length - 1);
+        v3[0] = 3;
+        ManifestEdit legacy = ManifestSerializer.deserialize(v3);
+        assertThat(legacy.maxHlc()).isEqualTo(Hlc.MIN);
+        assertThat(legacy.newWalLedgerId()).isEqualTo(5L);
+    }
+
+    @Test
+    void maxHlcNeverRegressesAcrossEdits() {
+        Manifest m = Manifest.createNew(store, cfg, 1L);
+        m.apply(ManifestEdit.builder().maxHlc(new Hlc(900, 0, 1)).build());
+        m.apply(ManifestEdit.builder().maxHlc(new Hlc(100, 0, 2)).build());
+        m.apply(ManifestEdit.builder().removedTableLedgerIds(Set.of(1L)).build());
+        assertThat(m.current().maxHlc()).isEqualTo(new Hlc(900, 0, 1));
     }
 }

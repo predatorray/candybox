@@ -17,6 +17,7 @@ package me.predatorray.candybox.lsm.manifest;
 
 import java.util.List;
 import java.util.Set;
+import me.predatorray.candybox.common.Hlc;
 import me.predatorray.candybox.common.Part;
 import me.predatorray.candybox.lsm.sstable.SSTableMeta;
 
@@ -44,6 +45,9 @@ import me.predatorray.candybox.lsm.sstable.SSTableMeta;
  * @param removedUploads        upload ids dropped by this edit (CompleteMultipartUpload / Abort)
  * @param addedRenameIntents    in-flight cross-partition rename intents recorded by this edit (v3)
  * @param removedRenameIntents  rename intent tokens finalized/abandoned by this edit (v3)
+ * @param maxHlc                highest HLC durably covered by this edit, folded monotonically into the
+ *                              state so a recovering owner never stamps below committed data (v4);
+ *                              {@link Hlc#MIN} if none
  * @param ownerFencingToken     fencing token of the authoring owner ({@code 0} = "stamp at apply time")
  */
 public record ManifestEdit(
@@ -57,6 +61,7 @@ public record ManifestEdit(
         Set<String> removedUploads,
         List<RenameIntent> addedRenameIntents,
         Set<String> removedRenameIntents,
+        Hlc maxHlc,
         long ownerFencingToken) {
 
     public ManifestEdit {
@@ -69,6 +74,7 @@ public record ManifestEdit(
         removedUploads = removedUploads == null ? Set.of() : Set.copyOf(removedUploads);
         addedRenameIntents = addedRenameIntents == null ? List.of() : List.copyOf(addedRenameIntents);
         removedRenameIntents = removedRenameIntents == null ? Set.of() : Set.copyOf(removedRenameIntents);
+        maxHlc = maxHlc == null ? Hlc.MIN : maxHlc;
         if (ownerFencingToken < 0) {
             throw new IllegalArgumentException("ownerFencingToken must be non-negative");
         }
@@ -79,16 +85,17 @@ public record ManifestEdit(
     }
 
     /** Convenience: a flush edit adding one table plus its syrups, optionally rotating the WAL. */
-    public static ManifestEdit flush(SSTableMeta table, Set<Long> syrups, Long newWalLedgerId) {
+    public static ManifestEdit flush(SSTableMeta table, Set<Long> syrups, Long newWalLedgerId,
+                                     Hlc maxHlc) {
         return new ManifestEdit(List.of(table), Set.of(), syrups, Set.of(), newWalLedgerId,
-                List.of(), List.of(), Set.of(), List.of(), Set.of(), 0L);
+                List.of(), List.of(), Set.of(), List.of(), Set.of(), maxHlc, 0L);
     }
 
     /** Returns a copy with the given owner fencing token (used by {@link Manifest#apply}). */
     public ManifestEdit withOwnerFencingToken(long token) {
         return new ManifestEdit(addedTables, removedTableLedgerIds, addedSyrups, removedSyrups,
                 newWalLedgerId, addedUploads, upsertParts, removedUploads, addedRenameIntents,
-                removedRenameIntents, token);
+                removedRenameIntents, maxHlc, token);
     }
 
     /**
@@ -121,6 +128,7 @@ public record ManifestEdit(
         private Set<String> removedUploads = Set.of();
         private List<RenameIntent> addedRenameIntents = List.of();
         private Set<String> removedRenameIntents = Set.of();
+        private Hlc maxHlc = Hlc.MIN;
         private long ownerFencingToken = 0L;
 
         public Builder addedTables(List<SSTableMeta> v) {
@@ -181,6 +189,11 @@ public record ManifestEdit(
             return this;
         }
 
+        public Builder maxHlc(Hlc v) {
+            this.maxHlc = v;
+            return this;
+        }
+
         public Builder ownerFencingToken(long v) {
             this.ownerFencingToken = v;
             return this;
@@ -205,7 +218,7 @@ public record ManifestEdit(
         public ManifestEdit build() {
             return new ManifestEdit(addedTables, removedTableLedgerIds, addedSyrups, removedSyrups,
                     newWalLedgerId, addedUploads, upsertParts, removedUploads, addedRenameIntents,
-                    removedRenameIntents, ownerFencingToken);
+                    removedRenameIntents, maxHlc, ownerFencingToken);
         }
     }
 

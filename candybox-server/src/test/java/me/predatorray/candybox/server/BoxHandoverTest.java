@@ -110,6 +110,32 @@ class BoxHandoverTest {
     }
 
     @Test
+    void overwriteAfterGracefulHandoverToABehindClockIsReadable() {
+        ManualClock clockA = new ManualClock(10_000);
+        ManualClock clockB = new ManualClock(8_000);
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clockA);
+        CandyboxConfig config = CandyboxConfig.builder().leaseRenewIntervalMillis(0).build();
+        BoxName box = BoxName.of("skewed-box");
+
+        CandyboxNode nodeA = new CandyboxNode(1, config, store, coordination, clockA);
+        CandyboxNode nodeB = new CandyboxNode(2, config, store, coordination, clockB);
+        try {
+            nodeA.createBox(box, 1);
+            nodeA.enginePartition(box, 0).putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
+            nodeA.releasePartitionForHandover(box, 0); // flushes, so B inherits an empty WAL
+            nodeB.openPartition(box, 0);
+
+            nodeB.enginePartition(box, 0).putCandy(CandyKey.of("k"), bytes("v2"), null, Map.of(), null);
+            assertThat(nodeB.enginePartition(box, 0).getCandy(CandyKey.of("k"))).isEqualTo(bytes("v2"));
+        } finally {
+            nodeA.close();
+            nodeB.close();
+            store.close();
+        }
+    }
+
+    @Test
     void nonOwnerHandlerReturnsMovedToTheOwner() {
         ManualClock clock = new ManualClock(1_000);
         InMemoryLedgerStore store = new InMemoryLedgerStore();

@@ -441,4 +441,59 @@ class BoxEngineTest {
         assertThatThrownBy(() -> ownerA.putCandy(CandyKey.of("k2"), bytes("zombie"), null, Map.of(), null))
                 .isInstanceOf(FencedException.class);
     }
+
+    @Test
+    void handoverAfterFlushWithRegressedClockDoesNotLoseLatestWrite() {
+        BoxEngine ownerA = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1,
+                new ManualClock(10_000), 1L);
+        CandyMetadata v1 = ownerA.putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
+        ownerA.flush(); // the next owner sees an empty WAL
+        long manifestLedgerId = ownerA.manifestLedgerId();
+
+        engine = BoxEngine.recover(box, CandyboxConfig.defaults(), store, 2, new ManualClock(8_000),
+                manifestLedgerId, 2L);
+        CandyMetadata v2 = engine.putCandy(CandyKey.of("k"), bytes("v2"), null, Map.of(), null);
+
+        assertThat(v2.hlc().isAfter(v1.hlc())).isTrue();
+        assertThat(engine.getCandy(CandyKey.of("k"))).isEqualTo(bytes("v2"));
+    }
+
+    @Test
+    void handoverAfterFlushedRangeDeleteWithRegressedClockDoesNotHideNewWrite() {
+        ManualClock clockA = new ManualClock(5_000);
+        BoxEngine ownerA = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1, clockA, 1L);
+        ownerA.putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
+        ownerA.flush();
+        clockA.setTime(10_000);
+        ownerA.deleteRange(CandyKey.of("a"), CandyKey.of("z"));
+        ownerA.flush(); // this table holds only the range tombstone
+        long manifestLedgerId = ownerA.manifestLedgerId();
+
+        engine = BoxEngine.recover(box, CandyboxConfig.defaults(), store, 2, new ManualClock(8_000),
+                manifestLedgerId, 2L);
+        engine.putCandy(CandyKey.of("k"), bytes("v2"), null, Map.of(), null);
+
+        assertThat(engine.getCandy(CandyKey.of("k"))).isEqualTo(bytes("v2"));
+    }
+
+    @Test
+    void highWaterHlcSurvivesRepeatedHandoversWithoutWrites() {
+        BoxEngine ownerA = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1,
+                new ManualClock(10_000), 1L);
+        ownerA.putCandy(CandyKey.of("flushed"), bytes("v1"), null, Map.of(), null);
+        ownerA.flush();
+        ownerA.putCandy(CandyKey.of("unflushed"), bytes("v1"), null, Map.of(), null);
+
+        // B takes over (replaying A's non-empty WAL), then crashes without writing anything.
+        BoxEngine ownerB = BoxEngine.recover(box, CandyboxConfig.defaults(), store, 2,
+                new ManualClock(9_000), ownerA.manifestLedgerId(), 2L);
+
+        engine = BoxEngine.recover(box, CandyboxConfig.defaults(), store, 3, new ManualClock(8_000),
+                ownerB.manifestLedgerId(), 3L);
+        engine.putCandy(CandyKey.of("flushed"), bytes("v2"), null, Map.of(), null);
+        engine.putCandy(CandyKey.of("unflushed"), bytes("v2"), null, Map.of(), null);
+
+        assertThat(engine.getCandy(CandyKey.of("flushed"))).isEqualTo(bytes("v2"));
+        assertThat(engine.getCandy(CandyKey.of("unflushed"))).isEqualTo(bytes("v2"));
+    }
 }

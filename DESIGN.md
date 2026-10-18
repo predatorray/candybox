@@ -80,9 +80,13 @@ counter at the frozen physical time). On handover the new owner **replays the pr
 observes the maximum durable HLC, and advances its clock past it (`observe`) before stamping anything.**
 Skipping this would let a newer write get a *lower* HLC and be silently dropped by the read path.
 Covered by `BoxEngineTest.handoverWithRegressedClockDoesNotLoseLatestWrite` (fake) and
-`Phase1EngineIT.unflushedWritesAreRecoveredFromTheWal` (real BookKeeper). Because the WAL is rotated
-on every flush, the current WAL always holds the most-recent mutations, so its max HLC dominates the
-flushed SSTables — observing the WAL max suffices.
+`Phase1EngineIT.unflushedWritesAreRecoveredFromTheWal` (real BookKeeper). The WAL max alone is **not**
+enough: right after a flush (which every graceful handover does) the WAL is empty and the newest HLCs
+live only in SSTables. So each flush records the max HLC of the flushed memtable (point mutations and
+range tombstones) as a monotonic high-water `maxHlc` in the manifest, the recovering owner observes
+`max(manifest maxHlc, WAL max)` even when the WAL is empty, and records that max in its own rotation
+edit. Like the WAL path, `observe` fails recovery loudly if the recorded HLC leads the local clock by
+more than `maxClockSkewMillis`.
 
 ## 4. Ledger roles & lifecycle
 
@@ -147,17 +151,18 @@ RangeTombstone payload>`. Replay reports the max HLC across **both** kinds, so h
 
 **Syrup chunk entry**: `int crc32c | payload[<= chunkSize]`. The crc covers the payload only.
 
-**ManifestEdit** (`ManifestSerializer`, **version 3**): `version | addedTables[]
+**ManifestEdit** (`ManifestSerializer`, **version 4**): `version | addedTables[]
 | removedTableLedgerIds[] | addedSyrups[] | removedSyrups[] | (bool, varlong) newWalLedgerId
 | ownerFencingToken | addedUploads[] | upsertParts[] | removedUploads[] | addedRenameIntents[]
-| removedRenameIntents[]`, where each `SSTableMeta`
+| removedRenameIntents[] | (bool, hlc) maxHlc`, where each `SSTableMeta`
 is `varlong ledgerId | varint level | bytes minKey | bytes maxKey | varlong entryCount`. The
 multipart-tracking trailing fields (Phase 5) carry in-flight upload state: a `MultipartUploadState`
 record per `addedUpload`, a `(uploadId, partNumber, Part)` triple per `upsertParts`, and a string
 per `removedUpload`. The v3 trailing fields carry in-flight **rename intents** (one per cross-partition
 `rename` the partition owns the source of, each pinning the source key and its HLC); like upload
 state they are replayed on handover, so a takeover finalizes (or abandons) a rename exactly where
-the prior owner left it.
+the prior owner left it. The v4 trailing `maxHlc` is the HLC high-water mark (see §3); v2/v3 records
+read back without one.
 
 **Protocol frame** (`FrameCodec`): `magic(2)=0xCB0F | version(1)=1 | opcode(1) | length(4) | payload`.
 **Message body** (`MessageCodec`): `bodyVersion(1) | <per-opcode fields>`.

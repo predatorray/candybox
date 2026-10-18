@@ -175,6 +175,7 @@ public final class BoxEngine implements AutoCloseable {
         ManifestState state = manifest.current();
 
         Memtable memtable = new Memtable();
+        Hlc highWater = state.maxHlc();
         long priorWalId = state.walLedgerId();
         if (priorWalId >= 0) {
             // recover-open fences the prior WAL so a resurrected old owner cannot keep appending.
@@ -192,18 +193,21 @@ public final class BoxEngine implements AutoCloseable {
                     memtable.delete(rd.tombstone());
                 }
             }
-            // The current WAL always holds the most recent mutations (it is rotated on flush), so its
-            // max HLC dominates the flushed SSTables — observing it suffices for LWW correctness. An
-            // empty WAL (prior owner flushed before handing over) reports Hlc.MIN: nothing to observe,
-            // and the SSTables' HLCs are in the past relative to any clock the prior owner stamped by.
-            if (!replay.entries().isEmpty()) {
-                hlc.observe(replay.maxHlc());
+            if (replay.maxHlc().isAfter(highWater)) {
+                highWater = replay.maxHlc();
             }
+        }
+        // The WAL alone is not enough: right after a flush it is empty and the newest HLCs live only
+        // in SSTables, which the manifest's high-water mark covers.
+        if (highWater.isAfter(Hlc.MIN)) {
+            hlc.observe(highWater);
         }
 
         WriteAheadLog newWal = WriteAheadLog.create(ledgerStore,
                 roleConfig(config, ledgerStore, box, LedgerRole.WAL));
-        manifest.apply(ManifestEdit.builder().newWalLedgerId(newWal.ledgerId()).build());
+        // Persist the replayed WAL's max too: its entries now live only in this owner's memtable.
+        manifest.apply(ManifestEdit.builder().newWalLedgerId(newWal.ledgerId()).maxHlc(highWater)
+                .build());
 
         BoxEngine engine = new BoxEngine(box, config, ledgerStore, hlc, clock, manifest, newWal);
         engine.active = memtable;
@@ -1441,12 +1445,22 @@ public final class BoxEngine implements AutoCloseable {
         if (flushing.isEmpty()) {
             return;
         }
-        // Collect the Syrups referenced by this memtable (for live-Syrup tracking / GC).
+        // Collect the Syrups referenced by this memtable (for live-Syrup tracking / GC) and its max HLC.
         Set<Long> syrups = new LinkedHashSet<>();
+        Hlc maxHlc = Hlc.MIN;
         Iterator<Mutation> scan = flushing.iterator();
         while (scan.hasNext()) {
-            for (SegmentRef seg : scan.next().locator().segments()) {
+            Mutation m = scan.next();
+            for (SegmentRef seg : m.locator().segments()) {
                 syrups.add(seg.syrupId());
+            }
+            if (m.hlc().isAfter(maxHlc)) {
+                maxHlc = m.hlc();
+            }
+        }
+        for (RangeTombstone rt : flushing.rangeTombstones()) {
+            if (rt.hlc().isAfter(maxHlc)) {
+                maxHlc = rt.hlc();
             }
         }
 
@@ -1455,7 +1469,7 @@ public final class BoxEngine implements AutoCloseable {
 
         WriteAheadLog newWal = WriteAheadLog.create(ledgerStore, ledgerConfig(LedgerRole.WAL));
         long obsoleteWalId = wal.ledgerId();
-        manifest.apply(ManifestEdit.flush(table, syrups, newWal.ledgerId()));
+        manifest.apply(ManifestEdit.flush(table, syrups, newWal.ledgerId(), maxHlc));
         wal.close();
         wal = newWal;
         active = new Memtable();
