@@ -1220,6 +1220,16 @@ public final class BoxEngine implements AutoCloseable {
         }
     }
 
+    /** Test hook: records {@code syrupId} as a pending orphan since {@code sinceMillis}. */
+    void trackPendingOrphan(long syrupId, long sinceMillis) {
+        lock.writeLock().lock();
+        try {
+            pendingOrphanSyrups.put(syrupId, sinceMillis);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
     /**
      * SSTable ledger ids dropped by a committed compaction at or before {@code asOfMillis} and not yet
      * physically deleted — the GC reclaim set for this Box.

@@ -175,7 +175,7 @@ class CrossPartitionZeroCopyEngineTest {
         // A sibling still references it.
         assertThat(src.claimReclaimableSyrups(Long.MAX_VALUE, dst.referencedSyrups())).isEmpty();
 
-        // The pending orphan is referenced again in this partition.
+        // The pending orphan is referenced again in this partition (zeroCopyPut clears it eagerly).
         src.zeroCopyPut(CandyKey.of("k2"), parts, null, Map.of(), 0L, ObjectAcl.NONE, null);
         assertThat(src.claimReclaimableSyrups(Long.MAX_VALUE, Set.of())).isEmpty();
         src.flush();
@@ -185,6 +185,39 @@ class CrossPartitionZeroCopyEngineTest {
         assertThat(src.claimReclaimableSyrups(Long.MAX_VALUE, Set.of())).containsExactly(syrup);
         assertThat(src.manifestState().liveSyrups()).doesNotContain(syrup);
         assertThat(src.claimReclaimableSyrups(Long.MAX_VALUE, Set.of())).isEmpty();
+    }
+
+    @Test
+    void claimDropsAStalePendingEntryForAStillReferencedSyrup() {
+        long syrup = sealedSyrupWithStalePendingEntry();
+        assertThat(src.claimReclaimableSyrups(Long.MAX_VALUE, Set.of())).isEmpty();
+        assertGracePeriodRestartsWhenOrphaned(syrup);
+    }
+
+    @Test
+    void recomputeDropsAStalePendingEntryForAStillReferencedSyrup() {
+        long syrup = sealedSyrupWithStalePendingEntry();
+        String uploadId = src.createMultipartUpload(CandyKey.of("mp"), null, Map.of());
+        src.abortMultipartUpload(uploadId); // recomputes orphans while the Syrup is still referenced
+        assertGracePeriodRestartsWhenOrphaned(syrup);
+    }
+
+    /** {@code k}'s sealed Syrup, still referenced, but with a stale pending-orphan entry at time 0. */
+    private long sealedSyrupWithStalePendingEntry() {
+        src = BoxEngine.createNew(box, CandyboxConfig.builder().syrupRolloverBytes(1).build(), store, 1,
+                new ManualClock(1000), 1L);
+        src.putCandy(CandyKey.of("k"), bytes("payload"), null, Map.of(), null);
+        src.putCandy(CandyKey.of("other"), bytes("x"), null, Map.of(), null);
+        long syrup = src.resolveLocator(CandyKey.of("k")).parts().get(0).segments().get(0).syrupId();
+        src.flush();
+        src.trackPendingOrphan(syrup, 0L);
+        return syrup;
+    }
+
+    private void assertGracePeriodRestartsWhenOrphaned(long syrup) {
+        orphan(src, CandyKey.of("k")); // orphaned at the engine clock's 1000
+        assertThat(src.claimReclaimableSyrups(999, Set.of())).isEmpty();
+        assertThat(src.claimReclaimableSyrups(1000, Set.of())).containsExactly(syrup);
     }
 
     /** Deletes {@code key} and compacts L0 so the Syrup it pointed at is no longer referenced. */
