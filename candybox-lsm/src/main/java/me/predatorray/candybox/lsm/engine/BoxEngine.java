@@ -200,7 +200,14 @@ public final class BoxEngine implements AutoCloseable {
         // The WAL alone is not enough: right after a flush it is empty and the newest HLCs live only
         // in SSTables, which the manifest's high-water mark covers.
         if (highWater.isAfter(Hlc.MIN)) {
-            hlc.observe(highWater);
+            try {
+                hlc.observe(highWater);
+            } catch (IllegalStateException e) {
+                throw new IllegalStateException("Cannot recover box " + box + ": recorded HLC "
+                        + highWater + " (manifest high-water " + state.maxHlc() + ") leads the local"
+                        + " clock by more than maxClockSkewMillis; fix the clock or raise the limit",
+                        e);
+            }
         }
 
         WriteAheadLog newWal = WriteAheadLog.create(ledgerStore,

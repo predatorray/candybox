@@ -24,6 +24,7 @@ import java.util.Random;
 import me.predatorray.candybox.bookkeeper.bk.BookKeeperLedgerStore;
 import me.predatorray.candybox.common.BoxName;
 import me.predatorray.candybox.common.CandyKey;
+import me.predatorray.candybox.common.ManualClock;
 import me.predatorray.candybox.common.SystemClock;
 import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.config.SizeLimits;
@@ -132,6 +133,23 @@ class Phase1EngineIT {
                 SystemClock.INSTANCE, manifestLedgerId, 2L)) {
             assertThat(ownerB.getCandy(CandyKey.of("k1"))).isEqualTo(bytes("v1"));
             assertThat(ownerB.getCandy(CandyKey.of("k2"))).isEqualTo(bytes("v2"));
+        }
+    }
+
+    @Test
+    void flushedWritesBoundTheHlcOfABehindRecoveringOwner() {
+        BoxName box = BoxName.of("flushed-hlc-box");
+        BoxEngine ownerA = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1,
+                SystemClock.INSTANCE, 1L);
+        ownerA.putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
+        ownerA.flush(); // leaves an empty WAL: only the manifest high-water mark bounds B's clock
+        long manifestLedgerId = ownerA.manifestLedgerId();
+
+        ManualClock behind = new ManualClock(SystemClock.INSTANCE.currentTimeMillis() - 2_000);
+        try (BoxEngine ownerB = BoxEngine.recover(box, CandyboxConfig.defaults(), store, 2, behind,
+                manifestLedgerId, 2L)) {
+            ownerB.putCandy(CandyKey.of("k"), bytes("v2"), null, Map.of(), null);
+            assertThat(ownerB.getCandy(CandyKey.of("k"))).isEqualTo(bytes("v2"));
         }
     }
 }

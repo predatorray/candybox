@@ -496,4 +496,19 @@ class BoxEngineTest {
         assertThat(engine.getCandy(CandyKey.of("flushed"))).isEqualTo(bytes("v2"));
         assertThat(engine.getCandy(CandyKey.of("unflushed"))).isEqualTo(bytes("v2"));
     }
+
+    @Test
+    void recoveryRejectsAFlushedHighWaterFarAheadOfTheLocalClock() {
+        BoxEngine ownerA = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1,
+                new ManualClock(10_000_000), 1L);
+        ownerA.putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
+        ownerA.flush();
+        long manifestLedgerId = ownerA.manifestLedgerId();
+
+        assertThatThrownBy(() -> BoxEngine.recover(box, CandyboxConfig.defaults(), store, 2,
+                new ManualClock(1_000), manifestLedgerId, 2L))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("my-box")
+                .hasMessageContaining("manifest high-water");
+    }
 }

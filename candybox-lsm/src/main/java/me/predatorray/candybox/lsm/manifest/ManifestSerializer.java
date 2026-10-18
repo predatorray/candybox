@@ -37,11 +37,10 @@ import me.predatorray.candybox.lsm.sstable.SSTableMeta;
  * <p><b>v2 layout</b> adds the multipart-upload tracking fields ({@code addedUploads},
  * {@code upsertParts}, {@code removedUploads}) at the end of the v1 record. <b>v3 layout</b> appends
  * the cross-partition rename-intent fields ({@code addedRenameIntents}, {@code removedRenameIntents}).
- * A v2 record (no rename-intent fields) still reads back as an edit with empty intent sets. <b>v4
- * layout</b> appends the optional high-water {@code maxHlc}; v2/v3 records read back with
- * {@link Hlc#MIN}. Older v1
- * records cannot be read back; this is acceptable because the project has no production data to
- * migrate.
+ * A v2 record (no rename-intent fields) still reads back as an edit with empty intent sets.
+ * <b>v4 layout</b> appends the optional high-water {@code maxHlc}; v2/v3 records read back with
+ * {@link Hlc#MIN}. Older v1 records cannot be read back; this is acceptable because the project has
+ * no production data to migrate.
  */
 public final class ManifestSerializer {
 

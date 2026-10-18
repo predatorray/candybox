@@ -30,7 +30,8 @@ import me.predatorray.candybox.lsm.sstable.SSTableMeta;
 /**
  * An immutable snapshot of a Box's LSM state: the SSTables that exist (with their levels and key
  * ranges), the set of live Syrups, the id of the current WAL ledger, the in-flight multipart
- * uploads, and the high-water HLC of everything committed outside the current WAL. Produced by replaying the manifest log and advanced by {@link #apply(ManifestEdit)}.
+ * uploads, and the high-water HLC of everything committed outside the current WAL. Produced by
+ * replaying the manifest log and advanced by {@link #apply(ManifestEdit)}.
  *
  * <p>One {@code ManifestState} corresponds to one Box's single partition (v1); the structure is kept
  * partition-shaped so key-range sharding can be added later without reworking it.
