@@ -32,8 +32,8 @@ The intended download, once releases are published, will look like:
 
 ```bash
 # Placeholder — not yet published
-curl -LO https://github.com/predatorray/candybox/releases/download/v0.1.0/candybox-0.1.0-bin.tar.gz
-tar xzf candybox-0.1.0-bin.tar.gz
+curl -LO https://github.com/predatorray/candybox/releases/download/v0.1.0/candybox-0.1.0.tar.gz
+tar xzf candybox-0.1.0.tar.gz
 ```
 
 ### Build it from source

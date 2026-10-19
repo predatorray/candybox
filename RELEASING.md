@@ -2,7 +2,7 @@
 
 Candybox publishes its library artifacts to [Maven Central](https://central.sonatype.com) under the
 `me.predatorray.candybox` group, and attaches the `candybox-dist` archives to a GitHub Release. Both
-happen in the [`Release`](.github/workflows/release.yml) workflow when a `v*` tag is pushed.
+happen in the [`Release`](.github/workflows/release.yml) workflow, which you start by hand.
 
 What is published: `candybox-parent` (POM), `candybox-common`, `candybox-bookkeeper`,
 `candybox-coordination`, `candybox-lsm`, `candybox-protocol`, `candybox-server`, `candybox-client`,
@@ -45,23 +45,32 @@ Releases on Central are permanent. A version can never be changed or deleted, on
 
 ## Cutting a release
 
-The tag must match the version in the POMs, and the workflow refuses `-SNAPSHOT` versions.
+1. Make sure `main` is green and holds what you want to ship.
+2. Open *Actions* → *Release* → *Run workflow*, keep the branch on `main`, and fill in the inputs
+   or leave them empty:
+   - **version**: the release version. Empty means the current version without `-SNAPSHOT`
+     (`0.1.0-SNAPSHOT` → `0.1.0`).
+   - **next-version**: the version `main` moves to afterwards. Empty means the next patch
+     (`0.1.0` → `0.1.1-SNAPSHOT`).
+3. If the `maven-central` environment has a required reviewer, approve the run.
 
-```bash
-mvn -q versions:set -DnewVersion=0.1.0 -DgenerateBackupPoms=false -DprocessAllModules
-git commit -am "Release 0.1.0"
-git tag v0.1.0
-git push origin HEAD v0.1.0      # or open a PR with the commit and tag the merge commit
+The workflow then:
 
-mvn -q versions:set -DnewVersion=0.2.0-SNAPSHOT -DgenerateBackupPoms=false -DprocessAllModules
-git commit -am "Prepare 0.2.0-SNAPSHOT"
-git push origin HEAD
-```
+1. sets the release version in every POM, commits `Release X.Y.Z` and tags it `vX.Y.Z` (locally);
+2. runs the full build with unit and integration tests, builds the dashboard, signs everything,
+   uploads one bundle to the Portal and waits until Central reports it as published;
+3. pushes the tag and creates a GitHub Release with the `candybox-dist` archives;
+4. sets the next `-SNAPSHOT` version, commits `Prepare X.Y.(Z+1)-SNAPSHOT`, and pushes both commits
+   to `main`.
 
-The workflow runs the full test suite, builds the dashboard (`-Pfrontend`), signs everything,
-uploads one bundle to the Portal, and waits until Central reports it as published. The artifacts
-then reach <https://repo.maven.apache.org/maven2/me/predatorray/candybox/> within about 30 minutes;
-search indexes take a few hours longer.
+Nothing is pushed until step 2 succeeds, so a run that fails during the build or the upload leaves
+the repository untouched and can simply be started again. Once step 2 has passed, the version is on
+Central for good. If a later step fails, finish that step by hand rather than re-running the
+workflow, because a re-run fails on the existing tag.
+
+The artifacts reach <https://repo.maven.apache.org/maven2/me/predatorray/candybox/> within about 30
+minutes; search indexes take a few hours longer. Pushes made by the workflow do not trigger other
+workflows, so CI does not run on the two version commits.
 
 ## Releasing from a workstation
 
