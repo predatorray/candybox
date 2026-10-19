@@ -11,6 +11,7 @@
 <p align="center">
   <a href="https://predatorray.github.io/candybox/"><img alt="Documentation" src="https://img.shields.io/badge/docs-website-blue"></a>
   <a href="https://hub.docker.com/r/zetaplusae/candybox"><img alt="Docker Hub" src="https://img.shields.io/badge/dockerhub-available-2496ED?logo=docker&logoColor=white"></a>
+  <a href="https://github.com/predatorray/candybox/releases"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/predatorray/candybox"></a>
   <a href="https://github.com/predatorray/candybox/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/predatorray/candybox"></a>
   <br>
   <a href="https://github.com/predatorray/candybox/actions/workflows/ci.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/predatorray/candybox/ci.yml?branch=main"></a>
@@ -57,6 +58,20 @@ docker compose run --rm cli get photos hello.txt   # -> hello candybox
 ```
 
 Tear it down with `docker compose down` (add `-v` to also wipe the data volumes).
+
+### Download and Maven Central
+
+Release **0.1.0** is out. The distribution archive is attached to the
+[GitHub Release](https://github.com/predatorray/candybox/releases/tag/v0.1.0), and the Java client is on
+Maven Central:
+
+```xml
+<dependency>
+  <groupId>me.predatorray.candybox</groupId>
+  <artifactId>candybox-client</artifactId>
+  <version>0.1.0</version>
+</dependency>
+```
 
 ### Web dashboard
 
