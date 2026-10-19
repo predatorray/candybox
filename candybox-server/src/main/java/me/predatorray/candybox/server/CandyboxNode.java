@@ -21,6 +21,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executors;
@@ -151,6 +152,7 @@ public final class CandyboxNode implements AutoCloseable {
         collectGarbageOnce();
         sweepStaleMultipartUploadsOnce();
         finalizeRenameIntentsOnce();
+        sweepStaleLocatorRelaysOnce();
     }
 
     private static ScheduledExecutorService daemonScheduler(String name) {
@@ -590,6 +592,43 @@ public final class CandyboxNode implements AutoCloseable {
     }
 
     /**
+     * Deletes the locator relays of every owned partition that no destination consumed within
+     * {@code renameIntentAbandonMillis} (the client gave up between resolving the source and the
+     * zero-copy put). Exposed for manual/operational triggering and tests.
+     *
+     * @return the number of relays deleted
+     */
+    public int sweepStaleLocatorRelaysOnce() {
+        long cutoff = clock.currentTimeMillis() - config.renameIntentAbandonMillis();
+        int deleted = 0;
+        for (PartitionOwnership ownership : partitions.values()) {
+            if (!ownership.isOwner()) {
+                continue;
+            }
+            String box = ownership.box().value();
+            int partition = ownership.partition();
+            for (String token : coordination.children(
+                    CandyboxKeys.locatorRelaysPath(box, partition))) {
+                String key = CandyboxKeys.locatorRelayKey(box, partition, token);
+                try {
+                    Optional<VersionedValue> value = coordination.get(key);
+                    if (value.isPresent()
+                            && LocatorRelay.deserialize(value.get().value()).createdAtMillis() <= cutoff) {
+                        coordination.delete(key, value.get().version());
+                        deleted++;
+                    }
+                } catch (CasConflictException raced) {
+                    // Consumed or deleted concurrently.
+                } catch (RuntimeException e) {
+                    LOG.warn("Locator relay sweep error on node {} for {}: {}", nodeId, key,
+                            e.getMessage());
+                }
+            }
+        }
+        return deleted;
+    }
+
+    /**
      * Aborts in-flight multipart uploads whose {@code createdAtMillis + multipartUploadTtlMillis} is
      * already in the past. Reuses the engine's {@link me.predatorray.candybox.lsm.engine.BoxEngine
      * #abortMultipartUpload} (fencing-gated; orphaned Syrup segments enter the normal reclaim path).
@@ -687,6 +726,27 @@ public final class CandyboxNode implements AutoCloseable {
             coordination.create(key, w.toByteArray());
         } catch (CasConflictException alreadyThere) {
             // Idempotent: the marker is already present.
+        }
+    }
+
+    /** Stashes a source locator for a cross-partition zero-copy put and returns its relay token. */
+    String writeLocatorRelay(String box, int srcPartition, LocatorRelay relay) {
+        String token = UUID.randomUUID().toString();
+        coordination.create(CandyboxKeys.locatorRelayKey(box, srcPartition, token), relay.serialize());
+        return token;
+    }
+
+    Optional<LocatorRelay> readLocatorRelay(String box, int srcPartition, String token) {
+        return coordination.get(CandyboxKeys.locatorRelayKey(box, srcPartition, token))
+                .map(v -> LocatorRelay.deserialize(v.value()));
+    }
+
+    void deleteLocatorRelay(String box, int srcPartition, String token) {
+        try {
+            CoordinationCas.deleteIfPresent(coordination,
+                    CandyboxKeys.locatorRelayKey(box, srcPartition, token), 0);
+        } catch (CasConflictException raced) {
+            // Already deleted (consumed twice, or reaped).
         }
     }
 

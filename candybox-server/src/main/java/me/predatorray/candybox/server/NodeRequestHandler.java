@@ -19,6 +19,7 @@ import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.regex.Pattern;
 import me.predatorray.candybox.common.BoxName;
 import me.predatorray.candybox.common.CandyKey;
 import me.predatorray.candybox.common.auth.BoxAcl;
@@ -64,6 +65,10 @@ import org.slf4j.LoggerFactory;
 final class NodeRequestHandler implements RequestHandler {
 
     private static final Logger LOG = LoggerFactory.getLogger(NodeRequestHandler.class);
+
+    /** Relay tokens are server-minted UUIDs; anything else never names a relay key. */
+    private static final Pattern RELAY_TOKEN =
+            Pattern.compile("[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}");
 
     private final CandyboxNode node;
     private final MessageCodec codec = new MessageCodec();
@@ -413,7 +418,7 @@ final class NodeRequestHandler implements RequestHandler {
         } else if (message instanceof Message.GetCandyLocatorRequest m) {
             CandyLocator locator = node.engine(BoxName.of(m.box()), m.key())
                     .resolveLocator(CandyKey.of(m.key()));
-            return toCandyLocatorResponse(locator);
+            return relayLocator(m.box(), m.key(), principal, null, null, locator);
         } else if (message instanceof Message.PrepareRenameRequest m) {
             // The source partition's owner: resolve the locator (relayed to the destination) and
             // durably record the rename intent so the owed source delete survives a crash/handover.
@@ -421,25 +426,28 @@ final class NodeRequestHandler implements RequestHandler {
             CandyLocator locator = engine.resolveLocator(CandyKey.of(m.srcKey()));
             engine.recordRenameIntent(new RenameIntent(m.renameToken(), m.srcKey(), locator.hlc(),
                     m.dstKey(), m.dstPartition(), node.currentTimeMillis()));
-            return toCandyLocatorResponse(locator);
+            return relayLocator(m.box(), m.srcKey(), principal, m.renameToken(), m.dstKey(), locator);
         } else if (message instanceof Message.ZeroCopyPutRequest m) {
-            BoxEngine engine = node.engine(BoxName.of(m.box()), m.dstKey());
-            boolean isRename = m.renameToken() != null;
-            // A rename keeps the object's identity, so the source's owner/grants travel verbatim; a
+            BoxName box = BoxName.of(m.box());
+            BoxEngine engine = node.engine(box, m.dstKey());
+            // The parts and a rename's ACL come from the source owner's relay, never from the client.
+            LocatorRelay relay = consumableRelay(m, principal);
+            CandyLocator source = relay.locator();
+            // A rename keeps the object's identity, so the source's owner/grants travel with it; a
             // copy belongs to the requester (effectiveAcl applies the super-user owner rule).
-            ObjectAcl acl = isRename
-                    ? parseObjectAcl(m.owner(), m.grants())
+            ObjectAcl acl = relay.isRename()
+                    ? source.acl()
                     : effectiveAcl(principal, m.owner(), m.grants());
-            CandyMetadata meta = engine.zeroCopyPut(CandyKey.of(m.dstKey()), m.parts(),
-                    m.contentType(), m.userMetadata(), 0L, acl, m.idempotencyToken());
+            CandyMetadata meta = engine.zeroCopyPut(CandyKey.of(m.dstKey()), source.parts(),
+                    source.contentType(), source.userMetadata(), 0L, acl, m.idempotencyToken());
             // Publish this partition's refs before the source delete can run, so the Box-global GC
             // already sees the new cross-partition reference (no premature reclaim of the shared Syrup).
-            node.publishPartitionRefs(BoxName.of(m.box()),
-                    node.descriptor(BoxName.of(m.box())).partitionOf(m.dstKey()));
-            if (isRename) {
-                node.writeRenameMarker(m.box(), m.renameToken(), m.srcKey(), m.srcPartition(),
-                        m.srcHlc(), m.dstKey());
+            node.publishPartitionRefs(box, node.descriptor(box).partitionOf(m.dstKey()));
+            if (relay.isRename()) {
+                node.writeRenameMarker(m.box(), relay.renameToken(), relay.srcKey(),
+                        m.srcPartition(), source.hlc(), m.dstKey());
             }
+            node.deleteLocatorRelay(m.box(), m.srcPartition(), m.relayToken());
             return new Message.HeadCandyResponse(meta.contentLength(), meta.contentType(),
                     meta.userMetadata(), meta.crc32c(), meta.createdAtMillis());
         } else if (message instanceof Message.CompleteRenameRequest m) {
@@ -599,29 +607,37 @@ final class NodeRequestHandler implements RequestHandler {
         return node.enginePartition(BoxName.of(box), dstPartition);
     }
 
+    /** Stashes a resolved source locator in coordination and answers with its relay handle. */
+    private Message.CandyLocatorResponse relayLocator(String box, String srcKey, Principal principal,
+                                                      String renameToken, String dstKey,
+                                                      CandyLocator locator) {
+        int srcPartition = node.descriptor(BoxName.of(box)).partitionOf(srcKey);
+        String token = node.writeLocatorRelay(box, srcPartition, new LocatorRelay(
+                principal.toString(), srcKey, renameToken, dstKey, node.currentTimeMillis(), locator));
+        return new Message.CandyLocatorResponse(token, locator.hlc());
+    }
+
+    /**
+     * The relay a zero-copy put names, provided the same principal created it and, for a rename, it
+     * was prepared for this destination key. Anything else is indistinguishable from a missing relay.
+     */
+    private LocatorRelay consumableRelay(Message.ZeroCopyPutRequest m, Principal principal) {
+        Optional<LocatorRelay> relay = m.relayToken() != null
+                && RELAY_TOKEN.matcher(m.relayToken()).matches()
+                ? node.readLocatorRelay(m.box(), m.srcPartition(), m.relayToken())
+                : Optional.empty();
+        return relay
+                .filter(r -> r.requester().equals(principal.toString()))
+                .filter(r -> !r.isRename() || r.dstKey().equals(m.dstKey()))
+                .orElseThrow(() -> new ValidationException("Unknown or expired locator relay"));
+    }
+
     /**
      * The owner/grants a write stamps into the locator. The owner is the connection's principal
      * (null when anonymous); a request-supplied owner is honored only from super-principals — the
      * S3 gateway writing on behalf of its authenticated end user. Request grants (the S3 canned-ACL
      * path) are accepted from any writer.
      */
-    private static Message.CandyLocatorResponse toCandyLocatorResponse(CandyLocator locator) {
-        return new Message.CandyLocatorResponse(locator.parts(), locator.contentType(),
-                locator.userMetadata(), locator.hlc(), locator.createdAtMillis(),
-                locator.acl().owner(), locator.acl().grants().stream().map(Grant::toText).toList());
-    }
-
-    /** Parses an object ACL from its wire text form verbatim (rename preserves the source's ACL). */
-    private static ObjectAcl parseObjectAcl(String owner, List<String> grantTexts) {
-        try {
-            List<Grant> grants = grantTexts == null ? List.of()
-                    : grantTexts.stream().map(Grant::parse).toList();
-            return new ObjectAcl(owner == null ? null : Principal.parse(owner).toString(), grants);
-        } catch (IllegalArgumentException e) {
-            throw new ValidationException("Invalid object ACL: " + e.getMessage());
-        }
-    }
-
     private ObjectAcl effectiveAcl(Principal principal, String requestedOwner,
                                    List<String> grantTexts) {
         List<Grant> grants;

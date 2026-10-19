@@ -31,10 +31,11 @@ to move across partitions; what broke is purely the *bookkeeping* (GC liveness) 
    the Syrup's creating partition deletes it only when it is in no sibling partition's published set.
    This subsumes the existing within-manifest reference counting and is safe by construction (the
    liveness decision is always recomputed from currently-committed references).
-2. **Cross-partition zero-copy via client relay.** The client fetches the source's `CandyLocator`
-   parts from the source owner (new `GetCandyLocator` op) and hands them to the destination owner
-   (new `ZeroCopyPut` op), which writes a destination locator reusing the source's segments
-   verbatim. No bytes move. Plain `copy` needs nothing more.
+2. **Cross-partition zero-copy via a coordination relay.** The source owner stashes the source's
+   `CandyLocator` in coordination (new `GetCandyLocator` op) and returns only a relay token; the
+   client hands the token to the destination owner (new `ZeroCopyPut` op), which reads the relay and
+   writes a destination locator reusing the source's segments verbatim. The client never carries the
+   parts or ACL, so the destination need not trust it (#47). No bytes move. Plain `copy` needs nothing more.
 3. **Rename intent journal, owner-local completion via a ZK rendezvous.** A cross-partition `rename`
    records a durable **rename intent** in the *source* partition's manifest (the owed conditional
    delete), the destination writes a durable **completion marker** in coordination when its
@@ -97,29 +98,30 @@ its last-published refs in ZK (conservative), and a new owner republishes on tak
 
 ### Cross-partition zero-copy protocol
 
-New wire ops (trusted intra-cluster client only):
+New wire ops:
 
-- `GetCandyLocatorRequest(box, key)` → `CandyLocatorResponse(parts, contentType, userMetadata, hlc,
-  createdAtMillis, acl)` — exposes the resolved locator's segment list so the client can relay it.
-- `ZeroCopyPutRequest(box, dstKey, parts, contentType, userMetadata, acl, idempotencyToken,
-  renameToken?, srcKey?, srcPartition?, srcHlc?)` → `HeadCandyResponse` — the destination owner
-  writes a destination locator reusing `parts` verbatim, commits it to WAL + memtable, publishes its
-  refs, and (when `renameToken` is set) writes the completion marker
-  `boxes/<box>/renames/<token>` = `{dstKey, srcKey, srcPartition, srcHlc}` after the locator is
-  durable.
+- `GetCandyLocatorRequest(box, key)` → `CandyLocatorResponse(relayToken, hlc)` — the source owner
+  writes the resolved locator, the requesting principal and the source key to
+  `boxes/<box>/partitions/<p>/relays/<relayToken>` (a server-minted UUID).
+- `ZeroCopyPutRequest(box, dstKey, srcPartition, relayToken, owner, grants, idempotencyToken)` →
+  `HeadCandyResponse` — the destination owner reads the relay (it must exist and belong to the same
+  principal, and a rename relay must name this `dstKey`), writes a destination locator reusing the
+  relayed parts verbatim, commits it to WAL + memtable, publishes its refs, and for a rename relay
+  writes the completion marker `boxes/<box>/renames/<token>` = `{dstKey, srcKey, srcPartition,
+  srcHlc}` after the locator is durable. It then deletes the relay. A copy is owned by the requester
+  (`owner`/`grants` follow the plain-put rules); a rename keeps the relayed ACL.
 - `CompleteRenameRequest(box, srcKey, srcPartition, renameToken, srcHlc)` → `OkResponse` — the
   source owner finalizes the rename: LWW-conditioned tombstone of `srcKey`, clear the intent, delete
   the marker. (Same code path the maintenance loop uses; this is just the synchronous fast path.)
 
 Client `renameCandy` (cross-partition):
 
-1. `GetCandyLocator(src)` from the source owner → parts + `srcHlc`. Also records the rename intent
-   on the source owner (folded into `GetCandyLocator` via a `forRename` flag, or a dedicated
-   `PrepareRename` — see work items).
-2. `ZeroCopyPut(dst, parts, renameToken=token, src..., srcHlc)` on the destination owner.
+1. `PrepareRename(src, dst, token)` on the source owner → relay token + `srcHlc`; records the rename
+   intent and a rename relay.
+2. `ZeroCopyPut(dst, srcPartition, relayToken)` on the destination owner.
 3. `CompleteRename(token)` on the source owner.
 
-Client `copyCandy` (cross-partition): steps 1–2 only, no `renameToken`, no intent.
+Client `copyCandy` (cross-partition): `GetCandyLocator` then `ZeroCopyPut`, no intent.
 
 ### Rename intent journal
 
@@ -152,13 +154,14 @@ Crash windows (all converge; none lose data):
 ```
 boxes/<box>/partitions/<p>/refs       versioned KV: this partition's referenced-Syrup id set (Box-global GC)
 boxes/<box>/renames/<token>           rename completion marker: {dstKey, srcKey, srcPartition, srcHlc}
+boxes/<box>/partitions/<p>/relays/<t> source locator snapshot for one zero-copy put (consumed once)
 ```
 
 ### Configuration
 
 | Key | Default | Meaning |
 |---|---|---|
-| `rename.intent.abandon.millis` | 60000 | Age after which a source-side rename intent with no completion marker is abandoned. |
+| `rename.intent.abandon.millis` | 60000 | Age after which a source-side rename intent with no completion marker, or an unconsumed locator relay, is abandoned. |
 
 Box-global GC reuses the existing `ledger.gc.grace.millis`.
 

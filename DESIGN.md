@@ -226,11 +226,13 @@ consults range tombstones across all tables rather than pruning by point range.
   rebuild — a multipart source becomes a multipart-shaped copy); `rename` also tombstones the
   source. Both commit atomically under the partition owner's write lock (same Box only). Several
   keys may share one segment set safely because GC reference-counts Syrups by actual `SegmentRef`
-  (§9). **Cross-partition** copy/rename is **zero-copy too**: the client fetches the source's
-  `CandyLocator` parts from the source partition's owner (`GetCandyLocator` / `PrepareRename` →
-  `CandyLocatorResponse`) and relays them to the destination owner (`ZeroCopyPut`), which writes a
-  destination locator reusing the very same Syrup segments — no object bytes are ever moved or
-  re-stored. This is safe because the blob layer is physically global (a `SegmentRef` resolves bytes
+  (§9). **Cross-partition** copy/rename is **zero-copy too**: the source partition's owner
+  (`GetCandyLocator` / `PrepareRename`) stashes the resolved `CandyLocator` in coordination
+  (`boxes/<box>/partitions/<p>/relays/<token>`) and hands the client only the token; the destination
+  owner (`ZeroCopyPut`) reads that relay — so the parts and a rename's ACL it writes never pass
+  through the client — and writes a destination locator reusing the very same Syrup segments. No
+  object bytes are ever moved or re-stored. A relay is bound to the requesting principal, consumed
+  once, and reaped by the source owner if unused past `rename.intent.abandon.millis`. This is safe because the blob layer is physically global (a `SegmentRef` resolves bytes
   by `syrupId` alone, no partition scoping) and because **Box-global GC** (§9) keeps a Syrup alive
   while *any* partition references it. A cross-partition `rename` is still copy-then-delete across
   two owners, but now **eventually atomic**: the source owner records a durable rename intent (§5),

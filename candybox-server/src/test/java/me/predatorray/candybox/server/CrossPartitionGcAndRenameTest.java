@@ -19,6 +19,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Map;
 import me.predatorray.candybox.bookkeeper.fake.InMemoryLedgerStore;
 import me.predatorray.candybox.common.BoxName;
@@ -29,9 +30,13 @@ import me.predatorray.candybox.common.Partitioning;
 import me.predatorray.candybox.common.auth.ObjectAcl;
 import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.exception.CandyNotFoundException;
+import me.predatorray.candybox.coordination.CandyboxKeys;
 import me.predatorray.candybox.coordination.fake.InMemoryCoordinationService;
 import me.predatorray.candybox.lsm.engine.BoxEngine;
 import me.predatorray.candybox.lsm.manifest.RenameIntent;
+import me.predatorray.candybox.protocol.Message;
+import me.predatorray.candybox.protocol.MessageCodec;
+import me.predatorray.candybox.protocol.transport.RequestHandler;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -44,6 +49,7 @@ class CrossPartitionGcAndRenameTest {
 
     private static final BoxName BOX = BoxName.of("xp-box");
     private static final int PARTITIONS = 4;
+    private static final MessageCodec CODEC = new MessageCodec();
 
     private static byte[] bytes(String s) {
         return s.getBytes(StandardCharsets.UTF_8);
@@ -170,5 +176,41 @@ class CrossPartitionGcAndRenameTest {
             assertThat(p0.getCandy(CandyKey.of(src))).isEqualTo(bytes("payload")); // source stays live
         }
         store.close();
+    }
+
+    @Test
+    void unconsumedLocatorRelaysAreReapedPastTheWindow() {
+        ManualClock clock = new ManualClock(1_000_000);
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        try (CandyboxNode node = new CandyboxNode(1, CandyboxConfig.builder()
+                .leaseRenewIntervalMillis(0).renameIntentAbandonMillis(1_000).build(),
+                new InMemoryLedgerStore(), coordination, clock)) {
+            node.createBox(BOX, PARTITIONS);
+            String src = keyIn(0, "src");
+            node.enginePartition(BOX, 0).putCandy(CandyKey.of(src), bytes("payload"), null,
+                    Map.of(), null);
+            RequestHandler handler = node.requestHandler();
+            String stale = relayToken(handler, src);
+            clock.advance(600);
+            String fresh = relayToken(handler, src);
+            String relays = CandyboxKeys.locatorRelaysPath(BOX.value(), 0);
+            assertThat(coordination.children(relays)).containsExactlyInAnyOrder(stale, fresh);
+
+            clock.advance(600);
+            assertThat(node.sweepStaleLocatorRelaysOnce()).isEqualTo(1);
+            assertThat(coordination.children(relays)).containsExactly(fresh);
+
+            // Consuming a relay deletes it.
+            Message put = CODEC.decode(handler.handle(CODEC.encode(new Message.ZeroCopyPutRequest(
+                    BOX.value(), keyIn(1, "dst"), 0, fresh, null, List.of(), null))));
+            assertThat(put).isInstanceOf(Message.HeadCandyResponse.class);
+            assertThat(coordination.children(relays)).isEmpty();
+        }
+    }
+
+    private static String relayToken(RequestHandler handler, String key) {
+        Message response = CODEC.decode(handler.handle(CODEC.encode(
+                new Message.GetCandyLocatorRequest(BOX.value(), key))));
+        return ((Message.CandyLocatorResponse) response).relayToken();
     }
 }
