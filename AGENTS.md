@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for coding agents working in this repository.
 
 ## Project
 
@@ -40,7 +40,7 @@ mvn -DskipTests -Pfrontend package   # also build the React dashboard into candy
 - `candybox-dist` runs bats tests for the `bin/` scripts (`bash candybox-dist/src/bin/test/run-bats.sh`),
   and skips them cleanly when `bats` is not installed.
 - Dashboard (`candybox-web/`, React + TS + MUI + Vite): `npm install`, then `npm run dev` (port 5173,
-  proxies `/api` to the admin API on :9712), `npm run lint`, `npm run format:check`, `npm test` (vitest),
+  proxies `/api` to the admin API on :9713), `npm run lint`, `npm run format:check`, `npm test` (vitest),
   `npm run build`.
 - Full local stack: `docker compose up -d` (ZooKeeper, 3 bookies, 3 nodes, S3 gateway on :9711, and the
   admin/dashboard on :9713/ui/). The S3 compatibility harness is `compat/s3-tests/run.sh`.
