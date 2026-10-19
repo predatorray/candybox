@@ -1,8 +1,8 @@
 name: Release
 
-# Cuts a release from main, start to finish: sets the release version, runs the full test suite,
-# publishes to Maven Central, tags it, creates a GitHub Release with the distribution archives, and
-# moves main to the next -SNAPSHOT. Start it from the Actions tab ("Run workflow"); see RELEASING.md.
+# Cuts a release from main: sets the release version, runs the full test suite, publishes to Maven
+# Central, tags it, creates a GitHub Release with the distribution archives, and opens a PR that
+# moves main to the next -SNAPSHOT. It never pushes to main itself. Start it from the Actions tab ("Run workflow"); see RELEASING.md.
 on:
   workflow_dispatch:
     inputs:
@@ -98,10 +98,14 @@ jobs:
           MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
           MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
 
-      - name: Push the release tag
+      # The branch goes first, so the released commit is on GitHub even if pushing the tag fails.
+      - name: Push the release commit and tag
         env:
           RELEASE: ${{ steps.versions.outputs.release }}
-        run: git push origin "refs/tags/v${RELEASE}"
+          NEXT: ${{ steps.versions.outputs.next }}
+        run: |
+          git push origin "HEAD:refs/heads/release/prepare-${NEXT}"
+          git push origin "refs/tags/v${RELEASE}"
 
       - name: Create the GitHub Release with the distribution archives
         uses: softprops/action-gh-release@v2
@@ -112,9 +116,10 @@ jobs:
             candybox-dist/target/candybox-*.tar.gz
             candybox-dist/target/candybox-*.zip
 
-      # main may be protected (or have moved while the build ran), so a direct push can be
-      # refused. Then the bump goes to a branch with a PR instead, which someone has to merge.
-      - name: Move main to the next development version
+      # The workflow never pushes to main: the next-version bump always goes through a PR. The
+      # branch carries the tagged release commit too, but the tag is what keeps it, so the PR can be
+      # squash-merged.
+      - name: Open a PR moving main to the next development version
         env:
           RELEASE: ${{ steps.versions.outputs.release }}
           NEXT: ${{ steps.versions.outputs.next }}
@@ -122,16 +127,11 @@ jobs:
         run: |
           mvn -q -B -ntp versions:set -DnewVersion="${NEXT}" -DgenerateBackupPoms=false -DprocessAllModules
           git commit -am "Prepare ${NEXT}"
-          if git push origin HEAD:main; then
-            echo "main is now at ${NEXT}." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
           branch="release/prepare-${NEXT}"
           git push origin "HEAD:refs/heads/${branch}"
-          body="Released ${RELEASE} to Maven Central (tag v${RELEASE}). Merge this to record the release commit on main and move it to ${NEXT}."
-          if url=$(gh pr create --base main --head "${branch}" --title "Prepare ${NEXT}" --body "${body}"); then
-            echo "main could not be pushed to directly; merge ${url} to move it to ${NEXT}." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "::warning::Could not open a PR (is 'Allow GitHub Actions to create and approve pull requests' off?). Open one from ${branch} to main by hand."
-            echo "main could not be pushed to directly, and no PR could be opened: open one from \`${branch}\` to main to move it to ${NEXT}." >> "$GITHUB_STEP_SUMMARY"
+          body="Released ${RELEASE} to Maven Central (tag \`v${RELEASE}\`). This moves main to ${NEXT}; any merge method works."
+          if ! url=$(gh pr create --base main --head "${branch}" --title "Prepare ${NEXT}" --body "${body}"); then
+            echo "::error::${RELEASE} is published, but no PR could be opened (is 'Allow GitHub Actions to create and approve pull requests' off?). Open one from ${branch} to main by hand."
+            exit 1
           fi
+          echo "Released ${RELEASE}. Merge ${url} to move main to ${NEXT}." >> "$GITHUB_STEP_SUMMARY"

@@ -59,11 +59,12 @@ The workflow then:
 1. sets the release version in every POM, commits `Release X.Y.Z` and tags it `vX.Y.Z` (locally);
 2. runs the full build with unit and integration tests, builds the dashboard, signs everything,
    uploads one bundle to the Portal and waits until Central reports it as published;
-3. pushes the tag and creates a GitHub Release with the `candybox-dist` archives;
-4. sets the next `-SNAPSHOT` version, commits `Prepare X.Y.(Z+1)-SNAPSHOT`, and pushes both commits
-   to `main`. If `main` refuses the push (branch protection or a ruleset, or `main` moved during
-   the build), it pushes them to a `release/prepare-<next>` branch instead and opens a PR to
-   `main`. The run's summary page says which happened.
+3. pushes the release commit to a `release/prepare-<next>` branch, pushes the tag, and creates a
+   GitHub Release with the `candybox-dist` archives;
+4. sets the next `-SNAPSHOT` version, commits `Prepare X.Y.(Z+1)-SNAPSHOT`, pushes it to the same
+   branch and opens a PR to `main`. The workflow never pushes to `main`.
+
+Merge that PR to finish the release.
 
 Nothing is pushed until step 2 succeeds, so a run that fails during the build or the upload leaves
 the repository untouched and can simply be started again. Once step 2 has passed, the version is on
@@ -73,19 +74,23 @@ workflow, because a re-run fails on the existing tag.
 The artifacts reach <https://repo.maven.apache.org/maven2/me/predatorray/candybox/> within about 30
 minutes; search indexes take a few hours longer.
 
-Notes for a protected `main`:
+About the version PR:
 
-- Opening the PR needs *Settings* → *Actions* → *General* → *Allow GitHub Actions to create and
-  approve pull requests*. Without it the branch is still pushed, and the run warns you to open the
-  PR by hand.
-- Pushes and PRs made with the workflow's token do not trigger other workflows, so CI does not run
-  on that PR by itself. If `main` requires status checks, close and reopen the PR (or push to its
-  branch) to start CI.
-- Merge it with a merge commit rather than a squash if you want the tagged `Release X.Y.Z` commit
-  to be part of `main`'s history. The tag and the published artifacts are unaffected either way.
+- Opening it needs *Settings* → *Actions* → *General* → *Allow GitHub Actions to create and approve
+  pull requests*. Without that setting, the branch is still pushed and the run fails with a message
+  asking you to open the PR by hand. The release itself is already done by then.
+- Pushes and PRs made with the workflow's token do not trigger other workflows, so CI does not
+  start on that PR by itself. If `main` requires status checks, close and reopen the PR to start CI.
+- Any merge method works, squash included. The branch holds two commits: `Release X.Y.Z`, which
+  the tag points to, and `Prepare <next>`. A squash merge lands only their combined diff
+  (`X.Y.Z-SNAPSHOT` → `<next>`) on `main`, so the release commit is not an ancestor of `main`. It
+  stays reachable through the tag, which marks exactly the published source, so the
+  `release/prepare-*` branch can be deleted after merging. One visible effect: `git describe` on
+  `main` does not find the tag.
 - If a tag ruleset stops the workflow from pushing `vX.Y.Z`, the version is already on Central by
-  then. Create the tag on the `Release X.Y.Z` commit, which is on the `release/prepare-*` branch or
-  on `main`, and then create the GitHub Release by hand.
+  then, and the `Release X.Y.Z` commit has been pushed to `release/prepare-<next>`. The run fails
+  before it opens the PR. Tag that commit by hand, create the GitHub Release, add the
+  `Prepare <next>` commit to the branch and open the PR.
 
 ## Releasing from a workstation
 
