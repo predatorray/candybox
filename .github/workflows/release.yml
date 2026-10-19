@@ -1,21 +1,24 @@
 name: Release
 
-# Cuts a release from main: sets the release version, runs the full test suite, publishes to Maven
-# Central, tags it, creates a GitHub Release with the distribution archives, and opens a PR that
-# moves main to the next -SNAPSHOT. It never pushes to main itself. Start it from the Actions tab ("Run workflow"); see RELEASING.md.
+# Cuts a release from a release/X.Y.x branch (see the Cut release branch workflow): sets the release
+# version, runs the full test suite, publishes to Maven Central, tags it, creates a GitHub Release with
+# the distribution archives, and opens a PR that moves the release branch to the next -SNAPSHOT. It
+# never pushes to main or to the release branch itself. Start it from the Actions tab ("Run
+# workflow") on the release branch; see RELEASING.md.
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version, e.g. 0.1.0. Leave empty to drop -SNAPSHOT from the current version.'
+        description: 'Release version, e.g. 0.1.0. Leave empty to drop -SNAPSHOT from the branch version.'
         required: false
         default: ''
       next-version:
-        description: 'Next development version, e.g. 0.1.1-SNAPSHOT. Leave empty to bump the patch number.'
+        description: 'Next version of the release branch, e.g. 0.1.1-SNAPSHOT. Leave empty to bump the patch number.'
         required: false
         default: ''
 
-# Never run two releases at once; never cancel one half-way through an upload.
+# Shared with the Cut release branch workflow: never run two of these at once, and never cancel a
+# release half-way through an upload.
 concurrency:
   group: release
   cancel-in-progress: false
@@ -23,7 +26,6 @@ concurrency:
 jobs:
   release:
     name: Release to Maven Central
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: maven-central
     permissions:
@@ -50,6 +52,11 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_NEXT_VERSION: ${{ inputs.next-version }}
         run: |
+          if ! [[ "${GITHUB_REF}" =~ ^refs/heads/release/([0-9]+)\.([0-9]+)\.x$ ]]; then
+            echo "::error::Run this workflow on a release/X.Y.x branch, not ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+          line="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
           current=$(mvn -q -B -ntp help:evaluate -Dexpression=project.version -DforceStdout)
           release="${INPUT_VERSION:-${current%-SNAPSHOT}}"
           next="${INPUT_NEXT_VERSION}"
@@ -67,13 +74,20 @@ jobs:
             *-SNAPSHOT) ;;
             *) echo "::error::Next version '${next}' must end in -SNAPSHOT"; exit 1 ;;
           esac
+          for v in "${release}" "${next}"; do
+            case "${v}" in
+              "${line}".*) ;;
+              *) echo "::error::Version '${v}' does not belong to ${GITHUB_REF_NAME}"; exit 1 ;;
+            esac
+          done
           if git ls-remote --exit-code --tags origin "refs/tags/v${release}" > /dev/null; then
-            echo "::error::Tag v${release} already exists"
+            echo "::error::Tag v${release} already exists. Is the Prepare PR from that release still unmerged?"
             exit 1
           fi
           echo "Releasing ${release} (from ${current}); next version ${next}"
           echo "release=${release}" >> "$GITHUB_OUTPUT"
           echo "next=${next}" >> "$GITHUB_OUTPUT"
+          echo "bump=version-bump/${GITHUB_REF_NAME//\//-}-${next}" >> "$GITHUB_OUTPUT"
 
       - name: Configure the git author
         run: |
@@ -102,9 +116,9 @@ jobs:
       - name: Push the release commit and tag
         env:
           RELEASE: ${{ steps.versions.outputs.release }}
-          NEXT: ${{ steps.versions.outputs.next }}
+          BUMP: ${{ steps.versions.outputs.bump }}
         run: |
-          git push origin "HEAD:refs/heads/release/prepare-${NEXT}"
+          git push origin "HEAD:refs/heads/${BUMP}"
           git push origin "refs/tags/v${RELEASE}"
 
       - name: Create the GitHub Release with the distribution archives
@@ -116,22 +130,21 @@ jobs:
             candybox-dist/target/candybox-*.tar.gz
             candybox-dist/target/candybox-*.zip
 
-      # The workflow never pushes to main: the next-version bump always goes through a PR. The
-      # branch carries the tagged release commit too, but the tag is what keeps it, so the PR can be
-      # squash-merged.
-      - name: Open a PR moving main to the next development version
+      # The next-version bump goes through a PR to the release branch. The PR branch carries the
+      # tagged release commit too, but the tag is what keeps it, so the PR can be squash-merged.
+      - name: Open a PR moving the release branch to the next development version
         env:
           RELEASE: ${{ steps.versions.outputs.release }}
           NEXT: ${{ steps.versions.outputs.next }}
+          BUMP: ${{ steps.versions.outputs.bump }}
           GH_TOKEN: ${{ github.token }}
         run: |
           mvn -q -B -ntp versions:set -DnewVersion="${NEXT}" -DgenerateBackupPoms=false -DprocessAllModules
           git commit -am "Prepare ${NEXT}"
-          branch="release/prepare-${NEXT}"
-          git push origin "HEAD:refs/heads/${branch}"
-          body="Released ${RELEASE} to Maven Central (tag \`v${RELEASE}\`). This moves main to ${NEXT}; any merge method works."
-          if ! url=$(gh pr create --base main --head "${branch}" --title "Prepare ${NEXT}" --body "${body}"); then
-            echo "::error::${RELEASE} is published, but no PR could be opened (is 'Allow GitHub Actions to create and approve pull requests' off?). Open one from ${branch} to main by hand."
+          git push origin "HEAD:refs/heads/${BUMP}"
+          body="Released ${RELEASE} to Maven Central (tag \`v${RELEASE}\`). This moves \`${GITHUB_REF_NAME}\` to ${NEXT}; any merge method works."
+          if ! url=$(gh pr create --base "${GITHUB_REF_NAME}" --head "${BUMP}" --title "Prepare ${NEXT}" --body "${body}"); then
+            echo "::error::${RELEASE} is published, but no PR could be opened (is 'Allow GitHub Actions to create and approve pull requests' off?). Open one from ${BUMP} to ${GITHUB_REF_NAME} by hand."
             exit 1
           fi
-          echo "Released ${RELEASE}. Merge ${url} to move main to ${NEXT}." >> "$GITHUB_STEP_SUMMARY"
+          echo "Released ${RELEASE}. Merge ${url} to move ${GITHUB_REF_NAME} to ${NEXT}." >> "$GITHUB_STEP_SUMMARY"

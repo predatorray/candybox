@@ -1,0 +1,118 @@
+name: Cut release branch
+
+# Starts a release line: creates release/X.Y.x from a commit on main, still at X.Y.Z-SNAPSHOT, and
+# opens a PR that moves main to the next minor -SNAPSHOT. Fixes then land on main first and are
+# cherry-picked onto the release branch; the Release workflow publishes from it. It never pushes to
+# main itself. Start it from the Actions tab ("Run workflow") on main; see RELEASING.md.
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: 'Commit on main to branch from. Leave empty for the latest main.'
+        required: false
+        default: ''
+      next-version:
+        description: 'Version main moves to, e.g. 0.2.0-SNAPSHOT. Leave empty to bump the minor number.'
+        required: false
+        default: ''
+
+# Shared with the Release workflow: never run two of these at once.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  cut:
+    name: Cut release branch
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history, to check that the chosen commit is on main.
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Resolve the branch and the next main version
+        id: versions
+        env:
+          INPUT_COMMIT: ${{ inputs.commit }}
+          INPUT_NEXT_VERSION: ${{ inputs.next-version }}
+        run: |
+          if [ "${GITHUB_REF}" != refs/heads/main ]; then
+            echo "::error::Run this workflow on main, not ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+          if ! commit=$(git rev-parse --verify --quiet "${INPUT_COMMIT:-HEAD}^{commit}"); then
+            echo "::error::Unknown commit '${INPUT_COMMIT}'"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "${commit}" HEAD; then
+            echo "::error::Commit ${commit} is not on main"
+            exit 1
+          fi
+          # The root POM holds the version literally, so -N reads it without the other modules.
+          git show "${commit}:pom.xml" > "${RUNNER_TEMP}/cut-pom.xml"
+          version=$(mvn -q -B -ntp -N -f "${RUNNER_TEMP}/cut-pom.xml" help:evaluate -Dexpression=project.version -DforceStdout)
+          main_version=$(mvn -q -B -ntp -N help:evaluate -Dexpression=project.version -DforceStdout)
+          if ! [[ "${version}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)-SNAPSHOT$ ]]; then
+            echo "::error::Version '${version}' at ${commit} is not of the form X.Y.Z-SNAPSHOT"
+            exit 1
+          fi
+          major="${BASH_REMATCH[1]}"
+          minor="${BASH_REMATCH[2]}"
+          if [ "${main_version}" != "${version}" ]; then
+            echo "::error::main is at ${main_version} but ${commit} is at ${version}; has this line already been cut?"
+            exit 1
+          fi
+          branch="release/${major}.${minor}.x"
+          if git ls-remote --exit-code --heads origin "refs/heads/${branch}" > /dev/null; then
+            echo "::error::Branch ${branch} already exists"
+            exit 1
+          fi
+          next="${INPUT_NEXT_VERSION:-${major}.$((minor + 1)).0-SNAPSHOT}"
+          case "${next}" in
+            *-SNAPSHOT) ;;
+            *) echo "::error::Next version '${next}' must end in -SNAPSHOT"; exit 1 ;;
+          esac
+          echo "Cutting ${branch} at ${commit} (${version}); main moves to ${next}"
+          echo "commit=${commit}" >> "$GITHUB_OUTPUT"
+          echo "branch=${branch}" >> "$GITHUB_OUTPUT"
+          echo "next=${next}" >> "$GITHUB_OUTPUT"
+
+      - name: Create the release branch
+        env:
+          COMMIT: ${{ steps.versions.outputs.commit }}
+          BRANCH: ${{ steps.versions.outputs.branch }}
+        run: git push origin "${COMMIT}:refs/heads/${BRANCH}"
+
+      - name: Configure the git author
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898283+github-actions[bot]@users.noreply.github.com'
+
+      - name: Open a PR moving main to the next development version
+        env:
+          BRANCH: ${{ steps.versions.outputs.branch }}
+          NEXT: ${{ steps.versions.outputs.next }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mvn -q -B -ntp versions:set -DnewVersion="${NEXT}" -DgenerateBackupPoms=false -DprocessAllModules
+          bump="version-bump/main-${NEXT}"
+          git switch -c "${bump}"
+          git commit -am "Prepare ${NEXT}"
+          git push origin "HEAD:refs/heads/${bump}"
+          body="Cut \`${BRANCH}\` for the next release. This moves main to ${NEXT}; any merge method works."
+          if ! url=$(gh pr create --base main --head "${bump}" --title "Prepare ${NEXT}" --body "${body}"); then
+            echo "::error::${BRANCH} was created, but no PR could be opened (is 'Allow GitHub Actions to create and approve pull requests' off?). Open one from ${bump} to main by hand."
+            exit 1
+          fi
+          echo "Created \`${BRANCH}\`. Merge ${url} to move main to ${NEXT}." >> "$GITHUB_STEP_SUMMARY"
