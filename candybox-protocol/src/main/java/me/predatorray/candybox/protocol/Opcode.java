@@ -48,7 +48,7 @@ public enum Opcode {
     /** Metadata-only locator rewrite replacing one object's owner/grants. */
     SET_CANDY_ACL(45),
 
-    /** Resolves a key's {@code CandyLocator} parts for a cross-partition zero-copy copy/rename. */
+    /** Relays a key's {@code CandyLocator} (via coordination) for a cross-partition zero-copy put. */
     GET_CANDY_LOCATOR(46),
     /** Like {@link #GET_CANDY_LOCATOR} but also records a source-side rename intent (cross-partition). */
     PREPARE_RENAME(47),
@@ -89,7 +89,7 @@ public enum Opcode {
     RESPONSE_ACCESS_DENIED(55),
     RESPONSE_BOX_ACL(56),
     RESPONSE_CANDY_ACL(57),
-    /** A resolved {@code CandyLocator}'s parts + metadata, for a cross-partition zero-copy relay. */
+    /** The relay token (and source HLC) for a cross-partition zero-copy put. */
     RESPONSE_CANDY_LOCATOR(58);
 
     private final int code;

@@ -436,8 +436,9 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
     /**
      * Server-side copy of {@code srcKey} to {@code dstKey} within the same Box. Zero-copy in both
      * cases: a same-partition copy reuses the stored bytes via one server-side call; a cross-partition
-     * copy relays the source's locator parts to the destination owner, which points the new key at the
-     * very same Syrup segments (no bytes are moved). Returns the destination's metadata.
+     * copy has the source owner stash its locator in coordination for the destination owner, which
+     * points the new key at the very same Syrup segments (no bytes are moved). Returns the
+     * destination's metadata.
      */
     public CandyInfo copyCandy(String box, String srcKey, String dstKey, String idempotencyToken) {
         return copyCandy(box, srcKey, dstKey, idempotencyToken, null, List.of());
@@ -452,13 +453,14 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
                     CandyKey.of(srcKey).value(), CandyKey.of(dstKey).value(), idempotencyToken,
                     owner, g));
         }
-        // Cross-partition zero-copy: resolve the source's parts, then point the destination at them.
+        // Cross-partition zero-copy: the source owner stashes its locator, the destination owner
+        // points the new key at the same segments.
         Message.CandyLocatorResponse loc = resolveLocator(box, srcKey,
                 new Message.GetCandyLocatorRequest(BoxName.of(box).value(),
                         CandyKey.of(srcKey).value()));
         return zeroCopyPut(box, dstKey, new Message.ZeroCopyPutRequest(BoxName.of(box).value(),
-                CandyKey.of(dstKey).value(), loc.parts(), loc.contentType(), loc.userMetadata(),
-                owner, g, idempotencyToken, null, null, 0, null));
+                CandyKey.of(dstKey).value(), partitionFor(box, srcKey), loc.relayToken(), owner, g,
+                idempotencyToken));
     }
 
     /**
@@ -486,9 +488,8 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
                         CandyKey.of(dstKey).value(), dstPartition, token));
         // 2. Zero-copy put on the destination owner (preserves the source's owner/grants).
         CandyInfo result = zeroCopyPut(box, dstKey, new Message.ZeroCopyPutRequest(
-                BoxName.of(box).value(), CandyKey.of(dstKey).value(), loc.parts(), loc.contentType(),
-                loc.userMetadata(), loc.owner(), loc.grants(), token, token,
-                CandyKey.of(srcKey).value(), srcPartition, loc.hlc()));
+                BoxName.of(box).value(), CandyKey.of(dstKey).value(), srcPartition,
+                loc.relayToken(), null, List.of(), token));
         // 3. Finalize the source delete (best-effort fast path; the maintenance sweep is the backstop).
         router.callPartition(box, srcPartition, new Message.CompleteRenameRequest(
                 BoxName.of(box).value(), CandyKey.of(srcKey).value(), srcPartition, token, loc.hlc()));

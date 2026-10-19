@@ -21,11 +21,14 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Predicate;
 import me.predatorray.candybox.bookkeeper.LedgerStore;
 import me.predatorray.candybox.common.BoxName;
 import me.predatorray.candybox.common.CandyKey;
@@ -37,6 +40,7 @@ import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.exception.BoxAlreadyExistsException;
 import me.predatorray.candybox.common.exception.BoxNotEmptyException;
 import me.predatorray.candybox.common.exception.BoxNotFoundException;
+import me.predatorray.candybox.common.exception.BusyException;
 import me.predatorray.candybox.common.exception.FencedException;
 import me.predatorray.candybox.common.exception.NotOwnerException;
 import me.predatorray.candybox.coordination.BoxDescriptor;
@@ -67,12 +71,17 @@ public final class CandyboxNode implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(CandyboxNode.class);
 
+    static final int MAX_PENDING_LOCATOR_RELAYS = 1024;
+    static final long RELAY_RECOUNT_INTERVAL_MILLIS = 1_000;
+
     private final int nodeId;
     private final CandyboxConfig config;
     private final LedgerStore ledgerStore;
     private final CoordinationService coordination;
     private final Clock clock;
     private final BoxAclStore aclStore;
+    private final AtomicLong pendingRelayBytes = new AtomicLong();
+    private final AtomicLong lastRelayRecountMillis = new AtomicLong(Long.MIN_VALUE / 2);
     private volatile Authorizer authorizer = Authorizer.ALLOW_ALL;
     private final ConcurrentMap<BoxPartition, PartitionOwnership> partitions =
             new ConcurrentHashMap<>();
@@ -151,6 +160,7 @@ public final class CandyboxNode implements AutoCloseable {
         collectGarbageOnce();
         sweepStaleMultipartUploadsOnce();
         finalizeRenameIntentsOnce();
+        sweepStaleLocatorRelaysOnce();
     }
 
     private static ScheduledExecutorService daemonScheduler(String name) {
@@ -307,6 +317,7 @@ public final class CandyboxNode implements AutoCloseable {
         descriptorCache.remove(box.value());
         deleteMetaQuietly(box);
         aclStore.delete(box.value());
+        deleteLocatorRelays(box, descriptor.partitionCount());
         // TODO(phase-3): reference-counted GC of the Box's SSTable/Syrup/WAL/manifest ledgers.
     }
 
@@ -590,6 +601,73 @@ public final class CandyboxNode implements AutoCloseable {
     }
 
     /**
+     * Deletes the locator relays of every owned partition that no destination consumed within
+     * {@code renameIntentAbandonMillis} (the client gave up between resolving the source and the
+     * zero-copy put), and recounts the bytes of the ones still pending against the node's relay
+     * budget. Exposed for manual/operational triggering and tests.
+     *
+     * @return the number of relays deleted
+     */
+    public int sweepStaleLocatorRelaysOnce() {
+        int deleted = 0;
+        long liveBytes = 0;
+        boolean complete = true;
+        for (PartitionOwnership ownership : partitions.values()) {
+            if (ownership.isOwner()) {
+                RelaySweep sweep = sweepStaleLocatorRelays(ownership.box().value(),
+                        ownership.partition());
+                deleted += sweep.deleted();
+                liveBytes += sweep.liveBytes();
+                complete &= sweep.complete();
+            }
+        }
+        if (complete) {
+            pendingRelayBytes.set(liveBytes);
+        }
+        return deleted;
+    }
+
+    private record RelaySweep(int deleted, long liveBytes, boolean complete) {
+    }
+
+    private RelaySweep sweepStaleLocatorRelays(String box, int partition) {
+        long cutoff = clock.currentTimeMillis() - config.renameIntentAbandonMillis();
+        int deleted = 0;
+        long liveBytes = 0;
+        boolean complete = true;
+        List<String> tokens;
+        try {
+            tokens = coordination.children(CandyboxKeys.locatorRelaysPath(box, partition));
+        } catch (RuntimeException e) {
+            LOG.warn("Locator relay sweep error on node {} for box {} partition {}: {}", nodeId, box,
+                    partition, e.getMessage());
+            return new RelaySweep(0, 0, false);
+        }
+        for (String token : tokens) {
+            String key = CandyboxKeys.locatorRelayKey(box, partition, token);
+            try {
+                Optional<VersionedValue> value = coordination.get(key);
+                if (value.isEmpty()) {
+                    continue;
+                }
+                if (LocatorRelay.deserialize(value.get().value()).createdAtMillis() <= cutoff) {
+                    coordination.delete(key, value.get().version());
+                    deleted++;
+                } else {
+                    liveBytes += value.get().value().length;
+                }
+            } catch (CasConflictException raced) {
+                // Consumed or deleted concurrently.
+            } catch (RuntimeException e) {
+                complete = false;
+                LOG.warn("Locator relay sweep error on node {} for {}: {}", nodeId, key,
+                        e.getMessage());
+            }
+        }
+        return new RelaySweep(deleted, liveBytes, complete);
+    }
+
+    /**
      * Aborts in-flight multipart uploads whose {@code createdAtMillis + multipartUploadTtlMillis} is
      * already in the past. Reuses the engine's {@link me.predatorray.candybox.lsm.engine.BoxEngine
      * #abortMultipartUpload} (fencing-gated; orphaned Syrup segments enter the normal reclaim path).
@@ -687,6 +765,87 @@ public final class CandyboxNode implements AutoCloseable {
             coordination.create(key, w.toByteArray());
         } catch (CasConflictException alreadyThere) {
             // Idempotent: the marker is already present.
+        }
+    }
+
+    /**
+     * Stashes a source locator for a cross-partition zero-copy put and returns its relay token. The
+     * pending relays a node writes are bounded in bytes ({@code zeroCopyRelayBudgetBytes}) and per
+     * partition in count, stale ones being reaped first, so clients cannot grow the coordination
+     * store without bound. The byte count is an upper bound: relays consumed by other nodes are
+     * only subtracted when the next sweep recounts.
+     */
+    String writeLocatorRelay(String box, int srcPartition, LocatorRelay relay) {
+        byte[] value = relay.serialize(config.sizeLimits().maxLocatorBytes());
+        long budget = config.zeroCopyRelayBudgetBytes();
+        if (pendingRelayBytes.get() + value.length > budget) {
+            if (tryStartRelayRecount()) {
+                sweepStaleLocatorRelaysOnce();
+            }
+            if (pendingRelayBytes.get() + value.length > budget) {
+                throw new BusyException("Zero-copy relay budget exhausted on node " + nodeId);
+            }
+        }
+        String relays = CandyboxKeys.locatorRelaysPath(box, srcPartition);
+        if (coordination.children(relays).size() >= MAX_PENDING_LOCATOR_RELAYS
+                && (!tryStartRelayRecount()
+                        || sweepStaleLocatorRelays(box, srcPartition).deleted() == 0
+                        || coordination.children(relays).size() >= MAX_PENDING_LOCATOR_RELAYS)) {
+            throw new BusyException("Too many pending zero-copy relays for box " + box
+                    + " partition " + srcPartition);
+        }
+        String token = UUID.randomUUID().toString();
+        coordination.create(CandyboxKeys.locatorRelayKey(box, srcPartition, token), value);
+        pendingRelayBytes.addAndGet(value.length);
+        return token;
+    }
+
+    /**
+     * Whether an over-budget write may reap and recount now. At most one such pass runs per
+     * {@link #RELAY_RECOUNT_INTERVAL_MILLIS}; the others are refused without touching coordination.
+     */
+    private boolean tryStartRelayRecount() {
+        long now = clock.currentTimeMillis();
+        long last = lastRelayRecountMillis.get();
+        return now - last >= RELAY_RECOUNT_INTERVAL_MILLIS
+                && lastRelayRecountMillis.compareAndSet(last, now);
+    }
+
+    /**
+     * The relay under {@code token}, if {@code acceptable} and still fresh. Freshness is half the
+     * abandon window, leaving the other half for clock skew against the source owner's intent sweep.
+     */
+    Optional<LocatorRelay> readLocatorRelay(String box, int srcPartition, String token,
+                                            Predicate<LocatorRelay> acceptable) {
+        return coordination.get(CandyboxKeys.locatorRelayKey(box, srcPartition, token))
+                .map(v -> LocatorRelay.deserialize(v.value()))
+                .filter(r -> clock.currentTimeMillis() - r.createdAtMillis()
+                        <= config.renameIntentAbandonMillis() / 2)
+                .filter(acceptable);
+    }
+
+    void deleteLocatorRelay(String box, int srcPartition, String token) {
+        try {
+            CoordinationCas.deleteIfPresent(coordination,
+                    CandyboxKeys.locatorRelayKey(box, srcPartition, token), 0);
+        } catch (CasConflictException raced) {
+            // Already consumed by a concurrent retry, or reaped.
+        }
+    }
+
+    /** Best-effort: a relay left behind expires at consume time anyway. */
+    private void deleteLocatorRelays(BoxName box, int partitionCount) {
+        for (int p = 0; p < partitionCount; p++) {
+            try {
+                for (String token : coordination.children(
+                        CandyboxKeys.locatorRelaysPath(box.value(), p))) {
+                    CoordinationCas.deleteIfPresent(coordination,
+                            CandyboxKeys.locatorRelayKey(box.value(), p, token), 0);
+                }
+            } catch (RuntimeException e) {
+                LOG.warn("Failed to delete locator relays of box {} partition {}: {}", box, p,
+                        e.getMessage());
+            }
         }
     }
 

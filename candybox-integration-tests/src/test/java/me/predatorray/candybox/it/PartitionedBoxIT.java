@@ -228,13 +228,12 @@ class PartitionedBoxIT {
         String token = "it-rename-token";
 
         // Drive the rename's first two steps by hand, then "crash" before the finalize:
-        // 1. prepare on the source owner (records the intent + returns the locator parts)
+        // 1. prepare on the source owner (records the intent + stashes the locator relay)
         Message prepared = send(nodeA, new Message.PrepareRenameRequest(BOX, src, dst, 2, token));
         Message.CandyLocatorResponse loc = (Message.CandyLocatorResponse) prepared;
         // 2. zero-copy put on the destination owner (writes the rendezvous marker)
-        Message put = send(nodeB, new Message.ZeroCopyPutRequest(BOX, dst, loc.parts(),
-                loc.contentType(), loc.userMetadata(), loc.owner(), loc.grants(), token, token,
-                src, 0, loc.hlc()));
+        Message put = send(nodeB, new Message.ZeroCopyPutRequest(BOX, dst, 0, loc.relayToken(),
+                null, List.of(), token));
         assertThat(put).isInstanceOf(Message.HeadCandyResponse.class);
 
         // The finalize (step 3) is lost: both keys are live (the transient W2 state).

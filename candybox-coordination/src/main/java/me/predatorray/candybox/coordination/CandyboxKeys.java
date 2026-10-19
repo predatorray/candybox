@@ -70,4 +70,20 @@ public final class CandyboxKeys {
     public static String renameMarkerKey(String boxName, String renameToken) {
         return BOXES_ROOT + "/" + boxName + "/renames/" + renameToken;
     }
+
+    /**
+     * The directory of locator relays a partition's owner stashed for cross-partition zero-copy
+     * puts; the owner reaps stale ones.
+     */
+    public static String locatorRelaysPath(String boxName, int partition) {
+        return BOXES_ROOT + "/" + boxName + "/partitions/" + partition + "/relays";
+    }
+
+    /**
+     * A source locator snapshot written by its partition's owner and read by the destination owner of
+     * a cross-partition zero-copy put, so the parts and ACL it writes never pass through the client.
+     */
+    public static String locatorRelayKey(String boxName, int partition, String relayToken) {
+        return locatorRelaysPath(boxName, partition) + "/" + relayToken;
+    }
 }

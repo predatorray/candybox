@@ -94,12 +94,8 @@ class PartitionedRoutingClientTest {
                 return new Message.HeadCandyResponse(7, "text/plain", Map.of(), 9, 1);
             } else if (message instanceof Message.GetCandyLocatorRequest
                     || message instanceof Message.PrepareRenameRequest) {
-                me.predatorray.candybox.common.Part part = new me.predatorray.candybox.common.Part(
-                        7, 1 << 20, 9,
-                        List.of(new me.predatorray.candybox.common.SegmentRef(1, 0, 0)));
-                return new Message.CandyLocatorResponse(List.of(part), "text/plain", Map.of("m", "x"),
-                        new me.predatorray.candybox.common.Hlc(1000, 0, 1), 1, "User:alice",
-                        List.of());
+                return new Message.CandyLocatorResponse("relay-" + message.opcode(),
+                        new me.predatorray.candybox.common.Hlc(1000, 0, 1));
             } else if (message instanceof Message.ZeroCopyPutRequest) {
                 return new Message.HeadCandyResponse(7, "text/plain", Map.of("m", "x"), 9, 1);
             }
@@ -213,7 +209,7 @@ class PartitionedRoutingClientTest {
         try (CandyboxClient client = new CandyboxClient(new LoopbackTransport(node), "x", 0)) {
             CandyboxClient.CandyInfo copied = client.copyCandy("box", src, dst, "tok");
             assertThat(copied.contentLength()).isEqualTo(7);
-            // No byte copy: the source's locator parts were relayed and reused at the destination.
+            // No byte copy: the destination consumes the relay the source owner stashed.
             assertThat(node.recorded(Message.GetCandyRequest.class)).isEmpty();
             assertThat(node.recorded(Message.PutCandyRequest.class)).isEmpty();
             Message.GetCandyLocatorRequest gl =
@@ -222,7 +218,8 @@ class PartitionedRoutingClientTest {
             Message.ZeroCopyPutRequest copyPut = node.recorded(Message.ZeroCopyPutRequest.class).get(0);
             assertThat(copyPut.dstKey()).isEqualTo(dst);
             assertThat(copyPut.idempotencyToken()).isEqualTo("tok");
-            assertThat(copyPut.renameToken()).isNull(); // a plain copy carries no rename intent
+            assertThat(copyPut.srcPartition()).isEqualTo(0);
+            assertThat(copyPut.relayToken()).isEqualTo("relay-GET_CANDY_LOCATOR");
 
             client.renameCandy("box", src, dst, "rtok");
             // Rename = prepare-intent on the source, zero-copy put on the destination, finalize delete.
@@ -231,8 +228,9 @@ class PartitionedRoutingClientTest {
             assertThat(pr.renameToken()).isEqualTo("rtok");
             Message.ZeroCopyPutRequest renamePut =
                     node.recorded(Message.ZeroCopyPutRequest.class).get(1);
-            assertThat(renamePut.renameToken()).isEqualTo("rtok");
-            assertThat(renamePut.srcKey()).isEqualTo(src);
+            assertThat(renamePut.srcPartition()).isEqualTo(0);
+            assertThat(renamePut.relayToken()).isEqualTo("relay-PREPARE_RENAME");
+            assertThat(renamePut.owner()).isNull(); // a rename's ACL comes from the relay
             Message.CompleteRenameRequest cr =
                     node.recorded(Message.CompleteRenameRequest.class).get(0);
             assertThat(cr.srcKey()).isEqualTo(src);

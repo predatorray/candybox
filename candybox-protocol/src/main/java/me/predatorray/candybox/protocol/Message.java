@@ -18,7 +18,6 @@ package me.predatorray.candybox.protocol;
 import java.util.List;
 import java.util.Map;
 import me.predatorray.candybox.common.Hlc;
-import me.predatorray.candybox.common.Part;
 
 /**
  * The typed protocol messages, mapped to/from {@link Frame}s by {@link MessageCodec}. A sealed
@@ -146,9 +145,9 @@ public sealed interface Message {
     // ---- cross-partition zero-copy copy/rename ---------------------------------------------
 
     /**
-     * Resolves {@code key}'s live {@link me.predatorray.candybox.common.CandyLocator} parts so the
-     * client can relay them to the destination partition's owner for a zero-copy
-     * {@link ZeroCopyPutRequest}. Answered with a {@link CandyLocatorResponse}.
+     * Resolves {@code key}'s live {@link me.predatorray.candybox.common.CandyLocator} on the source
+     * partition's owner and stashes it in coordination for a zero-copy {@link ZeroCopyPutRequest} on
+     * the destination owner. Answered with a {@link CandyLocatorResponse} carrying the relay handle.
      */
     record GetCandyLocatorRequest(String box, String key) implements Message {
         public Opcode opcode() {
@@ -169,28 +168,29 @@ public sealed interface Message {
     }
 
     /**
-     * The resolved source locator relayed to the destination owner. {@code parts} are reused verbatim
-     * (zero byte copy); {@code hlc} is the source's LWW stamp (the rename's delete guard).
+     * A handle to the source locator the source owner stashed in coordination. The locator itself
+     * never round-trips through the client, so the destination owner can trust what it writes;
+     * {@code hlc} is the source's LWW stamp (the rename's delete guard).
      */
-    record CandyLocatorResponse(List<Part> parts, String contentType,
-                                Map<String, String> userMetadata, Hlc hlc, long createdAtMillis,
-                                String owner, List<String> grants) implements Message {
+    record CandyLocatorResponse(String relayToken, Hlc hlc) implements Message {
         public Opcode opcode() {
             return Opcode.RESPONSE_CANDY_LOCATOR;
         }
     }
 
     /**
-     * Writes a destination Candy at {@code dstKey} reusing {@code parts} verbatim — the cross-partition
-     * zero-copy put. For a rename, {@code renameToken} is set and the destination owner writes the
-     * coordination completion marker once the locator is durable; {@code srcKey}/{@code srcPartition}/
-     * {@code srcHlc} are recorded in that marker. For a plain copy they are null/absent. Answered with
-     * a {@link HeadCandyResponse}.
+     * Writes a destination Candy at {@code dstKey} reusing the parts of the source locator stashed
+     * under {@code relayToken} by {@code srcPartition}'s owner — the cross-partition zero-copy put.
+     * A relay made by {@link PrepareRenameRequest} turns this into the rename's destination step
+     * (the source's owner/grants are kept and the completion marker is written); otherwise it is a
+     * copy owned by the requester, stamped with {@code owner}/{@code grants} as a plain put would
+     * be. A relay is deleted once its put succeeds, so retrying a put whose response was lost fails
+     * as an unknown relay; restart from the locator request. Answered with a
+     * {@link HeadCandyResponse}.
      */
-    record ZeroCopyPutRequest(String box, String dstKey, List<Part> parts, String contentType,
-                              Map<String, String> userMetadata, String owner, List<String> grants,
-                              String idempotencyToken, String renameToken, String srcKey,
-                              int srcPartition, Hlc srcHlc) implements Message {
+    record ZeroCopyPutRequest(String box, String dstKey, int srcPartition, String relayToken,
+                              String owner, List<String> grants, String idempotencyToken)
+            implements Message {
         public Opcode opcode() {
             return Opcode.ZERO_COPY_PUT;
         }

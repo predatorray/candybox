@@ -49,6 +49,7 @@ public final class CandyboxConfig {
     private final long balancerIntervalMillis;
     private final int balancerMaxMovesPerRound;
     private final long renameIntentAbandonMillis;
+    private final long zeroCopyRelayBudgetBytes;
 
     private CandyboxConfig(Builder b) {
         this.sizeLimits = b.sizeLimits;
@@ -74,6 +75,7 @@ public final class CandyboxConfig {
         this.balancerIntervalMillis = b.balancerIntervalMillis;
         this.balancerMaxMovesPerRound = b.balancerMaxMovesPerRound;
         this.renameIntentAbandonMillis = b.renameIntentAbandonMillis;
+        this.zeroCopyRelayBudgetBytes = b.zeroCopyRelayBudgetBytes;
     }
 
     public static CandyboxConfig defaults() {
@@ -194,6 +196,14 @@ public final class CandyboxConfig {
         return renameIntentAbandonMillis;
     }
 
+    /**
+     * The bytes of cross-partition zero-copy locator relays one node may have pending in
+     * coordination; past it, new copy/rename requests are refused as busy.
+     */
+    public long zeroCopyRelayBudgetBytes() {
+        return zeroCopyRelayBudgetBytes;
+    }
+
     public static final class Builder {
         private SizeLimits sizeLimits = SizeLimits.defaults();
         private Map<LedgerRole, QuorumConfig> quorums = new EnumMap<>(QuorumConfig.defaults());
@@ -218,6 +228,7 @@ public final class CandyboxConfig {
         private long balancerIntervalMillis = 0L;                       // balancing round; 0 disables
         private int balancerMaxMovesPerRound = 4;                       // migration rate limit
         private long renameIntentAbandonMillis = 60_000L;               // abandon a stuck rename intent
+        private long zeroCopyRelayBudgetBytes = 32L * 1024 * 1024;      // pending relay bytes per node
 
         public Builder sizeLimits(SizeLimits v) {
             this.sizeLimits = v;
@@ -334,7 +345,15 @@ public final class CandyboxConfig {
             return this;
         }
 
+        public Builder zeroCopyRelayBudgetBytes(long v) {
+            this.zeroCopyRelayBudgetBytes = v;
+            return this;
+        }
+
         public CandyboxConfig build() {
+            if (zeroCopyRelayBudgetBytes <= 0) {
+                throw new IllegalArgumentException("zeroCopyRelayBudgetBytes must be > 0");
+            }
             if (l0StallThreshold < l0CompactionTrigger) {
                 throw new IllegalArgumentException("l0StallThreshold must be >= l0CompactionTrigger");
             }

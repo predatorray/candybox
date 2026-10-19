@@ -19,8 +19,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.UUID;
 import me.predatorray.candybox.bookkeeper.fake.InMemoryLedgerStore;
 import me.predatorray.candybox.common.ManualClock;
+import me.predatorray.candybox.common.Partitioning;
 import me.predatorray.candybox.common.auth.Grant;
 import me.predatorray.candybox.common.auth.Operation;
 import me.predatorray.candybox.common.auth.Principal;
@@ -64,6 +66,14 @@ class AuthorizationTest {
         }
         Frame response = handler.handle(context, CODEC.encode(request));
         return CODEC.decode(response);
+    }
+
+    private static String keyIn(int partition, int partitions, String tag) {
+        for (int i = 0; ; i++) {
+            if (Partitioning.partitionOf(tag + i, partitions) == partition) {
+                return tag + i;
+            }
+        }
     }
 
     private static Message.PutCandyRequest put(String box, String key) {
@@ -329,6 +339,112 @@ class AuthorizationTest {
             Message.CandyAclResponse spoofed = (Message.CandyAclResponse)
                     call(handler, ALICE, new Message.GetCandyAclRequest("fronted", "spoofed"));
             assertThat(spoofed.owner()).isEqualTo("User:alice");
+        }
+    }
+
+    @Test
+    void crossPartitionRenameKeepsTheSourceAclWhateverTheRequestClaims() {
+        try (CandyboxNode node = newAuthorizedNode()) {
+            RequestHandler handler = node.requestHandler();
+            call(handler, ALICE, new Message.CreateBoxRequest("xpart", 2));
+            call(handler, ALICE, new Message.SetBoxAclRequest("xpart", "User:alice",
+                    List.of("User:bob:READ+WRITE")));
+            String src = keyIn(0, 2, "src");
+            String dst = keyIn(1, 2, "dst");
+            call(handler, BOB, put("xpart", src));
+
+            Message.CandyLocatorResponse relay = (Message.CandyLocatorResponse) call(handler, BOB,
+                    new Message.PrepareRenameRequest("xpart", src, dst, 1, "rename-1"));
+            // bob claims alice owns the destination; a rename's ACL comes from the source alone.
+            assertThat(call(handler, BOB, new Message.ZeroCopyPutRequest("xpart", dst, 0,
+                    relay.relayToken(), "User:alice", List.of("AllUsers:READ"), "rename-1")))
+                    .isInstanceOf(Message.HeadCandyResponse.class);
+            Message.CandyAclResponse acl = (Message.CandyAclResponse)
+                    call(handler, ALICE, new Message.GetCandyAclRequest("xpart", dst));
+            assertThat(acl.owner()).isEqualTo("User:bob");
+            assertThat(acl.grants()).isEmpty();
+        }
+    }
+
+    @Test
+    void crossPartitionCopyIgnoresAnOwnerClaimFromARegularUser() {
+        try (CandyboxNode node = newAuthorizedNode()) {
+            RequestHandler handler = node.requestHandler();
+            call(handler, ALICE, new Message.CreateBoxRequest("xpart", 2));
+            call(handler, ALICE, new Message.SetBoxAclRequest("xpart", "User:alice",
+                    List.of("User:bob:READ+WRITE")));
+            String src = keyIn(0, 2, "src");
+            String dst = keyIn(1, 2, "dst");
+            call(handler, ALICE, put("xpart", src));
+
+            Message.CandyLocatorResponse relay = (Message.CandyLocatorResponse)
+                    call(handler, BOB, new Message.GetCandyLocatorRequest("xpart", src));
+            call(handler, BOB, new Message.ZeroCopyPutRequest("xpart", dst, 0, relay.relayToken(),
+                    "User:alice", List.of(), null));
+            Message.CandyAclResponse acl = (Message.CandyAclResponse)
+                    call(handler, BOB, new Message.GetCandyAclRequest("xpart", dst));
+            assertThat(acl.owner()).isEqualTo("User:bob");
+        }
+    }
+
+    @Test
+    void zeroCopyPutOnlyConsumesARelayItsRequesterGotFromThisBox() {
+        try (CandyboxNode node = newAuthorizedNode()) {
+            RequestHandler handler = node.requestHandler();
+            call(handler, ALICE, new Message.CreateBoxRequest("secret", 1));
+            call(handler, ALICE, new Message.PutCandyRequest("secret", "k", null, null, null,
+                    "top-secret".getBytes(StandardCharsets.UTF_8)));
+            call(handler, BOB, new Message.CreateBoxRequest("bobs", 1));
+            call(handler, ALICE, new Message.SetBoxAclRequest("secret", "User:alice",
+                    List.of("User:bob:WRITE")));
+            Message.CandyLocatorResponse alices = (Message.CandyLocatorResponse)
+                    call(handler, ALICE, new Message.GetCandyLocatorRequest("secret", "k"));
+
+            // Another Box, another principal, a guessed token, a malformed token: all rejected.
+            assertThat(call(handler, BOB, new Message.ZeroCopyPutRequest("bobs", "stolen", 0,
+                    alices.relayToken(), null, List.of(), null)))
+                    .isInstanceOf(Message.ErrorResponse.class);
+            assertThat(call(handler, BOB, new Message.ZeroCopyPutRequest("secret", "stolen", 0,
+                    alices.relayToken(), null, List.of(), null)))
+                    .isInstanceOf(Message.ErrorResponse.class);
+            assertThat(call(handler, BOB, new Message.ZeroCopyPutRequest("bobs", "stolen", 0,
+                    UUID.randomUUID().toString(), null, List.of(), null)))
+                    .isInstanceOf(Message.ErrorResponse.class);
+            assertThat(call(handler, BOB, new Message.ZeroCopyPutRequest("bobs", "stolen", 0,
+                    "../../meta", null, List.of(), null)))
+                    .isInstanceOf(Message.ErrorResponse.class);
+            assertThat(call(handler, BOB, new Message.GetCandyRequest("bobs", "stolen")))
+                    .isInstanceOf(Message.NotFoundResponse.class);
+            assertThat(call(handler, BOB, new Message.GetCandyRequest("secret", "stolen")))
+                    .isInstanceOf(Message.AccessDeniedResponse.class);
+
+            // The requester itself can consume it, exactly once.
+            assertThat(call(handler, ALICE, new Message.ZeroCopyPutRequest("secret", "copy", 0,
+                    alices.relayToken(), null, List.of(), null)))
+                    .isInstanceOf(Message.HeadCandyResponse.class);
+            assertThat(call(handler, ALICE, new Message.ZeroCopyPutRequest("secret", "again", 0,
+                    alices.relayToken(), null, List.of(), null)))
+                    .isInstanceOf(Message.ErrorResponse.class);
+        }
+    }
+
+    @Test
+    void renameRelayOnlyWritesThePreparedDestination() {
+        try (CandyboxNode node = newAuthorizedNode()) {
+            RequestHandler handler = node.requestHandler();
+            call(handler, ALICE, new Message.CreateBoxRequest("xpart", 2));
+            String src = keyIn(0, 2, "src");
+            String dst = keyIn(1, 2, "dst");
+            String other = keyIn(1, 2, "other");
+            call(handler, ALICE, put("xpart", src));
+
+            Message.CandyLocatorResponse relay = (Message.CandyLocatorResponse) call(handler, ALICE,
+                    new Message.PrepareRenameRequest("xpart", src, dst, 1, "rename-2"));
+            assertThat(call(handler, ALICE, new Message.ZeroCopyPutRequest("xpart", other, 0,
+                    relay.relayToken(), null, List.of(), "rename-2")))
+                    .isInstanceOf(Message.ErrorResponse.class);
+            assertThat(call(handler, ALICE, new Message.GetCandyRequest("xpart", other)))
+                    .isInstanceOf(Message.NotFoundResponse.class);
         }
     }
 
