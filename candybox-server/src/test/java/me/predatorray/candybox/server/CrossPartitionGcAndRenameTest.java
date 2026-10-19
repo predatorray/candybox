@@ -291,6 +291,59 @@ class CrossPartitionGcAndRenameTest {
     }
 
     @Test
+    void pendingRelayBytesAreBudgetedPerNodeAcrossBoxes() {
+        ManualClock clock = new ManualClock(1_000_000);
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        BoxName other = BoxName.of("xp-other");
+        try (CandyboxNode node = new CandyboxNode(1, CandyboxConfig.builder()
+                .leaseRenewIntervalMillis(0).renameIntentAbandonMillis(1_000)
+                .zeroCopyRelayBudgetBytes(3 * relaySize(clock) + 8).build(),
+                new InMemoryLedgerStore(), coordination, clock)) {
+            node.createBox(BOX, PARTITIONS);
+            node.createBox(other, PARTITIONS);
+            String src = keyIn(0, "src");
+            node.enginePartition(BOX, 0).putCandy(CandyKey.of(src), bytes("payload"), null,
+                    Map.of(), null);
+            node.enginePartition(other, 0).putCandy(CandyKey.of(src), bytes("payload"), null,
+                    Map.of(), null);
+            RequestHandler handler = node.requestHandler();
+            relayToken(handler, src);
+            String consumable = relayToken(handler, src);
+            assertThat(send(handler, new Message.GetCandyLocatorRequest(other.value(), src)))
+                    .isInstanceOf(Message.CandyLocatorResponse.class);
+            assertThat(send(handler, new Message.GetCandyLocatorRequest(other.value(), src)))
+                    .isInstanceOf(Message.BusyResponse.class);
+
+            // A consumed relay frees its bytes once the budget check recounts.
+            send(handler, new Message.ZeroCopyPutRequest(BOX.value(), keyIn(1, "dst"), 0,
+                    consumable, null, List.of(), null));
+            assertThat(send(handler, new Message.GetCandyLocatorRequest(other.value(), src)))
+                    .isInstanceOf(Message.CandyLocatorResponse.class);
+
+            // And stale ones are reaped by that recount.
+            clock.advance(1_001);
+            assertThat(send(handler, new Message.GetCandyLocatorRequest(other.value(), src)))
+                    .isInstanceOf(Message.CandyLocatorResponse.class);
+        }
+    }
+
+    /** The serialized size of a relay for a small single-part Candy. */
+    private static long relaySize(ManualClock clock) {
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        try (CandyboxNode node = new CandyboxNode(9, CandyboxConfig.builder()
+                .leaseRenewIntervalMillis(0).build(), new InMemoryLedgerStore(), coordination,
+                clock)) {
+            node.createBox(BOX, PARTITIONS);
+            String src = keyIn(0, "src");
+            node.enginePartition(BOX, 0).putCandy(CandyKey.of(src), bytes("payload"), null,
+                    Map.of(), null);
+            String token = relayToken(node.requestHandler(), src);
+            return coordination.get(CandyboxKeys.locatorRelayKey(BOX.value(), 0, token))
+                    .orElseThrow().value().length;
+        }
+    }
+
+    @Test
     void relaySweepSurvivesACoordinationError() {
         FailingChildren coordination = new FailingChildren(new InMemoryCoordinationService());
         try (CandyboxNode node = new CandyboxNode(1, CandyboxConfig.builder()
