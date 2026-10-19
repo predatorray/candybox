@@ -27,6 +27,7 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
 import me.predatorray.candybox.bookkeeper.LedgerStore;
 import me.predatorray.candybox.common.BoxName;
 import me.predatorray.candybox.common.CandyKey;
@@ -308,6 +309,7 @@ public final class CandyboxNode implements AutoCloseable {
         }
         descriptorCache.remove(box.value());
         deleteMetaQuietly(box);
+        deleteLocatorRelays(box, descriptor.partitionCount());
         aclStore.delete(box.value());
         // TODO(phase-3): reference-counted GC of the Box's SSTable/Syrup/WAL/manifest ledgers.
     }
@@ -736,17 +738,43 @@ public final class CandyboxNode implements AutoCloseable {
         return token;
     }
 
-    Optional<LocatorRelay> readLocatorRelay(String box, int srcPartition, String token) {
-        return coordination.get(CandyboxKeys.locatorRelayKey(box, srcPartition, token))
-                .map(v -> LocatorRelay.deserialize(v.value()));
+    /**
+     * Takes the relay under {@code token} if {@code acceptable} and still fresh, deleting it at the
+     * version read so concurrent puts cannot both consume it. Freshness is half the abandon window,
+     * leaving the other half for clock skew against the source owner's intent sweep.
+     */
+    Optional<LocatorRelay> claimLocatorRelay(String box, int srcPartition, String token,
+                                             Predicate<LocatorRelay> acceptable) {
+        String key = CandyboxKeys.locatorRelayKey(box, srcPartition, token);
+        Optional<VersionedValue> value = coordination.get(key);
+        if (value.isEmpty()) {
+            return Optional.empty();
+        }
+        LocatorRelay relay = LocatorRelay.deserialize(value.get().value());
+        long age = clock.currentTimeMillis() - relay.createdAtMillis();
+        if (age > config.renameIntentAbandonMillis() / 2 || !acceptable.test(relay)) {
+            return Optional.empty();
+        }
+        try {
+            coordination.delete(key, value.get().version());
+        } catch (CasConflictException raced) {
+            return Optional.empty();
+        }
+        return Optional.of(relay);
     }
 
-    void deleteLocatorRelay(String box, int srcPartition, String token) {
-        try {
-            CoordinationCas.deleteIfPresent(coordination,
-                    CandyboxKeys.locatorRelayKey(box, srcPartition, token), 0);
-        } catch (CasConflictException raced) {
-            // Already deleted (consumed twice, or reaped).
+    private void deleteLocatorRelays(BoxName box, int partitionCount) {
+        for (int p = 0; p < partitionCount; p++) {
+            for (String token : coordination.children(
+                    CandyboxKeys.locatorRelaysPath(box.value(), p))) {
+                try {
+                    CoordinationCas.deleteIfPresent(coordination,
+                            CandyboxKeys.locatorRelayKey(box.value(), p, token), 0);
+                } catch (RuntimeException e) {
+                    LOG.warn("Failed to delete locator relay {} of box {}: {}", token, box,
+                            e.getMessage());
+                }
+            }
         }
     }
 

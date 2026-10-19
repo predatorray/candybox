@@ -447,7 +447,6 @@ final class NodeRequestHandler implements RequestHandler {
                 node.writeRenameMarker(m.box(), relay.renameToken(), relay.srcKey(),
                         m.srcPartition(), source.hlc(), m.dstKey());
             }
-            node.deleteLocatorRelay(m.box(), m.srcPartition(), m.relayToken());
             return new Message.HeadCandyResponse(meta.contentLength(), meta.contentType(),
                     meta.userMetadata(), meta.crc32c(), meta.createdAtMillis());
         } else if (message instanceof Message.CompleteRenameRequest m) {
@@ -618,18 +617,19 @@ final class NodeRequestHandler implements RequestHandler {
     }
 
     /**
-     * The relay a zero-copy put names, provided the same principal created it and, for a rename, it
-     * was prepared for this destination key. Anything else is indistinguishable from a missing relay.
+     * Claims the relay a zero-copy put names, provided the same principal created it and, for a
+     * rename, it was prepared for this destination key. Anything else, including an expired or
+     * already-claimed relay, is indistinguishable from a missing one.
      */
     private LocatorRelay consumableRelay(Message.ZeroCopyPutRequest m, Principal principal) {
         Optional<LocatorRelay> relay = m.relayToken() != null
                 && RELAY_TOKEN.matcher(m.relayToken()).matches()
-                ? node.readLocatorRelay(m.box(), m.srcPartition(), m.relayToken())
+                ? node.claimLocatorRelay(m.box(), m.srcPartition(), m.relayToken(),
+                        r -> r.requester().equals(principal.toString())
+                                && (!r.isRename() || r.dstKey().equals(m.dstKey())))
                 : Optional.empty();
-        return relay
-                .filter(r -> r.requester().equals(principal.toString()))
-                .filter(r -> !r.isRename() || r.dstKey().equals(m.dstKey()))
-                .orElseThrow(() -> new ValidationException("Unknown or expired locator relay"));
+        return relay.orElseThrow(
+                () -> new ValidationException("Unknown or expired locator relay"));
     }
 
     /**

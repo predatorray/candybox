@@ -104,11 +104,12 @@ New wire ops:
   writes the resolved locator, the requesting principal and the source key to
   `boxes/<box>/partitions/<p>/relays/<relayToken>` (a server-minted UUID).
 - `ZeroCopyPutRequest(box, dstKey, srcPartition, relayToken, owner, grants, idempotencyToken)` →
-  `HeadCandyResponse` — the destination owner reads the relay (it must exist and belong to the same
-  principal, and a rename relay must name this `dstKey`), writes a destination locator reusing the
+  `HeadCandyResponse` — the destination owner claims the relay with a versioned delete (it must
+  belong to the same principal, be younger than half of `rename.intent.abandon.millis`, and a
+  rename relay must name this `dstKey`), writes a destination locator reusing the
   relayed parts verbatim, commits it to WAL + memtable, publishes its refs, and for a rename relay
   writes the completion marker `boxes/<box>/renames/<token>` = `{dstKey, srcKey, srcPartition,
-  srcHlc}` after the locator is durable. It then deletes the relay. A copy is owned by the requester
+  srcHlc}` after the locator is durable. A copy is owned by the requester
   (`owner`/`grants` follow the plain-put rules); a rename keeps the relayed ACL.
 - `CompleteRenameRequest(box, srcKey, srcPartition, renameToken, srcHlc)` → `OkResponse` — the
   source owner finalizes the rename: LWW-conditioned tombstone of `srcKey`, clear the intent, delete

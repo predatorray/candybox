@@ -200,17 +200,74 @@ class CrossPartitionGcAndRenameTest {
             assertThat(node.sweepStaleLocatorRelaysOnce()).isEqualTo(1);
             assertThat(coordination.children(relays)).containsExactly(fresh);
 
+            // Past half the window a relay is no longer consumable, even before the sweep reaps it.
+            assertThat(send(handler, new Message.ZeroCopyPutRequest(BOX.value(), keyIn(1, "dst"),
+                    0, fresh, null, List.of(), null))).isInstanceOf(Message.ErrorResponse.class);
+
             // Consuming a relay deletes it.
-            Message put = CODEC.decode(handler.handle(CODEC.encode(new Message.ZeroCopyPutRequest(
-                    BOX.value(), keyIn(1, "dst"), 0, fresh, null, List.of(), null))));
-            assertThat(put).isInstanceOf(Message.HeadCandyResponse.class);
-            assertThat(coordination.children(relays)).isEmpty();
+            String current = relayToken(handler, src);
+            assertThat(send(handler, new Message.ZeroCopyPutRequest(BOX.value(), keyIn(1, "dst"),
+                    0, current, null, List.of(), null)))
+                    .isInstanceOf(Message.HeadCandyResponse.class);
+            assertThat(coordination.children(relays)).containsExactly(fresh);
         }
     }
 
+    @Test
+    void deletingABoxDropsItsLocatorRelays() {
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService();
+        try (CandyboxNode node = new CandyboxNode(1, CandyboxConfig.builder()
+                .leaseRenewIntervalMillis(0).build(), new InMemoryLedgerStore(), coordination,
+                new ManualClock(1000))) {
+            node.createBox(BOX, PARTITIONS);
+            String src = keyIn(2, "src");
+            node.enginePartition(BOX, 2).putCandy(CandyKey.of(src), bytes("payload"), null,
+                    Map.of(), null);
+            relayToken(node.requestHandler(), src);
+            node.enginePartition(BOX, 2).deleteCandy(CandyKey.of(src));
+
+            node.deleteBox(BOX, false);
+
+            assertThat(coordination.children(CandyboxKeys.locatorRelaysPath(BOX.value(), 2)))
+                    .isEmpty();
+        }
+    }
+
+    @Test
+    void anonymousCrossPartitionRenameRunsThroughTheHandler() {
+        try (CandyboxNode node = new CandyboxNode(1, CandyboxConfig.builder()
+                .leaseRenewIntervalMillis(0).build(), new InMemoryLedgerStore(),
+                new InMemoryCoordinationService(), new ManualClock(1000))) {
+            node.createBox(BOX, PARTITIONS);
+            String src = keyIn(0, "src");
+            String dst = keyIn(1, "dst");
+            node.enginePartition(BOX, 0).putCandy(CandyKey.of(src), bytes("payload"), "text/plain",
+                    Map.of("m", "v"), null);
+            RequestHandler handler = node.requestHandler();
+
+            Message.CandyLocatorResponse relay = (Message.CandyLocatorResponse) send(handler,
+                    new Message.PrepareRenameRequest(BOX.value(), src, dst, 1, "anon-rename"));
+            Message.HeadCandyResponse head = (Message.HeadCandyResponse) send(handler,
+                    new Message.ZeroCopyPutRequest(BOX.value(), dst, 0, relay.relayToken(), null,
+                            List.of(), "anon-rename"));
+            assertThat(head.contentType()).isEqualTo("text/plain");
+            assertThat(head.userMetadata()).containsEntry("m", "v");
+            assertThat(send(handler, new Message.CompleteRenameRequest(BOX.value(), src, 0,
+                    "anon-rename", relay.hlc()))).isInstanceOf(Message.OkResponse.class);
+
+            assertThat(node.enginePartition(BOX, 1).getCandy(CandyKey.of(dst)))
+                    .isEqualTo(bytes("payload"));
+            assertThatThrownBy(() -> node.enginePartition(BOX, 0).getCandy(CandyKey.of(src)))
+                    .isInstanceOf(CandyNotFoundException.class);
+        }
+    }
+
+    private static Message send(RequestHandler handler, Message request) {
+        return CODEC.decode(handler.handle(CODEC.encode(request)));
+    }
+
     private static String relayToken(RequestHandler handler, String key) {
-        Message response = CODEC.decode(handler.handle(CODEC.encode(
-                new Message.GetCandyLocatorRequest(BOX.value(), key))));
-        return ((Message.CandyLocatorResponse) response).relayToken();
+        return ((Message.CandyLocatorResponse) send(handler,
+                new Message.GetCandyLocatorRequest(BOX.value(), key))).relayToken();
     }
 }

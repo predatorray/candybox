@@ -231,8 +231,10 @@ consults range tombstones across all tables rather than pruning by point range.
   (`boxes/<box>/partitions/<p>/relays/<token>`) and hands the client only the token; the destination
   owner (`ZeroCopyPut`) reads that relay — so the parts and a rename's ACL it writes never pass
   through the client — and writes a destination locator reusing the very same Syrup segments. No
-  object bytes are ever moved or re-stored. A relay is bound to the requesting principal, consumed
-  once, and reaped by the source owner if unused past `rename.intent.abandon.millis`. This is safe because the blob layer is physically global (a `SegmentRef` resolves bytes
+  object bytes are ever moved or re-stored. A relay is bound to the requesting principal, claimed
+  atomically by one put, consumable only within half of `rename.intent.abandon.millis` (so it can
+  never outlive its rename intent, with the rest as clock-skew margin), and reaped by the source
+  owner past the full window. This is safe because the blob layer is physically global (a `SegmentRef` resolves bytes
   by `syrupId` alone, no partition scoping) and because **Box-global GC** (§9) keeps a Syrup alive
   while *any* partition references it. A cross-partition `rename` is still copy-then-delete across
   two owners, but now **eventually atomic**: the source owner records a durable rename intent (§5),
