@@ -306,9 +306,11 @@ public final class ZooKeeperCoordinationService implements CoordinationService {
         try {
             PersistentNode existing = memberNodes.get(nodeId);
             if (existing != null) {
-                existing.setData(info); // what a re-creation will write
+                // The recipe writes in the background (and on re-creation); the direct write makes
+                // the new info visible before this returns.
+                existing.setData(info);
                 try {
-                    client.setData().forPath(p, info); // visible now, not in the background
+                    client.setData().forPath(p, info);
                 } catch (KeeperException.NoNodeException ignored) {
                     // being re-created after a session loss, with the new info
                 }
@@ -317,6 +319,7 @@ public final class ZooKeeperCoordinationService implements CoordinationService {
             dropPersistentMember(p);
             PersistentNode node = new PersistentNode(client, CreateMode.EPHEMERAL, false, p, info);
             node.start();
+            // Holds the monitor while waiting; registration only happens at node startup.
             boolean created;
             try {
                 created = node.waitForInitialCreate(MEMBER_REGISTER_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);

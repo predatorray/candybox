@@ -193,6 +193,10 @@ class PartitionBalancerTest {
                 clock.advance(1_000);
                 nodeA.renewLeases();
             }
+            // Until its session expires, node 2 is still a member and keeps its (unowned) partitions.
+            nodeA.runBalancerOnce();
+            assertThat(countOwnedBy(coordination, box.value(), 4, 1)).isEqualTo(2);
+
             coordination.expireMember(2);
 
             nodeA.runBalancerOnce();

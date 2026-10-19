@@ -19,11 +19,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
-import me.predatorray.candybox.common.SystemClock;
 import me.predatorray.candybox.common.Clock;
+import me.predatorray.candybox.common.SystemClock;
 import me.predatorray.candybox.coordination.CoordinationService;
 import me.predatorray.candybox.coordination.CoordinationServiceContract;
 import me.predatorray.candybox.coordination.zk.ZooKeeperCoordinationService;
@@ -31,9 +33,9 @@ import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
 import org.apache.curator.retry.ExponentialBackoffRetry;
 import org.apache.curator.test.TestingServer;
-import org.junit.jupiter.api.AfterAll;
 import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.data.Stat;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -51,6 +53,7 @@ class ZooKeeperCoordinationServiceContractIT extends CoordinationServiceContract
     private static TestingServer zookeeper;
     private static final AtomicInteger NAMESPACE_SEQ = new AtomicInteger();
     private static final List<CuratorFramework> CLIENTS = new ArrayList<>();
+    private static final Map<ZooKeeperCoordinationService, CuratorFramework> SERVICES = new HashMap<>();
 
     @BeforeAll
     static void startZooKeeper() throws Exception {
@@ -59,6 +62,11 @@ class ZooKeeperCoordinationServiceContractIT extends CoordinationServiceContract
 
     @AfterAll
     static void stopZooKeeper() throws Exception {
+        // Close member recipes before their clients, or Curator keeps retrying them on a closed client.
+        for (ZooKeeperCoordinationService service : SERVICES.keySet()) {
+            service.close();
+        }
+        SERVICES.clear();
         for (CuratorFramework client : CLIENTS) {
             client.close();
         }
@@ -90,6 +98,19 @@ class ZooKeeperCoordinationServiceContractIT extends CoordinationServiceContract
         }
         CLIENTS.add(client);
         return client;
+    }
+
+    private static ZooKeeperCoordinationService service(CuratorFramework client) {
+        ZooKeeperCoordinationService service = new ZooKeeperCoordinationService(client, SystemClock.INSTANCE);
+        SERVICES.put(service, client);
+        return service;
+    }
+
+    /** Ends the client's session for good and abandons it with its services, as a crashed process would. */
+    private static void crash(CuratorFramework client) throws Exception {
+        client.getZookeeperClient().getZooKeeper().close();
+        CLIENTS.remove(client);
+        SERVICES.values().removeIf(client::equals);
     }
 
     private static long sessionId(CuratorFramework client) throws Exception {
@@ -125,13 +146,13 @@ class ZooKeeperCoordinationServiceContractIT extends CoordinationServiceContract
     void crashedMemberDisappearsWithItsSession() throws Exception {
         String ns = "crash-" + NAMESPACE_SEQ.incrementAndGet();
         CuratorFramework crashing = newClient(ns);
-        ZooKeeperCoordinationService member = new ZooKeeperCoordinationService(crashing, SystemClock.INSTANCE);
-        ZooKeeperCoordinationService observer = new ZooKeeperCoordinationService(newClient(ns), SystemClock.INSTANCE);
+        ZooKeeperCoordinationService member = service(crashing);
+        ZooKeeperCoordinationService observer = service(newClient(ns));
 
         member.registerMember(7, "host-7:70".getBytes(StandardCharsets.UTF_8));
         assertThat(observer.members()).containsExactly(7);
 
-        crashing.close(); // the session ends without unregisterMember
+        crash(crashing); // closing the handle ends the session at once; expiry is covered below
         await("the crashed member is gone", () -> observer.members().isEmpty());
     }
 
@@ -140,7 +161,7 @@ class ZooKeeperCoordinationServiceContractIT extends CoordinationServiceContract
         String ns = "expiry-" + NAMESPACE_SEQ.incrementAndGet();
         CuratorFramework client = newClient(ns);
         CuratorFramework observer = newClient(ns);
-        ZooKeeperCoordinationService member = new ZooKeeperCoordinationService(client, SystemClock.INSTANCE);
+        ZooKeeperCoordinationService member = service(client);
         member.registerMember(7, "host-7:70".getBytes(StandardCharsets.UTF_8));
         long firstSession = sessionId(client);
         assertThat(memberOwner(observer, 7)).isEqualTo(firstSession);
@@ -163,12 +184,12 @@ class ZooKeeperCoordinationServiceContractIT extends CoordinationServiceContract
         String ns = "restart-" + NAMESPACE_SEQ.incrementAndGet();
         CuratorFramework previous = newClient(ns);
         CuratorFramework restarted = newClient(ns);
-        new ZooKeeperCoordinationService(previous, SystemClock.INSTANCE)
+        service(previous)
                 .registerMember(7, "old:70".getBytes(StandardCharsets.UTF_8));
 
-        ZooKeeperCoordinationService member = new ZooKeeperCoordinationService(restarted, SystemClock.INSTANCE);
+        ZooKeeperCoordinationService member = service(restarted);
         member.registerMember(7, "new:70".getBytes(StandardCharsets.UTF_8));
-        previous.close();
+        crash(previous);
 
         await("the restarted node owns its member znode", ownedBy(restarted, 7, restarted));
         assertThat(member.memberInfo(7).map(String::new)).contains("new:70");
@@ -181,7 +202,7 @@ class ZooKeeperCoordinationServiceContractIT extends CoordinationServiceContract
         client.create().creatingParentsIfNeeded().withMode(CreateMode.PERSISTENT)
                 .forPath("/members/7", "old:70".getBytes(StandardCharsets.UTF_8));
 
-        new ZooKeeperCoordinationService(client, SystemClock.INSTANCE)
+        service(client)
                 .registerMember(7, "new:70".getBytes(StandardCharsets.UTF_8));
 
         assertThat(memberOwner(client, 7)).isEqualTo(sessionId(client));
