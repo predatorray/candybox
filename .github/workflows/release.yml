@@ -2,8 +2,9 @@ name: Release
 
 # Cuts a release from a release/X.Y.x branch (see the Cut release branch workflow): sets the release
 # version, runs the full test suite, publishes to Maven Central, tags it, creates a GitHub Release with
-# the distribution archives, and opens a PR that moves the release branch to the next -SNAPSHOT. It
-# never pushes to main or to the release branch itself. Start it from the Actions tab ("Run
+# the distribution archives, and opens a PR that moves the release branch to the next -SNAPSHOT,
+# plus one that points main's docs at the new release. It never pushes to main or to the release
+# branch itself. Start it from the Actions tab ("Run
 # workflow") on the release branch; see RELEASING.md.
 on:
   workflow_dispatch:
@@ -98,7 +99,7 @@ jobs:
         env:
           RELEASE: ${{ steps.versions.outputs.release }}
         run: |
-          mvn -q -B -ntp versions:set -DnewVersion="${RELEASE}" -DgenerateBackupPoms=false -DprocessAllModules
+          .github/scripts/set-version.sh "${RELEASE}"
           git commit -am "Release ${RELEASE}"
           git tag -a "v${RELEASE}" -m "Release ${RELEASE}"
 
@@ -139,7 +140,7 @@ jobs:
           BUMP: ${{ steps.versions.outputs.bump }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          mvn -q -B -ntp versions:set -DnewVersion="${NEXT}" -DgenerateBackupPoms=false -DprocessAllModules
+          .github/scripts/set-version.sh "${NEXT}"
           git commit -am "Prepare ${NEXT}"
           git push origin "HEAD:refs/heads/${BUMP}"
           body="Released ${RELEASE} to Maven Central (tag \`v${RELEASE}\`). This moves \`${GITHUB_REF_NAME}\` to ${NEXT}; any merge method works."
@@ -148,3 +149,29 @@ jobs:
             exit 1
           fi
           echo "Released ${RELEASE}. Merge ${url} to move ${GITHUB_REF_NAME} to ${NEXT}." >> "$GITHUB_STEP_SUMMARY"
+
+      # The docs are published from main, so they learn about a release through a PR to main. Only
+      # a release newer than the one main documents moves it: a patch on an older line does not.
+      - name: Open a PR documenting the release on main
+        env:
+          RELEASE: ${{ steps.versions.outputs.release }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch -q origin main
+          documented=$(git show origin/main:docs/config.toml | sed -n "s/^ *candyboxRelease = '\([^']*\)'.*/\1/p")
+          newest=$(printf '%s\n%s\n' "${documented}" "${RELEASE}" | sort -V | tail -n 1)
+          if [ "${documented}" = "${RELEASE}" ] || [ "${newest}" != "${RELEASE}" ]; then
+            echo "main documents ${documented:-no release}; leaving it for ${RELEASE}." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          docs="version-bump/docs-${RELEASE}"
+          git switch -q -c "${docs}" origin/main
+          sed -i "s/^\( *candyboxRelease = '\)[^']*'/\1${RELEASE}'/" docs/config.toml
+          git commit -am "Document release ${RELEASE}"
+          git push origin "HEAD:refs/heads/${docs}"
+          body="Points the docs' install instructions at ${RELEASE} (tag \`v${RELEASE}\`), which is now on Maven Central."
+          if ! url=$(gh pr create --base main --head "${docs}" --title "Document release ${RELEASE}" --body "${body}"); then
+            echo "::error::${RELEASE} is published, but no docs PR could be opened. Open one from ${docs} to main by hand."
+            exit 1
+          fi
+          echo "Merge ${url} to point main's docs at ${RELEASE}." >> "$GITHUB_STEP_SUMMARY"

@@ -105,7 +105,7 @@ jobs:
           NEXT: ${{ steps.versions.outputs.next }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          mvn -q -B -ntp versions:set -DnewVersion="${NEXT}" -DgenerateBackupPoms=false -DprocessAllModules
+          .github/scripts/set-version.sh "${NEXT}"
           bump="version-bump/main-${NEXT}"
           git switch -c "${bump}"
           git commit -am "Prepare ${NEXT}"

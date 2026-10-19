@@ -40,6 +40,10 @@ enableGitInfo = true
   # Only pages under content/docs become part of the manual's menu; the landing
   # page (content/_index.md) stays out of the sidebar tree.
   BookSection = 'docs'
+  # The latest release on Maven Central and GitHub Releases. Pages print it with
+  # {{< param "candyboxRelease" >}}. The Release workflow opens a PR updating it after each
+  # release, so keep it as the only literal release version in the docs.
+  candyboxRelease = '0.1.0'
 
 [menu]
   # A couple of fixed links pinned under the sidebar nav.

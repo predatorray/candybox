@@ -10,10 +10,25 @@ What is published: `candybox-parent` (POM), `candybox-common`, `candybox-bookkee
 `candybox-coordination`, `candybox-lsm`, `candybox-protocol`, `candybox-server`, `candybox-client`,
 `candybox-s3-gateway`, `candybox-admin-api` and `candybox-web`, each with `-sources` and `-javadoc`
 jars and GPG signatures. `candybox-bookkeeper` and `candybox-coordination` also ship their `-tests`
-jars, which hold the SPI contract suites. `candybox-integration-tests` and `candybox-dist` are not
-published to Central.
+jars, which hold the SPI contract suites. `candybox-integration-tests` is test scaffolding and is
+not published. The `candybox-dist` archives go to GitHub Releases only (see the limits below).
 
 Releases on Central are permanent. A version can never be changed or deleted, only superseded.
+
+## Central publishing limits
+
+Since 2026-10-01, Central rate-limits each organization's publishing per calendar month. On the
+free tier the limits are about 1,167 files, 78 MB of release size, and 7 releases; Sonatype's
+*Usage Center* shows the current values and your usage. The limits are per organization, so the
+`predatorray` namespaces' other projects (timestone, for example) count against them too.
+
+- One Candybox release is a single deployment of about 170 files and 6 MB. Signatures and
+  checksums count as files, so the build generates only the `.md5` and `.sha1` checksums that
+  Central requires, not `.sha256` and `.sha512`.
+- The `candybox-dist` archives are about 95 MB each, which on its own is more than the monthly
+  size limit. That is why they are excluded from the Central bundle and attached to the GitHub
+  Release instead.
+- Several releases in one month, from any of your projects, can reach the release-count limit.
 
 ## One-time setup
 
@@ -52,6 +67,36 @@ Releases on Central are permanent. A version can never be changed or deleted, on
    `main`, so that changes reach them only through reviewed PRs with green CI. CI runs for pushes
    and PRs to `release/**` as well as `main`. If the ruleset restricts branch *creation*, let
    GitHub Actions bypass that one rule, because the Cut release branch workflow creates the branch.
+
+## Versions outside the POMs
+
+`.github/scripts/set-version.sh <version>` sets the version in every POM and in
+`candybox-web/package.json` and `package-lock.json`. Both workflows use it for every version
+change, so those files always carry the project version.
+
+The docs print the latest release from one place: `candyboxRelease` in `docs/config.toml`, used
+through `{{< param "candyboxRelease" >}}`. The Release workflow opens a PR to `main` that
+updates it, but only when the new release is newer than the one documented, so a patch release
+on an older line leaves it alone.
+
+The Kubernetes example uses the published `zetaplusae/candybox:latest` image, so it carries no
+version.
+
+### Before each release
+
+1. Look for version literals that nothing above updates. Take the release branch's version
+   without `-SNAPSHOT` (for example `0.1.0`):
+
+   ```bash
+   git grep -nF '0.1.0' -- ':!*pom.xml' ':!*package.json' ':!*package-lock.json' ':!RELEASING.md'
+   ```
+
+   Expected hits are `candyboxRelease` in `docs/config.toml`, which the Release workflow updates,
+   and the examples in the workflows' input descriptions. Any other hit that names Candybox's own
+   version needs fixing; third-party versions can stay. Fix it on `main` first, then cherry-pick
+   it like any other fix.
+2. After the first release (0.1.0), remove the *Not yet published* warnings and the
+   *Placeholder* comments in `docs/content/docs/installation/_index.md`. This is a one-time step.
 
 ## Branching model
 
@@ -117,9 +162,12 @@ The workflow then:
 3. pushes the release commit to a `version-bump/release-X.Y.x-<next>` branch, pushes the tag, and
    creates a GitHub Release with the `candybox-dist` archives;
 4. sets the next `-SNAPSHOT` version, commits `Prepare <next>`, pushes it to the same branch and
-   opens a PR against the release branch.
+   opens a PR against the release branch;
+5. if this release is newer than the one the docs name, opens a *Document release X.Y.Z* PR
+   against `main` that updates `candyboxRelease` in `docs/config.toml`.
 
-Merge that PR to finish the release. Until it is merged, the release branch still carries the old
+Merge the *Prepare* PR to finish the release, and the *Document release* PR to update the
+published docs. Until it is merged, the release branch still carries the old
 `-SNAPSHOT` version, and the next Release run stops on the existing tag.
 
 For a patch release, cherry-pick the fixes onto the same release branch and run *Release* on it

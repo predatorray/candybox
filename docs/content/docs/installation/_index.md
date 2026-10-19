@@ -32,8 +32,8 @@ The intended download, once releases are published, will look like:
 
 ```bash
 # Placeholder — not yet published
-curl -LO https://github.com/predatorray/candybox/releases/download/v0.1.0/candybox-0.1.0.tar.gz
-tar xzf candybox-0.1.0.tar.gz
+curl -LO https://github.com/predatorray/candybox/releases/download/v{{< param "candyboxRelease" >}}/candybox-{{< param "candyboxRelease" >}}.tar.gz
+tar xzf candybox-{{< param "candyboxRelease" >}}.tar.gz
 ```
 
 ### Build it from source
@@ -67,14 +67,14 @@ module.
 <dependency>
   <groupId>me.predatorray.candybox</groupId>
   <artifactId>candybox-client</artifactId>
-  <version>0.1.0</version>
+  <version>{{< param "candyboxRelease" >}}</version>
 </dependency>
 ```
 {{< /tab >}}
 {{< tab "Gradle" >}}
 ```groovy
 // Placeholder — not yet published to Maven Central
-implementation 'me.predatorray.candybox:candybox-client:0.1.0'
+implementation 'me.predatorray.candybox:candybox-client:{{< param "candyboxRelease" >}}'
 ```
 {{< /tab >}}
 {{< /tabs >}}

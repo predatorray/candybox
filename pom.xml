@@ -457,9 +457,14 @@
                         <configuration>
                             <publishingServerId>central</publishingServerId>
                             <deploymentName>candybox-${project.version}</deploymentName>
-                            <!-- Test scaffolding and the fat distribution archive (it bundles every
-                                 third-party jar) are not library artifacts; the archive goes to
-                                 GitHub Releases instead. -->
+                            <!-- Central limits each organization's monthly publishing by file count
+                                 and total size, and checksum files count. Central requires only
+                                 .md5 and .sha1, which keeps a release at about 170 files. -->
+                            <checksums>required</checksums>
+                            <!-- candybox-integration-tests is test scaffolding. The candybox-dist
+                                 archives (about 95 MB each, bundling every runtime dependency) would
+                                 exceed the monthly size limit on their own, so they go to GitHub
+                                 Releases instead. -->
                             <excludeArtifacts>
                                 <excludeArtifact>candybox-integration-tests</excludeArtifact>
                                 <excludeArtifact>candybox-dist</excludeArtifact>
