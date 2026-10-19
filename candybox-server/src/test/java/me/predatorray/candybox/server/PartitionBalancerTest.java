@@ -208,6 +208,38 @@ class PartitionBalancerTest {
     }
 
     @Test
+    void liveOwnerKeepsItsPartitionsWhenOnlyItsSessionBlips() {
+        ManualClock clock = new ManualClock(1_000);
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        BoxName box = BoxName.of("blip-box");
+
+        CandyboxNode nodeA = new CandyboxNode(1, config(8), store, coordination, clock);
+        CandyboxNode nodeB = new CandyboxNode(2, config(8), store, coordination, clock);
+        try {
+            nodeA.createBox(box, 4);
+            for (int i = 0; i < 3; i++) {
+                nodeA.runBalancerOnce();
+                nodeB.runBalancerOnce();
+            }
+            assertThat(countOwnedBy(coordination, box.value(), 4, 2)).isEqualTo(2);
+
+            // Node 2's membership session expires while its leases are still valid, then comes back.
+            coordination.expireMember(2);
+            nodeA.runBalancerOnce();
+            coordination.registerMember(2, "node-2".getBytes(StandardCharsets.UTF_8));
+            nodeB.runBalancerOnce();
+            nodeA.runBalancerOnce();
+
+            assertThat(countOwnedBy(coordination, box.value(), 4, 2)).isEqualTo(2);
+        } finally {
+            nodeA.close();
+            nodeB.close();
+            store.close();
+        }
+    }
+
+    @Test
     void ownersDropPartitionsOfDeletedBoxes() {
         ManualClock clock = new ManualClock(1_000);
         InMemoryLedgerStore store = new InMemoryLedgerStore();

@@ -98,7 +98,8 @@ class MembershipFailoverIT {
             }
             assertThat(ownedBy(node1, box, 4, 2)).isEqualTo(2);
 
-            // Node 2 "crashes": its session ends and it can no longer renew, but it never closes.
+            // Node 2 "crashes": it never closes and can no longer renew. Closing the handle ends the
+            // session at once instead of after the timeout; ZooKeeper's expiry gives the same end state.
             client2.getZookeeperClient().getZooKeeper().close();
 
             long deadline = System.nanoTime() + 30_000_000_000L;

@@ -141,8 +141,12 @@ final class PartitionBalancer {
 
         for (BoxPartition bp : partitions) {
             Integer holder = liveHolder(bp);
-            if (holder == null || !load.containsKey(holder)) {
+            if (holder == null) {
                 unowned.add(bp); // failover / brand new: not a "move", never rate-limited
+            } else if (!load.containsKey(holder)) {
+                // Holder lost its membership session but its lease is valid: leave the partition
+                // until the lease lapses, so a ZooKeeper blip does not hand over a live node.
+                targets.put(bp, holder);
             } else if (load.get(holder) < capacity) {
                 targets.put(bp, holder); // sticky: keep the live owner within its fair share
                 load.merge(holder, 1, Integer::sum);
