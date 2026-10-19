@@ -100,7 +100,10 @@ level N's budget is `levelBaseBytes × multiplier^(N-1)`.
 | **Crash mid cross-partition rename** | Converges by roll-forward: the source owner finalizes its durable rename intent against the destination's rendezvous marker — synchronously, on its background maintenance sweep, or after a handover replays the intent. Marker present ⇒ source tombstoned; absent past `rename.intent.abandon.millis` ⇒ intent dropped, source stays live. It never leaves both keys live forever and never loses data. |
 
 With the balancer enabled (`balancerIntervalMillis > 0`), a dead node's partitions are reassigned
-and taken over automatically within a round or two of its leases expiring. With it disabled,
+and taken over automatically within a round or two of its ZooKeeper session expiring (15 s), which
+also removes it from membership. A node's `members/<nodeId>` znode is ephemeral; one left persistent
+by an older version is converted when that node next starts, and must be deleted by hand if the node
+never comes back. With it disabled,
 recovery requires some node to take over unowned partitions manually
 (`CandyboxNode.openPartition` / `openBox`).
 

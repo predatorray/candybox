@@ -290,7 +290,7 @@ boxes/<box>/partitions/<p>/refs       partition p's published referenced-Syrup s
 boxes/<box>/renames/<token>           cross-partition rename rendezvous marker (§6); cleared on finalize
 cluster/balancer                      the balancer's coordinator-election lease
 cluster/assignment                    the desired partition→node assignment table (versioned CAS)
-members/<nodeId>                      membership (advertised host:port)
+members/<nodeId>                      membership (advertised host:port); ephemeral, session-bound
 ```
 
 ### 7a. Partition balancing (elected coordinator)

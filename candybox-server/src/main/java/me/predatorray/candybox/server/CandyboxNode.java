@@ -467,7 +467,7 @@ public final class CandyboxNode implements AutoCloseable {
         balancer.runOnce();
     }
 
-    private void renewLeases() {
+    void renewLeases() {
         for (PartitionOwnership ownership : partitions.values()) {
             try {
                 ownership.renew();

@@ -229,4 +229,71 @@ class ClusterRouterTest {
                     .isInstanceOf(IllegalStateException.class);
         }
     }
+
+    /** A transport that cannot reach {@code deadPort}; every other port answers OK. */
+    private static final class PartlyDeadTransport implements Transport {
+        final int deadPort;
+        final List<Integer> contacted = Collections.synchronizedList(new ArrayList<>());
+
+        PartlyDeadTransport(int deadPort) {
+            this.deadPort = deadPort;
+        }
+
+        @Override
+        public Connection connect(String host, int port) {
+            contacted.add(port);
+            if (port == deadPort) {
+                throw new IllegalStateException("connection refused");
+            }
+            return new Connection() {
+                @Override
+                public Frame call(Frame request) {
+                    return CODEC.encode(new Message.OkResponse());
+                }
+
+                @Override
+                public void close() {
+                }
+            };
+        }
+
+        @Override
+        public void close() {
+        }
+    }
+
+    @Test
+    void callAnyFailsOverWhenAMemberIsUnreachable() {
+        InMemoryCoordinationService coordination = coordinationWithMembers();
+        PartlyDeadTransport transport = new PartlyDeadTransport(1001); // the lowest-id member is down
+        try (ClusterRouter router = new ClusterRouter(transport, coordination, 5_000, SystemClock.INSTANCE)) {
+            for (int i = 0; i < 4; i++) {
+                assertThat(router.callAny(new Message.ListBoxesRequest())).isInstanceOf(Message.OkResponse.class);
+            }
+            assertThat(transport.contacted).contains(1001, 2002);
+        }
+    }
+
+    @Test
+    void callAnySpreadsAcrossMembers() {
+        InMemoryCoordinationService coordination = coordinationWithMembers();
+        RecordingTransport transport = new RecordingTransport();
+        try (ClusterRouter router = new ClusterRouter(transport, coordination, 5_000, SystemClock.INSTANCE)) {
+            router.callAny(new Message.ListBoxesRequest());
+            router.callAny(new Message.ListBoxesRequest());
+            assertThat(transport.contacted).containsExactlyInAnyOrder(1001, 2002);
+        }
+    }
+
+    @Test
+    void callAnyThrowsWhenNoMemberIsReachable() {
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService();
+        coordination.registerMember(1, "127.0.0.1:1001".getBytes(StandardCharsets.UTF_8));
+        PartlyDeadTransport transport = new PartlyDeadTransport(1001);
+        try (ClusterRouter router = new ClusterRouter(transport, coordination, 5_000, SystemClock.INSTANCE)) {
+            assertThatThrownBy(() -> router.callAny(new Message.ListBoxesRequest()))
+                    .isInstanceOf(IllegalStateException.class)
+                    .hasMessageContaining("connection refused");
+        }
+    }
 }

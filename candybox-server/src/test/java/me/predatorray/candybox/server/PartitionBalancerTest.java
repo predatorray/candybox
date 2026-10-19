@@ -171,6 +171,39 @@ class PartitionBalancerTest {
     }
 
     @Test
+    void crashedNodesPartitionsFailOverOnceItsSessionExpires() {
+        ManualClock clock = new ManualClock(1_000);
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        BoxName box = BoxName.of("crash-box");
+        CandyboxConfig config = config(8);
+
+        CandyboxNode nodeA = new CandyboxNode(1, config, store, coordination, clock);
+        CandyboxNode nodeB = new CandyboxNode(2, config, store, coordination, clock);
+        try {
+            nodeA.createBox(box, 4);
+            for (int i = 0; i < 3; i++) {
+                nodeA.runBalancerOnce();
+                nodeB.runBalancerOnce();
+            }
+            assertThat(countOwnedBy(coordination, box.value(), 4, 2)).isEqualTo(2);
+
+            // Node 2 crashes: it stops renewing and never unregisters, but its session expires.
+            for (long t = 0; t <= config.ownershipLeaseTtlMillis(); t += 1_000) {
+                clock.advance(1_000);
+                nodeA.renewLeases();
+            }
+            coordination.expireMember(2);
+
+            nodeA.runBalancerOnce();
+            assertThat(countOwnedBy(coordination, box.value(), 4, 1)).isEqualTo(4);
+        } finally {
+            nodeA.close();
+            store.close();
+        }
+    }
+
+    @Test
     void ownersDropPartitionsOfDeletedBoxes() {
         ManualClock clock = new ManualClock(1_000);
         InMemoryLedgerStore store = new InMemoryLedgerStore();

@@ -118,4 +118,18 @@ class InMemoryCoordinationServiceTest {
         assertThat(b).isPresent();
         assertThat(b.get().fencingToken()).isGreaterThan(a.fencingToken());
     }
+
+    @Test
+    void expiredMemberDisappearsUntilItRegistersAgain() {
+        InMemoryCoordinationService cs = new InMemoryCoordinationService();
+        cs.registerMember(1, b("host-1:10"));
+        cs.registerMember(2, b("host-2:20"));
+
+        cs.expireMember(2);
+        assertThat(cs.members()).containsExactly(1);
+        assertThat(cs.memberInfo(2)).isEmpty();
+
+        cs.registerMember(2, b("host-2:20"));
+        assertThat(cs.members()).containsExactly(1, 2);
+    }
 }
