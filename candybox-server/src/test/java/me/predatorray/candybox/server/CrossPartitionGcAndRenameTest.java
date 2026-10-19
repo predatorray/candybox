@@ -21,6 +21,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import me.predatorray.candybox.bookkeeper.fake.InMemoryLedgerStore;
 import me.predatorray.candybox.common.BoxName;
 import me.predatorray.candybox.common.CandyKey;
@@ -31,6 +32,10 @@ import me.predatorray.candybox.common.auth.ObjectAcl;
 import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.exception.CandyNotFoundException;
 import me.predatorray.candybox.coordination.CandyboxKeys;
+import me.predatorray.candybox.coordination.CoordinationService;
+import me.predatorray.candybox.coordination.Lease;
+import me.predatorray.candybox.coordination.LeaseInfo;
+import me.predatorray.candybox.coordination.VersionedValue;
 import me.predatorray.candybox.coordination.fake.InMemoryCoordinationService;
 import me.predatorray.candybox.lsm.engine.BoxEngine;
 import me.predatorray.candybox.lsm.manifest.RenameIntent;
@@ -259,6 +264,114 @@ class CrossPartitionGcAndRenameTest {
                     .isEqualTo(bytes("payload"));
             assertThatThrownBy(() -> node.enginePartition(BOX, 0).getCandy(CandyKey.of(src)))
                     .isInstanceOf(CandyNotFoundException.class);
+        }
+    }
+
+    @Test
+    void pendingRelaysAreCappedPerPartitionAndStaleOnesReapedOnWrite() {
+        ManualClock clock = new ManualClock(1_000_000);
+        try (CandyboxNode node = new CandyboxNode(1, CandyboxConfig.builder()
+                .leaseRenewIntervalMillis(0).renameIntentAbandonMillis(1_000).build(),
+                new InMemoryLedgerStore(), new InMemoryCoordinationService(clock), clock)) {
+            node.createBox(BOX, PARTITIONS);
+            String src = keyIn(0, "src");
+            node.enginePartition(BOX, 0).putCandy(CandyKey.of(src), bytes("payload"), null,
+                    Map.of(), null);
+            RequestHandler handler = node.requestHandler();
+            for (int i = 0; i < CandyboxNode.MAX_PENDING_LOCATOR_RELAYS; i++) {
+                relayToken(handler, src);
+            }
+            assertThat(send(handler, new Message.GetCandyLocatorRequest(BOX.value(), src)))
+                    .isInstanceOf(Message.BusyResponse.class);
+
+            clock.advance(1_001);
+            assertThat(send(handler, new Message.GetCandyLocatorRequest(BOX.value(), src)))
+                    .isInstanceOf(Message.CandyLocatorResponse.class);
+        }
+    }
+
+    @Test
+    void relaySweepSurvivesACoordinationError() {
+        FailingChildren coordination = new FailingChildren(new InMemoryCoordinationService());
+        try (CandyboxNode node = new CandyboxNode(1, CandyboxConfig.builder()
+                .leaseRenewIntervalMillis(0).build(), new InMemoryLedgerStore(), coordination,
+                new ManualClock(1000))) {
+            node.createBox(BOX, PARTITIONS);
+            coordination.failChildren = true;
+            assertThat(node.sweepStaleLocatorRelaysOnce()).isZero();
+        }
+    }
+
+    /** Delegates to a real fake, but {@link #children} fails on demand (a ZooKeeper outage). */
+    private static final class FailingChildren implements CoordinationService {
+        private final CoordinationService delegate;
+        volatile boolean failChildren;
+
+        FailingChildren(CoordinationService delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public List<String> children(String path) {
+            if (failChildren) {
+                throw new IllegalStateException("connection loss");
+            }
+            return delegate.children(path);
+        }
+
+        @Override
+        public Optional<VersionedValue> get(String key) {
+            return delegate.get(key);
+        }
+
+        @Override
+        public long create(String key, byte[] value) {
+            return delegate.create(key, value);
+        }
+
+        @Override
+        public long compareAndSet(String key, byte[] value, long expectedVersion) {
+            return delegate.compareAndSet(key, value, expectedVersion);
+        }
+
+        @Override
+        public void delete(String key, long expectedVersion) {
+            delegate.delete(key, expectedVersion);
+        }
+
+        @Override
+        public Optional<Lease> tryAcquireLease(String resource, int nodeId, long ttlMillis) {
+            return delegate.tryAcquireLease(resource, nodeId, ttlMillis);
+        }
+
+        @Override
+        public Optional<LeaseInfo> leaseHolder(String resource) {
+            return delegate.leaseHolder(resource);
+        }
+
+        @Override
+        public void registerMember(int nodeId, byte[] info) {
+            delegate.registerMember(nodeId, info);
+        }
+
+        @Override
+        public void unregisterMember(int nodeId) {
+            delegate.unregisterMember(nodeId);
+        }
+
+        @Override
+        public List<Integer> members() {
+            return delegate.members();
+        }
+
+        @Override
+        public Optional<byte[]> memberInfo(int nodeId) {
+            return delegate.memberInfo(nodeId);
+        }
+
+        @Override
+        public void close() {
+            delegate.close();
         }
     }
 

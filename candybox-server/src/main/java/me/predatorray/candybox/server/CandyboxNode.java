@@ -39,6 +39,7 @@ import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.exception.BoxAlreadyExistsException;
 import me.predatorray.candybox.common.exception.BoxNotEmptyException;
 import me.predatorray.candybox.common.exception.BoxNotFoundException;
+import me.predatorray.candybox.common.exception.BusyException;
 import me.predatorray.candybox.common.exception.FencedException;
 import me.predatorray.candybox.common.exception.NotOwnerException;
 import me.predatorray.candybox.coordination.BoxDescriptor;
@@ -68,6 +69,8 @@ import org.slf4j.LoggerFactory;
 public final class CandyboxNode implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(CandyboxNode.class);
+
+    static final int MAX_PENDING_LOCATOR_RELAYS = 1024;
 
     private final int nodeId;
     private final CandyboxConfig config;
@@ -601,30 +604,40 @@ public final class CandyboxNode implements AutoCloseable {
      * @return the number of relays deleted
      */
     public int sweepStaleLocatorRelaysOnce() {
-        long cutoff = clock.currentTimeMillis() - config.renameIntentAbandonMillis();
         int deleted = 0;
         for (PartitionOwnership ownership : partitions.values()) {
-            if (!ownership.isOwner()) {
-                continue;
+            if (ownership.isOwner()) {
+                deleted += sweepStaleLocatorRelays(ownership.box().value(), ownership.partition());
             }
-            String box = ownership.box().value();
-            int partition = ownership.partition();
-            for (String token : coordination.children(
-                    CandyboxKeys.locatorRelaysPath(box, partition))) {
-                String key = CandyboxKeys.locatorRelayKey(box, partition, token);
-                try {
-                    Optional<VersionedValue> value = coordination.get(key);
-                    if (value.isPresent()
-                            && LocatorRelay.deserialize(value.get().value()).createdAtMillis() <= cutoff) {
-                        coordination.delete(key, value.get().version());
-                        deleted++;
-                    }
-                } catch (CasConflictException raced) {
-                    // Consumed or deleted concurrently.
-                } catch (RuntimeException e) {
-                    LOG.warn("Locator relay sweep error on node {} for {}: {}", nodeId, key,
-                            e.getMessage());
+        }
+        return deleted;
+    }
+
+    private int sweepStaleLocatorRelays(String box, int partition) {
+        long cutoff = clock.currentTimeMillis() - config.renameIntentAbandonMillis();
+        int deleted = 0;
+        List<String> tokens;
+        try {
+            tokens = coordination.children(CandyboxKeys.locatorRelaysPath(box, partition));
+        } catch (RuntimeException e) {
+            LOG.warn("Locator relay sweep error on node {} for box {} partition {}: {}", nodeId, box,
+                    partition, e.getMessage());
+            return 0;
+        }
+        for (String token : tokens) {
+            String key = CandyboxKeys.locatorRelayKey(box, partition, token);
+            try {
+                Optional<VersionedValue> value = coordination.get(key);
+                if (value.isPresent()
+                        && LocatorRelay.deserialize(value.get().value()).createdAtMillis() <= cutoff) {
+                    coordination.delete(key, value.get().version());
+                    deleted++;
                 }
+            } catch (CasConflictException raced) {
+                // Consumed or deleted concurrently.
+            } catch (RuntimeException e) {
+                LOG.warn("Locator relay sweep error on node {} for {}: {}", nodeId, key,
+                        e.getMessage());
             }
         }
         return deleted;
@@ -731,36 +744,44 @@ public final class CandyboxNode implements AutoCloseable {
         }
     }
 
-    /** Stashes a source locator for a cross-partition zero-copy put and returns its relay token. */
+    /**
+     * Stashes a source locator for a cross-partition zero-copy put and returns its relay token. The
+     * number of pending relays per partition is capped (stale ones are reaped first) so clients
+     * cannot grow the coordination store without bound.
+     */
     String writeLocatorRelay(String box, int srcPartition, LocatorRelay relay) {
+        String relays = CandyboxKeys.locatorRelaysPath(box, srcPartition);
+        if (coordination.children(relays).size() >= MAX_PENDING_LOCATOR_RELAYS
+                && (sweepStaleLocatorRelays(box, srcPartition) == 0
+                        || coordination.children(relays).size() >= MAX_PENDING_LOCATOR_RELAYS)) {
+            throw new BusyException("Too many pending zero-copy relays for box " + box
+                    + " partition " + srcPartition);
+        }
         String token = UUID.randomUUID().toString();
         coordination.create(CandyboxKeys.locatorRelayKey(box, srcPartition, token), relay.serialize());
         return token;
     }
 
     /**
-     * Takes the relay under {@code token} if {@code acceptable} and still fresh, deleting it at the
-     * version read so concurrent puts cannot both consume it. Freshness is half the abandon window,
-     * leaving the other half for clock skew against the source owner's intent sweep.
+     * The relay under {@code token}, if {@code acceptable} and still fresh. Freshness is half the
+     * abandon window, leaving the other half for clock skew against the source owner's intent sweep.
      */
-    Optional<LocatorRelay> claimLocatorRelay(String box, int srcPartition, String token,
-                                             Predicate<LocatorRelay> acceptable) {
-        String key = CandyboxKeys.locatorRelayKey(box, srcPartition, token);
-        Optional<VersionedValue> value = coordination.get(key);
-        if (value.isEmpty()) {
-            return Optional.empty();
-        }
-        LocatorRelay relay = LocatorRelay.deserialize(value.get().value());
-        long age = clock.currentTimeMillis() - relay.createdAtMillis();
-        if (age > config.renameIntentAbandonMillis() / 2 || !acceptable.test(relay)) {
-            return Optional.empty();
-        }
+    Optional<LocatorRelay> readLocatorRelay(String box, int srcPartition, String token,
+                                            Predicate<LocatorRelay> acceptable) {
+        return coordination.get(CandyboxKeys.locatorRelayKey(box, srcPartition, token))
+                .map(v -> LocatorRelay.deserialize(v.value()))
+                .filter(r -> clock.currentTimeMillis() - r.createdAtMillis()
+                        <= config.renameIntentAbandonMillis() / 2)
+                .filter(acceptable);
+    }
+
+    void deleteLocatorRelay(String box, int srcPartition, String token) {
         try {
-            coordination.delete(key, value.get().version());
+            CoordinationCas.deleteIfPresent(coordination,
+                    CandyboxKeys.locatorRelayKey(box, srcPartition, token), 0);
         } catch (CasConflictException raced) {
-            return Optional.empty();
+            // Already consumed by a concurrent retry, or reaped.
         }
-        return Optional.of(relay);
     }
 
     private void deleteLocatorRelays(BoxName box, int partitionCount) {
