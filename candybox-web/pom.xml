@@ -52,6 +52,81 @@
     </build>
 
     <profiles>
+        <!-- Maven Central requires -sources and -javadoc jars next to every jar, and the parent's
+             release profile only produces them from Java sources. Ship the frontend sources as the
+             -sources jar and the README as the (Java-less) -javadoc jar instead. -->
+        <profile>
+            <id>release</id>
+            <build>
+                <plugins>
+                    <!-- A jar published without the dashboard can never be replaced on Central, so
+                         refuse to package one: release with -Pfrontend. -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-enforcer-plugin</artifactId>
+                        <version>${enforcer.plugin.version}</version>
+                        <executions>
+                            <execution>
+                                <id>require-frontend-bundle</id>
+                                <phase>prepare-package</phase>
+                                <goals>
+                                    <goal>enforce</goal>
+                                </goals>
+                                <configuration>
+                                    <rules>
+                                        <requireFilesExist>
+                                            <files>
+                                                <file>${project.build.outputDirectory}/ui/index.html</file>
+                                            </files>
+                                            <message>The dashboard bundle is missing; release with -Prelease,frontend.</message>
+                                        </requireFilesExist>
+                                    </rules>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-jar-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>frontend-sources-jar</id>
+                                <goals>
+                                    <goal>jar</goal>
+                                </goals>
+                                <configuration>
+                                    <classifier>sources</classifier>
+                                    <classesDirectory>${project.basedir}</classesDirectory>
+                                    <includes>
+                                        <include>src/**</include>
+                                        <include>public/**</include>
+                                        <include>index.html</include>
+                                        <include>package.json</include>
+                                        <include>package-lock.json</include>
+                                        <include>tsconfig.json</include>
+                                        <include>vite.config.ts</include>
+                                        <include>README.md</include>
+                                    </includes>
+                                </configuration>
+                            </execution>
+                            <execution>
+                                <id>readme-javadoc-jar</id>
+                                <goals>
+                                    <goal>jar</goal>
+                                </goals>
+                                <configuration>
+                                    <classifier>javadoc</classifier>
+                                    <classesDirectory>${project.basedir}</classesDirectory>
+                                    <includes>
+                                        <include>README.md</include>
+                                    </includes>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
         <!-- Activate with `mvn -Pfrontend ...` to actually run npm install + vite build. CI ships
              a second job with this profile; local devs hitting `mvn -DskipTests package` skip it
              so the build stays seconds-fast. -->

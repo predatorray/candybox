@@ -30,6 +30,7 @@ mvn -pl candybox-integration-tests verify -Dit.test=Phase1EngineIT
 
 mvn license:format              # add the Apache header (etc/license-header.txt) to new .java files
 mvn -DskipTests -Pfrontend package   # also build the React dashboard into candybox-web.jar
+mvn -Prelease,frontend -DskipUpload=true deploy   # Maven Central dry run (needs a GPG key); see RELEASING.md
 ```
 
 - `verify` runs `license-maven-plugin:check`, so every `src/{main,test}/java/**/*.java` file needs the
@@ -109,7 +110,7 @@ Core invariants (details in `DESIGN.md`):
 
 ## Further docs
 
-`DESIGN.md` covers record formats, read/write/merge paths, manifest and fencing, compaction, GC, size
+`RELEASING.md` covers publishing to Maven Central. `DESIGN.md` covers record formats, read/write/merge paths, manifest and fencing, compaction, GC, size
 limits, and the deliberate v1 simplifications. `OPERATIONS.md` covers configuration and operations
 (every config key can be overridden by a `CANDYBOX_<KEY>` env var). The `*_PLAN.md` files are design
 plans for individual features (partitioning, cross-partition zero-copy, S3 gateway, multipart/range,

@@ -1,0 +1,62 @@
+name: Release
+
+# Publishes the Maven artifacts to Maven Central and the distribution archives to a GitHub
+# Release. Push a tag `vX.Y.Z` on a commit whose POMs already carry version X.Y.Z (see RELEASING.md).
+on:
+  push:
+    tags: ['v*']
+
+# Never run two releases at once; never cancel one half-way through an upload.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Publish to Maven Central
+    runs-on: ubuntu-latest
+    environment: maven-central
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17 with Central credentials and the signing key
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+          server-id: central
+          server-username: MAVEN_CENTRAL_USERNAME
+          server-password: MAVEN_CENTRAL_PASSWORD
+          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+
+      - name: Check the tag matches the project version
+        run: |
+          version=$(mvn -q -B -ntp help:evaluate -Dexpression=project.version -DforceStdout)
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match project version ${version}"
+            exit 1
+          fi
+          case "${version}" in
+            *-SNAPSHOT) echo "::error::Refusing to release a SNAPSHOT version"; exit 1 ;;
+          esac
+
+      # Runs the unit and integration tests too: nothing reaches Central (where it can never be
+      # replaced) unless the tagged commit passes the whole suite.
+      - name: Build, test, sign and publish
+        run: mvn -B -ntp -Prelease,frontend deploy
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+
+      - name: Create the GitHub Release with the distribution archives
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            candybox-dist/target/candybox-*.tar.gz
+            candybox-dist/target/candybox-*.zip

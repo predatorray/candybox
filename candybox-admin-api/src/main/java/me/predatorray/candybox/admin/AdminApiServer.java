@@ -43,7 +43,7 @@ import org.slf4j.LoggerFactory;
 
 /**
  * The admin/dashboard HTTP server. Built on the JDK's {@link HttpServer} so this module stays as
- * dependency-light as {@link me.predatorray.candybox.s3.GatewayHealthServer} — a small Netty
+ * dependency-light as {@code me.predatorray.candybox.s3.GatewayHealthServer} — a small Netty
  * pipeline would be overkill for a few JSON routes plus a static-asset mount.
  *
  * <p>Route map (see {@code WEB_DASHBOARD_PLAN.md} for the full v1 contract):

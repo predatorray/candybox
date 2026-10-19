@@ -12,7 +12,7 @@
 
     <artifactId>candybox-s3-gateway</artifactId>
     <name>Candybox :: S3 Gateway</name>
-    <description>An anonymous, path-style S3-compatible HTTP gateway (Netty) that translates the S3
+    <description>A path-style S3-compatible HTTP gateway (Netty) that translates the S3
         REST/XML protocol onto the Candybox client API. Stateless; sits behind an HTTP(S) load
         balancer. See S3_GATEWAY_PLAN.md.</description>
 
