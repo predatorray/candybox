@@ -61,7 +61,9 @@ The workflow then:
    uploads one bundle to the Portal and waits until Central reports it as published;
 3. pushes the tag and creates a GitHub Release with the `candybox-dist` archives;
 4. sets the next `-SNAPSHOT` version, commits `Prepare X.Y.(Z+1)-SNAPSHOT`, and pushes both commits
-   to `main`.
+   to `main`. If `main` refuses the push (branch protection or a ruleset, or `main` moved during
+   the build), it pushes them to a `release/prepare-<next>` branch instead and opens a PR to
+   `main`. The run's summary page says which happened.
 
 Nothing is pushed until step 2 succeeds, so a run that fails during the build or the upload leaves
 the repository untouched and can simply be started again. Once step 2 has passed, the version is on
@@ -69,8 +71,21 @@ Central for good. If a later step fails, finish that step by hand rather than re
 workflow, because a re-run fails on the existing tag.
 
 The artifacts reach <https://repo.maven.apache.org/maven2/me/predatorray/candybox/> within about 30
-minutes; search indexes take a few hours longer. Pushes made by the workflow do not trigger other
-workflows, so CI does not run on the two version commits.
+minutes; search indexes take a few hours longer.
+
+Notes for a protected `main`:
+
+- Opening the PR needs *Settings* → *Actions* → *General* → *Allow GitHub Actions to create and
+  approve pull requests*. Without it the branch is still pushed, and the run warns you to open the
+  PR by hand.
+- Pushes and PRs made with the workflow's token do not trigger other workflows, so CI does not run
+  on that PR by itself. If `main` requires status checks, close and reopen the PR (or push to its
+  branch) to start CI.
+- Merge it with a merge commit rather than a squash if you want the tagged `Release X.Y.Z` commit
+  to be part of `main`'s history. The tag and the published artifacts are unaffected either way.
+- If a tag ruleset stops the workflow from pushing `vX.Y.Z`, the version is already on Central by
+  then. Create the tag on the `Release X.Y.Z` commit, which is on the `release/prepare-*` branch or
+  on `main`, and then create the GitHub Release by hand.
 
 ## Releasing from a workstation
 

@@ -28,11 +28,9 @@ jobs:
     environment: maven-central
     permissions:
       contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
-        with:
-          # Full history, so the final merge with a main that moved during the build works.
-          fetch-depth: 0
 
       - name: Set up JDK 17 with Central credentials and the signing key
         uses: actions/setup-java@v4
@@ -114,13 +112,26 @@ jobs:
             candybox-dist/target/candybox-*.tar.gz
             candybox-dist/target/candybox-*.zip
 
+      # main may be protected (or have moved while the build ran), so a direct push can be
+      # refused. Then the bump goes to a branch with a PR instead, which someone has to merge.
       - name: Move main to the next development version
         env:
+          RELEASE: ${{ steps.versions.outputs.release }}
           NEXT: ${{ steps.versions.outputs.next }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           mvn -q -B -ntp versions:set -DnewVersion="${NEXT}" -DgenerateBackupPoms=false -DprocessAllModules
           git commit -am "Prepare ${NEXT}"
-          # main may have moved while the build ran; merge rather than rebase so the tagged
-          # release commit stays in main's history.
-          git pull --no-rebase --no-edit origin main
-          git push origin HEAD:main
+          if git push origin HEAD:main; then
+            echo "main is now at ${NEXT}." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          branch="release/prepare-${NEXT}"
+          git push origin "HEAD:refs/heads/${branch}"
+          body="Released ${RELEASE} to Maven Central (tag v${RELEASE}). Merge this to record the release commit on main and move it to ${NEXT}."
+          if url=$(gh pr create --base main --head "${branch}" --title "Prepare ${NEXT}" --body "${body}"); then
+            echo "main could not be pushed to directly; merge ${url} to move it to ${NEXT}." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::Could not open a PR (is 'Allow GitHub Actions to create and approve pull requests' off?). Open one from ${branch} to main by hand."
+            echo "main could not be pushed to directly, and no PR could be opened: open one from \`${branch}\` to main to move it to ${NEXT}." >> "$GITHUB_STEP_SUMMARY"
+          fi
