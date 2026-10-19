@@ -1,0 +1,177 @@
+name: Release
+
+# Cuts a release from a release/X.Y.x branch (see the Cut release branch workflow): sets the release
+# version, runs the full test suite, publishes to Maven Central, tags it, creates a GitHub Release with
+# the distribution archives, and opens a PR that moves the release branch to the next -SNAPSHOT,
+# plus one that points main's docs at the new release. It never pushes to main or to the release
+# branch itself. Start it from the Actions tab ("Run
+# workflow") on the release branch; see RELEASING.md.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version, e.g. 0.1.0. Leave empty to drop -SNAPSHOT from the branch version.'
+        required: false
+        default: ''
+      next-version:
+        description: 'Next version of the release branch, e.g. 0.1.1-SNAPSHOT. Leave empty to bump the patch number.'
+        required: false
+        default: ''
+
+# Shared with the Cut release branch workflow: never run two of these at once, and never cancel a
+# release half-way through an upload.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release to Maven Central
+    runs-on: ubuntu-latest
+    environment: maven-central
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17 with Central credentials and the signing key
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+          server-id: central
+          server-username: MAVEN_CENTRAL_USERNAME
+          server-password: MAVEN_CENTRAL_PASSWORD
+          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+
+      - name: Resolve the release and next versions
+        id: versions
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_NEXT_VERSION: ${{ inputs.next-version }}
+        run: |
+          if ! [[ "${GITHUB_REF}" =~ ^refs/heads/release/([0-9]+)\.([0-9]+)\.x$ ]]; then
+            echo "::error::Run this workflow on a release/X.Y.x branch, not ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+          line="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+          current=$(mvn -q -B -ntp help:evaluate -Dexpression=project.version -DforceStdout)
+          release="${INPUT_VERSION:-${current%-SNAPSHOT}}"
+          next="${INPUT_NEXT_VERSION}"
+          case "${release}" in
+            ''|*-SNAPSHOT) echo "::error::Release version '${release}' must not be a SNAPSHOT"; exit 1 ;;
+          esac
+          if [ -z "${next}" ]; then
+            if ! [[ "${release}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              echo "::error::Cannot bump '${release}' automatically; set next-version."
+              exit 1
+            fi
+            next="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))-SNAPSHOT"
+          fi
+          case "${next}" in
+            *-SNAPSHOT) ;;
+            *) echo "::error::Next version '${next}' must end in -SNAPSHOT"; exit 1 ;;
+          esac
+          for v in "${release}" "${next}"; do
+            case "${v}" in
+              "${line}".*) ;;
+              *) echo "::error::Version '${v}' does not belong to ${GITHUB_REF_NAME}"; exit 1 ;;
+            esac
+          done
+          if git ls-remote --exit-code --tags origin "refs/tags/v${release}" > /dev/null; then
+            echo "::error::Tag v${release} already exists. Is the Prepare PR from that release still unmerged?"
+            exit 1
+          fi
+          echo "Releasing ${release} (from ${current}); next version ${next}"
+          echo "release=${release}" >> "$GITHUB_OUTPUT"
+          echo "next=${next}" >> "$GITHUB_OUTPUT"
+          echo "bump=version-bump/${GITHUB_REF_NAME//\//-}-${next}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure the git author
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898283+github-actions[bot]@users.noreply.github.com'
+
+      - name: Commit and tag the release version
+        env:
+          RELEASE: ${{ steps.versions.outputs.release }}
+        run: |
+          .github/scripts/set-version.sh "${RELEASE}"
+          git commit -am "Release ${RELEASE}"
+          git tag -a "v${RELEASE}" -m "Release ${RELEASE}"
+
+      # Runs the unit and integration tests too: nothing reaches Central (where it can never be
+      # replaced) unless the release commit passes the whole suite. Nothing is pushed until this
+      # succeeds, so a failed run leaves the repository untouched and can simply be re-run.
+      - name: Build, test, sign and publish to Maven Central
+        run: mvn -B -ntp -Prelease,frontend deploy
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+
+      # The branch goes first, so the released commit is on GitHub even if pushing the tag fails.
+      - name: Push the release commit and tag
+        env:
+          RELEASE: ${{ steps.versions.outputs.release }}
+          BUMP: ${{ steps.versions.outputs.bump }}
+        run: |
+          git push origin "HEAD:refs/heads/${BUMP}"
+          git push origin "refs/tags/v${RELEASE}"
+
+      - name: Create the GitHub Release with the distribution archives
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.versions.outputs.release }}
+          generate_release_notes: true
+          files: |
+            candybox-dist/target/candybox-*.tar.gz
+            candybox-dist/target/candybox-*.zip
+
+      # The next-version bump goes through a PR to the release branch. The PR branch carries the
+      # tagged release commit too, but the tag is what keeps it, so the PR can be squash-merged.
+      - name: Open a PR moving the release branch to the next development version
+        env:
+          RELEASE: ${{ steps.versions.outputs.release }}
+          NEXT: ${{ steps.versions.outputs.next }}
+          BUMP: ${{ steps.versions.outputs.bump }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/set-version.sh "${NEXT}"
+          git commit -am "Prepare ${NEXT}"
+          git push origin "HEAD:refs/heads/${BUMP}"
+          body="Released ${RELEASE} to Maven Central (tag \`v${RELEASE}\`). This moves \`${GITHUB_REF_NAME}\` to ${NEXT}; any merge method works."
+          if ! url=$(gh pr create --base "${GITHUB_REF_NAME}" --head "${BUMP}" --title "Prepare ${NEXT}" --body "${body}"); then
+            echo "::error::${RELEASE} is published, but no PR could be opened (is 'Allow GitHub Actions to create and approve pull requests' off?). Open one from ${BUMP} to ${GITHUB_REF_NAME} by hand."
+            exit 1
+          fi
+          echo "Released ${RELEASE}. Merge ${url} to move ${GITHUB_REF_NAME} to ${NEXT}." >> "$GITHUB_STEP_SUMMARY"
+
+      # The docs are published from main, so they learn about a release through a PR to main. Only
+      # a release newer than the one main documents moves it: a patch on an older line does not.
+      - name: Open a PR documenting the release on main
+        env:
+          RELEASE: ${{ steps.versions.outputs.release }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch -q origin main
+          documented=$(git show origin/main:docs/config.toml | sed -n "s/^ *candyboxRelease = '\([^']*\)'.*/\1/p")
+          newest=$(printf '%s\n%s\n' "${documented}" "${RELEASE}" | sort -V | tail -n 1)
+          if [ "${documented}" = "${RELEASE}" ] || [ "${newest}" != "${RELEASE}" ]; then
+            echo "main documents ${documented:-no release}; leaving it for ${RELEASE}." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          docs="version-bump/docs-${RELEASE}"
+          git switch -q -c "${docs}" origin/main
+          sed -i "s/^\( *candyboxRelease = '\)[^']*'/\1${RELEASE}'/" docs/config.toml
+          git commit -am "Document release ${RELEASE}"
+          git push origin "HEAD:refs/heads/${docs}"
+          body="Points the docs' install instructions at ${RELEASE} (tag \`v${RELEASE}\`), which is now on Maven Central."
+          if ! url=$(gh pr create --base main --head "${docs}" --title "Document release ${RELEASE}" --body "${body}"); then
+            echo "::error::${RELEASE} is published, but no docs PR could be opened. Open one from ${docs} to main by hand."
+            exit 1
+          fi
+          echo "Merge ${url} to point main's docs at ${RELEASE}." >> "$GITHUB_STEP_SUMMARY"

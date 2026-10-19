@@ -12,6 +12,37 @@
     <name>Candybox</name>
     <description>A distributed, S3-like object store whose storage engine is a distributed LSM tree built on Apache BookKeeper.</description>
     <inceptionYear>2026</inceptionYear>
+    <url>https://github.com/predatorray/candybox</url>
+
+    <!-- Project metadata below is required by Maven Central and inherited by every module. -->
+    <licenses>
+        <license>
+            <name>Apache License, Version 2.0</name>
+            <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
+    <developers>
+        <developer>
+            <id>predatorray</id>
+            <name>Wenhao Ji</name>
+            <email>predator.ray@gmail.com</email>
+            <url>https://github.com/predatorray</url>
+        </developer>
+    </developers>
+
+    <scm>
+        <connection>scm:git:https://github.com/predatorray/candybox.git</connection>
+        <developerConnection>scm:git:git@github.com:predatorray/candybox.git</developerConnection>
+        <url>https://github.com/predatorray/candybox</url>
+        <tag>HEAD</tag>
+    </scm>
+
+    <issueManagement>
+        <system>GitHub</system>
+        <url>https://github.com/predatorray/candybox/issues</url>
+    </issueManagement>
 
     <modules>
         <module>candybox-common</module>
@@ -55,6 +86,12 @@
         <os.plugin.version>1.7.1</os.plugin.version>
         <node.version>v20.18.0</node.version>
         <npm.version>10.9.0</npm.version>
+        <source.plugin.version>3.3.1</source.plugin.version>
+        <javadoc.plugin.version>3.12.0</javadoc.plugin.version>
+        <gpg.plugin.version>3.2.8</gpg.plugin.version>
+        <central.publishing.plugin.version>0.12.0</central.publishing.plugin.version>
+        <versions.plugin.version>2.18.0</versions.plugin.version>
+        <enforcer.plugin.version>3.5.0</enforcer.plugin.version>
     </properties>
 
     <dependencyManagement>
@@ -252,6 +289,31 @@
                     <artifactId>jacoco-maven-plugin</artifactId>
                     <version>${jacoco.plugin.version}</version>
                 </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-source-plugin</artifactId>
+                    <version>${source.plugin.version}</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-javadoc-plugin</artifactId>
+                    <version>${javadoc.plugin.version}</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-gpg-plugin</artifactId>
+                    <version>${gpg.plugin.version}</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.sonatype.central</groupId>
+                    <artifactId>central-publishing-maven-plugin</artifactId>
+                    <version>${central.publishing.plugin.version}</version>
+                </plugin>
+                <plugin>
+                    <groupId>org.codehaus.mojo</groupId>
+                    <artifactId>versions-maven-plugin</artifactId>
+                    <version>${versions.plugin.version}</version>
+                </plugin>
             </plugins>
         </pluginManagement>
 
@@ -327,4 +389,100 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!-- Publishing to Maven Central (https://central.sonatype.com). Activate with -Prelease; it
+             attaches the -sources and -javadoc jars Central requires, GPG-signs every artifact and
+             uploads one bundle through the Central Portal. Run it with -Pfrontend too, so the
+             published candybox-web jar carries the dashboard. Needs a `central` server entry
+             (Portal user token) in settings.xml and a GPG key: see RELEASING.md. -->
+        <profile>
+            <id>release</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-source-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>attach-sources</id>
+                                <goals>
+                                    <goal>jar-no-fork</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-javadoc-plugin</artifactId>
+                        <configuration>
+                            <!-- Don't fail the release over missing @param/@return tags; broken
+                                 references and malformed HTML still fail. -->
+                            <doclint>all,-missing</doclint>
+                            <quiet>true</quiet>
+                        </configuration>
+                        <executions>
+                            <execution>
+                                <id>attach-javadocs</id>
+                                <goals>
+                                    <goal>jar</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-gpg-plugin</artifactId>
+                        <configuration>
+                            <!-- Lets CI sign with a key imported into a non-interactive agent. -->
+                            <gpgArguments>
+                                <arg>--pinentry-mode</arg>
+                                <arg>loopback</arg>
+                            </gpgArguments>
+                        </configuration>
+                        <executions>
+                            <execution>
+                                <id>sign-artifacts</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>sign</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.sonatype.central</groupId>
+                        <artifactId>central-publishing-maven-plugin</artifactId>
+                        <extensions>true</extensions>
+                        <configuration>
+                            <publishingServerId>central</publishingServerId>
+                            <deploymentName>candybox-${project.version}</deploymentName>
+                            <!-- Central limits each organization's monthly publishing by file count
+                                 and total size, and checksum files count. Central requires only
+                                 .md5 and .sha1, which keeps a release at about 170 files. -->
+                            <checksums>required</checksums>
+                            <!-- candybox-integration-tests is test scaffolding. The candybox-dist
+                                 archives (about 95 MB each, bundling every runtime dependency) would
+                                 exceed the monthly size limit on their own, so they go to GitHub
+                                 Releases instead. -->
+                            <excludeArtifacts>
+                                <excludeArtifact>candybox-integration-tests</excludeArtifact>
+                                <excludeArtifact>candybox-dist</excludeArtifact>
+                            </excludeArtifacts>
+                            <waitMaxTime>3600</waitMaxTime>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+            <properties>
+                <!-- Read by central-publishing-maven-plugin: once the uploaded bundle validates,
+                     release it and wait until it is live. Override with
+                     -DautoPublish=false -DwaitUntil=validated to inspect the deployment in the
+                     Portal and click Publish (or Drop) by hand, or -DskipUpload=true to only
+                     build the bundle under target/central-publishing/. -->
+                <autoPublish>true</autoPublish>
+                <waitUntil>published</waitUntil>
+            </properties>
+        </profile>
+    </profiles>
 </project>

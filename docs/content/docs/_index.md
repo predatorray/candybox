@@ -21,5 +21,5 @@ Use the navigation on the left to browse, or jump to a common starting point:
 - **[Configuration reference]({{< relref "/docs/reference/configuration" >}})** — every tunable key.
 
 > [!WARNING]
-> Candybox is pre-`1.0` (current version `0.1.0-SNAPSHOT`). APIs, wire protocol, and on-disk formats
-> may still change between releases.
+> Candybox is pre-`1.0`. APIs, wire protocol, and on-disk formats may still change between
+> releases.

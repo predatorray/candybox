@@ -12,7 +12,7 @@
 
     <artifactId>candybox-server</artifactId>
     <name>Candybox :: Server</name>
-    <description>The storage node: wires LSM + coordination + transport, handles requests, routing, background flush/compaction/GC. (Scaffold in this run.)</description>
+    <description>The storage node: wires LSM + coordination + transport, handles requests, routing, background flush/compaction/GC.</description>
 
     <dependencies>
         <dependency>
