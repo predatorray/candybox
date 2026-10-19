@@ -184,7 +184,9 @@ public sealed interface Message {
      * A relay made by {@link PrepareRenameRequest} turns this into the rename's destination step
      * (the source's owner/grants are kept and the completion marker is written); otherwise it is a
      * copy owned by the requester, stamped with {@code owner}/{@code grants} as a plain put would
-     * be. Answered with a {@link HeadCandyResponse}.
+     * be. A relay is deleted once its put succeeds, so retrying a put whose response was lost fails
+     * as an unknown relay; restart from the locator request. Answered with a
+     * {@link HeadCandyResponse}.
      */
     record ZeroCopyPutRequest(String box, String dstKey, int srcPartition, String relayToken,
                               String owner, List<String> grants, String idempotencyToken)

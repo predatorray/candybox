@@ -42,8 +42,8 @@ record LocatorRelay(String requester, String srcKey, String renameToken, String 
         return renameToken != null;
     }
 
-    byte[] serialize() {
-        byte[] locatorBytes = CandyLocatorSerializer.serialize(locator);
+    byte[] serialize(int maxLocatorBytes) {
+        byte[] locatorBytes = CandyLocatorSerializer.serialize(locator, maxLocatorBytes);
         BinaryWriter w = new BinaryWriter(locatorBytes.length + 64);
         w.writeByte(FORMAT_VERSION);
         w.writeString(requester);

@@ -312,8 +312,8 @@ public final class CandyboxNode implements AutoCloseable {
         }
         descriptorCache.remove(box.value());
         deleteMetaQuietly(box);
-        deleteLocatorRelays(box, descriptor.partitionCount());
         aclStore.delete(box.value());
+        deleteLocatorRelays(box, descriptor.partitionCount());
         // TODO(phase-3): reference-counted GC of the Box's SSTable/Syrup/WAL/manifest ledgers.
     }
 
@@ -758,7 +758,7 @@ public final class CandyboxNode implements AutoCloseable {
                     + " partition " + srcPartition);
         }
         String token = UUID.randomUUID().toString();
-        coordination.create(CandyboxKeys.locatorRelayKey(box, srcPartition, token), relay.serialize());
+        coordination.create(CandyboxKeys.locatorRelayKey(box, srcPartition, token), relay.serialize(config.sizeLimits().maxLocatorBytes()));
         return token;
     }
 
@@ -784,17 +784,18 @@ public final class CandyboxNode implements AutoCloseable {
         }
     }
 
+    /** Best-effort: a relay left behind expires at consume time anyway. */
     private void deleteLocatorRelays(BoxName box, int partitionCount) {
         for (int p = 0; p < partitionCount; p++) {
-            for (String token : coordination.children(
-                    CandyboxKeys.locatorRelaysPath(box.value(), p))) {
-                try {
+            try {
+                for (String token : coordination.children(
+                        CandyboxKeys.locatorRelaysPath(box.value(), p))) {
                     CoordinationCas.deleteIfPresent(coordination,
                             CandyboxKeys.locatorRelayKey(box.value(), p, token), 0);
-                } catch (RuntimeException e) {
-                    LOG.warn("Failed to delete locator relay {} of box {}: {}", token, box,
-                            e.getMessage());
                 }
+            } catch (RuntimeException e) {
+                LOG.warn("Failed to delete locator relays of box {} partition {}: {}", box, p,
+                        e.getMessage());
             }
         }
     }

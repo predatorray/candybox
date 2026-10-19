@@ -56,7 +56,7 @@ All knobs are configurable; pick defaults unless a workload demands otherwise.
 | `maxClockSkewMillis` | 5 min | HLC skew-rejection bound on observed timestamps. |
 | `tombstoneGcGraceMillis` | 24 h | Late-write window before a bottommost tombstone may be dropped. |
 | `ledgerGcGraceMillis` | 5 min | Grace before an obsoleted ledger (compaction input, dead Syrup, rotated WAL) is deleted; also gates Box-global GC of cross-partition-shared Syrups. |
-| `rename.intent.abandon.millis` | 60 s | Cross-partition rename: a rename intent whose rendezvous marker never appears is dropped after this (the source stays live, the rename never reached the destination); unconsumed zero-copy locator relays are reaped after the same age (by the maintenance tick, or inline once a partition reaches its cap of 1024 pending relays). Env `CANDYBOX_RENAME_INTENT_ABANDON_MILLIS`. |
+| `rename.intent.abandon.millis` | 60 s | Cross-partition rename: a rename intent whose rendezvous marker never appears is dropped after this (the source stays live, the rename never reached the destination); unconsumed zero-copy locator relays are reaped after the same age (by the maintenance tick, or inline once a partition reaches its cap of 1024 pending relays). A relay embeds the source locator, so `sizeLimits.maxLocatorBytes` must stay below ZooKeeper's `jute.maxbuffer` (1 MiB by default). Env `CANDYBOX_RENAME_INTENT_ABANDON_MILLIS`. |
 
 Leveled compaction also takes a per-level byte budget (`levelBaseBytes` 10 MiB, `levelMultiplier` 10):
 level N's budget is `levelBaseBytes × multiplier^(N-1)`.

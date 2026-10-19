@@ -41,20 +41,20 @@ class LocatorRelayTest {
     @Test
     void renameRelayRoundTrips() {
         LocatorRelay relay = new LocatorRelay("User:alice", "src", "tok", "dst", 99L, LOCATOR);
-        assertThat(LocatorRelay.deserialize(relay.serialize())).isEqualTo(relay);
+        assertThat(LocatorRelay.deserialize(relay.serialize(1 << 20))).isEqualTo(relay);
     }
 
     @Test
     void copyRelayRoundTrips() {
         LocatorRelay relay = new LocatorRelay("User:ANONYMOUS", "src", null, null, 99L, LOCATOR);
-        LocatorRelay decoded = LocatorRelay.deserialize(relay.serialize());
+        LocatorRelay decoded = LocatorRelay.deserialize(relay.serialize(1 << 20));
         assertThat(decoded).isEqualTo(relay);
         assertThat(decoded.isRename()).isFalse();
     }
 
     @Test
     void unknownVersionAndTruncatedBytesAreRejected() {
-        byte[] bytes = new LocatorRelay("User:alice", "src", null, null, 99L, LOCATOR).serialize();
+        byte[] bytes = new LocatorRelay("User:alice", "src", null, null, 99L, LOCATOR).serialize(1 << 20);
         byte[] future = bytes.clone();
         future[0] = 2;
         assertThatThrownBy(() -> LocatorRelay.deserialize(future))
