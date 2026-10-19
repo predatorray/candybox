@@ -118,8 +118,12 @@ Run only by a Box's owner, against the committed manifest, after `ledgerGcGraceM
 source partition's Syrup segments, each partition owner publishes its referenced-Syrup set to
 coordination (`boxes/<box>/partitions/<p>/refs`). The creating partition's GC skips any Syrup a
 sibling partition still references, so a shared Syrup is reclaimed only once **no** partition of the
-Box references it (still gated by `ledgerGcGraceMillis`). A partial or crashed rename can therefore
-only *retain* a Syrup (a leak), never delete one another partition still points at.
+Box references it (still gated by `ledgerGcGraceMillis`). A partition re-checks its own references
+when it claims a Syrup for deletion, and a Syrup that is referenced again restarts its grace period
+in that partition once orphaned anew (siblings that also tracked it keep their older timestamps,
+#66), so renaming an object away and back no longer loses its bytes through a stale orphan entry. A
+locator resolved before its Syrup was reclaimed and zero-copy-put afterwards is not yet guarded
+against (#65).
 
 GC tracking is in-memory, so ledgers orphaned by a prior owner that crashed before GC leak until an
 enumeration backstop is added (future).

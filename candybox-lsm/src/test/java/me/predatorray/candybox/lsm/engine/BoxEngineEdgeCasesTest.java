@@ -353,10 +353,11 @@ class BoxEngineEdgeCasesTest {
     // ---- GC bookkeeping ----------------------------------------------------------------------
 
     @Test
-    void dropSyrupsIgnoresAnEmptyCollection() {
+    void claimReclaimableSyrupsClaimsNothingWhenNoSyrupIsOrphaned() {
         engine = newEngine();
-        engine.dropSyrups(List.of()); // no-op, must not touch the manifest
         engine.putCandy(CandyKey.of("k"), bytes("v"), null, Map.of(), null);
+        engine.flush();
+        assertThat(engine.claimReclaimableSyrups(Long.MAX_VALUE, java.util.Set.of())).isEmpty();
         assertThat(engine.getCandy(CandyKey.of("k"))).isEqualTo(bytes("v"));
     }
 }

@@ -767,6 +767,12 @@ public final class BoxEngine implements AutoCloseable {
             Mutation mutation = new Mutation(dst, dstLocator);
             wal.append(mutation);
             active.put(mutation);
+            // The parts may point at a Syrup this partition already counts as a pending orphan. Clear it
+            // here so its grace period restarts: flush does not recompute orphans, so a later recompute
+            // may never see it referenced, and claim-time re-validation only guards safety.
+            for (SegmentRef seg : dstLocator.segments()) {
+                pendingOrphanSyrups.remove(seg.syrupId());
+            }
             maybeFlushLocked();
             CandyMetadata result = CandyMetadata.from(dstLocator);
             if (idempotencyToken != null) {
@@ -844,22 +850,27 @@ public final class BoxEngine implements AutoCloseable {
     public java.util.Set<Long> referencedSyrups() {
         lock.readLock().lock();
         try {
-            ManifestState current = manifest.current();
-            java.util.Set<Long> referenced = new java.util.HashSet<>(current.referencedSyrups());
-            referenced.addAll(current.multipartReferencedSyrups());
-            for (java.util.Iterator<Mutation> it = active.iterator(); it.hasNext(); ) {
-                for (SegmentRef seg : it.next().locator().segments()) {
-                    referenced.add(seg.syrupId());
-                }
-            }
-            long openSyrup = syrupManager.currentSyrupId();
-            if (openSyrup >= 0) {
-                referenced.add(openSyrup);
-            }
-            return referenced;
+            return referencedSyrupsLocked();
         } finally {
             lock.readLock().unlock();
         }
+    }
+
+    private java.util.Set<Long> referencedSyrupsLocked() {
+        ManifestState current = manifest.current();
+        java.util.Set<Long> referenced = new java.util.HashSet<>(current.referencedSyrups());
+        // In-flight multipart uploads pin their parts' Syrups until Complete or Abort fires.
+        referenced.addAll(current.multipartReferencedSyrups());
+        for (java.util.Iterator<Mutation> it = active.iterator(); it.hasNext(); ) {
+            for (SegmentRef seg : it.next().locator().segments()) {
+                referenced.add(seg.syrupId());
+            }
+        }
+        long openSyrup = syrupManager.currentSyrupId();
+        if (openSyrup >= 0) {
+            referenced.add(openSyrup);
+        }
+        return referenced;
     }
 
     /**
@@ -1161,57 +1172,59 @@ public final class BoxEngine implements AutoCloseable {
     }
 
     /**
-     * Recomputes which live Syrups are no longer referenced by any SSTable, the active memtable, or the
-     * currently open write Syrup, recording newly-orphaned ones with the time first seen. Syrup
-     * references only ever decrease (compaction drops superseded/tombstoned locators), so an orphan
-     * stays an orphan. Called under the write lock after a manifest change.
+     * Recomputes which live Syrups are no longer referenced by any SSTable, in-flight multipart upload,
+     * the active memtable, or the currently open write Syrup, recording newly-orphaned ones with the
+     * time first seen. A cross-partition zero-copy put can re-reference an orphan, so pending entries
+     * that are referenced again are dropped; {@link #zeroCopyPut} also clears them eagerly, since a
+     * Syrup can be re-referenced and orphaned again between two recomputes. Called under the write
+     * lock after a manifest change.
      */
     private void recomputeOrphanSyrupsLocked(long now) {
-        ManifestState current = manifest.current();
-        java.util.Set<Long> referenced = new java.util.HashSet<>(current.referencedSyrups());
-        // In-flight multipart uploads pin their parts' Syrups until Complete or Abort fires.
-        referenced.addAll(current.multipartReferencedSyrups());
-        for (java.util.Iterator<Mutation> it = active.iterator(); it.hasNext(); ) {
-            for (SegmentRef seg : it.next().locator().segments()) {
-                referenced.add(seg.syrupId());
-            }
-        }
-        long openSyrup = syrupManager.currentSyrupId();
-        if (openSyrup >= 0) {
-            referenced.add(openSyrup);
-        }
-        for (Long syrup : current.liveSyrups()) {
+        java.util.Set<Long> referenced = referencedSyrupsLocked();
+        pendingOrphanSyrups.keySet().removeIf(referenced::contains);
+        for (Long syrup : manifest.current().liveSyrups()) {
             if (!referenced.contains(syrup)) {
                 pendingOrphanSyrups.putIfAbsent(syrup, now);
             }
         }
     }
 
-    /** Orphaned Syrup ledger ids first seen at or before {@code asOfMillis} — the GC reclaim set. */
-    public java.util.List<Long> reclaimableSyrups(long asOfMillis) {
-        java.util.List<Long> ids = new java.util.ArrayList<>();
-        for (Map.Entry<Long, Long> e : pendingOrphanSyrups.entrySet()) {
-            if (e.getValue() <= asOfMillis) {
-                ids.add(e.getKey());
-            }
-        }
-        return ids;
-    }
-
     /**
-     * Drops the given orphaned Syrups from the live set via a fencing-gated manifest edit (so a fenced
-     * owner cannot remove them) and stops tracking them. Call before physically deleting the ledgers.
+     * Claims the orphaned Syrups that have been pending since at or before {@code asOfMillis} and are
+     * in neither this partition's current references nor {@code foreignReferencedSyrups}, dropping
+     * them from the live set via a fencing-gated manifest edit. References are re-validated under the
+     * write lock, so a Syrup re-referenced since it was orphaned is never claimed. The caller may then
+     * physically delete exactly the returned ledgers.
      */
-    public void dropSyrups(java.util.Collection<Long> syrupIds) {
-        if (syrupIds.isEmpty()) {
-            return;
-        }
+    public java.util.List<Long> claimReclaimableSyrups(long asOfMillis,
+                                                       java.util.Set<Long> foreignReferencedSyrups) {
         lock.writeLock().lock();
         try {
-            manifest.apply(ManifestEdit.builder()
-                    .removedSyrups(new java.util.LinkedHashSet<>(syrupIds))
-                    .build());
-            syrupIds.forEach(pendingOrphanSyrups::remove);
+            java.util.Set<Long> referenced = referencedSyrupsLocked();
+            pendingOrphanSyrups.keySet().removeIf(referenced::contains);
+            java.util.List<Long> claimed = new java.util.ArrayList<>();
+            for (Map.Entry<Long, Long> e : pendingOrphanSyrups.entrySet()) {
+                if (e.getValue() <= asOfMillis && !foreignReferencedSyrups.contains(e.getKey())) {
+                    claimed.add(e.getKey());
+                }
+            }
+            if (!claimed.isEmpty()) {
+                manifest.apply(ManifestEdit.builder()
+                        .removedSyrups(new java.util.LinkedHashSet<>(claimed))
+                        .build());
+                claimed.forEach(pendingOrphanSyrups::remove);
+            }
+            return claimed;
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /** Test hook: records {@code syrupId} as a pending orphan since {@code sinceMillis}. */
+    void trackPendingOrphan(long syrupId, long sinceMillis) {
+        lock.writeLock().lock();
+        try {
+            pendingOrphanSyrups.put(syrupId, sinceMillis);
         } finally {
             lock.writeLock().unlock();
         }

@@ -112,19 +112,14 @@ public final class GarbageCollector {
     }
 
     private int collectSyrups(BoxEngine engine, long cutoff, Set<Long> foreignReferencedSyrups) {
-        List<Long> orphans = new java.util.ArrayList<>(engine.reclaimableSyrups(cutoff));
-        if (!foreignReferencedSyrups.isEmpty()) {
-            // Box-global gate: keep a Syrup alive (neither dropped from the live set nor deleted) while
-            // any sibling partition still references it — it stays a pending orphan and is retried on a
-            // later pass once the cross-partition reference is gone.
-            orphans.removeIf(foreignReferencedSyrups::contains);
-        }
+        // Box-global gate: a Syrup any sibling partition still references stays a pending orphan and is
+        // retried on a later pass. The engine re-checks this partition's own references atomically with
+        // dropping the rest from the live set; only those are deleted (whole-ledger — v1 has no
+        // defragmentation).
+        List<Long> orphans = engine.claimReclaimableSyrups(cutoff, foreignReferencedSyrups);
         if (orphans.isEmpty()) {
             return 0;
         }
-        // Drop them from the live set first via a fencing-gated manifest edit; then delete the ledgers
-        // (a Syrup is removed whole only once every segment in it is dead — v1 has no defragmentation).
-        engine.dropSyrups(orphans);
         int deleted = 0;
         for (long syrupId : orphans) {
             if (deleteLedger(syrupId)) {
