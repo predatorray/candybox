@@ -351,6 +351,9 @@ public final class CandyboxConfig {
         }
 
         public CandyboxConfig build() {
+            if (zeroCopyRelayBudgetBytes <= 0) {
+                throw new IllegalArgumentException("zeroCopyRelayBudgetBytes must be > 0");
+            }
             if (l0StallThreshold < l0CompactionTrigger) {
                 throw new IllegalArgumentException("l0StallThreshold must be >= l0CompactionTrigger");
             }

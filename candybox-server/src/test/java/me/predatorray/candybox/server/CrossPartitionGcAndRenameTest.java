@@ -296,7 +296,7 @@ class CrossPartitionGcAndRenameTest {
         InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
         BoxName other = BoxName.of("xp-other");
         try (CandyboxNode node = new CandyboxNode(1, CandyboxConfig.builder()
-                .leaseRenewIntervalMillis(0).renameIntentAbandonMillis(1_000)
+                .leaseRenewIntervalMillis(0).renameIntentAbandonMillis(4_000)
                 .zeroCopyRelayBudgetBytes(3 * relaySize(clock) + 8).build(),
                 new InMemoryLedgerStore(), coordination, clock)) {
             node.createBox(BOX, PARTITIONS);
@@ -307,23 +307,22 @@ class CrossPartitionGcAndRenameTest {
             node.enginePartition(other, 0).putCandy(CandyKey.of(src), bytes("payload"), null,
                     Map.of(), null);
             RequestHandler handler = node.requestHandler();
+            Message locate = new Message.GetCandyLocatorRequest(other.value(), src);
             relayToken(handler, src);
             String consumable = relayToken(handler, src);
-            assertThat(send(handler, new Message.GetCandyLocatorRequest(other.value(), src)))
-                    .isInstanceOf(Message.CandyLocatorResponse.class);
-            assertThat(send(handler, new Message.GetCandyLocatorRequest(other.value(), src)))
-                    .isInstanceOf(Message.BusyResponse.class);
+            assertThat(send(handler, locate)).isInstanceOf(Message.CandyLocatorResponse.class);
+            assertThat(send(handler, locate)).isInstanceOf(Message.BusyResponse.class);
 
-            // A consumed relay frees its bytes once the budget check recounts.
+            // A consumed relay frees its bytes at the next recount, which is rate-limited.
             send(handler, new Message.ZeroCopyPutRequest(BOX.value(), keyIn(1, "dst"), 0,
                     consumable, null, List.of(), null));
-            assertThat(send(handler, new Message.GetCandyLocatorRequest(other.value(), src)))
-                    .isInstanceOf(Message.CandyLocatorResponse.class);
+            assertThat(send(handler, locate)).isInstanceOf(Message.BusyResponse.class);
+            clock.advance(CandyboxNode.RELAY_RECOUNT_INTERVAL_MILLIS);
+            assertThat(send(handler, locate)).isInstanceOf(Message.CandyLocatorResponse.class);
 
             // And stale ones are reaped by that recount.
-            clock.advance(1_001);
-            assertThat(send(handler, new Message.GetCandyLocatorRequest(other.value(), src)))
-                    .isInstanceOf(Message.CandyLocatorResponse.class);
+            clock.advance(3_001);
+            assertThat(send(handler, locate)).isInstanceOf(Message.CandyLocatorResponse.class);
         }
     }
 

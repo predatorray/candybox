@@ -72,6 +72,7 @@ public final class CandyboxNode implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(CandyboxNode.class);
 
     static final int MAX_PENDING_LOCATOR_RELAYS = 1024;
+    static final long RELAY_RECOUNT_INTERVAL_MILLIS = 1_000;
 
     private final int nodeId;
     private final CandyboxConfig config;
@@ -80,6 +81,7 @@ public final class CandyboxNode implements AutoCloseable {
     private final Clock clock;
     private final BoxAclStore aclStore;
     private final AtomicLong pendingRelayBytes = new AtomicLong();
+    private final AtomicLong lastRelayRecountMillis = new AtomicLong(Long.MIN_VALUE / 2);
     private volatile Authorizer authorizer = Authorizer.ALLOW_ALL;
     private final ConcurrentMap<BoxPartition, PartitionOwnership> partitions =
             new ConcurrentHashMap<>();
@@ -777,14 +779,17 @@ public final class CandyboxNode implements AutoCloseable {
         byte[] value = relay.serialize(config.sizeLimits().maxLocatorBytes());
         long budget = config.zeroCopyRelayBudgetBytes();
         if (pendingRelayBytes.get() + value.length > budget) {
-            sweepStaleLocatorRelaysOnce();
+            if (tryStartRelayRecount()) {
+                sweepStaleLocatorRelaysOnce();
+            }
             if (pendingRelayBytes.get() + value.length > budget) {
                 throw new BusyException("Zero-copy relay budget exhausted on node " + nodeId);
             }
         }
         String relays = CandyboxKeys.locatorRelaysPath(box, srcPartition);
         if (coordination.children(relays).size() >= MAX_PENDING_LOCATOR_RELAYS
-                && (sweepStaleLocatorRelays(box, srcPartition).deleted() == 0
+                && (!tryStartRelayRecount()
+                        || sweepStaleLocatorRelays(box, srcPartition).deleted() == 0
                         || coordination.children(relays).size() >= MAX_PENDING_LOCATOR_RELAYS)) {
             throw new BusyException("Too many pending zero-copy relays for box " + box
                     + " partition " + srcPartition);
@@ -793,6 +798,17 @@ public final class CandyboxNode implements AutoCloseable {
         coordination.create(CandyboxKeys.locatorRelayKey(box, srcPartition, token), value);
         pendingRelayBytes.addAndGet(value.length);
         return token;
+    }
+
+    /**
+     * Whether an over-budget write may reap and recount now. At most one such pass runs per
+     * {@link #RELAY_RECOUNT_INTERVAL_MILLIS}; the others are refused without touching coordination.
+     */
+    private boolean tryStartRelayRecount() {
+        long now = clock.currentTimeMillis();
+        long last = lastRelayRecountMillis.get();
+        return now - last >= RELAY_RECOUNT_INTERVAL_MILLIS
+                && lastRelayRecountMillis.compareAndSet(last, now);
     }
 
     /**
