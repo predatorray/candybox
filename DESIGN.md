@@ -379,10 +379,11 @@ The detailed rules:
   the prior claim (under (e)) that cross-partition copy/rename cannot share segments. Because a
   zero-copy put can point a partition back at a Syrup it already counts as a pending orphan, orphan
   tracking is not monotonic: a re-referenced Syrup leaves the pending set (its grace period restarts
-  if it is orphaned again), and GC claims Syrups through one write-locked step that re-checks the
-  partition's own references before dropping them from the live set. Only the claimed Syrups are
-  deleted. A source locator resolved before its Syrup was claimed and zero-copy-put only afterwards
-  is not yet guarded against.
+  in that partition if it is orphaned again; a sibling that also tracked it keeps its older timestamp,
+  #66), and GC claims Syrups through one write-locked step that re-checks the partition's own
+  references before dropping them from the live set. Only the claimed Syrups are deleted. A source
+  locator resolved before its Syrup was claimed and zero-copy-put only afterwards is not yet guarded
+  against (#65).
 
 The full compaction-then-GC cycle is covered end-to-end by `CompactionGcCycleIT`. One gap: deleting a
 Box drops its manifest pointer but does not yet reclaim that Box's SSTable/Syrup/WAL/manifest ledgers
