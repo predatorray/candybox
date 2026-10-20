@@ -169,6 +169,14 @@ public abstract class CoordinationServiceContract {
     }
 
     @Test
+    void reRegisteringAMemberRefreshesItsInfo() {
+        service.registerMember(1, b("host-1:10"));
+        service.registerMember(1, b("host-1:11"));
+        assertThat(service.members()).containsExactly(1);
+        assertThat(service.memberInfo(1).map(String::new)).contains("host-1:11");
+    }
+
+    @Test
     void leaseHolderReportsCurrentOwnerAndClearsOnExpiry() {
         assertThat(service.leaseHolder("owner")).isEmpty();
 

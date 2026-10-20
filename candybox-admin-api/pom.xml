@@ -45,6 +45,10 @@
             <groupId>org.apache.curator</groupId>
             <artifactId>curator-framework</artifactId>
         </dependency>
+        <dependency>
+            <groupId>org.apache.curator</groupId>
+            <artifactId>curator-recipes</artifactId>
+        </dependency>
 
         <!-- Jackson handles request-body parsing for the mutating endpoints (POST /api/boxes etc.).
              Response shaping is still the dependency-free JsonWriter — the read side benefits from

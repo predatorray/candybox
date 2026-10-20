@@ -300,7 +300,7 @@ boxes/<box>/partitions/<p>/refs       partition p's published referenced-Syrup s
 boxes/<box>/renames/<token>           cross-partition rename rendezvous marker (§6); cleared on finalize
 cluster/balancer                      the balancer's coordinator-election lease
 cluster/assignment                    the desired partition→node assignment table (versioned CAS)
-members/<nodeId>                      membership (advertised host:port)
+members/<nodeId>                      membership (advertised host:port); ephemeral, session-bound
 ```
 
 ### 7a. Partition balancing (elected coordinator)
@@ -311,7 +311,7 @@ node holds the `cluster/balancer` lease is the **elected coordinator**: it enume
 a target assignment, and CAS-publishes it at `cluster/assignment`. The computation is **sticky**
 (a live owner keeps its partitions up to the fair-share capacity ⌈partitions/members⌉),
 **failover-eager** (unowned partitions — a new Box, a dead node — go to the least-loaded members
-without limit), and **rate-limited** (at most `balancer.max.moves.per.round` partitions are taken
+without limit; a holder that left membership keeps its partitions until its lease lapses), and **rate-limited** (at most `balancer.max.moves.per.round` partitions are taken
 away from live owners per round, so a node join migrates load gradually). Every node — coordinator
 or not — then converges on the table: partitions assigned elsewhere are released after a
 **pre-handover flush** (shrinking the next owner's WAL replay to ~nothing), and partitions assigned

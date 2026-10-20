@@ -27,7 +27,11 @@ interface Router extends AutoCloseable {
     /** Routes a partition-scoped request to that partition's current owner. */
     Message callPartition(String box, int partition, Message request);
 
-    /** Routes a cluster-wide request (createBox, boxInfo, listBoxes) to any reachable node. */
+    /**
+     * Routes a cluster-wide request (createBox, boxInfo, listBoxes) to any reachable node. A request
+     * retried on another node after a transport failure may already have been applied, so a
+     * create/delete can then report "already exists" / "not found" although it succeeded.
+     */
     Message callAny(Message request);
 
     @Override
