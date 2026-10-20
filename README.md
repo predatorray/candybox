@@ -10,6 +10,7 @@
 
 <p align="center">
   <a href="https://predatorray.github.io/candybox/"><img alt="Documentation" src="https://img.shields.io/badge/docs-website-blue"></a>
+  <a href="https://javadoc.io/doc/me.predatorray.candybox/candybox-client"><img alt="Javadoc" src="https://javadoc.io/badge2/me.predatorray.candybox/candybox-client/javadoc.svg"></a>
   <a href="https://hub.docker.com/r/zetaplusae/candybox"><img alt="Docker Hub" src="https://img.shields.io/badge/dockerhub-available-2496ED?logo=docker&logoColor=white"></a>
   <a href="https://github.com/predatorray/candybox/releases"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/predatorray/candybox"></a>
   <a href="https://github.com/predatorray/candybox/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/predatorray/candybox"></a>
