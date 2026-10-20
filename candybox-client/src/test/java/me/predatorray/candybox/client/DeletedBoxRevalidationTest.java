@@ -23,8 +23,11 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import me.predatorray.candybox.common.ManualClock;
+import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.config.SizeLimits;
 import me.predatorray.candybox.common.exception.BoxNotFoundException;
+import me.predatorray.candybox.common.exception.BusyException;
+import me.predatorray.candybox.common.exception.CandyboxException;
 import me.predatorray.candybox.common.exception.NotOwnerException;
 import me.predatorray.candybox.coordination.CandyboxKeys;
 import me.predatorray.candybox.coordination.Lease;
@@ -145,6 +148,42 @@ class DeletedBoxRevalidationTest {
                 .isInstanceOf(BoxNotFoundException.class);
         assertThatThrownBy(() -> client.deleteRange("box", "a", "z"))
                 .isInstanceOf(BoxNotFoundException.class);
+    }
+
+    @Test
+    void fanOutNotFoundForALiveBoxKeepsTheOriginalError() {
+        node.partitionResponse = new Message.NotFoundResponse();
+
+        assertThatThrownBy(() -> client.listCandies("box", null, null, 10))
+                .isExactlyInstanceOf(CandyboxException.class);
+        assertThatThrownBy(() -> client.listMultipartUploads("box", null, null, null, 10))
+                .isExactlyInstanceOf(CandyboxException.class);
+        assertThatThrownBy(() -> client.deleteRangeByPrefix("box", "p/"))
+                .isExactlyInstanceOf(CandyboxException.class);
+        assertThatThrownBy(() -> client.deleteRange("box", "a", "z"))
+                .isExactlyInstanceOf(CandyboxException.class);
+
+        node.partitionResponse = new Message.BusyResponse(10); // not a NOT_FOUND: no revalidation
+        assertThatThrownBy(() -> client.listCandies("box", null, null, 10))
+                .isInstanceOf(BusyException.class);
+    }
+
+    @Test
+    void aFailedRevalidationKeepsTheOriginalError() {
+        leases.forEach(Lease::release);
+        coordination.unregisterMember(1); // the BoxInfo lookup has nowhere to go
+        clock.advance(TTL + 1);
+
+        assertThatThrownBy(() -> client.listCandies("box", null, null, 10))
+                .isInstanceOf(NotOwnerException.class);
+    }
+
+    @Test
+    void clusterClientRoutesThroughCoordination() {
+        try (CandyboxClient cluster = new CandyboxClient(new LoopbackTransport(node), coordination,
+                CandyboxConfig.builder().build())) {
+            assertThat(cluster.listCandies("box", null, null, 10).entries()).isEmpty();
+        }
     }
 
     @Test
