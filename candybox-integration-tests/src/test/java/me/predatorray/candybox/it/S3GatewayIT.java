@@ -51,6 +51,8 @@ import org.junit.jupiter.api.Test;
  */
 class S3GatewayIT {
 
+    private static final long ROUTER_CACHE_TTL_MILLIS = 1_000;
+
     private static EmbeddedBookKeeper bookKeeper;
     private static TestingServer zookeeper;
 
@@ -80,7 +82,8 @@ class S3GatewayIT {
 
         transport = new TcpTransport();
         clientCoord = new ZooKeeperCoordinationService(zookeeper.getConnectString(), SystemClock.INSTANCE);
-        client = new CandyboxClient(transport, clientCoord, config);
+        client = new CandyboxClient(transport, clientCoord,
+                CandyboxConfig.builder().routerCacheTtlMillis(ROUTER_CACHE_TTL_MILLIS).build());
 
         Properties props = new Properties();
         props.setProperty("zookeeper.connect", zookeeper.getConnectString());
@@ -109,6 +112,32 @@ class S3GatewayIT {
         if (bookKeeper != null) {
             bookKeeper.close();
         }
+    }
+
+    @Test
+    void bucketDeletedByAnotherClientReturnsNoSuchBucket() throws Exception {
+        assertThat(send("PUT", "/stale", null).statusCode()).isEqualTo(200);
+        // The gateway's client now caches the bucket's partition count and owner.
+        assertThat(send("GET", "/stale?list-type=2", null).statusCode()).isEqualTo(200);
+
+        try (TcpTransport t2 = new TcpTransport();
+             ZooKeeperCoordinationService c2 = new ZooKeeperCoordinationService(
+                     zookeeper.getConnectString(), SystemClock.INSTANCE);
+             CandyboxClient other = new CandyboxClient(t2, c2, CandyboxConfig.builder().build())) {
+            other.deleteBox("stale", true);
+        }
+
+        // Before the cached owner expires (the stale owner answers NOT_FOUND) and after (no owner).
+        assertNoSuchBucket(send("GET", "/stale?list-type=2", null));
+        Thread.sleep(ROUTER_CACHE_TTL_MILLIS + 500);
+        assertNoSuchBucket(send("GET", "/stale?list-type=2", null));
+        assertNoSuchBucket(send("GET", "/stale?uploads", null));
+        assertNoSuchBucket(send("GET", "/stale/k", null));
+    }
+
+    private static void assertNoSuchBucket(HttpResponse<String> response) {
+        assertThat(response.statusCode()).isEqualTo(404);
+        assertThat(response.body()).contains("<Code>NoSuchBucket</Code>");
     }
 
     @Test

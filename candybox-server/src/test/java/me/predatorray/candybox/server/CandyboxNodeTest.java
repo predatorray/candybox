@@ -365,6 +365,32 @@ class CandyboxNodeTest {
     }
 
     @Test
+    void boxDeletedOnAnotherNodeIsNotReportedFromAStaleDescriptorCache() {
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService();
+        try (CandyboxNode owner = new CandyboxNode(1, CandyboxConfig.defaults(), store, coordination,
+                new ManualClock(1000));
+             CandyboxNode other = new CandyboxNode(2, CandyboxConfig.defaults(), store, coordination,
+                new ManualClock(1000))) {
+            owner.createBox(BoxName.of("gone-box"), 2);
+            RequestHandler handler = other.requestHandler();
+            // Node 2 serves the Box's metadata (caching its descriptor) without owning a partition.
+            assertThat(roundTrip(handler, new Message.BoxInfoRequest("gone-box")))
+                    .isEqualTo(new Message.BoxInfoResponse(2));
+
+            owner.deleteBox(BoxName.of("gone-box"), true);
+
+            assertThat(roundTrip(handler, new Message.BoxInfoRequest("gone-box")))
+                    .isInstanceOf(Message.NotFoundResponse.class);
+            assertThat(roundTrip(handler, new Message.HeadBoxRequest("gone-box")))
+                    .isInstanceOf(Message.NotFoundResponse.class);
+            assertThat(roundTrip(handler, new Message.GetBoxAclRequest("gone-box")))
+                    .isInstanceOf(Message.NotFoundResponse.class);
+        }
+        store.close();
+    }
+
+    @Test
     void releaseBoxThenOpenBoxReplaysEveryPartition() {
         InMemoryLedgerStore store = new InMemoryLedgerStore();
         InMemoryCoordinationService coordination = new InMemoryCoordinationService();
