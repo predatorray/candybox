@@ -396,9 +396,16 @@ public final class CandyboxNode implements AutoCloseable {
         return out;
     }
 
-    /** Whether the Box exists in the cluster (its descriptor is present in coordination). */
+    /**
+     * Whether the Box exists in the cluster. Reads coordination directly, not the descriptor cache,
+     * because another node may have deleted the Box since it was cached here.
+     */
     public boolean boxExists(BoxName box) {
-        return findDescriptor(box).isPresent();
+        boolean exists = coordination.get(CandyboxKeys.boxMetaKey(box.value())).isPresent();
+        if (!exists) {
+            descriptorCache.remove(box.value());
+        }
+        return exists;
     }
 
     /** The Box's descriptor, or throws {@link BoxNotFoundException}. Cached (it is immutable). */
