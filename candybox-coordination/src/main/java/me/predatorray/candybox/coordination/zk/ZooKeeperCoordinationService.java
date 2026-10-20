@@ -15,9 +15,13 @@
  */
 package me.predatorray.candybox.coordination.zk;
 
+import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 import me.predatorray.candybox.common.Clock;
 import me.predatorray.candybox.common.SystemClock;
 import me.predatorray.candybox.common.serial.BinaryReader;
@@ -32,7 +36,9 @@ import me.predatorray.candybox.coordination.VersionedValue;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
 import org.apache.curator.framework.api.ACLProvider;
+import org.apache.curator.framework.recipes.nodes.PersistentNode;
 import org.apache.curator.retry.ExponentialBackoffRetry;
+import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.ZooDefs;
 import org.apache.zookeeper.data.ACL;
@@ -53,7 +59,9 @@ import org.apache.zookeeper.data.Stat;
  *       Expiry is driven by the injected {@link Clock} (so it is identical to the fake and testable),
  *       and safety rests on the fencing token, not on session liveness — a fenced owner is detected
  *       because a strictly higher token exists.</li>
- *   <li><b>Membership</b> → child znodes under {@code /members}.</li>
+ *   <li><b>Membership</b> → ephemeral child znodes under {@code /members}, held by Curator's
+ *       {@link PersistentNode} so they are re-created after a session loss. A crashed node drops out
+ *       once its session expires.</li>
  * </ul>
  *
  * <p>All paths are scoped under the {@code candybox} Curator namespace. Thread-safe.
@@ -61,10 +69,12 @@ import org.apache.zookeeper.data.Stat;
 public final class ZooKeeperCoordinationService implements CoordinationService {
 
     private static final String MEMBERS_BASE = "/members";
+    private static final long MEMBER_REGISTER_TIMEOUT_MILLIS = 15_000;
 
     private final CuratorFramework client;
     private final Clock clock;
     private final boolean ownsClient;
+    private final Map<Integer, PersistentNode> memberNodes = new HashMap<>();
 
     /** Builds and owns a Curator client connected to {@code connectString}, unauthenticated. */
     public ZooKeeperCoordinationService(String connectString, Clock clock) {
@@ -291,19 +301,63 @@ public final class ZooKeeperCoordinationService implements CoordinationService {
     // ---- membership ------------------------------------------------------------------------
 
     @Override
-    public void registerMember(int nodeId, byte[] info) {
+    public synchronized void registerMember(int nodeId, byte[] info) {
+        String p = memberPath(nodeId);
         try {
-            client.create().orSetData().creatingParentsIfNeeded()
-                    .forPath(MEMBERS_BASE + "/" + nodeId, info);
+            PersistentNode existing = memberNodes.get(nodeId);
+            if (existing != null) {
+                // The recipe writes in the background (and on re-creation); the direct write makes
+                // the new info visible before this returns.
+                existing.setData(info);
+                try {
+                    client.setData().forPath(p, info);
+                } catch (KeeperException.NoNodeException ignored) {
+                    // being re-created after a session loss, with the new info
+                }
+                return;
+            }
+            dropPersistentMember(p);
+            PersistentNode node = new PersistentNode(client, CreateMode.EPHEMERAL, false, p, info);
+            node.start();
+            // Holds the monitor while waiting; registration only happens at node startup.
+            boolean created;
+            try {
+                created = node.waitForInitialCreate(MEMBER_REGISTER_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                closeQuietly(node);
+                throw e;
+            }
+            if (!created) {
+                closeQuietly(node);
+                throw new CoordinationException("Timed out registering member " + nodeId);
+            }
+            memberNodes.put(nodeId, node);
         } catch (Exception e) {
             throw wrap("registerMember", Integer.toString(nodeId), e);
         }
     }
 
+    /** Removes a member znode left persistent by an older version, so it can become ephemeral. */
+    private void dropPersistentMember(String p) throws Exception {
+        Stat stat = client.checkExists().forPath(p);
+        if (stat != null && stat.getEphemeralOwner() == 0) {
+            try {
+                client.delete().withVersion(stat.getVersion()).forPath(p);
+            } catch (KeeperException.NoNodeException | KeeperException.BadVersionException ignored) {
+                // changed concurrently; the PersistentNode takes over whatever is there
+            }
+        }
+    }
+
     @Override
-    public void unregisterMember(int nodeId) {
+    public synchronized void unregisterMember(int nodeId) {
         try {
-            client.delete().forPath(MEMBERS_BASE + "/" + nodeId);
+            PersistentNode node = memberNodes.remove(nodeId);
+            if (node != null) {
+                node.close(); // deletes the znode
+            } else {
+                client.delete().forPath(memberPath(nodeId));
+            }
         } catch (KeeperException.NoNodeException ignored) {
             // already gone
         } catch (Exception e) {
@@ -331,7 +385,7 @@ public final class ZooKeeperCoordinationService implements CoordinationService {
     @Override
     public Optional<byte[]> memberInfo(int nodeId) {
         try {
-            return Optional.of(client.getData().forPath(MEMBERS_BASE + "/" + nodeId));
+            return Optional.of(client.getData().forPath(memberPath(nodeId)));
         } catch (KeeperException.NoNodeException e) {
             return Optional.empty();
         } catch (Exception e) {
@@ -341,8 +395,24 @@ public final class ZooKeeperCoordinationService implements CoordinationService {
 
     @Override
     public void close() {
+        synchronized (this) {
+            memberNodes.values().forEach(ZooKeeperCoordinationService::closeQuietly);
+            memberNodes.clear();
+        }
         if (ownsClient) {
             client.close();
+        }
+    }
+
+    private static String memberPath(int nodeId) {
+        return MEMBERS_BASE + "/" + nodeId;
+    }
+
+    private static void closeQuietly(PersistentNode node) {
+        try {
+            node.close();
+        } catch (IOException | RuntimeException ignored) {
+            // best effort: the session ending removes the ephemeral znode anyway
         }
     }
 

@@ -94,7 +94,11 @@ public interface CoordinationService extends AutoCloseable {
 
     // ---- membership -------------------------------------------------------------------------
 
-    /** Registers (or refreshes) this node in the cluster with opaque info bytes. */
+    /**
+     * Registers (or refreshes) this node in the cluster with opaque info bytes. Membership is bound to
+     * this service's session: it lasts until {@link #unregisterMember}, {@link #close}, or the session
+     * is lost (e.g. the process crashes), so {@link #members()} lists only live nodes.
+     */
     void registerMember(int nodeId, byte[] info);
 
     /** Removes this node from the cluster. */

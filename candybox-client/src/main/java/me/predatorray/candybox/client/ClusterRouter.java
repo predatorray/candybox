@@ -19,6 +19,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import me.predatorray.candybox.common.Clock;
 import me.predatorray.candybox.common.concurrent.TtlCache;
 import me.predatorray.candybox.common.exception.CandyboxException;
@@ -37,7 +38,8 @@ import me.predatorray.candybox.protocol.transport.Transport;
  * per-partition coordination lease, maps the owner's node id to its advertised {@code host:port} via
  * membership, connects there, and re-routes on a {@code MOVED} response (using the named owner).
  * Partition→address resolutions are cached with a TTL and invalidated on redirect; one connection is
- * kept per node address.
+ * kept per node address. Requests that any node can serve rotate across members and fail over to the
+ * next member when one is unreachable.
  */
 final class ClusterRouter implements Router {
 
@@ -49,6 +51,7 @@ final class ClusterRouter implements Router {
 
     private final TtlCache<String, NodeAddress> partitionCache;
     private final ConcurrentMap<String, Connection> connections = new ConcurrentHashMap<>();
+    private final AtomicInteger nextMember = new AtomicInteger();
 
     ClusterRouter(Transport transport, CoordinationService coordination, long cacheTtlMillis,
                   Clock clock) {
@@ -76,7 +79,25 @@ final class ClusterRouter implements Router {
 
     @Override
     public Message callAny(Message request) {
-        return send(anyMember(), request);
+        List<Integer> members = coordination.members();
+        if (members.isEmpty()) {
+            throw new CandyboxException("No cluster members to route to");
+        }
+        int start = Math.floorMod(nextMember.getAndIncrement(), members.size());
+        RuntimeException failure = null;
+        for (int i = 0; i < members.size(); i++) {
+            int nodeId = members.get((start + i) % members.size());
+            try {
+                return send(addressOfNode(nodeId), request);
+            } catch (RuntimeException e) {
+                if (failure == null) {
+                    failure = e;
+                } else {
+                    failure.addSuppressed(e);
+                }
+            }
+        }
+        throw failure;
     }
 
     private NodeAddress resolveOwner(String box, int partition, String cacheKey) {
@@ -96,14 +117,6 @@ final class ClusterRouter implements Router {
         byte[] info = coordination.memberInfo(nodeId)
                 .orElseThrow(() -> new NotOwnerException("node " + nodeId + " is not registered"));
         return NodeAddress.parse(new String(info, StandardCharsets.UTF_8));
-    }
-
-    private NodeAddress anyMember() {
-        List<Integer> members = coordination.members();
-        if (members.isEmpty()) {
-            throw new CandyboxException("No cluster members to route to");
-        }
-        return addressOfNode(members.get(0));
     }
 
     private Message send(NodeAddress address, Message request) {

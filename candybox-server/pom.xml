@@ -49,6 +49,10 @@
             <groupId>org.apache.curator</groupId>
             <artifactId>curator-framework</artifactId>
         </dependency>
+        <dependency>
+            <groupId>org.apache.curator</groupId>
+            <artifactId>curator-recipes</artifactId>
+        </dependency>
         <!-- Same story for the NIO transport: candybox-protocol marks Netty `optional` so embedding
              the client does not pull it in, and the node — which listens — provides it here. -->
         <dependency>
