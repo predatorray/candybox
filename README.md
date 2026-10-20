@@ -200,67 +200,19 @@ Candybox is layered top to bottom: an S3-like object API sits on a per-Box LSM e
 two narrow SPIs, which in turn run on Apache BookKeeper (durable ledgers) and ZooKeeper
 (coordination/metadata).
 
-```
-┌────────────────────────────────────────────────────────────┐
-│  Client API — S3-like object store: Boxes of Candy         │
-├────────────────────────────────────────────────────────────┤
-│  LSM engine  (candybox-lsm)                                │
-│  WAL → Memtable → SSTables → Manifest                      │
-│  Compaction · GC · HLC · single fenced owner               │
-├──────────────────────────────┬─────────────────────────────┤
-│  LedgerStore SPI             │  Coordination SPI           │
-│  (candybox-bookkeeper)       │  (candybox-coordination)    │
-│  ledger roles: WAL,          │  fencing tokens,            │
-│  SSTable, Syrup, manifest    │  manifest pointer CAS       │
-├──────────────────────────────┼─────────────────────────────┤
-│  Apache BookKeeper           │  ZooKeeper                  │
-│  (durable ledgers)           │  (metadata / CAS)           │
-└──────────────────────────────┴─────────────────────────────┘
-```
+![Candybox architecture: client API, LSM engine, LedgerStore and Coordination SPIs, BookKeeper and ZooKeeper](docs/content/docs/architecture/architecture.excalidraw.svg)
 
 `candybox-common` (shared records, `BinaryWriter`/`BinaryReader` serialization, HLC, config) underpins
 every layer. Object bytes never enter the LSM tree: candy lives in Syrups and the tree holds only
 `CandyLocator` pointers. The protocol/server/client modules (see [Project layout](#project-layout))
-wrap the engine behind the wire API; the dashed arrow in the data-flow diagram below shows how the
+wrap the engine behind the wire API; the red dashed arrow in the data-flow diagram below shows how the
 fenced owner gates every state change.
 
 ### How it works
 
 Candybox blends three well-known designs:
 
-```mermaid
-flowchart TB
-    client([Client])
-
-    subgraph owner["Partition owner (single, fenced node)"]
-        direction TB
-        wal[Write-ahead log]
-        memtable[Memtable]
-        sst[SSTables<br/>sorted, immutable]
-        compaction([Compaction])
-    end
-
-    lease[(ZooKeeper lease<br/>+ fencing token)]
-    syrup[(Syrups<br/>object data ledgers)]
-
-    client -- "write object" --> owner
-    owner -- "object bytes" --> syrup
-    syrup -- "CandyLocator pointer" --> wal
-    wal --> memtable
-    memtable -- "flush when full" --> sst
-    sst --> compaction
-    compaction --> sst
-
-    client -- "read object" --> memtable
-    memtable -. "merge, newest wins" .- sst
-    sst -- "pointer" --> syrup
-    syrup -- "object bytes" --> client
-
-    owner -. "every state change carries token" .-> lease
-
-    classDef store fill:#fff3cd,stroke:#d4a017;
-    class lease,syrup store;
-```
+![How it works: writes and reads flow through the partition owner's WAL, memtable and SSTables, with object bytes in Syrups and the fencing token checked against a ZooKeeper lease](docs/content/docs/architecture/how-it-works.excalidraw.svg)
 
 - **A LevelDB-style LSM tree** for the index. Writes land in an in-memory *memtable* fronted by a
   write-ahead log; when it fills, it is flushed to an immutable, sorted **SSTable** and later merged
