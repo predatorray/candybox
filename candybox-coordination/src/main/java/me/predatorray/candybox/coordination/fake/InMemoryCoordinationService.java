@@ -40,6 +40,8 @@ import me.predatorray.candybox.coordination.VersionedValue;
  *       strictly higher and the previous holder's lease immediately reports invalid.</li>
  *   <li><b>CAS conflicts</b>: versioned writes fail with {@link CasConflictException} on a version
  *       mismatch, so the manifest-pointer race is real, not papered over.</li>
+ *   <li><b>Session-bound membership</b>: {@link #expireMember} drops a member without
+ *       {@link #unregisterMember}, as ZooKeeper does when a crashed node's session expires.</li>
  * </ul>
  *
  * <p>Thread-safe via coarse synchronization on the service instance.
@@ -162,6 +164,11 @@ public final class InMemoryCoordinationService implements CoordinationService {
 
     @Override
     public void unregisterMember(int nodeId) {
+        members.remove(Integer.toString(nodeId));
+    }
+
+    /** Test hook: simulates a crashed member whose coordination session expired. */
+    public void expireMember(int nodeId) {
         members.remove(Integer.toString(nodeId));
     }
 
