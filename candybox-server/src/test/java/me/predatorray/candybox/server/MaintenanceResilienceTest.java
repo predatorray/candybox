@@ -18,13 +18,17 @@ package me.predatorray.candybox.server;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.BiPredicate;
+import java.util.function.BooleanSupplier;
 import me.predatorray.candybox.bookkeeper.fake.InMemoryLedgerStore;
 import me.predatorray.candybox.common.BoxName;
 import me.predatorray.candybox.common.CandyKey;
@@ -37,6 +41,8 @@ import me.predatorray.candybox.coordination.CoordinationException;
 import me.predatorray.candybox.coordination.CoordinationService;
 import me.predatorray.candybox.coordination.Lease;
 import me.predatorray.candybox.coordination.fake.InMemoryCoordinationService;
+import me.predatorray.candybox.lsm.engine.BoxEngine;
+import me.predatorray.candybox.lsm.manifest.RenameIntent;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -45,7 +51,7 @@ class MaintenanceResilienceTest {
 
     private static final BoxName BOX = BoxName.of("maint-box");
     private static final byte[] VALUE = "v".getBytes(StandardCharsets.UTF_8);
-    private static final long GC_GRACE = 60_000;
+    private static final long WINDOW = 60_000; // GC grace, multipart TTL and rename abandon window
 
     private final InMemoryLedgerStore store = new InMemoryLedgerStore();
 
@@ -59,26 +65,56 @@ class MaintenanceResilienceTest {
         AtomicBoolean failOnce = new AtomicBoolean(true);
         CoordinationService flaky = flaky(new InMemoryCoordinationService(SystemClock.INSTANCE),
                 (method, key) -> method.equals("get") && key.endsWith("/refs")
-                        && failOnce.compareAndSet(true, false),
-                resource -> null);
+                        && failOnce.compareAndSet(true, false) ? connectionLoss() : null);
         CandyboxConfig config = CandyboxConfig.builder()
                 .compactionIntervalMillis(20).l0CompactionTrigger(2).build();
         try (CandyboxNode node = new CandyboxNode(1, config, store, flaky)) {
             node.createBox(BOX, 1);
-            long deadline = System.currentTimeMillis() + 5_000;
-            while (failOnce.get() && System.currentTimeMillis() < deadline) {
-                Thread.sleep(10);
-            }
-            assertThat(failOnce).as("the injected error fired").isFalse();
+            awaitTrue(() -> !failOnce.get());
 
             for (int i = 0; i < 6; i++) {
                 node.engine(BOX, "k" + i).putCandy(CandyKey.of("k" + i), VALUE, null, Map.of(), null);
                 node.enginePartition(BOX, 0).flush();
             }
-            while (level0(node, 0) >= 2 && System.currentTimeMillis() < deadline) {
-                Thread.sleep(10);
+            awaitTrue(() -> level0(node, 0) < 2);
+        }
+    }
+
+    @Test
+    void scheduledTasksSurviveAnErrorEscapingThem() throws Exception {
+        Set<String> pending = ConcurrentHashMap.newKeySet();
+        pending.addAll(Set.of("candybox-compaction-", "candybox-lease-", "candybox-balancer-"));
+        Map<String, AtomicInteger> ticksAfterError = new ConcurrentHashMap<>();
+        String p0Resource = CandyboxKeys.ownerResource(BOX.value(), 0);
+        // One Error per scheduled task, each from a call only that task makes; later calls are counted.
+        CoordinationService flaky = flaky(new InMemoryCoordinationService(), (method, key) -> {
+            String task = switch (method) {
+                case "lease.isValid" -> key.equals(p0Resource) ? "candybox-compaction-" : null;
+                case "lease.renew" -> "candybox-lease-";
+                case "tryAcquireLease" -> key.equals(CandyboxKeys.BALANCER_RESOURCE)
+                        ? "candybox-balancer-" : null;
+                default -> null;
+            };
+            if (task == null || !Thread.currentThread().getName().startsWith(task)) {
+                return null;
             }
-            assertThat(level0(node, 0)).isLessThan(2);
+            if (pending.remove(task)) {
+                throw new AssertionError("simulated unexpected error in " + task);
+            }
+            ticksAfterError.computeIfAbsent(task, t -> new AtomicInteger()).incrementAndGet();
+            return null;
+        });
+        CandyboxConfig config = CandyboxConfig.builder().compactionIntervalMillis(20)
+                .leaseRenewIntervalMillis(20).balancerIntervalMillis(20).l0CompactionTrigger(2).build();
+        try (CandyboxNode node = new CandyboxNode(1, config, store, flaky)) {
+            node.createBox(BOX, 2);
+            awaitTrue(pending::isEmpty);
+
+            for (int i = 0; i < 2; i++) {
+                putAndFlush(node, keyIn(0, i));
+            }
+            awaitTrue(() -> level0(node, 0) < 2);
+            awaitTrue(() -> ticksAfterError.keySet().size() == 3);
         }
     }
 
@@ -86,7 +122,7 @@ class MaintenanceResilienceTest {
     void compactionSkipsOnlyThePartitionWhoseOwnershipCheckFails() {
         AtomicReference<Fault> p0 = new AtomicReference<>(Fault.NONE);
         try (CandyboxNode node = twoPartitionNode(p0, CandyboxConfig.builder()
-                .l0CompactionTrigger(2).build())) {
+                .l0CompactionTrigger(2).build(), new ManualClock(1000))) {
             for (int i = 0; i < 2; i++) {
                 putAndFlush(node, keyIn(1, i));
             }
@@ -104,17 +140,17 @@ class MaintenanceResilienceTest {
         InMemoryCoordinationService real = new InMemoryCoordinationService();
         String p0Refs = CandyboxKeys.partitionRefsKey(BOX.value(), 0);
         CandyboxConfig config = CandyboxConfig.builder()
-                .l0CompactionTrigger(2).ledgerGcGraceMillis(GC_GRACE).build();
-        try (CandyboxNode node = new CandyboxNode(1, config, store, flaky(real,
-                (method, key) -> failP0Publish.get() && !method.equals("get") && key.equals(p0Refs),
-                resource -> null), clock)) {
+                .l0CompactionTrigger(2).ledgerGcGraceMillis(WINDOW).build();
+        try (CandyboxNode node = new CandyboxNode(1, config, store, flaky(real, (method, key) ->
+                failP0Publish.get() && !method.equals("get") && key.equals(p0Refs)
+                        ? connectionLoss() : null), clock)) {
             node.createBox(BOX, 2);
             node.collectGarbageOnce();
             for (int i = 0; i < 2; i++) {
                 putAndFlush(node, keyIn(1, i));
             }
             assertThat(node.compactOwnedBoxesOnce()).isPositive();
-            clock.advance(GC_GRACE + 1);
+            clock.advance(WINDOW + 1);
 
             // p0's published refs are now stale, so p1's obsolete ledgers must not be reclaimed yet.
             failP0Publish.set(true);
@@ -130,11 +166,11 @@ class MaintenanceResilienceTest {
     void multipartSweepSkipsOnlyThePartitionWhoseOwnershipCheckFails() {
         AtomicReference<Fault> p0 = new AtomicReference<>(Fault.NONE);
         ManualClock clock = new ManualClock(1000);
-        CandyboxConfig config = CandyboxConfig.builder().multipartUploadTtlMillis(60_000).build();
+        CandyboxConfig config = CandyboxConfig.builder().multipartUploadTtlMillis(WINDOW).build();
         try (CandyboxNode node = twoPartitionNode(p0, config, clock)) {
             node.enginePartition(BOX, 0).createMultipartUpload(CandyKey.of(keyIn(0, 0)), null, Map.of());
             node.enginePartition(BOX, 1).createMultipartUpload(CandyKey.of(keyIn(1, 0)), null, Map.of());
-            clock.advance(120_000);
+            clock.advance(WINDOW + 1);
             p0.set(Fault.THROW);
 
             assertThat(node.sweepStaleMultipartUploadsOnce()).isEqualTo(1);
@@ -143,13 +179,17 @@ class MaintenanceResilienceTest {
     }
 
     @Test
-    void renameFinalizeAndRelaySweepTolerateAFailingOwnershipCheck() {
+    void renameFinalizeAndRelaySweepSkipOnlyThePartitionWhoseOwnershipCheckFails() {
         AtomicReference<Fault> p0 = new AtomicReference<>(Fault.NONE);
-        try (CandyboxNode node = twoPartitionNode(p0, CandyboxConfig.defaults())) {
+        ManualClock clock = new ManualClock(1000);
+        CandyboxConfig config = CandyboxConfig.builder().renameIntentAbandonMillis(WINDOW).build();
+        try (CandyboxNode node = twoPartitionNode(p0, config, clock)) {
+            seedStaleRenameIntentAndRelayInP1(node, clock);
             p0.set(Fault.THROW);
 
-            assertThat(node.finalizeRenameIntentsOnce()).isZero();
-            assertThat(node.sweepStaleLocatorRelaysOnce()).isZero();
+            node.finalizeRenameIntentsOnce();
+            assertThat(node.enginePartition(BOX, 1).listRenameIntents()).isEmpty();
+            assertThat(node.sweepStaleLocatorRelaysOnce()).isEqualTo(1);
         }
     }
 
@@ -157,78 +197,57 @@ class MaintenanceResilienceTest {
     void everyPassSkipsAPartitionWhoseLeaseWasLost() {
         AtomicReference<Fault> p0 = new AtomicReference<>(Fault.NONE);
         ManualClock clock = new ManualClock(1000);
-        CandyboxConfig config = CandyboxConfig.builder()
-                .l0CompactionTrigger(2).multipartUploadTtlMillis(60_000).build();
+        CandyboxConfig config = CandyboxConfig.builder().l0CompactionTrigger(2)
+                .ledgerGcGraceMillis(WINDOW).multipartUploadTtlMillis(WINDOW)
+                .renameIntentAbandonMillis(WINDOW).build();
         try (CandyboxNode node = twoPartitionNode(p0, config, clock)) {
+            BoxEngine p1 = node.enginePartition(BOX, 1);
             for (int i = 0; i < 2; i++) {
                 putAndFlush(node, keyIn(1, i));
             }
-            node.enginePartition(BOX, 1).createMultipartUpload(CandyKey.of(keyIn(1, 0)), null, Map.of());
-            clock.advance(120_000);
+            p1.createMultipartUpload(CandyKey.of(keyIn(1, 0)), null, Map.of());
+            seedStaleRenameIntentAndRelayInP1(node, clock);
             p0.set(Fault.LOST);
 
             assertThat(node.compactOwnedBoxesOnce()).isPositive();
-            node.collectGarbageOnce();
+            clock.advance(WINDOW + 1);
+            assertThat(node.collectGarbageOnce()).isPositive();
             assertThat(node.sweepStaleMultipartUploadsOnce()).isEqualTo(1);
-            assertThat(node.finalizeRenameIntentsOnce()).isZero();
-            assertThat(node.sweepStaleLocatorRelaysOnce()).isZero();
+            node.finalizeRenameIntentsOnce();
+            assertThat(p1.listRenameIntents()).isEmpty();
+            assertThat(node.sweepStaleLocatorRelaysOnce()).isEqualTo(1);
         }
     }
 
-    @Test
-    void scheduledTasksSurviveAnErrorEscapingAPass() throws Exception {
-        AtomicReference<Fault> p0 = new AtomicReference<>(Fault.NONE);
-        CandyboxConfig config = CandyboxConfig.builder().compactionIntervalMillis(20)
-                .balancerIntervalMillis(20).l0CompactionTrigger(2).build();
-        try (CandyboxNode node = twoPartitionNode(p0, config, new ManualClock(1000))) {
-            p0.set(Fault.ERROR_ONCE);
-            long deadline = System.currentTimeMillis() + 5_000;
-            while (p0.get() != Fault.NONE && System.currentTimeMillis() < deadline) {
-                Thread.sleep(10);
-            }
-            assertThat(p0.get()).as("the injected error fired").isEqualTo(Fault.NONE);
-
-            for (int i = 0; i < 2; i++) {
-                putAndFlush(node, keyIn(0, i));
-            }
-            while (level0(node, 0) >= 2 && System.currentTimeMillis() < deadline) {
-                Thread.sleep(10);
-            }
-            assertThat(level0(node, 0)).isLessThan(2);
-        }
+    /** Leaves p1 with a rename intent and a locator relay that both fall out of their window. */
+    private static void seedStaleRenameIntentAndRelayInP1(CandyboxNode node, ManualClock clock) {
+        BoxEngine p1 = node.enginePartition(BOX, 1);
+        String src = keyIn(1, 7);
+        p1.putCandy(CandyKey.of(src), VALUE, null, Map.of(), null);
+        var locator = p1.resolveLocator(CandyKey.of(src));
+        p1.recordRenameIntent(new RenameIntent("stuck", src, locator.hlc(), "dst", 0,
+                clock.currentTimeMillis()));
+        node.writeLocatorRelay(BOX.value(), 1, new LocatorRelay("User:test", src, null, null,
+                clock.currentTimeMillis(), locator));
+        clock.advance(WINDOW + 1);
     }
 
-    private enum Fault { NONE, THROW, LOST, ERROR_ONCE }
-
-    private CandyboxNode twoPartitionNode(AtomicReference<Fault> p0, CandyboxConfig config) {
-        return twoPartitionNode(p0, config, new ManualClock(1000));
-    }
+    private enum Fault { NONE, THROW, LOST }
 
     /** A node owning both partitions of {@link #BOX}, whose partition-0 lease check fails on demand. */
     private CandyboxNode twoPartitionNode(AtomicReference<Fault> p0, CandyboxConfig config,
                                           ManualClock clock) {
         String p0Resource = CandyboxKeys.ownerResource(BOX.value(), 0);
         CandyboxNode node = new CandyboxNode(1, config, store,
-                flaky(new InMemoryCoordinationService(), (method, key) -> false, resource -> {
-                    if (!resource.equals(p0Resource)) {
+                flaky(new InMemoryCoordinationService(), (method, key) -> {
+                    if (!method.equals("lease.isValid") || !key.equals(p0Resource)) {
                         return null;
                     }
-                    switch (p0.get()) {
-                        case THROW -> throw new CoordinationException("simulated connection loss");
-                        case LOST -> {
-                            return false;
-                        }
-                        case ERROR_ONCE -> {
-                            if (!Thread.currentThread().getName().startsWith("candybox-compaction-")) {
-                                return null;
-                            }
-                            p0.set(Fault.NONE);
-                            throw new AssertionError("simulated unexpected error");
-                        }
-                        default -> {
-                            return null;
-                        }
-                    }
+                    return switch (p0.get()) {
+                        case THROW -> connectionLoss();
+                        case LOST -> false;
+                        case NONE -> null;
+                    };
                 }), clock);
         node.createBox(BOX, 2);
         return node;
@@ -254,48 +273,60 @@ class MaintenanceResilienceTest {
         return node.enginePartition(BOX, partition).manifestState().level0().size();
     }
 
-    /** Overrides a lease's {@code isValid()}: {@code null} defers to the real lease; may throw. */
-    private interface LeaseCheck {
-        Boolean isValid(String resource);
+    private static void awaitTrue(BooleanSupplier condition) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (!condition.getAsBoolean() && System.currentTimeMillis() < deadline) {
+            Thread.sleep(10);
+        }
+        assertThat(condition.getAsBoolean()).isTrue();
+    }
+
+    private static Object connectionLoss() {
+        throw new CoordinationException("simulated connection loss");
     }
 
     /**
-     * Delegates to {@code real}, but a keyed call throws a {@link CoordinationException} (a ZooKeeper
-     * connection loss) whenever {@code fail(method, key)} says so, and leases defer to {@code leaseCheck}.
+     * Sees every keyed coordination call as {@code (method, key)} and every lease call as
+     * {@code ("lease.<method>", resource)}. Returns {@code null} to defer to the real call, or a
+     * value to return instead; may throw.
      */
-    private static CoordinationService flaky(CoordinationService real,
-                                             BiPredicate<String, String> fail, LeaseCheck leaseCheck) {
-        return (CoordinationService) Proxy.newProxyInstance(CoordinationService.class.getClassLoader(),
-                new Class<?>[] {CoordinationService.class}, (proxy, method, args) -> {
-                    if (args != null && args.length > 0 && args[0] instanceof String key
-                            && fail.test(method.getName(), key)) {
-                        throw new CoordinationException("simulated connection loss");
-                    }
-                    Object result = invoke(method, real, args);
-                    if (method.getName().equals("tryAcquireLease")) {
-                        String resource = (String) args[0];
-                        return ((Optional<?>) result).map(lease -> flakyLease((Lease) lease,
-                                () -> leaseCheck.isValid(resource)));
-                    }
-                    return result;
-                });
+    private interface Interceptor {
+        Object intercept(String method, String key);
     }
 
-    private static Lease flakyLease(Lease real, java.util.function.Supplier<Boolean> check) {
-        return (Lease) Proxy.newProxyInstance(Lease.class.getClassLoader(), new Class<?>[] {Lease.class},
-                (proxy, method, args) -> {
-                    if (method.getName().equals("isValid")) {
-                        Boolean valid = check.get();
-                        if (valid != null) {
-                            return valid;
-                        }
-                    }
-                    return invoke(method, real, args);
-                });
+    private static CoordinationService flaky(CoordinationService real, Interceptor interceptor) {
+        return proxy(CoordinationService.class, real, (method, args) -> {
+            if (args != null && args.length > 0 && args[0] instanceof String key) {
+                Object override = interceptor.intercept(method.getName(), key);
+                if (override != null) {
+                    return override;
+                }
+            }
+            Object result = invoke(method, real, args);
+            if (method.getName().equals("tryAcquireLease")) {
+                return ((Optional<?>) result).map(lease -> flakyLease((Lease) lease, interceptor));
+            }
+            return result;
+        });
     }
 
-    private static Object invoke(java.lang.reflect.Method method, Object target, Object[] args)
-            throws Throwable {
+    private static Lease flakyLease(Lease real, Interceptor interceptor) {
+        return proxy(Lease.class, real, (method, args) -> {
+            Object override = interceptor.intercept("lease." + method.getName(), real.resource());
+            return override != null ? override : invoke(method, real, args);
+        });
+    }
+
+    private interface Handler {
+        Object handle(Method method, Object[] args) throws Throwable;
+    }
+
+    private static <T> T proxy(Class<T> type, T real, Handler handler) {
+        return type.cast(Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[] {type},
+                (proxy, method, args) -> handler.handle(method, args)));
+    }
+
+    private static Object invoke(Method method, Object target, Object[] args) throws Throwable {
         try {
             return method.invoke(target, args);
         } catch (InvocationTargetException e) {

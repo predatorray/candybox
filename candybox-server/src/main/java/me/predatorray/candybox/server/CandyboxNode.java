@@ -135,8 +135,8 @@ public final class CandyboxNode implements AutoCloseable {
         long compactionInterval = config.compactionIntervalMillis();
         if (compactionInterval > 0) {
             this.compactionWorker = daemonScheduler("candybox-compaction-" + nodeId);
-            this.compactionWorker.scheduleWithFixedDelay(guarded("maintenance", this::runMaintenance),
-                    compactionInterval, compactionInterval, TimeUnit.MILLISECONDS);
+            this.compactionWorker.scheduleWithFixedDelay(this::runMaintenance, compactionInterval,
+                    compactionInterval, TimeUnit.MILLISECONDS);
         } else {
             this.compactionWorker = null;
         }
@@ -165,7 +165,8 @@ public final class CandyboxNode implements AutoCloseable {
 
     /**
      * A periodic task that throws is silently cancelled by its {@link ScheduledExecutorService}, so
-     * every scheduled task (and each maintenance phase) logs and swallows its failure instead.
+     * every scheduled task (and each maintenance phase, which is what keeps maintenance itself from
+     * throwing) logs and swallows its failure instead.
      */
     private Runnable guarded(String what, Runnable task) {
         return () -> {
