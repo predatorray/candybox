@@ -17,10 +17,17 @@ cross-account access patterns work the way S3 SDKs expect.
 Point any S3 client at the gateway endpoint with path-style addressing. For example, with the AWS CLI:
 
 ```bash
-aws --endpoint-url http://localhost:9711 s3 mb s3://photos
-echo 'hello candybox' | aws --endpoint-url http://localhost:9711 s3 cp - s3://photos/hello.txt
-aws --endpoint-url http://localhost:9711 s3 ls s3://photos/
+export AWS_ACCESS_KEY_ID=dummy
+export AWS_SECRET_ACCESS_KEY=dummy
+export AWS_ENDPOINT_URL=http://localhost:9711
+
+aws s3 mb s3://photos
+echo 'hello candybox' | aws s3 cp - s3://photos/hello.txt
+aws s3 ls s3://photos/
 ```
+
+The dummy credentials are only there so the AWS CLI can sign requests on a fresh machine with no
+credentials configured; use real keys if the gateway has SigV4 authentication enabled.
 
 ## Range GET and multipart upload
 
