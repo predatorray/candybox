@@ -18,6 +18,8 @@ every layer. Object bytes never enter the LSM tree: candy lives in Syrups and th
 
 ## How it works
 
+![How it works: writes and reads flow through the partition owner's WAL, memtable and SSTables, with object bytes in Syrups and the fencing token checked against a ZooKeeper lease](how-it-works.excalidraw.svg)
+
 Candybox blends three well-known designs.
 
 - **A LevelDB-style LSM tree** for the index. Writes land in an in-memory *memtable* fronted by a
