@@ -10,23 +10,7 @@ Candybox is layered top to bottom: an S3-like object API sits on a per-Box LSM e
 two narrow SPIs, which in turn run on Apache BookKeeper (durable ledgers) and ZooKeeper
 (coordination/metadata).
 
-```
-┌────────────────────────────────────────────────────────────┐
-│  Client API — S3-like object store: Boxes of Candy         │
-├────────────────────────────────────────────────────────────┤
-│  LSM engine  (candybox-lsm)                                │
-│  WAL → Memtable → SSTables → Manifest                      │
-│  Compaction · GC · HLC · single fenced owner               │
-├──────────────────────────────┬─────────────────────────────┤
-│  LedgerStore SPI             │  Coordination SPI           │
-│  (candybox-bookkeeper)       │  (candybox-coordination)    │
-│  ledger roles: WAL,          │  fencing tokens,            │
-│  SSTable, Syrup, manifest    │  manifest pointer CAS       │
-├──────────────────────────────┼─────────────────────────────┤
-│  Apache BookKeeper           │  ZooKeeper                  │
-│  (durable ledgers)           │  (metadata / CAS)           │
-└──────────────────────────────┴─────────────────────────────┘
-```
+![Candybox architecture: client API, LSM engine, LedgerStore and Coordination SPIs, BookKeeper and ZooKeeper](architecture.excalidraw.svg)
 
 `candybox-common` (shared records, `BinaryWriter`/`BinaryReader` serialization, HLC, config) underpins
 every layer. Object bytes never enter the LSM tree: candy lives in Syrups and the tree holds only
