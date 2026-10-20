@@ -54,7 +54,7 @@ The client is published to [Maven Central](https://central.sonatype.com/namespac
 as of **{{< param "candyboxRelease" >}}**; no extra repository configuration is needed.
 
 {{< tabs "client-dep" >}}
-{{< tab "Maven" >}}
+{{% tab "Maven" %}}
 ```xml
 <dependency>
   <groupId>me.predatorray.candybox</groupId>
@@ -62,12 +62,12 @@ as of **{{< param "candyboxRelease" >}}**; no extra repository configuration is 
   <version>{{< param "candyboxRelease" >}}</version>
 </dependency>
 ```
-{{< /tab >}}
-{{< tab "Gradle" >}}
+{{% /tab %}}
+{{% tab "Gradle" %}}
 ```groovy
 implementation 'me.predatorray.candybox:candybox-client:{{< param "candyboxRelease" >}}'
 ```
-{{< /tab >}}
+{{% /tab %}}
 {{< /tabs >}}
 
 See the [command-line client]({{< relref "/docs/client" >}}) page for the CLI built on the same library.
