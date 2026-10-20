@@ -126,8 +126,8 @@ public final class CandyboxNode implements AutoCloseable {
         long renewInterval = config.leaseRenewIntervalMillis();
         if (renewInterval > 0) {
             this.leaseHeartbeat = daemonScheduler("candybox-lease-" + nodeId);
-            this.leaseHeartbeat.scheduleAtFixedRate(this::renewLeases, renewInterval, renewInterval,
-                    TimeUnit.MILLISECONDS);
+            this.leaseHeartbeat.scheduleAtFixedRate(guarded("lease renewal", this::renewLeases),
+                    renewInterval, renewInterval, TimeUnit.MILLISECONDS);
         } else {
             this.leaseHeartbeat = null;
         }
@@ -144,8 +144,8 @@ public final class CandyboxNode implements AutoCloseable {
         long balancerInterval = config.balancerIntervalMillis();
         if (balancerInterval > 0) {
             this.balancerWorker = daemonScheduler("candybox-balancer-" + nodeId);
-            this.balancerWorker.scheduleWithFixedDelay(this::runBalancerOnce, balancerInterval,
-                    balancerInterval, TimeUnit.MILLISECONDS);
+            this.balancerWorker.scheduleWithFixedDelay(guarded("balancer", this::runBalancerOnce),
+                    balancerInterval, balancerInterval, TimeUnit.MILLISECONDS);
         } else {
             this.balancerWorker = null;
         }
@@ -156,11 +156,26 @@ public final class CandyboxNode implements AutoCloseable {
      * any abandoned in-flight multipart uploads (older than {@code multipartUploadTtlMillis}).
      */
     private void runMaintenance() {
-        compactOwnedBoxesOnce();
-        collectGarbageOnce();
-        sweepStaleMultipartUploadsOnce();
-        finalizeRenameIntentsOnce();
-        sweepStaleLocatorRelaysOnce();
+        guarded("compaction", this::compactOwnedBoxesOnce).run();
+        guarded("GC", this::collectGarbageOnce).run();
+        guarded("multipart TTL sweep", this::sweepStaleMultipartUploadsOnce).run();
+        guarded("rename-intent finalize", this::finalizeRenameIntentsOnce).run();
+        guarded("locator relay sweep", this::sweepStaleLocatorRelaysOnce).run();
+    }
+
+    /**
+     * A periodic task that throws is silently cancelled by its {@link ScheduledExecutorService}, so
+     * every scheduled task (and each maintenance phase, which is what keeps maintenance itself from
+     * throwing) logs and swallows its failure instead.
+     */
+    private Runnable guarded(String what, Runnable task) {
+        return () -> {
+            try {
+                task.run();
+            } catch (Throwable t) {
+                LOG.error("Background {} failed on node {}", what, nodeId, t);
+            }
+        };
     }
 
     private static ScheduledExecutorService daemonScheduler(String name) {
@@ -501,10 +516,10 @@ public final class CandyboxNode implements AutoCloseable {
     public int compactOwnedBoxesOnce() {
         int performed = 0;
         for (PartitionOwnership ownership : partitions.values()) {
-            if (!ownership.isOwner()) {
-                continue;
-            }
             try {
+                if (!ownership.isOwner()) {
+                    continue;
+                }
                 BoxEngine engine = ownership.engine();
                 for (int pass = 0; pass < MAX_COMPACTIONS_PER_TICK; pass++) {
                     if (!compactionService.compactOnce(engine)) {
@@ -531,18 +546,25 @@ public final class CandyboxNode implements AutoCloseable {
     public int collectGarbageOnce() {
         // Publish every owned partition's referenced-Syrup set first, so this pass's Box-global gate
         // sees up-to-date references from this node's partitions (cross-node freshness rides the other
-        // owners' own publishes plus the GC grace period).
+        // owners' own publishes plus the GC grace period). A Box with a failed publish sits this pass
+        // out rather than gate on its stale references.
+        Set<String> unpublished = new HashSet<>();
         for (PartitionOwnership ownership : partitions.values()) {
-            if (ownership.isOwner()) {
-                publishPartitionRefs(ownership);
+            try {
+                if (ownership.isOwner()) {
+                    publishPartitionRefs(ownership);
+                }
+            } catch (RuntimeException e) {
+                unpublished.add(ownership.box().value());
+                LOG.warn("Referenced-Syrup publish error on node {}: {}", nodeId, e.getMessage());
             }
         }
         int deleted = 0;
         for (PartitionOwnership ownership : partitions.values()) {
-            if (!ownership.isOwner()) {
-                continue;
-            }
             try {
+                if (unpublished.contains(ownership.box().value()) || !ownership.isOwner()) {
+                    continue;
+                }
                 Set<Long> foreign = syrupsReferencedByOtherPartitions(ownership.box().value(),
                         ownership.partition());
                 deleted += garbageCollector.collect(ownership.engine(), foreign);
@@ -569,17 +591,22 @@ public final class CandyboxNode implements AutoCloseable {
         long abandon = config.renameIntentAbandonMillis();
         int finalized = 0;
         for (PartitionOwnership ownership : partitions.values()) {
-            if (!ownership.isOwner()) {
-                continue;
-            }
             BoxEngine engine;
+            List<RenameIntent> intents;
             String box = ownership.box().value();
             try {
+                if (!ownership.isOwner()) {
+                    continue;
+                }
                 engine = ownership.engine();
+                intents = engine.listRenameIntents();
             } catch (NotOwnerException lost) {
                 continue;
+            } catch (RuntimeException e) {
+                LOG.warn("Rename-intent finalize error on node {}: {}", nodeId, e.getMessage());
+                continue;
             }
-            for (RenameIntent intent : engine.listRenameIntents()) {
+            for (RenameIntent intent : intents) {
                 try {
                     if (renameMarkerPresent(box, intent.token())) {
                         engine.deleteCandyConditional(CandyKey.of(intent.srcKey()), intent.srcHlc());
@@ -613,7 +640,15 @@ public final class CandyboxNode implements AutoCloseable {
         long liveBytes = 0;
         boolean complete = true;
         for (PartitionOwnership ownership : partitions.values()) {
-            if (ownership.isOwner()) {
+            boolean owner;
+            try {
+                owner = ownership.isOwner();
+            } catch (RuntimeException e) {
+                LOG.warn("Locator relay sweep error on node {}: {}", nodeId, e.getMessage());
+                complete = false;
+                continue;
+            }
+            if (owner) {
                 RelaySweep sweep = sweepStaleLocatorRelays(ownership.box().value(),
                         ownership.partition());
                 deleted += sweep.deleted();
@@ -682,10 +717,10 @@ public final class CandyboxNode implements AutoCloseable {
         long cutoff = clock.currentTimeMillis() - ttl;
         int aborted = 0;
         for (PartitionOwnership ownership : partitions.values()) {
-            if (!ownership.isOwner()) {
-                continue;
-            }
             try {
+                if (!ownership.isOwner()) {
+                    continue;
+                }
                 for (me.predatorray.candybox.lsm.manifest.MultipartUploadState u
                         : ownership.engine().listMultipartUploads()) {
                     if (u.createdAtMillis() <= cutoff) {
