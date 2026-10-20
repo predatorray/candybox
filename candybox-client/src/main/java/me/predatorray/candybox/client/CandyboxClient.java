@@ -82,9 +82,13 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
 
     /** Cluster-aware client: routes each request to the owning node via coordination. */
     public CandyboxClient(Transport transport, CoordinationService coordination, CandyboxConfig config) {
-        this.router = new ClusterRouter(transport, coordination, config.routerCacheTtlMillis(),
-                SystemClock.INSTANCE);
-        this.limits = config.sizeLimits();
+        this(new ClusterRouter(transport, coordination, config.routerCacheTtlMillis(),
+                SystemClock.INSTANCE), config.sizeLimits());
+    }
+
+    CandyboxClient(Router router, SizeLimits limits) {
+        this.router = router;
+        this.limits = limits;
     }
 
     // ---- Box admin -------------------------------------------------------------------------
@@ -130,7 +134,53 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
 
     /** Routes a keyed request to the owner of the key's partition. */
     private Message callKey(String box, String key, Message request) {
-        return router.callPartition(box, partitionFor(box, key), request);
+        return callPartition(box, partitionFor(box, key), request);
+    }
+
+    /**
+     * Routes to a partition's owner. A partition with no owner may mean the Box was deleted by
+     * another client, so the cached descriptor is revalidated before the retryable error surfaces.
+     * That costs an extra {@code BoxInfo} round-trip per {@link NotOwnerException}, so keep this
+     * off hot retry loops.
+     */
+    private Message callPartition(String box, int partition, Message request) {
+        try {
+            return router.callPartition(box, partition, request);
+        } catch (NotOwnerException e) {
+            revalidateBox(box, e);
+            throw e;
+        }
+    }
+
+    /**
+     * Drops the cached partition count and re-asks the cluster: throws {@link BoxNotFoundException}
+     * if the Box is gone, otherwise returns so the caller surfaces {@code original}. A failed lookup
+     * is attached to {@code original} as suppressed.
+     */
+    private void revalidateBox(String box, RuntimeException original) {
+        partitionCounts.remove(box);
+        Message response;
+        try {
+            response = router.callAny(new Message.BoxInfoRequest(BoxName.of(box).value()));
+        } catch (RuntimeException e) {
+            original.addSuppressed(e);
+            return;
+        }
+        if (response instanceof Message.NotFoundResponse) {
+            throw new BoxNotFoundException(box);
+        }
+        if (response instanceof Message.BoxInfoResponse info) {
+            partitionCounts.put(box, info.partitionCount());
+        }
+    }
+
+    /** A fan-out page answered {@code NOT_FOUND}: the Box may be gone, else it maps as usual. */
+    private CandyboxException fanOutFailure(String box, Message response) {
+        CandyboxException failure = mapResponse(response);
+        if (response instanceof Message.NotFoundResponse) {
+            revalidateBox(box, failure);
+        }
+        return failure;
     }
 
     // ---- Candy ops -------------------------------------------------------------------------
@@ -394,10 +444,10 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
         List<UploadEntry> all = new ArrayList<>();
         boolean anyTruncated = false;
         for (int p = 0; p < n; p++) {
-            Message response = router.callPartition(box, p, new Message.ListMultipartUploadsRequest(
+            Message response = callPartition(box, p, new Message.ListMultipartUploadsRequest(
                     BoxName.of(box).value(), p, prefix, keyMarker, uploadIdMarker, limit));
             if (!(response instanceof Message.ListMultipartUploadsResponse page)) {
-                throw mapResponse(response);
+                throw fanOutFailure(box, response);
             }
             for (Message.InProgressUpload u : page.uploads()) {
                 all.add(new UploadEntry(u.uploadId(), u.key(), u.createdAtMillis()));
@@ -491,7 +541,7 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
                 BoxName.of(box).value(), CandyKey.of(dstKey).value(), srcPartition,
                 loc.relayToken(), null, List.of(), token));
         // 3. Finalize the source delete (best-effort fast path; the maintenance sweep is the backstop).
-        router.callPartition(box, srcPartition, new Message.CompleteRenameRequest(
+        callPartition(box, srcPartition, new Message.CompleteRenameRequest(
                 BoxName.of(box).value(), CandyKey.of(srcKey).value(), srcPartition, token, loc.hlc()));
         return result;
     }
@@ -507,7 +557,7 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
 
     /** Sends a locator-resolving request to the source's partition owner and unwraps the response. */
     private Message.CandyLocatorResponse resolveLocator(String box, String srcKey, Message request) {
-        Message response = router.callPartition(box, partitionFor(box, srcKey), request);
+        Message response = callPartition(box, partitionFor(box, srcKey), request);
         if (response instanceof Message.CandyLocatorResponse loc) {
             return loc;
         }
@@ -516,7 +566,7 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
 
     /** Sends a zero-copy put to the destination's partition owner and unwraps the head response. */
     private CandyInfo zeroCopyPut(String box, String dstKey, Message.ZeroCopyPutRequest request) {
-        Message response = router.callPartition(box, partitionFor(box, dstKey), request);
+        Message response = callPartition(box, partitionFor(box, dstKey), request);
         if (response instanceof Message.HeadCandyResponse head) {
             return new CandyInfo(head.contentLength(), head.contentType(), head.userMetadata(),
                     head.crc32c(), head.createdAtMillis());
@@ -532,8 +582,11 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
     public void deleteRangeByPrefix(String box, String prefix) {
         int n = partitionCount(box);
         for (int p = 0; p < n; p++) {
-            expectOk(router.callPartition(box, p, new Message.DeleteRangeRequest(
-                    BoxName.of(box).value(), p, prefix == null ? "" : prefix, null, null)));
+            Message response = callPartition(box, p, new Message.DeleteRangeRequest(
+                    BoxName.of(box).value(), p, prefix == null ? "" : prefix, null, null));
+            if (!(response instanceof Message.OkResponse)) {
+                throw fanOutFailure(box, response);
+            }
         }
     }
 
@@ -544,8 +597,11 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
     public void deleteRange(String box, String startKey, String endKey) {
         int n = partitionCount(box);
         for (int p = 0; p < n; p++) {
-            expectOk(router.callPartition(box, p, new Message.DeleteRangeRequest(
-                    BoxName.of(box).value(), p, null, startKey, endKey)));
+            Message response = callPartition(box, p, new Message.DeleteRangeRequest(
+                    BoxName.of(box).value(), p, null, startKey, endKey));
+            if (!(response instanceof Message.OkResponse)) {
+                throw fanOutFailure(box, response);
+            }
         }
     }
 
@@ -565,11 +621,11 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
         List<Listing.Entry> all = new ArrayList<>();
         boolean anyTruncated = false;
         for (int p = 0; p < n; p++) {
-            Message response = router.callPartition(box, p, new Message.ListCandiesRequest(
+            Message response = callPartition(box, p, new Message.ListCandiesRequest(
                     BoxName.of(box).value(), p, prefix, startAfter, maxKeys, startKey, endKey,
                     reverse));
             if (!(response instanceof Message.ListCandiesResponse page)) {
-                throw mapResponse(response);
+                throw fanOutFailure(box, response);
             }
             for (Message.ListedCandy c : page.entries()) {
                 all.add(new Listing.Entry(c.key(), c.contentLength(), c.createdAtMillis()));
