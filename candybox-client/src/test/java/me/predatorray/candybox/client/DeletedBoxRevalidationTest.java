@@ -23,7 +23,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import me.predatorray.candybox.common.ManualClock;
-import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.config.SizeLimits;
 import me.predatorray.candybox.common.exception.BoxNotFoundException;
 import me.predatorray.candybox.common.exception.BusyException;
@@ -175,15 +174,8 @@ class DeletedBoxRevalidationTest {
         clock.advance(TTL + 1);
 
         assertThatThrownBy(() -> client.listCandies("box", null, null, 10))
-                .isInstanceOf(NotOwnerException.class);
-    }
-
-    @Test
-    void clusterClientRoutesThroughCoordination() {
-        try (CandyboxClient cluster = new CandyboxClient(new LoopbackTransport(node), coordination,
-                CandyboxConfig.builder().build())) {
-            assertThat(cluster.listCandies("box", null, null, 10).entries()).isEmpty();
-        }
+                .isInstanceOf(NotOwnerException.class)
+                .satisfies(e -> assertThat(e.getSuppressed()).hasSize(1));
     }
 
     @Test

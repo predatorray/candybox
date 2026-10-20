@@ -140,27 +140,30 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
     /**
      * Routes to a partition's owner. A partition with no owner may mean the Box was deleted by
      * another client, so the cached descriptor is revalidated before the retryable error surfaces.
+     * That costs an extra {@code BoxInfo} round-trip per {@link NotOwnerException}, so keep this
+     * off hot retry loops.
      */
     private Message callPartition(String box, int partition, Message request) {
         try {
             return router.callPartition(box, partition, request);
         } catch (NotOwnerException e) {
-            revalidateBox(box);
+            revalidateBox(box, e);
             throw e;
         }
     }
 
     /**
      * Drops the cached partition count and re-asks the cluster: throws {@link BoxNotFoundException}
-     * if the Box is gone, otherwise (or if the lookup itself fails) returns so the caller surfaces
-     * its original error.
+     * if the Box is gone, otherwise returns so the caller surfaces {@code original}. A failed lookup
+     * is attached to {@code original} as suppressed.
      */
-    private void revalidateBox(String box) {
+    private void revalidateBox(String box, RuntimeException original) {
         partitionCounts.remove(box);
         Message response;
         try {
             response = router.callAny(new Message.BoxInfoRequest(BoxName.of(box).value()));
         } catch (RuntimeException e) {
+            original.addSuppressed(e);
             return;
         }
         if (response instanceof Message.NotFoundResponse) {
@@ -173,10 +176,11 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
 
     /** A fan-out page answered {@code NOT_FOUND}: the Box may be gone, else it maps as usual. */
     private CandyboxException fanOutFailure(String box, Message response) {
+        CandyboxException failure = mapResponse(response);
         if (response instanceof Message.NotFoundResponse) {
-            revalidateBox(box);
+            revalidateBox(box, failure);
         }
-        return mapResponse(response);
+        return failure;
     }
 
     // ---- Candy ops -------------------------------------------------------------------------
