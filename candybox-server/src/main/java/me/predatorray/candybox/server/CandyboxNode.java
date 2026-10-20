@@ -555,7 +555,7 @@ public final class CandyboxNode implements AutoCloseable {
                 }
             } catch (RuntimeException e) {
                 unpublished.add(ownership.box().value());
-                LOG.warn("Referenced-Syrup publish error on node {}", nodeId, e);
+                LOG.warn("Referenced-Syrup publish error on node {}: {}", nodeId, e.getMessage());
             }
         }
         int deleted = 0;
@@ -602,7 +602,7 @@ public final class CandyboxNode implements AutoCloseable {
             } catch (NotOwnerException lost) {
                 continue;
             } catch (RuntimeException e) {
-                LOG.warn("Rename-intent finalize error on node {}", nodeId, e);
+                LOG.warn("Rename-intent finalize error on node {}: {}", nodeId, e.getMessage());
                 continue;
             }
             for (RenameIntent intent : intents) {
@@ -643,7 +643,7 @@ public final class CandyboxNode implements AutoCloseable {
             try {
                 owner = ownership.isOwner();
             } catch (RuntimeException e) {
-                LOG.warn("Locator relay sweep error on node {}", nodeId, e);
+                LOG.warn("Locator relay sweep error on node {}: {}", nodeId, e.getMessage());
                 complete = false;
                 continue;
             }

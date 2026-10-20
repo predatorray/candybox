@@ -24,7 +24,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.Predicate;
+import java.util.function.BiPredicate;
 import me.predatorray.candybox.bookkeeper.fake.InMemoryLedgerStore;
 import me.predatorray.candybox.common.BoxName;
 import me.predatorray.candybox.common.CandyKey;
@@ -45,6 +45,7 @@ class MaintenanceResilienceTest {
 
     private static final BoxName BOX = BoxName.of("maint-box");
     private static final byte[] VALUE = "v".getBytes(StandardCharsets.UTF_8);
+    private static final long GC_GRACE = 60_000;
 
     private final InMemoryLedgerStore store = new InMemoryLedgerStore();
 
@@ -57,7 +58,8 @@ class MaintenanceResilienceTest {
     void scheduledMaintenanceKeepsCompactingAfterACoordinationError() throws Exception {
         AtomicBoolean failOnce = new AtomicBoolean(true);
         CoordinationService flaky = flaky(new InMemoryCoordinationService(SystemClock.INSTANCE),
-                key -> key.endsWith("/refs") && failOnce.compareAndSet(true, false),
+                (method, key) -> method.equals("get") && key.endsWith("/refs")
+                        && failOnce.compareAndSet(true, false),
                 resource -> null);
         CandyboxConfig config = CandyboxConfig.builder()
                 .compactionIntervalMillis(20).l0CompactionTrigger(2).build();
@@ -96,18 +98,31 @@ class MaintenanceResilienceTest {
     }
 
     @Test
-    void gcPublishesOtherPartitionsRefsWhenOneFails() {
-        AtomicReference<Fault> p0 = new AtomicReference<>(Fault.NONE);
-        InMemoryCoordinationService real = new InMemoryCoordinationService(new ManualClock(1000));
-        try (CandyboxNode node = new CandyboxNode(1, CandyboxConfig.defaults(), store,
-                flaky(real, key -> p0.get() == Fault.THROW && key.equals(
-                        CandyboxKeys.partitionRefsKey(BOX.value(), 0)), resource -> null), new ManualClock(1000))) {
+    void gcSkipsABoxWhosePartitionFailedToPublishItsRefs() {
+        AtomicBoolean failP0Publish = new AtomicBoolean();
+        ManualClock clock = new ManualClock(1000);
+        InMemoryCoordinationService real = new InMemoryCoordinationService();
+        String p0Refs = CandyboxKeys.partitionRefsKey(BOX.value(), 0);
+        CandyboxConfig config = CandyboxConfig.builder()
+                .l0CompactionTrigger(2).ledgerGcGraceMillis(GC_GRACE).build();
+        try (CandyboxNode node = new CandyboxNode(1, config, store, flaky(real,
+                (method, key) -> failP0Publish.get() && !method.equals("get") && key.equals(p0Refs),
+                resource -> null), clock)) {
             node.createBox(BOX, 2);
-            p0.set(Fault.THROW);
-
             node.collectGarbageOnce();
+            for (int i = 0; i < 2; i++) {
+                putAndFlush(node, keyIn(1, i));
+            }
+            assertThat(node.compactOwnedBoxesOnce()).isPositive();
+            clock.advance(GC_GRACE + 1);
 
+            // p0's published refs are now stale, so p1's obsolete ledgers must not be reclaimed yet.
+            failP0Publish.set(true);
+            assertThat(node.collectGarbageOnce()).isZero();
             assertThat(real.get(CandyboxKeys.partitionRefsKey(BOX.value(), 1))).isPresent();
+
+            failP0Publish.set(false);
+            assertThat(node.collectGarbageOnce()).isPositive();
         }
     }
 
@@ -194,7 +209,7 @@ class MaintenanceResilienceTest {
                                           ManualClock clock) {
         String p0Resource = CandyboxKeys.ownerResource(BOX.value(), 0);
         CandyboxNode node = new CandyboxNode(1, config, store,
-                flaky(new InMemoryCoordinationService(), key -> false, resource -> {
+                flaky(new InMemoryCoordinationService(), (method, key) -> false, resource -> {
                     if (!resource.equals(p0Resource)) {
                         return null;
                     }
@@ -204,6 +219,9 @@ class MaintenanceResilienceTest {
                             return false;
                         }
                         case ERROR_ONCE -> {
+                            if (!Thread.currentThread().getName().startsWith("candybox-compaction-")) {
+                                return null;
+                            }
                             p0.set(Fault.NONE);
                             throw new AssertionError("simulated unexpected error");
                         }
@@ -242,14 +260,15 @@ class MaintenanceResilienceTest {
     }
 
     /**
-     * Delegates to {@code real}, but {@code get(key)} throws a {@link CoordinationException} (a
-     * ZooKeeper connection loss) whenever {@code failGet} says so, and leases defer to {@code leaseCheck}.
+     * Delegates to {@code real}, but a keyed call throws a {@link CoordinationException} (a ZooKeeper
+     * connection loss) whenever {@code fail(method, key)} says so, and leases defer to {@code leaseCheck}.
      */
-    private static CoordinationService flaky(CoordinationService real, Predicate<String> failGet,
-                                             LeaseCheck leaseCheck) {
+    private static CoordinationService flaky(CoordinationService real,
+                                             BiPredicate<String, String> fail, LeaseCheck leaseCheck) {
         return (CoordinationService) Proxy.newProxyInstance(CoordinationService.class.getClassLoader(),
                 new Class<?>[] {CoordinationService.class}, (proxy, method, args) -> {
-                    if (method.getName().equals("get") && failGet.test((String) args[0])) {
+                    if (args != null && args.length > 0 && args[0] instanceof String key
+                            && fail.test(method.getName(), key)) {
                         throw new CoordinationException("simulated connection loss");
                     }
                     Object result = invoke(method, real, args);
