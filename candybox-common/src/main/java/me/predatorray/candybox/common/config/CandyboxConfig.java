@@ -35,6 +35,7 @@ public final class CandyboxConfig {
     private final long ownershipLeaseTtlMillis;
     private final long leaseRenewIntervalMillis;
     private final long routerCacheTtlMillis;
+    private final long routerUnownedRetryMillis;
     private final long compactionIntervalMillis;
     private final long maxClockSkewMillis;
     private final long tombstoneGcGraceMillis;
@@ -61,6 +62,7 @@ public final class CandyboxConfig {
         this.ownershipLeaseTtlMillis = b.ownershipLeaseTtlMillis;
         this.leaseRenewIntervalMillis = b.leaseRenewIntervalMillis;
         this.routerCacheTtlMillis = b.routerCacheTtlMillis;
+        this.routerUnownedRetryMillis = b.routerUnownedRetryMillis;
         this.compactionIntervalMillis = b.compactionIntervalMillis;
         this.maxClockSkewMillis = b.maxClockSkewMillis;
         this.tombstoneGcGraceMillis = b.tombstoneGcGraceMillis;
@@ -122,6 +124,14 @@ public final class CandyboxConfig {
     /** How long the client caches a Box→owner routing entry before re-resolving. */
     public long routerCacheTtlMillis() {
         return routerCacheTtlMillis;
+    }
+
+    /**
+     * How long the client keeps retrying a partition that has no owner (a handover gap) before
+     * failing with a retriable {@code NotOwnerException}. {@code 0} fails at once.
+     */
+    public long routerUnownedRetryMillis() {
+        return routerUnownedRetryMillis;
     }
 
     /** How often a node runs background compaction over its owned Boxes. {@code 0} disables it. */
@@ -214,6 +224,7 @@ public final class CandyboxConfig {
         private long ownershipLeaseTtlMillis = 10_000L;        // 10s lease
         private long leaseRenewIntervalMillis = 3_000L;        // renew well within the TTL; 0 disables
         private long routerCacheTtlMillis = 5_000L;            // client Box->owner cache TTL
+        private long routerUnownedRetryMillis = 15_000L;       // ~ lease TTL + a balancer round
         private long compactionIntervalMillis = 0L;            // background compaction; 0 disables
         private long maxClockSkewMillis = 300_000L;            // 5 min HLC skew bound
         private long tombstoneGcGraceMillis = 24L * 3600 * 1000; // 24h late-write window
@@ -272,6 +283,11 @@ public final class CandyboxConfig {
 
         public Builder routerCacheTtlMillis(long v) {
             this.routerCacheTtlMillis = v;
+            return this;
+        }
+
+        public Builder routerUnownedRetryMillis(long v) {
+            this.routerUnownedRetryMillis = v;
             return this;
         }
 

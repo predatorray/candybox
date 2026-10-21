@@ -83,7 +83,8 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
     /** Cluster-aware client: routes each request to the owning node via coordination. */
     public CandyboxClient(Transport transport, CoordinationService coordination, CandyboxConfig config) {
         this(new ClusterRouter(transport, coordination, config.routerCacheTtlMillis(),
-                SystemClock.INSTANCE), config.sizeLimits());
+                SystemClock.INSTANCE, config.routerUnownedRetryMillis(), Thread::sleep),
+                config.sizeLimits());
     }
 
     CandyboxClient(Router router, SizeLimits limits) {
@@ -678,6 +679,10 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
         if (response instanceof Message.MovedResponse moved) {
             // Only reachable via the DirectRouter (the ClusterRouter re-routes MOVED internally).
             return new NotOwnerException("owned by node " + moved.ownerNodeId());
+        }
+        if (response instanceof Message.UnavailableResponse) {
+            // Likewise: the ClusterRouter retries a handover gap itself.
+            return new NotOwnerException("partition has no current owner");
         }
         return new CandyboxException("Unexpected response: " + response.opcode());
     }

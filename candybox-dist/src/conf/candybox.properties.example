@@ -88,6 +88,7 @@ data.dir=./data
 # ownership.lease.ttl.millis=10000
 # lease.renew.interval.millis=3000
 # router.cache.ttl.millis=5000
+# router.unowned.retry.millis=15000
 # compaction.interval.millis=0
 # max.clock.skew.millis=300000
 # tombstone.gc.grace.millis=86400000

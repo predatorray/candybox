@@ -29,6 +29,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.Properties;
 import me.predatorray.candybox.bookkeeper.bk.BookKeeperLedgerStore;
 import me.predatorray.candybox.client.CandyboxClient;
+import me.predatorray.candybox.common.BoxName;
 import me.predatorray.candybox.common.SystemClock;
 import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.coordination.zk.ZooKeeperCoordinationService;
@@ -52,6 +53,7 @@ import org.junit.jupiter.api.Test;
 class S3GatewayIT {
 
     private static final long ROUTER_CACHE_TTL_MILLIS = 1_000;
+    private static final long ROUTER_UNOWNED_RETRY_MILLIS = 3_000;
 
     private static EmbeddedBookKeeper bookKeeper;
     private static TestingServer zookeeper;
@@ -83,7 +85,8 @@ class S3GatewayIT {
         transport = new TcpTransport();
         clientCoord = new ZooKeeperCoordinationService(zookeeper.getConnectString(), SystemClock.INSTANCE);
         client = new CandyboxClient(transport, clientCoord,
-                CandyboxConfig.builder().routerCacheTtlMillis(ROUTER_CACHE_TTL_MILLIS).build());
+                CandyboxConfig.builder().routerCacheTtlMillis(ROUTER_CACHE_TTL_MILLIS)
+                        .routerUnownedRetryMillis(ROUTER_UNOWNED_RETRY_MILLIS).build());
 
         Properties props = new Properties();
         props.setProperty("zookeeper.connect", zookeeper.getConnectString());
@@ -133,6 +136,47 @@ class S3GatewayIT {
         assertNoSuchBucket(send("GET", "/stale?list-type=2", null));
         assertNoSuchBucket(send("GET", "/stale?uploads", null));
         assertNoSuchBucket(send("GET", "/stale/k", null));
+    }
+
+    @Test
+    void unownedPartitionReturnsServiceUnavailableNotNoSuchKey() throws Exception {
+        assertThat(send("PUT", "/gap", null).statusCode()).isEqualTo(200);
+        assertThat(send("PUT", "/gap/k", "v".getBytes(StandardCharsets.UTF_8)).statusCode()).isEqualTo(200);
+
+        node.releaseBox(BoxName.of("gap"));
+        try {
+            HttpResponse<String> get = send("GET", "/gap/k", null);
+            assertThat(get.statusCode()).isEqualTo(503);
+            assertThat(get.headers().firstValue("Retry-After")).isPresent();
+            assertThat(get.body()).contains("<Code>ServiceUnavailable</Code>");
+        } finally {
+            node.openBox(BoxName.of("gap"));
+        }
+        assertThat(send("GET", "/gap/k", null).statusCode()).isEqualTo(200);
+    }
+
+    @Test
+    void requestDuringAShortOwnershipGapSucceeds() throws Exception {
+        assertThat(send("PUT", "/brief", null).statusCode()).isEqualTo(200);
+        assertThat(send("PUT", "/brief/k", "v".getBytes(StandardCharsets.UTF_8)).statusCode()).isEqualTo(200);
+
+        node.releaseBox(BoxName.of("brief"));
+        Thread reopen = new Thread(() -> {
+            try {
+                Thread.sleep(300);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            node.openBox(BoxName.of("brief"));
+        });
+        reopen.start();
+        try {
+            HttpResponse<String> get = send("GET", "/brief/k", null);
+            assertThat(get.statusCode()).isEqualTo(200);
+            assertThat(get.body()).isEqualTo("v");
+        } finally {
+            reopen.join();
+        }
     }
 
     private static void assertNoSuchBucket(HttpResponse<String> response) {

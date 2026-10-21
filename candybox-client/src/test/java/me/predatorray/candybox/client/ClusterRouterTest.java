@@ -22,6 +22,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+import me.predatorray.candybox.common.ManualClock;
 import me.predatorray.candybox.common.SystemClock;
 import me.predatorray.candybox.common.exception.CandyboxException;
 import me.predatorray.candybox.common.exception.NotOwnerException;
@@ -37,7 +39,7 @@ import org.junit.jupiter.api.Test;
 /**
  * Drives {@link ClusterRouter} against a fake coordination service and a recording stub transport:
  * resolution by lease holder, redirect on {@code MOVED} using the named owner, route caching, and the
- * no-owner case.
+ * no-owner (handover gap) retry.
  */
 class ClusterRouterTest {
 
@@ -294,6 +296,106 @@ class ClusterRouterTest {
             assertThatThrownBy(() -> router.callAny(new Message.ListBoxesRequest()))
                     .isInstanceOf(IllegalStateException.class)
                     .hasMessageContaining("connection refused");
+        }
+    }
+
+    /** A sleeper that advances {@code clock} and records each requested sleep. */
+    private static ClusterRouter.Sleeper advancing(ManualClock clock, List<Long> sleeps, Runnable onSleep) {
+        return millis -> {
+            sleeps.add(millis);
+            clock.advance(millis);
+            onSleep.run();
+        };
+    }
+
+    @Test
+    void waitsForALeaseHolderToAppearWithinTheRetryBudget() {
+        ManualClock clock = new ManualClock(1_000);
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        coordination.registerMember(2, "127.0.0.1:2002".getBytes(StandardCharsets.UTF_8));
+        coordination.create(CandyboxKeys.boxMetaKey("b"), new byte[0]);
+        RecordingTransport transport = new RecordingTransport();
+        List<Long> sleeps = new ArrayList<>();
+        Runnable acquireOnThirdSleep = () -> {
+            if (sleeps.size() == 3) {
+                coordination.tryAcquireLease(CandyboxKeys.ownerResource("b", 0), 2, 10_000);
+            }
+        };
+        try (ClusterRouter router = new ClusterRouter(transport, coordination, 5_000, clock, 15_000,
+                advancing(clock, sleeps, acquireOnThirdSleep))) {
+            Message resp = router.callPartition("b", 0, new Message.GetCandyRequest("b", "k"));
+            assertThat(resp).isInstanceOf(Message.OkResponse.class);
+            assertThat(transport.contacted).containsExactly(2002);
+            assertThat(sleeps).containsExactly(50L, 100L, 200L); // exponential backoff
+        }
+    }
+
+    @Test
+    void retriesAnUnavailableAnswerHonoringItsRetryAfter() {
+        ManualClock clock = new ManualClock(1_000);
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        coordination.registerMember(2, "127.0.0.1:2002".getBytes(StandardCharsets.UTF_8));
+        coordination.tryAcquireLease(CandyboxKeys.ownerResource("b", 0), 2, 60_000);
+        AtomicInteger calls = new AtomicInteger();
+        Transport unavailableOnce = new Transport() {
+            @Override
+            public Connection connect(String host, int port) {
+                return new Connection() {
+                    @Override
+                    public Frame call(Frame request) {
+                        return CODEC.encode(calls.getAndIncrement() == 0
+                                ? new Message.UnavailableResponse(300)
+                                : new Message.OkResponse());
+                    }
+
+                    @Override
+                    public void close() {
+                    }
+                };
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        List<Long> sleeps = new ArrayList<>();
+        try (ClusterRouter router = new ClusterRouter(unavailableOnce, coordination, 5_000, clock, 15_000,
+                advancing(clock, sleeps, () -> { }))) {
+            Message resp = router.callPartition("b", 0, new Message.GetCandyRequest("b", "k"));
+            assertThat(resp).isInstanceOf(Message.OkResponse.class);
+            assertThat(calls).hasValue(2);
+            assertThat(sleeps).containsExactly(300L);
+        }
+    }
+
+    @Test
+    void givesUpWithNotOwnerOnceTheRetryBudgetIsSpent() {
+        ManualClock clock = new ManualClock(1_000);
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        coordination.create(CandyboxKeys.boxMetaKey("b"), new byte[0]);
+        RecordingTransport transport = new RecordingTransport();
+        List<Long> sleeps = new ArrayList<>();
+        try (ClusterRouter router = new ClusterRouter(transport, coordination, 5_000, clock, 2_000,
+                advancing(clock, sleeps, () -> { }))) {
+            assertThatThrownBy(() -> router.callPartition("b", 0, new Message.GetCandyRequest("b", "k")))
+                    .isInstanceOf(NotOwnerException.class)
+                    .hasMessageContaining("has no current owner");
+            assertThat(sleeps.stream().mapToLong(Long::longValue).sum()).isEqualTo(2_000);
+            assertThat(transport.contacted).isEmpty();
+        }
+    }
+
+    @Test
+    void doesNotWaitForAnOwnerOfADeletedBox() {
+        ManualClock clock = new ManualClock(1_000);
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        RecordingTransport transport = new RecordingTransport();
+        List<Long> sleeps = new ArrayList<>();
+        try (ClusterRouter router = new ClusterRouter(transport, coordination, 5_000, clock, 15_000,
+                advancing(clock, sleeps, () -> { }))) {
+            assertThatThrownBy(() -> router.callPartition("gone", 0, new Message.GetCandyRequest("gone", "k")))
+                    .isInstanceOf(NotOwnerException.class);
+            assertThat(sleeps).isEmpty();
         }
     }
 }

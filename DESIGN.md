@@ -319,7 +319,9 @@ to it are acquired once their lease is observed free. The table is advisory: saf
 the per-partition fenced lease, never on the balancer. Each round also sweeps locally owned
 partitions whose Box descriptor is gone (the convergence path of a force `deleteBox` issued
 elsewhere). Requests that land on the wrong node get `RESPONSE_MOVED` naming the partition's
-current owner, and the client re-routes.
+current owner, and the client re-routes. If no node holds the lease (a handover gap), the node
+answers `RESPONSE_UNAVAILABLE` and the client retries with bounded backoff; `NOT_FOUND` always
+means the Box or key is really gone.
 
 ## 8. Compaction model
 

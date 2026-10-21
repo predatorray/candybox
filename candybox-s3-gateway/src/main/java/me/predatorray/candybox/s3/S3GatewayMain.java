@@ -82,6 +82,7 @@ public final class S3GatewayMain {
                         security.zkAclEnabled()));
         CandyboxConfig clientConfig = CandyboxConfig.builder()
                 .routerCacheTtlMillis(config.routerCacheTtlMillis())
+                .routerUnownedRetryMillis(config.routerUnownedRetryMillis())
                 .build();
         CandyboxClient client = new CandyboxClient(transport, coordination, clientConfig);
 

@@ -346,6 +346,7 @@ Follow the node's `ServerConfig` pattern exactly: `conf/*.properties` keys overr
 | `s3.max-object-bytes` | Reject single PUTs larger than this (no multipart). | from `SizeLimits` / e.g. 5 GiB |
 | `s3.worker-threads` | Size of the blocking worker pool calling `CandyboxClient`. | `2 × cores` |
 | `s3.router-cache-ttl-ms` | Box→owner resolution cache TTL (passed to the cluster router). | client default |
+| `s3.router-unowned-retry-ms` | How long a request waits out a partition ownership gap before answering 503. | `15000` |
 | `health.port` | HTTP port for `/healthz`, `/readyz`, `/metrics`. | `9712` |
 
 The gateway builds `CandyboxClient(transport, coordinationService, candyboxConfig)` (cluster mode), so

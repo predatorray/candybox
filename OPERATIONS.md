@@ -47,6 +47,7 @@ All knobs are configurable; pick defaults unless a workload demands otherwise.
 | `ownershipLeaseTtlMillis` | 10 s | Partition ownership lease TTL; must be renewed within it. |
 | `leaseRenewIntervalMillis` | 3 s | Lease heartbeat interval; `0` disables the background heartbeat. |
 | `routerCacheTtlMillis` | 5 s | Client partition→owner routing-cache TTL. |
+| `routerUnownedRetryMillis` | 15 s | How long the client retries (with backoff) a partition that has no owner during a handover before failing with a retriable `NotOwnerException` (S3: `503 ServiceUnavailable`). Keep it ≥ `ownershipLeaseTtlMillis` + `balancerIntervalMillis` to ride out a crash failover. |
 | `partitionsPerBoxDefault` | 8 | Hash-partition count for a new Box when the creator passes none; fixed for the Box's lifetime. |
 | `balancerIntervalMillis` | 0 (disabled) | Partition-balancing round period; **set > 0 in production** (shipped conf: 5 s). |
 | `balancerMaxMovesPerRound` | 4 | Max partitions migrated away from live owners per round (failover is unlimited). |
@@ -97,6 +98,7 @@ level N's budget is `levelBaseBytes × multiplier^(N-1)`.
 | **Owner crash / lease loss** | Another node acquires the lease, **recover-opens (fences)** the prior WAL and manifest, replays them, advances its HLC past the max observed, opens fresh WAL/manifest ledgers, and CAS-advances the ZK manifest pointer. The old owner is fenced: its writes fail with `FencedException`. |
 | **Zombie owner / zombie compactor** | A fencing token on every manifest append, plus BookKeeper recover-open, reject any commit from a superseded owner. |
 | **Client hits the wrong node** | The node replies `RESPONSE_MOVED(ownerNodeId)`; the client re-resolves via coordination and retries. |
+| **Partition momentarily unowned** (handover gap: after the old owner releases or its lease lapses, before the new owner acquires) | The node replies `RESPONSE_UNAVAILABLE`, never `NOT_FOUND`, which is reserved for a missing Box or key. The client re-resolves with exponential backoff for up to `routerUnownedRetryMillis`, then fails with `NotOwnerException` (S3 gateway: `503 ServiceUnavailable` + `Retry-After`). |
 | **Clock skew** | HLC ordering survives a regressing wall clock; an observed HLC leading local time by more than `maxClockSkewMillis` is rejected. The manifest keeps the highest HLC ever flushed, so once an owner with a far-ahead clock has flushed, every later takeover fails until real time catches up; fix that clock, or temporarily raise `maxClockSkewMillis` on the recovering node. |
 | **Crash mid cross-partition rename** | Converges by roll-forward: the source owner finalizes its durable rename intent against the destination's rendezvous marker — synchronously, on its background maintenance sweep, or after a handover replays the intent. Marker present ⇒ source tombstoned; absent past `rename.intent.abandon.millis` ⇒ intent dropped, source stays live. It never leaves both keys live forever and never loses data. |
 
