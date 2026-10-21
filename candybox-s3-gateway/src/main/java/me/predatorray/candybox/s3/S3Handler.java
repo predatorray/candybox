@@ -112,7 +112,7 @@ final class S3Handler extends ChannelInboundHandlerAdapter {
         if (!(msg instanceof FullHttpRequest) && !(msg instanceof S3BodyLimitHandler.Rejected)) {
             ctx.fireChannelRead(msg);
         } else if (closing) {
-            ReferenceCountUtil.release(msg);
+            release(msg);
         } else if (streaming) {
             queued.add(msg);
         } else {
@@ -169,7 +169,15 @@ final class S3Handler extends ChannelInboundHandlerAdapter {
     private void abandon() {
         Object next;
         while ((next = queued.poll()) != null) {
-            ReferenceCountUtil.release(next);
+            release(next);
+        }
+    }
+
+    private static void release(Object msg) {
+        if (msg instanceof S3BodyLimitHandler.Rejected rejected) {
+            rejected.response().release();
+        } else {
+            ReferenceCountUtil.release(msg);
         }
     }
 

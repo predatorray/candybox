@@ -22,8 +22,9 @@ s3.region=us-east-1
 # s3.max-object-bytes=5368709120
 
 # Protocol frame cap; must match the nodes' max.frame.size.bytes. GETs of larger objects are
-# streamed as a sequence of frame-sized range reads. Default: 16777216 (16 MiB).
-# max.frame.size.bytes=16777216
+# streamed as a sequence of frame-sized range reads. Default: 16842752 (16 MiB + 64 KiB, so the
+# largest PUT / part is exactly 16 MiB).
+# max.frame.size.bytes=16842752
 
 # Size of the blocking worker pool that issues Candybox client calls. Default: 2 x CPU cores (min 4).
 # s3.worker-threads=8

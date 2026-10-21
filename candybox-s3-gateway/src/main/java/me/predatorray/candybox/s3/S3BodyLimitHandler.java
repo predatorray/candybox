@@ -37,7 +37,8 @@ import java.util.UUID;
 /**
  * Sits ahead of the {@code HttpObjectAggregator} and rejects a request whose declared body (the
  * {@code x-amz-decoded-content-length} of an aws-chunked upload, else {@code Content-Length}) is
- * over {@code limit}, before any of it is buffered. The error goes downstream as a {@link Rejected},
+ * over {@code limit}, before any of it is buffered; a body with no declared length is counted and
+ * rejected as soon as it passes the limit. The error goes downstream as a {@link Rejected},
  * so {@link S3Handler} sends it in request order; the connection closes once it is sent and the rest
  * of the body has been drained (a client still sending it then reads the error, not a reset). A
  * client waiting on {@code Expect: 100-continue} sends no body. Nothing after a rejection is read.
@@ -47,6 +48,9 @@ final class S3BodyLimitHandler extends ChannelInboundHandlerAdapter {
     private final long limit;
     private boolean discarding;
     private CompletableFuture<Void> bodyDone;
+    /** URI of the in-flight request whose body length is undeclared (chunked); its bytes are counted. */
+    private String countingUri;
+    private long received;
 
     /** A refused request: its {@code 400} response, and when the client has finished its body. */
     record Rejected(FullHttpResponse response, CompletableFuture<Void> bodyDone) {
@@ -62,13 +66,23 @@ final class S3BodyLimitHandler extends ChannelInboundHandlerAdapter {
             long declared = declaredLength(request);
             if (!discarding && declared > limit) {
                 ReferenceCountUtil.release(msg);
-                discarding = true;
-                bodyDone = new CompletableFuture<>();
-                if (HttpUtil.is100ContinueExpected(request)) {
-                    bodyDone.complete(null);
-                }
-                ctx.fireChannelRead(new Rejected(rejection(request, declared), bodyDone));
+                reject(ctx, request.uri(), "of " + declared + " bytes",
+                        HttpUtil.is100ContinueExpected(request));
                 return;
+            }
+            countingUri = declared < 0 ? request.uri() : null;
+            received = 0;
+        } else if (!discarding && countingUri != null && msg instanceof HttpContent content) {
+            received += content.content().readableBytes();
+            if (received > limit) {
+                // Ahead of the aggregator's own (out-of-order) 413 for an undeclared length.
+                boolean last = msg instanceof LastHttpContent;
+                ReferenceCountUtil.release(msg);
+                reject(ctx, countingUri, "over " + limit + " bytes", last);
+                return;
+            }
+            if (msg instanceof LastHttpContent) {
+                countingUri = null;
             }
         }
         if (discarding) {
@@ -94,11 +108,21 @@ final class S3BodyLimitHandler extends ChannelInboundHandlerAdapter {
         }
     }
 
-    private FullHttpResponse rejection(HttpRequest request, long declared) {
+    private void reject(ChannelHandlerContext ctx, String uri, String size, boolean bodyComplete) {
+        discarding = true;
+        bodyDone = new CompletableFuture<>();
+        if (bodyComplete) {
+            bodyDone.complete(null);
+        }
+        ctx.fireChannelRead(new Rejected(rejection(uri, size), bodyDone));
+    }
+
+    private FullHttpResponse rejection(String uri, String size) {
         String requestId = UUID.randomUUID().toString();
-        String resource = new QueryStringDecoder(request.uri()).rawPath();
-        String message = "Request body of " + declared + " bytes exceeds the maximum of " + limit
-                + " bytes for a single PUT or part; use multipart upload";
+        String resource = new QueryStringDecoder(uri).rawPath();
+        String message = "Request body " + size + " exceeds the maximum of " + limit
+                + " bytes for a single PUT or part (use multipart upload with parts of at most "
+                + limit + " bytes)";
         FullHttpResponse r = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1,
                 HttpResponseStatus.valueOf(S3ErrorCode.ENTITY_TOO_LARGE.httpStatus()),
                 Unpooled.copiedBuffer(S3Xml.error(S3ErrorCode.ENTITY_TOO_LARGE, message, resource,

@@ -266,6 +266,7 @@ class S3LargeObjectTest {
 
             // Two pipelined GETs in one write: both answered in order, bodies intact.
             try (java.net.Socket socket = new java.net.Socket("127.0.0.1", server.port())) {
+                socket.setSoTimeout(10_000);
                 String req = "GET /big/obj HTTP/1.1\r\nHost: x\r\n\r\n";
                 socket.getOutputStream().write((req + req.replace("\r\n\r\n",
                         "\r\nConnection: close\r\n\r\n")).getBytes(StandardCharsets.US_ASCII));
@@ -274,6 +275,25 @@ class S3LargeObjectTest {
                 assertThat(split).isPositive();
                 assertThat(bodyOf(raw, 0, split)).isEqualTo(object);
                 assertThat(bodyOf(raw, split, raw.length)).isEqualTo(object);
+            }
+
+            // A chunked PUT with no declared length, pipelined behind a streamed GET: counted and
+            // refused in order, after the GET's body.
+            try (java.net.Socket socket = new java.net.Socket("127.0.0.1", server.port())) {
+                socket.setSoTimeout(10_000);
+                java.io.ByteArrayOutputStream req = new java.io.ByteArrayOutputStream();
+                req.writeBytes("GET /big/obj HTTP/1.1\r\nHost: x\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
+                req.writeBytes(("PUT /big/chunked HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+                        + Integer.toHexString(INLINE + 1) + "\r\n").getBytes(StandardCharsets.US_ASCII));
+                req.writeBytes(new byte[INLINE + 1]);
+                req.writeBytes("\r\n0\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
+                socket.getOutputStream().write(req.toByteArray());
+                byte[] raw = socket.getInputStream().readAllBytes();
+                int split = indexOf(raw, "HTTP/1.1 400".getBytes(StandardCharsets.US_ASCII), 1);
+                assertThat(split).isPositive();
+                assertThat(bodyOf(raw, 0, split)).isEqualTo(object);
+                assertThat(new String(raw, split, raw.length - split, StandardCharsets.UTF_8))
+                        .contains("<Code>EntityTooLarge</Code>");
             }
 
             var put = http.send(java.net.http.HttpRequest.newBuilder(URI.create(base + "/big/huge"))

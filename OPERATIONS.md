@@ -43,7 +43,7 @@ All knobs are configurable; pick defaults unless a workload demands otherwise.
 | `bloomBitsPerKey` | 10 | SSTable bloom filter sizing (~1% FPR). |
 | `memtableFlushThresholdBytes` | 4 MiB | Memtable size that triggers a flush to an L0 SSTable. |
 | `syrupRolloverBytes` | 1 GiB | Open Syrup size before rolling to a fresh one. |
-| `maxFrameSizeBytes` | 16 MiB | Protocol frame cap; oversized/malformed frames are rejected pre-allocation. |
+| `maxFrameSizeBytes` | 16 MiB + 64 KiB | Protocol frame cap; oversized/malformed frames are rejected pre-allocation. 64 KiB is reserved for metadata, so the largest single PUT / part / GET frame carries 16 MiB of data. |
 | `ownershipLeaseTtlMillis` | 10 s | Partition ownership lease TTL; must be renewed within it. |
 | `leaseRenewIntervalMillis` | 3 s | Lease heartbeat interval; `0` disables the background heartbeat. |
 | `routerCacheTtlMillis` | 5 s | Client partition→owner routing-cache TTL. |
@@ -294,7 +294,10 @@ authentication.
 - **Streaming on the wire (Phase 2.5):** a protocol PUT or GET carries the whole object in one
   frame (≤ `max.frame.size.bytes`); a larger GET is refused unread with `LimitExceededException`.
   The S3 gateway serves larger objects (created by multipart upload) by streaming frame-sized range
-  reads, and rejects single PUTs / parts over the frame with `EntityTooLarge`.
+  reads, and rejects single PUTs / parts over the frame with `EntityTooLarge`. With the default
+  frame a part may be at most 16 MiB: minio-go / `mc` defaults fit, but clients with larger parts
+  must lower them (e.g. Hadoop S3A `fs.s3a.multipart.size=16M`) or raise `max.frame.size.bytes`
+  on nodes and gateway alike.
 - **Automatic failover needs the balancer:** with `balancerIntervalMillis = 0`, a crashed owner's
   partitions are served again only when some node calls `openPartition`/`openBox`.
 - **Fixed partition count per Box:** set at creation, no re-partitioning; ordered listings
