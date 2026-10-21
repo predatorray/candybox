@@ -470,6 +470,13 @@ public sealed interface Message {
         }
     }
 
+    /** The partition is momentarily unowned (handover gap); retry after re-resolving its owner. */
+    record UnavailableResponse(long retryAfterMillis) implements Message {
+        public Opcode opcode() {
+            return Opcode.RESPONSE_UNAVAILABLE;
+        }
+    }
+
     /** A Box's descriptor: its (creation-time-fixed) partition count. */
     record BoxInfoResponse(int partitionCount) implements Message {
         public Opcode opcode() {

@@ -156,6 +156,59 @@ class NodeRequestHandlerTest {
     }
 
     @Test
+    void unownedPartitionOfAnExistingBoxIsUnavailableNotNotFound() {
+        ManualClock clock = new ManualClock(1000);
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        CandyboxConfig config = CandyboxConfig.builder().leaseRenewIntervalMillis(0)
+                .ownershipLeaseTtlMillis(10_000).build();
+        try (CandyboxNode owner = new CandyboxNode(1, config, store, coordination, clock);
+             CandyboxNode other = new CandyboxNode(2, config, store, coordination, clock)) {
+            owner.createBox(BoxName.of("gap-box"), 1);
+            assertThat(roundTrip(owner.requestHandler(), new Message.PutCandyRequest(
+                    "gap-box", "k", null, Map.of(), null, bytes("v"))))
+                    .isInstanceOf(Message.OkResponse.class);
+
+            clock.advance(11_000); // the owner's lease lapses; no one has taken over yet
+
+            List<Message> requests = List.of(
+                    new Message.GetCandyRequest("gap-box", "k"),
+                    new Message.HeadCandyRequest("gap-box", "k"),
+                    new Message.PutCandyRequest("gap-box", "k", null, Map.of(), null, bytes("v2")),
+                    new Message.DeleteCandyRequest("gap-box", "k"),
+                    new Message.ListCandiesRequest("gap-box", 0, null, null, 10));
+            // Both the lapsed owner and a node that never held the partition answer UNAVAILABLE.
+            for (CandyboxNode node : List.of(owner, other)) {
+                for (Message request : requests) {
+                    assertThat(roundTrip(node.requestHandler(), request))
+                            .as("node %d %s", node.nodeId(), request.opcode())
+                            .isInstanceOf(Message.UnavailableResponse.class);
+                }
+            }
+        }
+        store.close();
+    }
+
+    @Test
+    void deletedBoxWithCachedDescriptorIsStillNotFound() {
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService();
+        try (CandyboxNode owner = new CandyboxNode(1, config(), store, coordination, new ManualClock(1000));
+             CandyboxNode other = new CandyboxNode(2, config(), store, coordination, new ManualClock(1000))) {
+            owner.createBox(BoxName.of("doomed-box"), 1);
+            // Caches the descriptor on node 2.
+            assertThat(roundTrip(other.requestHandler(), new Message.GetCandyRequest("doomed-box", "k")))
+                    .isInstanceOf(Message.MovedResponse.class);
+
+            owner.deleteBox(BoxName.of("doomed-box"), false);
+
+            assertThat(roundTrip(other.requestHandler(), new Message.GetCandyRequest("doomed-box", "k")))
+                    .isInstanceOf(Message.NotFoundResponse.class);
+        }
+        store.close();
+    }
+
+    @Test
     void crossPartitionServerSideCopyIsRejectedAsValidationError() {
         try (CandyboxNode node = new CandyboxNode(1, config(), new InMemoryLedgerStore(),
                 new InMemoryCoordinationService(), new ManualClock(1000))) {

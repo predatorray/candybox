@@ -50,6 +50,7 @@ public final class S3GatewayConfig {
     private final long maxObjectBytes;
     private final int workerThreads;
     private final long routerCacheTtlMillis;
+    private final long routerUnownedRetryMillis;
     private final SecurityConfig security;
     private final boolean s3AuthEnabled;
     private final boolean s3AllowAnonymous;
@@ -63,6 +64,7 @@ public final class S3GatewayConfig {
         this.maxObjectBytes = b.maxObjectBytes;
         this.workerThreads = b.workerThreads;
         this.routerCacheTtlMillis = b.routerCacheTtlMillis;
+        this.routerUnownedRetryMillis = b.routerUnownedRetryMillis;
         this.security = b.security;
         this.s3AuthEnabled = b.s3AuthEnabled;
         this.s3AllowAnonymous = b.s3AllowAnonymous;
@@ -91,6 +93,7 @@ public final class S3GatewayConfig {
                 .workerThreads(r.getInt("s3.worker-threads")
                         .orElse(Math.max(4, Runtime.getRuntime().availableProcessors() * 2)))
                 .routerCacheTtlMillis(r.getLong("s3.router-cache-ttl-ms").orElse(5_000L))
+                .routerUnownedRetryMillis(r.getLong("s3.router-unowned-retry-ms").orElse(15_000L))
                 .security(SecurityConfig.resolve(r::get))
                 .s3AuthEnabled(r.get("s3.auth.enabled").map(Boolean::parseBoolean).orElse(false))
                 .s3AllowAnonymous(r.get("s3.auth.allow-anonymous").map(Boolean::parseBoolean)
@@ -128,6 +131,10 @@ public final class S3GatewayConfig {
 
     public long routerCacheTtlMillis() {
         return routerCacheTtlMillis;
+    }
+
+    public long routerUnownedRetryMillis() {
+        return routerUnownedRetryMillis;
     }
 
     /** The shared {@code auth.*} / {@code tls.*} surface: how this gateway dials the nodes. */
@@ -203,6 +210,7 @@ public final class S3GatewayConfig {
         private boolean s3AllowAnonymous = true;
         private int workerThreads = 8;
         private long routerCacheTtlMillis = 5_000L;
+        private long routerUnownedRetryMillis = 15_000L;
 
         Builder bindHost(String v) {
             this.bindHost = v;
@@ -241,6 +249,11 @@ public final class S3GatewayConfig {
 
         Builder routerCacheTtlMillis(long v) {
             this.routerCacheTtlMillis = v;
+            return this;
+        }
+
+        Builder routerUnownedRetryMillis(long v) {
+            this.routerUnownedRetryMillis = v;
             return this;
         }
 

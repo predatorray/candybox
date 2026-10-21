@@ -438,8 +438,8 @@ public final class CandyboxNode implements AutoCloseable {
 
     /**
      * Returns the engine of the partition holding {@code key}. Throws {@link BoxNotFoundException}
-     * if the Box does not exist or this node has no ownership object for the partition, or
-     * {@link NotOwnerException} if its lease is no longer valid.
+     * if the Box does not exist, or {@link NotOwnerException} if this node does not hold the
+     * partition or its lease is no longer valid.
      */
     public BoxEngine engine(BoxName box, String key) {
         return enginePartition(box, descriptor(box).partitionOf(key));
@@ -449,7 +449,11 @@ public final class CandyboxNode implements AutoCloseable {
     public BoxEngine enginePartition(BoxName box, int partition) {
         PartitionOwnership ownership = partitions.get(new BoxPartition(box.value(), partition));
         if (ownership == null) {
-            throw new BoxNotFoundException(box.value());
+            if (!boxExists(box)) {
+                throw new BoxNotFoundException(box.value());
+            }
+            throw new NotOwnerException("box " + box.value() + " partition " + partition
+                    + " is not served by node " + nodeId);
         }
         return ownership.engine();
     }
