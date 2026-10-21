@@ -21,6 +21,10 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse.BodyHandlers;
+import java.time.Duration;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import me.predatorray.candybox.common.ManualClock;
 import me.predatorray.candybox.coordination.fake.InMemoryCoordinationService;
@@ -55,7 +59,8 @@ class GatewayHealthServerTest {
     void readinessTracksCoordinationAndMembershipWhileLivenessStaysOk() throws Exception {
         InMemoryCoordinationService coordination = new InMemoryCoordinationService();
         ManualClock clock = new ManualClock(1_000);
-        GatewayReadiness readiness = new GatewayReadiness(coordination, clock, 1_000);
+        GatewayReadiness readiness = new GatewayReadiness(coordination::isConnected,
+                coordination::members, clock, 1_000, Runnable::run);
         GatewayHealthServer health = new GatewayHealthServer(0, readiness);
         health.start();
         try {
@@ -87,8 +92,49 @@ class GatewayHealthServerTest {
         ManualClock clock = new ManualClock(1_000);
         GatewayReadiness readiness = new GatewayReadiness(() -> true, () -> {
             throw new IllegalStateException("connection loss");
-        }, clock, 1_000);
+        }, clock, 1_000, Runnable::run);
         assertThat(readiness.getAsBoolean()).isFalse();
+    }
+
+    @Test
+    void slowMembershipReadBlocksNeitherReadyzNorHealthz() throws Exception {
+        CountDownLatch release = new CountDownLatch(1);
+        GatewayReadiness readiness = new GatewayReadiness(() -> true, () -> {
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return List.of(1);
+        }, new ManualClock(1_000), 1_000, Executors.newSingleThreadExecutor());
+        GatewayHealthServer health = new GatewayHealthServer(0, readiness);
+        health.start();
+        try {
+            HttpClient http = HttpClient.newBuilder().build();
+            String base = "http://127.0.0.1:" + health.port();
+            Duration timeout = Duration.ofSeconds(2);
+
+            // The refresh is stuck in ZooKeeper: no snapshot yet, so not ready, and promptly.
+            assertThat(get(http, base + "/readyz", timeout).statusCode()).isEqualTo(503);
+            assertThat(get(http, base + "/healthz", timeout).statusCode()).isEqualTo(200);
+
+            release.countDown();
+            long deadline = System.nanoTime() + 5_000_000_000L;
+            while (get(http, base + "/readyz", timeout).statusCode() != 200) {
+                assertThat(System.nanoTime()).isLessThan(deadline);
+                Thread.sleep(20);
+            }
+        } finally {
+            release.countDown();
+            health.close();
+            readiness.close();
+        }
+    }
+
+    private static java.net.http.HttpResponse<String> get(HttpClient http, String url,
+                                                          Duration timeout) throws Exception {
+        return http.send(HttpRequest.newBuilder(URI.create(url)).timeout(timeout).GET().build(),
+                BodyHandlers.ofString());
     }
 
     private static java.net.http.HttpResponse<String> get(HttpClient http, String url) throws Exception {

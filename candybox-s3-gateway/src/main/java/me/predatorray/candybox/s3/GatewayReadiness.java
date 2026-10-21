@@ -16,7 +16,11 @@
 package me.predatorray.candybox.s3;
 
 import java.util.List;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 import me.predatorray.candybox.common.Clock;
@@ -24,10 +28,12 @@ import me.predatorray.candybox.coordination.CoordinationService;
 
 /**
  * Gateway readiness: the coordination session is connected and at least one node is registered to
- * route to. The membership read is cached for {@code ttlMillis} so frequent probes don't hit
- * ZooKeeper; the connection check is local and never cached.
+ * route to. The connection check is local and never cached. The membership read is a ZooKeeper round
+ * trip, so it is cached for {@code ttlMillis} and refreshed on a background thread: a probe never
+ * waits on ZooKeeper, which keeps the health server's single dispatcher thread free for
+ * {@code /healthz}.
  */
-final class GatewayReadiness implements BooleanSupplier {
+final class GatewayReadiness implements BooleanSupplier, AutoCloseable {
 
     static final long DEFAULT_TTL_MILLIS = 1_000;
 
@@ -35,22 +41,32 @@ final class GatewayReadiness implements BooleanSupplier {
     private final Supplier<List<Integer>> members;
     private final Clock clock;
     private final long ttlMillis;
-    private final ReentrantLock refreshLock = new ReentrantLock();
+    private final Executor refresher;
+    private final ExecutorService ownedRefresher;
+    private final AtomicBoolean refreshing = new AtomicBoolean();
     private volatile Snapshot snapshot;
 
     private record Snapshot(boolean hasMembers, long atMillis) {
     }
 
     GatewayReadiness(CoordinationService coordination, Clock clock, long ttlMillis) {
-        this(coordination::isConnected, coordination::members, clock, ttlMillis);
+        this(coordination::isConnected, coordination::members, clock, ttlMillis,
+                Executors.newSingleThreadExecutor(r -> {
+                    Thread t = new Thread(r, "candybox-s3-gateway-readiness");
+                    t.setDaemon(true);
+                    return t;
+                }));
     }
 
+    /** @param refresher runs the membership refresh; {@code Runnable::run} refreshes inline */
     GatewayReadiness(BooleanSupplier connected, Supplier<List<Integer>> members, Clock clock,
-                     long ttlMillis) {
+                     long ttlMillis, Executor refresher) {
         this.connected = connected;
         this.members = members;
         this.clock = clock;
         this.ttlMillis = ttlMillis;
+        this.refresher = refresher;
+        this.ownedRefresher = refresher instanceof ExecutorService es ? es : null;
     }
 
     @Override
@@ -60,15 +76,20 @@ final class GatewayReadiness implements BooleanSupplier {
         }
         Snapshot current = snapshot;
         long now = clock.currentTimeMillis();
-        // One caller refreshes; concurrent probes answer from the last snapshot instead of queueing
-        // behind a slow ZooKeeper read.
-        if ((current == null || now - current.atMillis() >= ttlMillis) && refreshLock.tryLock()) {
+        if ((current == null || now - current.atMillis() >= ttlMillis)
+                && refreshing.compareAndSet(false, true)) {
             try {
-                current = new Snapshot(hasMembers(), now);
-                snapshot = current;
-            } finally {
-                refreshLock.unlock();
+                refresher.execute(() -> {
+                    try {
+                        snapshot = new Snapshot(hasMembers(), now);
+                    } finally {
+                        refreshing.set(false);
+                    }
+                });
+            } catch (RejectedExecutionException e) {
+                refreshing.set(false);
             }
+            current = snapshot;
         }
         return current != null && current.hasMembers();
     }
@@ -78,6 +99,13 @@ final class GatewayReadiness implements BooleanSupplier {
             return !members.get().isEmpty();
         } catch (RuntimeException e) {
             return false;
+        }
+    }
+
+    @Override
+    public void close() {
+        if (ownedRefresher != null) {
+            ownedRefresher.shutdownNow();
         }
     }
 }

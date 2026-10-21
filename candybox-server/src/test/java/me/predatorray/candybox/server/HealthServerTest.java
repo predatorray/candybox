@@ -78,9 +78,9 @@ class HealthServerTest {
     @Test
     void readyzFollowsCoordinationConnectivityWhileHealthzStaysOk() throws Exception {
         InMemoryCoordinationService coordination = new InMemoryCoordinationService();
-        CandyboxNode node = new CandyboxNode(1, CandyboxConfig.defaults(), new InMemoryLedgerStore(),
-                coordination, new ManualClock(1000));
-        try (HealthServer server = new HealthServer(0, 1, node::isReady, Map::of)) {
+        try (CandyboxNode node = new CandyboxNode(1, CandyboxConfig.defaults(),
+                     new InMemoryLedgerStore(), coordination, new ManualClock(1000));
+             HealthServer server = new HealthServer(0, 1, node::isReady, Map::of)) {
             server.start();
             int port = server.port();
 

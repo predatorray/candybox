@@ -103,6 +103,7 @@ public final class S3GatewayMain {
             LOG.info("Shutdown signal received; draining S3 gateway");
             ready.set(false);
             closeQuietly("health server", health);
+            closeQuietly("readiness", cluster);
             closeQuietly("S3 gateway", gateway);
             closeQuietly("candybox client", client);
             closeQuietly("coordination", coordination);
