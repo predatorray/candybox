@@ -62,7 +62,9 @@ A `StatefulSet` + headless `Service` manifest lives under
 [`examples/kubernetes/`](https://github.com/predatorray/candybox/tree/main/examples/kubernetes) (also
 bundled into the distribution tarball under `examples/`). The StatefulSet gives each pod a stable
 identity, so `node.id` and the advertised address derive automatically from the pod name, and
-liveness/readiness probes hit the health endpoint.
+liveness/readiness probes hit the health endpoint. Nodes advertise their headless-Service DNS names
+into membership, so that Service sets `publishNotReadyAddresses: true`: those names must keep
+resolving while `/readyz` is 503.
 
 For a self-contained local cluster (ZooKeeper + bookies + nodes), use the
 [`docker-compose.yml`](https://github.com/predatorray/candybox/blob/main/docker-compose.yml) described

@@ -60,7 +60,7 @@ class GatewayHealthServerTest {
         InMemoryCoordinationService coordination = new InMemoryCoordinationService();
         ManualClock clock = new ManualClock(1_000);
         GatewayReadiness readiness = new GatewayReadiness(coordination::isConnected,
-                coordination::members, clock, 1_000, Runnable::run);
+                coordination::members, clock, 1_000, Runnable::run, false);
         GatewayHealthServer health = new GatewayHealthServer(0, readiness);
         health.start();
         try {
@@ -80,8 +80,10 @@ class GatewayHealthServerTest {
             coordination.setConnected(false);
             assertThat(get(http, base + "/readyz").statusCode()).isEqualTo(503);
             assertThat(get(http, base + "/healthz").statusCode()).isEqualTo(200);
+            // The pre-outage membership is dropped: after reconnecting, the answer is fresh.
+            coordination.expireMember(1);
             coordination.setConnected(true);
-            assertThat(get(http, base + "/readyz").statusCode()).isEqualTo(200);
+            assertThat(get(http, base + "/readyz").statusCode()).isEqualTo(503);
         } finally {
             health.close();
         }
@@ -92,7 +94,7 @@ class GatewayHealthServerTest {
         ManualClock clock = new ManualClock(1_000);
         GatewayReadiness readiness = new GatewayReadiness(() -> true, () -> {
             throw new IllegalStateException("connection loss");
-        }, clock, 1_000, Runnable::run);
+        }, clock, 1_000, Runnable::run, false);
         assertThat(readiness.getAsBoolean()).isFalse();
     }
 
@@ -124,7 +126,7 @@ class GatewayHealthServerTest {
                 Thread.currentThread().interrupt();
             }
             return List.of(1);
-        }, new ManualClock(1_000), 1_000, Executors.newSingleThreadExecutor());
+        }, new ManualClock(1_000), 1_000, Executors.newSingleThreadExecutor(), true);
         GatewayHealthServer health = new GatewayHealthServer(0, readiness);
         health.start();
         try {

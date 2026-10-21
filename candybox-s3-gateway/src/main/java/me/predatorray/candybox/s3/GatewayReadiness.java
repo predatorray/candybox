@@ -55,23 +55,28 @@ final class GatewayReadiness implements BooleanSupplier, AutoCloseable {
                     Thread t = new Thread(r, "candybox-s3-gateway-readiness");
                     t.setDaemon(true);
                     return t;
-                }));
+                }), true);
     }
 
-    /** @param refresher runs the membership refresh; {@code Runnable::run} refreshes inline */
+    /**
+     * @param refresher      runs the membership refresh; {@code Runnable::run} refreshes inline
+     * @param ownsRefresher  whether {@link #close} shuts {@code refresher} down (it must then be an
+     *                       {@link ExecutorService})
+     */
     GatewayReadiness(BooleanSupplier connected, Supplier<List<Integer>> members, Clock clock,
-                     long ttlMillis, Executor refresher) {
+                     long ttlMillis, Executor refresher, boolean ownsRefresher) {
         this.connected = connected;
         this.members = members;
         this.clock = clock;
         this.ttlMillis = ttlMillis;
         this.refresher = refresher;
-        this.ownedRefresher = refresher instanceof ExecutorService es ? es : null;
+        this.ownedRefresher = ownsRefresher ? (ExecutorService) refresher : null;
     }
 
     @Override
     public boolean getAsBoolean() {
         if (!connected.getAsBoolean()) {
+            snapshot = null; // after reconnecting, answer from fresh membership only
             return false;
         }
         Snapshot current = snapshot;
