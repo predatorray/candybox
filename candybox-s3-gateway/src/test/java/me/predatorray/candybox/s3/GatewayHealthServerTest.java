@@ -97,6 +97,24 @@ class GatewayHealthServerTest {
     }
 
     @Test
+    void refreshesInTheBackgroundAndKeepsTheLastSnapshotOnceClosed() throws Exception {
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService();
+        coordination.registerMember(1, "127.0.0.1:9700".getBytes());
+        ManualClock clock = new ManualClock(1_000);
+        GatewayReadiness readiness = new GatewayReadiness(coordination, clock, 1_000);
+        long deadline = System.nanoTime() + 5_000_000_000L;
+        while (!readiness.getAsBoolean()) {
+            assertThat(System.nanoTime()).isLessThan(deadline);
+            Thread.sleep(10);
+        }
+
+        readiness.close();
+        clock.advance(1_000);
+        // The refresh is rejected after close; the probe still answers from the last snapshot.
+        assertThat(readiness.getAsBoolean()).isTrue();
+    }
+
+    @Test
     void slowMembershipReadBlocksNeitherReadyzNorHealthz() throws Exception {
         CountDownLatch release = new CountDownLatch(1);
         GatewayReadiness readiness = new GatewayReadiness(() -> true, () -> {
