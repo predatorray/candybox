@@ -19,7 +19,7 @@ import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.handler.codec.http.DefaultFullHttpResponse;
 import io.netty.handler.codec.http.DefaultHttpContent;
 import io.netty.handler.codec.http.DefaultHttpResponse;
@@ -33,6 +33,8 @@ import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.LastHttpContent;
 import io.netty.handler.codec.http.QueryStringDecoder;
+import io.netty.util.ReferenceCountUtil;
+import java.util.ArrayDeque;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -70,7 +72,7 @@ import org.slf4j.LoggerFactory;
  * bodies larger than a frame are streamed as a sequence of range reads. Path-style addressing only,
  * anonymous (the {@code Authorization} header is accepted and ignored). See {@code S3_GATEWAY_PLAN.md}.
  */
-final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
+final class S3Handler extends ChannelInboundHandlerAdapter {
 
     private static final Logger LOG = LoggerFactory.getLogger(S3Handler.class);
     private static final String META_PREFIX = "x-amz-meta-";
@@ -82,6 +84,12 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
     private final S3GatewayConfig config;
     private final S3Authenticator authenticator;
     private final S3AccessControl access;
+
+    // Per-connection state, touched only from this handler's executor. HTTP/1.1 responses must go
+    // out in request order, so requests that arrive while a GET body is streaming wait here.
+    private final ArrayDeque<Object> queued = new ArrayDeque<>();
+    private boolean streaming;
+    private boolean closing;
 
     /** Auth-disabled handler (anonymous full access) — the pre-SigV4 behavior, used by tests. */
     S3Handler(CandyStore store, S3GatewayConfig config) {
@@ -100,7 +108,72 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
     }
 
     @Override
-    protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest request) {
+    public void channelRead(ChannelHandlerContext ctx, Object msg) {
+        if (!(msg instanceof FullHttpRequest) && !(msg instanceof S3BodyLimitHandler.Rejected)) {
+            ctx.fireChannelRead(msg);
+        } else if (closing) {
+            ReferenceCountUtil.release(msg);
+        } else if (streaming) {
+            queued.add(msg);
+        } else {
+            serve(ctx, msg);
+        }
+    }
+
+    @Override
+    public void channelInactive(ChannelHandlerContext ctx) {
+        abandon();
+        ctx.fireChannelInactive();
+    }
+
+    @Override
+    public void handlerRemoved(ChannelHandlerContext ctx) {
+        abandon();
+    }
+
+    private void serve(ChannelHandlerContext ctx, Object msg) {
+        if (msg instanceof S3BodyLimitHandler.Rejected rejected) {
+            // Close once the error is out and the client has finished sending the refused body.
+            closing = true;
+            abandon();
+            ctx.writeAndFlush(rejected.response()).addListener(
+                    f -> rejected.bodyDone().whenComplete((v, t) -> ctx.channel().close()));
+            return;
+        }
+        FullHttpRequest request = (FullHttpRequest) msg;
+        try {
+            handle(ctx, request);
+        } finally {
+            request.release();
+        }
+    }
+
+    /** Ends a streamed body: serves the requests that queued behind it, in order. */
+    private void streamEnded(ChannelHandlerContext ctx) {
+        streaming = false;
+        ctx.channel().config().setAutoRead(true);
+        Object next;
+        while (!streaming && !closing && (next = queued.poll()) != null) {
+            serve(ctx, next);
+        }
+    }
+
+    /** The stream was cut off and the connection is closing: nothing queued will be answered. */
+    private void streamAborted(ChannelHandlerContext ctx) {
+        streaming = false;
+        closing = true;
+        abandon();
+        ctx.close();
+    }
+
+    private void abandon() {
+        Object next;
+        while ((next = queued.poll()) != null) {
+            ReferenceCountUtil.release(next);
+        }
+    }
+
+    private void handle(ChannelHandlerContext ctx, FullHttpRequest request) {
         String requestId = UUID.randomUUID().toString();
         String method = request.method().name().toUpperCase(Locale.ROOT);
         QueryStringDecoder decoder = new QueryStringDecoder(request.uri());
@@ -418,6 +491,8 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
         boolean keepAlive = HttpUtil.isKeepAlive(request);
         head.headers().set(HttpHeaderNames.CONNECTION,
                 keepAlive ? HttpHeaderValues.KEEP_ALIVE : HttpHeaderValues.CLOSE);
+        streaming = true;
+        ctx.channel().config().setAutoRead(false); // bound what a pipelining client can queue
         ctx.write(head);
         ChannelFuture written = ctx.writeAndFlush(new DefaultHttpContent(Unpooled.wrappedBuffer(firstSlice)));
         long offset = first + firstSlice.length;
@@ -438,11 +513,16 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
                              boolean keepAlive, String requestId) {
         pending.addListener(f -> ctx.executor().execute(() -> {
             if (!f.isSuccess()) {
-                return; // the client went away
+                streamAborted(ctx); // the client went away
+                return;
             }
             if (offset > last) {
                 ChannelFuture done = ctx.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT);
-                if (!keepAlive) {
+                if (keepAlive) {
+                    streamEnded(ctx);
+                } else {
+                    closing = true;
+                    abandon();
                     done.addListener(ChannelFutureListener.CLOSE);
                 }
                 return;
@@ -471,7 +551,7 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
         } catch (RuntimeException e) {
             LOG.warn("Aborting GET {}/{} at byte {} (req {}): {}", parts.bucket(), parts.key(), offset,
                     requestId, e.toString());
-            ctx.close();
+            streamAborted(ctx);
             return null;
         }
     }

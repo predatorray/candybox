@@ -132,7 +132,7 @@ class S3LargeObjectTest {
 
     @Test
     void oversizedPutIsRejectedBeforeItsBodyIsAggregated() {
-        EmbeddedChannel ch = new EmbeddedChannel(new S3BodyLimitHandler(INLINE));
+        EmbeddedChannel ch = limitedChannel();
         HttpRequest put = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.PUT, "/big/huge");
         put.headers().set(HttpHeaderNames.CONTENT_LENGTH, INLINE + 1);
         ch.writeInbound(put);
@@ -153,11 +153,53 @@ class S3LargeObjectTest {
 
     @Test
     void oversizedPutAwaitingContinueIsClosedAtOnce() {
-        EmbeddedChannel ch = new EmbeddedChannel(new S3BodyLimitHandler(INLINE));
+        EmbeddedChannel ch = limitedChannel();
         HttpRequest put = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.PUT, "/big/huge");
         put.headers().set(HttpHeaderNames.CONTENT_LENGTH, INLINE + 1);
         put.headers().set(HttpHeaderNames.EXPECT, HttpHeaderValues.CONTINUE);
         ch.writeInbound(put);
+        FullHttpResponse r = ch.readOutbound();
+        assertThat(r.status().code()).isEqualTo(400);
+        r.release();
+        assertThat(ch.isOpen()).isFalse();
+    }
+
+    @Test
+    void pipelinedRequestsAreAnsweredInOrderAfterAStreamedBody() {
+        byte[] second = random(2500, 4);
+        store.putCandy("big", "second", second, "text/plain", Map.of());
+        store.putCandy("big", "small", "tiny".getBytes(StandardCharsets.UTF_8), "text/plain", Map.of());
+        EmbeddedChannel ch = limitedChannel();
+        // All three arrive in one read, before the first body has finished streaming.
+        ch.writeInbound(getRequest("/big/obj"), getRequest("/big/second"), getRequest("/big/small"));
+        ch.runPendingTasks();
+
+        HttpResponse head1 = ch.readOutbound();
+        assertThat(head1.headers().get(HttpHeaderNames.CONTENT_LENGTH)).isEqualTo("3500");
+        assertThat(readBody(ch)).isEqualTo(object);
+        HttpResponse head2 = ch.readOutbound();
+        assertThat(head2).isNotInstanceOf(FullHttpResponse.class);
+        assertThat(head2.headers().get(HttpHeaderNames.CONTENT_LENGTH)).isEqualTo("2500");
+        assertThat(readBody(ch)).isEqualTo(second);
+        FullHttpResponse third = ch.readOutbound();
+        assertThat(third.content().toString(StandardCharsets.UTF_8)).isEqualTo("tiny");
+        third.release();
+        assertThat((Object) ch.readOutbound()).isNull();
+        assertThat(ch.config().isAutoRead()).isTrue();
+        ch.finishAndReleaseAll();
+    }
+
+    @Test
+    void rejectionPipelinedBehindAStreamWaitsForItsBody() {
+        EmbeddedChannel ch = limitedChannel();
+        HttpRequest put = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.PUT, "/big/huge");
+        put.headers().set(HttpHeaderNames.CONTENT_LENGTH, INLINE + 1);
+        ch.writeInbound(getRequest("/big/obj"), put, new DefaultLastHttpContent());
+        ch.runPendingTasks();
+
+        HttpResponse head = ch.readOutbound();
+        assertThat(head.status().code()).isEqualTo(200);
+        assertThat(readBody(ch)).isEqualTo(object);
         FullHttpResponse r = ch.readOutbound();
         assertThat(r.status().code()).isEqualTo(400);
         r.release();
@@ -189,7 +231,7 @@ class S3LargeObjectTest {
 
     @Test
     void awsChunkedPutIsJudgedByItsDecodedLength() {
-        EmbeddedChannel ch = new EmbeddedChannel(new S3BodyLimitHandler(INLINE));
+        EmbeddedChannel ch = limitedChannel();
         HttpRequest fits = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.PUT, "/big/a");
         fits.headers().set(HttpHeaderNames.CONTENT_LENGTH, INLINE + 200); // framing overhead
         fits.headers().set("x-amz-decoded-content-length", INLINE);
@@ -222,6 +264,18 @@ class S3LargeObjectTest {
             assertThat(get.statusCode()).isEqualTo(200);
             assertThat(get.body()).isEqualTo(object);
 
+            // Two pipelined GETs in one write: both answered in order, bodies intact.
+            try (java.net.Socket socket = new java.net.Socket("127.0.0.1", server.port())) {
+                String req = "GET /big/obj HTTP/1.1\r\nHost: x\r\n\r\n";
+                socket.getOutputStream().write((req + req.replace("\r\n\r\n",
+                        "\r\nConnection: close\r\n\r\n")).getBytes(StandardCharsets.US_ASCII));
+                byte[] raw = socket.getInputStream().readAllBytes();
+                int split = indexOf(raw, "HTTP/1.1 200".getBytes(StandardCharsets.US_ASCII), 1);
+                assertThat(split).isPositive();
+                assertThat(bodyOf(raw, 0, split)).isEqualTo(object);
+                assertThat(bodyOf(raw, split, raw.length)).isEqualTo(object);
+            }
+
             var put = http.send(java.net.http.HttpRequest.newBuilder(URI.create(base + "/big/huge"))
                     .PUT(BodyPublishers.ofByteArray(new byte[INLINE + 1])).build(),
                     BodyHandlers.ofString());
@@ -242,6 +296,47 @@ class S3LargeObjectTest {
         assertThatThrownBy(() -> S3GatewayConfig.fromProperties(p, Map.of()))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("max.frame.size.bytes");
+    }
+
+    private EmbeddedChannel limitedChannel() {
+        return new EmbeddedChannel(new S3BodyLimitHandler(INLINE),
+                new S3Handler(store, S3GatewayConfig.fromProperties(baseProps(), Map.of())));
+    }
+
+    private static DefaultFullHttpRequest getRequest(String uri) {
+        return new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, uri, Unpooled.EMPTY_BUFFER);
+    }
+
+    /** The body chunks of a streamed response, up to and including its last content. */
+    private static byte[] readBody(EmbeddedChannel ch) {
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+        while (true) {
+            HttpContent c = ch.readOutbound();
+            append(body, c.content());
+            c.release();
+            if (c instanceof LastHttpContent) {
+                return body.toByteArray();
+            }
+        }
+    }
+
+    private static int indexOf(byte[] haystack, byte[] needle, int from) {
+        outer:
+        for (int i = from; i <= haystack.length - needle.length; i++) {
+            for (int j = 0; j < needle.length; j++) {
+                if (haystack[i + j] != needle[j]) {
+                    continue outer;
+                }
+            }
+            return i;
+        }
+        return -1;
+    }
+
+    /** The body of the raw HTTP response in {@code raw[from, to)}. */
+    private static byte[] bodyOf(byte[] raw, int from, int to) {
+        int start = indexOf(raw, "\r\n\r\n".getBytes(StandardCharsets.US_ASCII), from) + 4;
+        return java.util.Arrays.copyOfRange(raw, start, to);
     }
 
     private static Properties baseProps() {
