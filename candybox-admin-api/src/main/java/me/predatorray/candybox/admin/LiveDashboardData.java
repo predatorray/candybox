@@ -57,6 +57,12 @@ public final class LiveDashboardData implements DashboardData {
         this.client = client;
     }
 
+    /** Ready while the ZooKeeper session is connected. */
+    @Override
+    public boolean isReady() {
+        return coordination.isConnected();
+    }
+
     @Override
     public ClusterSnapshot cluster() {
         List<String> boxes = safeListBoxes();

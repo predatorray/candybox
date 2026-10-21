@@ -75,6 +75,7 @@ public final class ZooKeeperCoordinationService implements CoordinationService {
     private final Clock clock;
     private final boolean ownsClient;
     private final Map<Integer, PersistentNode> memberNodes = new HashMap<>();
+    private volatile boolean closed;
 
     /** Builds and owns a Curator client connected to {@code connectString}, unauthenticated. */
     public ZooKeeperCoordinationService(String connectString, Clock clock) {
@@ -394,7 +395,13 @@ public final class ZooKeeperCoordinationService implements CoordinationService {
     }
 
     @Override
+    public boolean isConnected() {
+        return !closed && client.getZookeeperClient().isConnected();
+    }
+
+    @Override
     public void close() {
+        closed = true;
         synchronized (this) {
             memberNodes.values().forEach(ZooKeeperCoordinationService::closeQuietly);
             memberNodes.clear();

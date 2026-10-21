@@ -90,8 +90,10 @@ public final class S3GatewayMain {
         gateway.start();
 
         AtomicBoolean ready = new AtomicBoolean(true);
-        GatewayHealthServer health = new GatewayHealthServer(config.healthPort(), ready::get,
-                security.metricsAuthToken());
+        GatewayReadiness cluster = new GatewayReadiness(coordination, SystemClock.INSTANCE,
+                GatewayReadiness.DEFAULT_TTL_MILLIS);
+        GatewayHealthServer health = new GatewayHealthServer(config.healthPort(),
+                () -> ready.get() && cluster.getAsBoolean(), security.metricsAuthToken());
         health.start();
 
         LOG.info("Candybox S3 gateway is up: S3 on {}, health on {}", gateway.port(), health.port());
@@ -101,6 +103,7 @@ public final class S3GatewayMain {
             LOG.info("Shutdown signal received; draining S3 gateway");
             ready.set(false);
             closeQuietly("health server", health);
+            closeQuietly("readiness", cluster);
             closeQuietly("S3 gateway", gateway);
             closeQuietly("candybox client", client);
             closeQuietly("coordination", coordination);

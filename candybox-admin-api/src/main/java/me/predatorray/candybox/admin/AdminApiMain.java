@@ -79,7 +79,7 @@ public final class AdminApiMain {
         SecurityConfig listenerSecurity = SecurityConfig.resolve(key -> java.util.Optional
                 .ofNullable(System.getenv("CANDYBOX_" + key.toUpperCase().replace('.', '_')))
                 .filter(v -> !v.isBlank()).map(String::trim));
-        AdminApiServer server = new AdminApiServer(config, () -> true, data, scraper, authToken,
+        AdminApiServer server = new AdminApiServer(config, data::isReady, data, scraper, authToken,
                 listenerSecurity.serverSslContext());
         if (authToken == null) {
             LOG.warn("CANDYBOX_ADMIN_AUTH_TOKEN is not set — the admin API (including box "

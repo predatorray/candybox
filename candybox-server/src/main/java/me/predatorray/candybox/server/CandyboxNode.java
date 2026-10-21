@@ -80,6 +80,7 @@ public final class CandyboxNode implements AutoCloseable {
     private final CoordinationService coordination;
     private final Clock clock;
     private final BoxAclStore aclStore;
+    private volatile boolean closed;
     private final AtomicLong pendingRelayBytes = new AtomicLong();
     private final AtomicLong lastRelayRecountMillis = new AtomicLong(Long.MIN_VALUE / 2);
     private volatile Authorizer authorizer = Authorizer.ALLOW_ALL;
@@ -184,6 +185,15 @@ public final class CandyboxNode implements AutoCloseable {
             t.setDaemon(true);
             return t;
         });
+    }
+
+    /**
+     * Readiness: not {@link #close}d (membership was registered at construction) and the
+     * coordination session is connected. Deliberately independent of partition ownership, since a
+     * fresh node owns none.
+     */
+    public boolean isReady() {
+        return !closed && coordination.isConnected();
     }
 
     public int nodeId() {
@@ -936,6 +946,7 @@ public final class CandyboxNode implements AutoCloseable {
 
     @Override
     public void close() {
+        closed = true;
         if (leaseHeartbeat != null) {
             leaseHeartbeat.shutdownNow();
         }

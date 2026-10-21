@@ -143,6 +143,22 @@ class ZooKeeperCoordinationServiceContractIT extends CoordinationServiceContract
     }
 
     @Test
+    void isConnectedFollowsTheServerGoingDownAndComingBack() throws Exception {
+        // A private server: stopping the shared one would disturb the other tests.
+        try (TestingServer server = new TestingServer(true);
+             ZooKeeperCoordinationService service = new ZooKeeperCoordinationService(
+                     server.getConnectString(), SystemClock.INSTANCE)) {
+            assertThat(service.isConnected()).isTrue();
+
+            server.stop();
+            await("the service reports disconnected", () -> !service.isConnected());
+
+            server.restart();
+            await("the service reports reconnected", service::isConnected);
+        }
+    }
+
+    @Test
     void crashedMemberDisappearsWithItsSession() throws Exception {
         String ns = "crash-" + NAMESPACE_SEQ.incrementAndGet();
         CuratorFramework crashing = newClient(ns);
