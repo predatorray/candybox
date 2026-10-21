@@ -291,8 +291,10 @@ authentication.
 
 ## Known limitations / deferred work
 
-- **Streaming on the wire (Phase 2.5):** large objects are buffered in a single frame (≤ 16 MiB);
-  chunked multi-frame PUT/GET is not yet implemented.
+- **Streaming on the wire (Phase 2.5):** a protocol PUT or GET carries the whole object in one
+  frame (≤ `max.frame.size.bytes`); a larger GET is refused unread with `LimitExceededException`.
+  The S3 gateway serves larger objects (created by multipart upload) by streaming frame-sized range
+  reads, and rejects single PUTs / parts over the frame with `EntityTooLarge`.
 - **Automatic failover needs the balancer:** with `balancerIntervalMillis = 0`, a crashed owner's
   partitions are served again only when some node calls `openPartition`/`openBox`.
 - **Fixed partition count per Box:** set at creation, no re-partitioning; ordered listings

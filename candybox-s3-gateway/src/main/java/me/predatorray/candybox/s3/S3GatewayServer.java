@@ -75,7 +75,10 @@ final class S3GatewayServer implements AutoCloseable {
     }
 
     void start() {
-        int maxContent = (int) Math.min(config.maxObjectBytes(), Integer.MAX_VALUE - 8L);
+        long maxBody = config.maxRequestBodyBytes();
+        // Headroom over the decoded body for aws-chunked framing (>= 1.1% at the 8 KiB minimum
+        // chunk) and small XML bodies.
+        int maxContent = (int) Math.min(maxBody + maxBody / 64 + (64 << 10), Integer.MAX_VALUE - 8L);
         boss = new NioEventLoopGroup(1);
         workers = new NioEventLoopGroup();
         blockingGroup = new DefaultEventExecutorGroup(config.workerThreads());
@@ -94,6 +97,7 @@ final class S3GatewayServer implements AutoCloseable {
                             ch.pipeline().addLast(new io.netty.handler.ssl.SslHandler(engine));
                         }
                         ch.pipeline().addLast(new HttpServerCodec());
+                        ch.pipeline().addLast(new S3BodyLimitHandler(maxBody));
                         ch.pipeline().addLast(new HttpObjectAggregator(maxContent));
                         // Run the (blocking) handler off the I/O event loop.
                         ch.pipeline().addLast(blockingGroup,

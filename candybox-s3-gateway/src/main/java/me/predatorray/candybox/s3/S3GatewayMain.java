@@ -71,7 +71,8 @@ public final class S3GatewayMain {
                 config.bindHost(), config.bindPort(), config.zookeeperConnect(), config.region(),
                 security.tlsEnabled(), security.clientUsername() != null);
 
-        Transport tcp = new TcpTransport(new FrameCodec(), security.clientSslContext(),
+        Transport tcp = new TcpTransport(new FrameCodec(config.maxFrameSizeBytes()),
+                security.clientSslContext(),
                 security.tlsVerifyEndpoint());
         Transport transport = security.clientUsername() == null ? tcp
                 : new AuthenticatingTransport(tcp, security.clientMechanism(),
