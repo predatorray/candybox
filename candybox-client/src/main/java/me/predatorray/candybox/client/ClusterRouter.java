@@ -30,6 +30,7 @@ import me.predatorray.candybox.coordination.LeaseInfo;
 import me.predatorray.candybox.protocol.Frame;
 import me.predatorray.candybox.protocol.Message;
 import me.predatorray.candybox.protocol.MessageCodec;
+import me.predatorray.candybox.protocol.ProtocolException;
 import me.predatorray.candybox.protocol.transport.Connection;
 import me.predatorray.candybox.protocol.transport.Transport;
 
@@ -37,8 +38,9 @@ import me.predatorray.candybox.protocol.transport.Transport;
  * A cluster-aware {@link Router}: it resolves a (Box, partition) to its owning node via the
  * per-partition coordination lease, maps the owner's node id to its advertised {@code host:port} via
  * membership, connects there, and re-routes on a {@code MOVED} response (using the named owner). A
- * partition with no owner (no lease holder, or an {@code UNAVAILABLE} answer) is a handover gap: it
- * is re-resolved with exponential backoff for up to {@code unownedRetryMillis}, then fails with
+ * partition without a reachable owner (no lease holder, a holder that is no longer a member or
+ * refuses connections, or an {@code UNAVAILABLE} answer) is a handover gap: it is re-resolved with
+ * exponential backoff for up to {@code unownedRetryMillis}, then fails with
  * {@link NotOwnerException}.
  * Partition→address resolutions are cached with a TTL and invalidated on redirect; one connection is
  * kept per node address. Requests that any node can serve rotate across members and fail over to the
@@ -47,6 +49,7 @@ import me.predatorray.candybox.protocol.transport.Transport;
 final class ClusterRouter implements Router {
 
     private static final int MAX_ATTEMPTS = 4;
+    /** First client-side backoff; a larger {@code UNAVAILABLE} retry hint from the server wins. */
     private static final long INITIAL_BACKOFF_MILLIS = 50;
     private static final long MAX_BACKOFF_MILLIS = 1_000;
 
@@ -89,21 +92,38 @@ final class ClusterRouter implements Router {
         long deadline = clock.currentTimeMillis() + unownedRetryMillis;
         long backoff = INITIAL_BACKOFF_MILLIS;
         while (true) {
-            NodeAddress address = resolveOwner(box, partition, cacheKey);
+            Route route = resolveOwner(box, partition, cacheKey);
+            String gap = route.gap();
+            RuntimeException connectFailure = null;
+            boolean unavailableAnswer = false;
             long retryAfter = 0;
-            if (address != null) {
-                Message response = sendFollowingMoves(box, partition, cacheKey, address, request);
-                if (!(response instanceof Message.UnavailableResponse unavailable)) {
-                    return response;
+            if (route.address() != null) {
+                // Connecting sends nothing, so a refused connection (e.g. a crashed owner whose lease
+                // has not lapsed yet) is safe to retry even for writes.
+                connectFailure = tryConnect(route.address());
+                if (connectFailure == null) {
+                    Message response = sendFollowingMoves(box, partition, cacheKey, route.address(),
+                            request);
+                    if (!(response instanceof Message.UnavailableResponse unavailable)) {
+                        return response;
+                    }
+                    unavailableAnswer = true; // the node checked the Box still exists
+                    retryAfter = unavailable.retryAfterMillis();
+                    gap = "has no current owner";
+                } else {
+                    gap = "owner at " + route.address().key() + " is unreachable";
                 }
                 partitionCache.invalidate(cacheKey);
-                retryAfter = unavailable.retryAfterMillis();
             }
             long remaining = deadline - clock.currentTimeMillis();
             // A deleted Box has no owner either; don't wait out the budget for it.
-            if (remaining <= 0 || (address == null && !boxExists(box))) {
-                throw new NotOwnerException("box " + box + " partition " + partition
-                        + " has no current owner");
+            if (remaining <= 0 || (!unavailableAnswer && !boxExists(box))) {
+                NotOwnerException failure = new NotOwnerException("box " + box + " partition "
+                        + partition + " " + gap);
+                if (connectFailure != null) {
+                    failure.addSuppressed(connectFailure);
+                }
+                throw failure;
             }
             try {
                 sleeper.sleep(Math.min(Math.max(backoff, retryAfter), remaining));
@@ -158,20 +178,35 @@ final class ClusterRouter implements Router {
         return coordination.get(CandyboxKeys.boxMetaKey(box)).isPresent();
     }
 
-    /** The partition owner's address, or {@code null} if no node holds its lease. */
-    private NodeAddress resolveOwner(String box, int partition, String cacheKey) {
+    /** The partition owner's address, or why there is none right now. */
+    private Route resolveOwner(String box, int partition, String cacheKey) {
         NodeAddress cached = partitionCache.getIfFresh(cacheKey).orElse(null);
         if (cached != null) {
-            return cached;
+            return new Route(cached, null);
         }
         LeaseInfo holder = coordination.leaseHolder(CandyboxKeys.ownerResource(box, partition))
                 .orElse(null);
         if (holder == null) {
-            return null;
+            return new Route(null, "has no current owner");
         }
-        NodeAddress address = addressOfNode(holder.ownerNodeId());
+        byte[] info = coordination.memberInfo(holder.ownerNodeId()).orElse(null);
+        if (info == null) {
+            // The holder's session is gone (it crashed) but its lease has not lapsed yet.
+            return new Route(null, "owner node " + holder.ownerNodeId() + " is not registered");
+        }
+        NodeAddress address = NodeAddress.parse(new String(info, StandardCharsets.UTF_8));
         partitionCache.put(cacheKey, address);
-        return address;
+        return new Route(address, null);
+    }
+
+    /** Opens (or reuses) a pooled connection; returns the failure if the node refuses it. */
+    private RuntimeException tryConnect(NodeAddress address) {
+        try {
+            acquireConnection(address);
+            return null;
+        } catch (ProtocolException e) {
+            return e;
+        }
     }
 
     private NodeAddress addressOfNode(int nodeId) {
@@ -236,6 +271,9 @@ final class ClusterRouter implements Router {
             }
         }
         connections.clear();
+    }
+
+    private record Route(NodeAddress address, String gap) {
     }
 
     private record NodeAddress(String host, int port) {

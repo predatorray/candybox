@@ -32,6 +32,7 @@ import me.predatorray.candybox.coordination.fake.InMemoryCoordinationService;
 import me.predatorray.candybox.protocol.Frame;
 import me.predatorray.candybox.protocol.Message;
 import me.predatorray.candybox.protocol.MessageCodec;
+import me.predatorray.candybox.protocol.ProtocolException;
 import me.predatorray.candybox.protocol.transport.Connection;
 import me.predatorray.candybox.protocol.transport.Transport;
 import org.junit.jupiter.api.Test;
@@ -394,8 +395,126 @@ class ClusterRouterTest {
         try (ClusterRouter router = new ClusterRouter(transport, coordination, 5_000, clock, 15_000,
                 advancing(clock, sleeps, () -> { }))) {
             assertThatThrownBy(() -> router.callPartition("gone", 0, new Message.GetCandyRequest("gone", "k")))
-                    .isInstanceOf(NotOwnerException.class);
+                    .isInstanceOf(NotOwnerException.class)
+                    .hasMessageContaining("has no current owner");
             assertThat(sleeps).isEmpty();
+            assertThat(transport.contacted).isEmpty();
+        }
+    }
+
+    /** Answers every call from {@code responses} in turn (the last one repeats), recording ports. */
+    private static final class ScriptedTransport implements Transport {
+        final List<Integer> contacted = Collections.synchronizedList(new ArrayList<>());
+        final List<Integer> refusedPorts = new ArrayList<>();
+        private final List<Message> responses;
+        private int next;
+
+        ScriptedTransport(Message... responses) {
+            this.responses = List.of(responses);
+        }
+
+        @Override
+        public Connection connect(String host, int port) {
+            if (refusedPorts.contains(port)) {
+                throw new ProtocolException("Failed to connect to " + host + ":" + port);
+            }
+            return new Connection() {
+                @Override
+                public Frame call(Frame request) {
+                    contacted.add(port);
+                    Message response = responses.get(Math.min(next++, responses.size() - 1));
+                    return CODEC.encode(response);
+                }
+
+                @Override
+                public void close() {
+                }
+            };
+        }
+
+        @Override
+        public void close() {
+        }
+    }
+
+    @Test
+    void followsMovedToARecoveringOwnerThatIsBrieflyUnavailable() {
+        ManualClock clock = new ManualClock(1_000);
+        InMemoryCoordinationService coordination = coordinationWithMembers();
+        coordination.tryAcquireLease(CandyboxKeys.ownerResource("b", 0), 1, 60_000);
+        ScriptedTransport transport = new ScriptedTransport(new Message.MovedResponse(2),
+                new Message.UnavailableResponse(200), new Message.OkResponse());
+        List<Long> sleeps = new ArrayList<>();
+        try (ClusterRouter router = new ClusterRouter(transport, coordination, 5_000, clock, 15_000,
+                advancing(clock, sleeps, () -> { }))) {
+            Message resp = router.callPartition("b", 0, new Message.GetCandyRequest("b", "k"));
+            assertThat(resp).isInstanceOf(Message.OkResponse.class);
+            // The stale lease still names node 1 after the retry; it re-routes to node 2 again.
+            assertThat(transport.contacted).containsExactly(1001, 2002, 1001);
+            assertThat(sleeps).containsExactly(200L);
+        }
+    }
+
+    @Test
+    void waitsOutALeaseHeldByAnUnregisteredOwner() {
+        ManualClock clock = new ManualClock(1_000);
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        coordination.registerMember(2, "127.0.0.1:2002".getBytes(StandardCharsets.UTF_8));
+        coordination.create(CandyboxKeys.boxMetaKey("b"), new byte[0]);
+        // Node 1 crashed: its member entry is gone but its lease runs for another second.
+        coordination.tryAcquireLease(CandyboxKeys.ownerResource("b", 0), 1, 1_000);
+        RecordingTransport transport = new RecordingTransport();
+        List<Long> sleeps = new ArrayList<>();
+        Runnable takeOverOnceLapsed = () -> coordination.tryAcquireLease(
+                CandyboxKeys.ownerResource("b", 0), 2, 10_000);
+        try (ClusterRouter router = new ClusterRouter(transport, coordination, 5_000, clock, 15_000,
+                advancing(clock, sleeps, takeOverOnceLapsed))) {
+            Message resp = router.callPartition("b", 0, new Message.GetCandyRequest("b", "k"));
+            assertThat(resp).isInstanceOf(Message.OkResponse.class);
+            assertThat(transport.contacted).containsExactly(2002);
+            assertThat(sleeps.stream().mapToLong(Long::longValue).sum()).isGreaterThanOrEqualTo(1_000);
+        }
+    }
+
+    @Test
+    void retriesARefusedConnectionToACrashedOwnerUntilTheNewOwnerTakesOver() {
+        ManualClock clock = new ManualClock(1_000);
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        coordination.registerMember(1, "127.0.0.1:1001".getBytes(StandardCharsets.UTF_8));
+        coordination.registerMember(2, "127.0.0.1:2002".getBytes(StandardCharsets.UTF_8));
+        coordination.create(CandyboxKeys.boxMetaKey("b"), new byte[0]);
+        coordination.tryAcquireLease(CandyboxKeys.ownerResource("b", 0), 1, 1_000);
+        ScriptedTransport transport = new ScriptedTransport(new Message.OkResponse());
+        transport.refusedPorts.add(1001); // node 1 is down but still holds its lease
+        List<Long> sleeps = new ArrayList<>();
+        Runnable takeOverOnceLapsed = () -> coordination.tryAcquireLease(
+                CandyboxKeys.ownerResource("b", 0), 2, 10_000);
+        try (ClusterRouter router = new ClusterRouter(transport, coordination, 5_000, clock, 15_000,
+                advancing(clock, sleeps, takeOverOnceLapsed))) {
+            Message resp = router.callPartition("b", 0, new Message.PutCandyRequest(
+                    "b", "k", null, java.util.Map.of(), null, new byte[] {1}));
+            assertThat(resp).isInstanceOf(Message.OkResponse.class);
+            assertThat(transport.contacted).containsExactly(2002); // the write was sent once
+        }
+    }
+
+    @Test
+    void anOwnerThatStaysUnreachableFailsWithNotOwnerCarryingTheConnectError() {
+        ManualClock clock = new ManualClock(1_000);
+        InMemoryCoordinationService coordination = coordinationWithMembers();
+        coordination.create(CandyboxKeys.boxMetaKey("b"), new byte[0]);
+        coordination.tryAcquireLease(CandyboxKeys.ownerResource("b", 0), 1, 60_000);
+        ScriptedTransport transport = new ScriptedTransport(new Message.OkResponse());
+        transport.refusedPorts.add(1001);
+        List<Long> sleeps = new ArrayList<>();
+        try (ClusterRouter router = new ClusterRouter(transport, coordination, 5_000, clock, 2_000,
+                advancing(clock, sleeps, () -> { }))) {
+            assertThatThrownBy(() -> router.callPartition("b", 0, new Message.GetCandyRequest("b", "k")))
+                    .isInstanceOf(NotOwnerException.class)
+                    .hasMessageContaining("unreachable")
+                    .satisfies(e -> assertThat(e.getSuppressed())
+                            .hasAtLeastOneElementOfType(ProtocolException.class));
+            assertThat(sleeps.stream().mapToLong(Long::longValue).sum()).isEqualTo(2_000);
         }
     }
 }
