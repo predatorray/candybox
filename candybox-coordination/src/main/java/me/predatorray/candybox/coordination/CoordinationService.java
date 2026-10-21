@@ -115,6 +115,14 @@ public interface CoordinationService extends AutoCloseable {
      */
     Optional<byte[]> memberInfo(int nodeId);
 
+    // ---- health -----------------------------------------------------------------------------
+
+    /**
+     * Whether the coordination session is currently connected, from locally cached client state (no
+     * round trip), so it is cheap enough for frequent readiness probes. False once {@link #close}d.
+     */
+    boolean isConnected();
+
     @Override
     void close();
 }

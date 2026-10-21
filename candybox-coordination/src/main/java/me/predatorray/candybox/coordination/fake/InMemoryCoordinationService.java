@@ -52,6 +52,7 @@ public final class InMemoryCoordinationService implements CoordinationService {
     private final ConcurrentMap<String, byte[]> members = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, Entry> kv = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, LeaseState> leases = new ConcurrentHashMap<>();
+    private volatile boolean connected = true;
 
     public InMemoryCoordinationService() {
         this(SystemClock.INSTANCE);
@@ -189,8 +190,18 @@ public final class InMemoryCoordinationService implements CoordinationService {
     }
 
     @Override
+    public boolean isConnected() {
+        return connected;
+    }
+
+    /** Test hook: simulates the coordination session disconnecting ({@code false}) or reconnecting. */
+    public void setConnected(boolean connected) {
+        this.connected = connected;
+    }
+
+    @Override
     public void close() {
-        // No resources to release in the fake.
+        connected = false;
     }
 
     private boolean isCurrentAndLive(LeaseState st) {

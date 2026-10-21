@@ -32,8 +32,8 @@ import org.slf4j.LoggerFactory;
  *
  * <ul>
  *   <li>{@code GET /healthz} — liveness; {@code 200} while the JVM is up.</li>
- *   <li>{@code GET /readyz} — readiness; {@code 200} when the supplied predicate is true (bound and the
- *       cluster client is usable), else {@code 503}.</li>
+ *   <li>{@code GET /readyz} — readiness; {@code 200} when the supplied predicate is true (see
+ *       {@link GatewayReadiness}), else {@code 503}.</li>
  *   <li>{@code GET /metrics} — minimal Prometheus exposition.</li>
  * </ul>
  */

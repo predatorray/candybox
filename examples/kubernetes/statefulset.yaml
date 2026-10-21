@@ -16,6 +16,8 @@ metadata:
     app: candybox
 spec:
   clusterIP: None          # headless: gives each pod a stable DNS A record
+  # Nodes advertise these names into membership, so they must resolve even while /readyz is 503.
+  publishNotReadyAddresses: true
   selector:
     app: candybox
   ports:
