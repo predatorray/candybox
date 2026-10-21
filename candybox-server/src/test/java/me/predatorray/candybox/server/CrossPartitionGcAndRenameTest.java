@@ -422,6 +422,11 @@ class CrossPartitionGcAndRenameTest {
         }
 
         @Override
+        public boolean isConnected() {
+            return delegate.isConnected();
+        }
+
+        @Override
         public void close() {
             delegate.close();
         }

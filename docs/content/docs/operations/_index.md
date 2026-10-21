@@ -35,6 +35,9 @@ for the full rules.
 
 Each node exposes an HTTP endpoint (default port `9710`) with `/healthz`, `/readyz`, and `/metrics`.
 Wire `/healthz` and `/readyz` to your liveness/readiness probes and scrape `/metrics`.
+`/healthz` is pure liveness. `/readyz` returns 503 while the ZooKeeper session is disconnected (on the
+S3 gateway, also while no node is registered), so a ZooKeeper blip takes a pod out of rotation
+without restarting it. The S3 gateway and the admin API serve the same pair.
 
 ### Admin / dashboard API
 
@@ -59,7 +62,9 @@ A `StatefulSet` + headless `Service` manifest lives under
 [`examples/kubernetes/`](https://github.com/predatorray/candybox/tree/main/examples/kubernetes) (also
 bundled into the distribution tarball under `examples/`). The StatefulSet gives each pod a stable
 identity, so `node.id` and the advertised address derive automatically from the pod name, and
-liveness/readiness probes hit the health endpoint.
+liveness/readiness probes hit the health endpoint. Nodes advertise their headless-Service DNS names
+into membership, so that Service sets `publishNotReadyAddresses: true`: those names must keep
+resolving while `/readyz` is 503.
 
 For a self-contained local cluster (ZooKeeper + bookies + nodes), use the
 [`docker-compose.yml`](https://github.com/predatorray/candybox/blob/main/docker-compose.yml) described

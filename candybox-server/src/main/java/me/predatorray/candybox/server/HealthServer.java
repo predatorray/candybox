@@ -34,8 +34,8 @@ import org.slf4j.LoggerFactory;
  *
  * <ul>
  *   <li>{@code GET /healthz} — process liveness; always {@code 200} while the JVM is up.</li>
- *   <li>{@code GET /readyz} — readiness; {@code 200} when the supplied predicate is true (TCP bound
- *       and membership registered), else {@code 503}. Wire this to a Kubernetes readiness probe.</li>
+ *   <li>{@code GET /readyz} — readiness; {@code 200} when the supplied predicate is true (see
+ *       {@link CandyboxNode#isReady()}), else {@code 503}. Wire this to a Kubernetes readiness probe.</li>
  *   <li>{@code GET /metrics} — Prometheus text exposition of {@link BoxEngineStats} counters, one
  *       series per owned Box (a {@code box} label) plus a {@code node} label.</li>
  * </ul>

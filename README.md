@@ -141,7 +141,7 @@ environment value wins. The most common keys:
 | `zookeeper.connect` | ZooKeeper connect string. | `127.0.0.1:2181` |
 | `server.bind` | Address clients connect to. | `0.0.0.0:9709` |
 | `server.advertised` | Address published to the cluster for routing. | bind address |
-| `health.port` | HTTP port for `/healthz`, `/readyz`, `/metrics`. | `9710` |
+| `health.port` | HTTP port for `/healthz` (liveness), `/readyz` (503 while ZooKeeper is unreachable), `/metrics`. | `9710` |
 
 The full list is in the [configuration reference](https://www.predatorray.me/candybox/docs/reference/configuration/).
 
