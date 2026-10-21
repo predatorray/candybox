@@ -298,6 +298,10 @@ public final class S3GatewayConfig {
         }
 
         S3GatewayConfig build() {
+            if (maxFrameSizeBytes <= Message.INLINE_DATA_OVERHEAD_BYTES) {
+                throw new IllegalArgumentException("max.frame.size.bytes must exceed "
+                        + Message.INLINE_DATA_OVERHEAD_BYTES + " (the per-frame metadata reserve)");
+            }
             return new S3GatewayConfig(this);
         }
     }

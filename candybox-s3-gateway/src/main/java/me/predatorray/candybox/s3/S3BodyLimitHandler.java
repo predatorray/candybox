@@ -16,6 +16,7 @@
 package me.predatorray.candybox.s3;
 
 import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
@@ -26,7 +27,9 @@ import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpHeaderValues;
 import io.netty.handler.codec.http.HttpRequest;
 import io.netty.handler.codec.http.HttpResponseStatus;
+import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
+import io.netty.handler.codec.http.LastHttpContent;
 import io.netty.handler.codec.http.QueryStringDecoder;
 import io.netty.util.ReferenceCountUtil;
 import java.nio.charset.StandardCharsets;
@@ -35,8 +38,9 @@ import java.util.UUID;
 /**
  * Sits ahead of the {@code HttpObjectAggregator} and rejects a request whose declared body (the
  * {@code x-amz-decoded-content-length} of an aws-chunked upload, else {@code Content-Length}) is
- * over {@code limit}, before any of it is buffered. The connection is closed after the error, and
- * the rest of the body is discarded.
+ * over {@code limit}, before any of it is buffered. The rest of the body is drained and dropped and the
+ * connection closed at its end, so a client still sending it reads the error rather than a reset; a
+ * client waiting on {@code Expect: 100-continue} sends no body, so its connection closes at once.
  */
 final class S3BodyLimitHandler extends ChannelInboundHandlerAdapter {
 
@@ -52,13 +56,21 @@ final class S3BodyLimitHandler extends ChannelInboundHandlerAdapter {
         if (msg instanceof HttpRequest request) {
             long declared = declaredLength(request);
             if (declared > limit) {
-                discarding = true;
                 ReferenceCountUtil.release(msg);
-                reject(ctx, request, declared);
+                ChannelFuture sent = reject(ctx, request, declared);
+                if (HttpUtil.is100ContinueExpected(request)) {
+                    sent.addListener(ChannelFutureListener.CLOSE);
+                } else {
+                    discarding = true;
+                }
                 return;
             }
         } else if (discarding && msg instanceof HttpContent) {
+            boolean end = msg instanceof LastHttpContent;
             ReferenceCountUtil.release(msg);
+            if (end) {
+                ctx.close();
+            }
             return;
         }
         ctx.fireChannelRead(msg);
@@ -77,7 +89,7 @@ final class S3BodyLimitHandler extends ChannelInboundHandlerAdapter {
         }
     }
 
-    private void reject(ChannelHandlerContext ctx, HttpRequest request, long declared) {
+    private ChannelFuture reject(ChannelHandlerContext ctx, HttpRequest request, long declared) {
         String requestId = UUID.randomUUID().toString();
         String resource = new QueryStringDecoder(request.uri()).rawPath();
         String message = "Request body of " + declared + " bytes exceeds the maximum of " + limit
@@ -91,6 +103,6 @@ final class S3BodyLimitHandler extends ChannelInboundHandlerAdapter {
         r.headers().set(HttpHeaderNames.CONNECTION, HttpHeaderValues.CLOSE);
         r.headers().set("x-amz-request-id", requestId);
         r.headers().set(HttpHeaderNames.SERVER, "Candybox");
-        ctx.writeAndFlush(r).addListener(ChannelFutureListener.CLOSE);
+        return ctx.writeAndFlush(r);
     }
 }

@@ -350,9 +350,10 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
      * multi-range is {@link S3ErrorCode#NOT_IMPLEMENTED}.
      *
      * <p>Headers come from one HEAD; the body is read as range slices of at most
-     * {@link #streamChunkBytes} (one node frame), each checked against that HEAD's ETag and length.
-     * A window that needs several slices is streamed; if the object changes mid-stream the
-     * connection is closed rather than return mixed content.
+     * {@link #streamChunkBytes} (one node frame), each checked against that HEAD's ETag (CRC32C)
+     * and length. A window that needs several slices is streamed; if the content changes mid-stream
+     * the connection is closed rather than return mixed bytes. The check is content-based: an
+     * overwrite with identical bytes but new metadata is served with the HEAD's (older) headers.
      */
     private void getObject(ChannelHandlerContext ctx, FullHttpRequest request, PathParts parts,
                            String requestId) {
@@ -418,30 +419,60 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
         head.headers().set(HttpHeaderNames.CONNECTION,
                 keepAlive ? HttpHeaderValues.KEEP_ALIVE : HttpHeaderValues.CLOSE);
         ctx.write(head);
-        // At most one slice in flight on the socket while the next one is fetched. The promise is
-        // bound to the I/O loop: one from ctx would belong to this (blocking) executor and could
-        // not be awaited here.
-        ChannelFuture pending = ctx.writeAndFlush(
-                new DefaultHttpContent(Unpooled.wrappedBuffer(firstSlice)), ctx.channel().newPromise());
-        for (long offset = first + firstSlice.length; offset <= last; offset += chunk) {
-            byte[] slice;
-            try {
-                slice = readSlice(parts, offset, Math.min(last, offset + chunk - 1), info);
-            } catch (RuntimeException e) {
-                LOG.warn("Aborting GET {}/{} at byte {} of {} (req {}): {}", parts.bucket(), parts.key(),
-                        offset - first, length, requestId, e.toString());
-                ctx.close();
-                return;
-            }
-            if (!pending.awaitUninterruptibly().isSuccess()) {
+        ChannelFuture written = ctx.writeAndFlush(new DefaultHttpContent(Unpooled.wrappedBuffer(firstSlice)));
+        long offset = first + firstSlice.length;
+        byte[] next = readSliceOrAbort(ctx, parts, offset, last, chunk, info, requestId);
+        if (next != null) {
+            streamAfter(ctx, written, parts, info, next, offset, last, chunk, keepAlive, requestId);
+        }
+    }
+
+    /**
+     * Once {@code pending} is on the wire, writes {@code slice} (at {@code offset}) and fetches the
+     * one after it while that write is in flight; the end of the window writes the last content.
+     * Each step runs as its own task on this handler's executor, so a client that reads slowly or
+     * not at all holds at most two slices of memory, never a worker thread.
+     */
+    private void streamAfter(ChannelHandlerContext ctx, ChannelFuture pending, PathParts parts,
+                             CandyInfo info, byte[] slice, long offset, long last, int chunk,
+                             boolean keepAlive, String requestId) {
+        pending.addListener(f -> ctx.executor().execute(() -> {
+            if (!f.isSuccess()) {
                 return; // the client went away
             }
-            pending = ctx.writeAndFlush(new DefaultHttpContent(Unpooled.wrappedBuffer(slice)),
-                    ctx.channel().newPromise());
+            if (offset > last) {
+                ChannelFuture done = ctx.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT);
+                if (!keepAlive) {
+                    done.addListener(ChannelFutureListener.CLOSE);
+                }
+                return;
+            }
+            ChannelFuture written = ctx.writeAndFlush(new DefaultHttpContent(Unpooled.wrappedBuffer(slice)));
+            long nextOffset = offset + slice.length;
+            byte[] next = readSliceOrAbort(ctx, parts, nextOffset, last, chunk, info, requestId);
+            if (next != null) {
+                streamAfter(ctx, written, parts, info, next, nextOffset, last, chunk, keepAlive,
+                        requestId);
+            }
+        }));
+    }
+
+    /**
+     * The slice starting at {@code offset} (empty past the window's end), or {@code null} after
+     * closing the connection because it could not be read as the version already promised.
+     */
+    private byte[] readSliceOrAbort(ChannelHandlerContext ctx, PathParts parts, long offset, long last,
+                                    int chunk, CandyInfo info, String requestId) {
+        if (offset > last) {
+            return new byte[0];
         }
-        ChannelFuture done = ctx.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT);
-        if (!keepAlive) {
-            done.addListener(ChannelFutureListener.CLOSE);
+        try {
+            return readSlice(parts, offset, Math.min(last, offset + chunk - 1), info);
+        } catch (RuntimeException e) {
+            LOG.warn("Aborting GET {}/{} at byte {} (req {}): {}", parts.bucket(), parts.key(), offset,
+                    requestId, e.toString());
+            ctx.close();
+            return null;
         }
     }
 
@@ -457,6 +488,11 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
             S3ErrorCode code = ErrorMapper.toS3(e).error();
             if (code == S3ErrorCode.NO_SUCH_KEY || code == S3ErrorCode.INVALID_RANGE) {
                 throw new ObjectChangedException(); // deleted, or shrank below the window
+            }
+            if (code == S3ErrorCode.ENTITY_TOO_LARGE) {
+                throw new S3Exception(S3ErrorCode.INTERNAL_ERROR, "A node refused a "
+                        + (last - first + 1) + "-byte slice; the gateway's max.frame.size.bytes ("
+                        + config.maxFrameSizeBytes() + ") must not exceed the nodes'", e);
             }
             throw e;
         }

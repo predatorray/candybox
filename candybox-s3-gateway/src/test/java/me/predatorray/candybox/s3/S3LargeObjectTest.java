@@ -16,20 +16,28 @@
 package me.predatorray.candybox.s3;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelOutboundHandlerAdapter;
+import io.netty.channel.ChannelPromise;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.handler.codec.http.DefaultFullHttpRequest;
+import io.netty.handler.codec.http.DefaultHttpContent;
 import io.netty.handler.codec.http.DefaultHttpRequest;
+import io.netty.handler.codec.http.DefaultLastHttpContent;
 import io.netty.handler.codec.http.FullHttpResponse;
 import io.netty.handler.codec.http.HttpContent;
 import io.netty.handler.codec.http.HttpHeaderNames;
+import io.netty.handler.codec.http.HttpHeaderValues;
 import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpRequest;
 import io.netty.handler.codec.http.HttpResponse;
 import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.LastHttpContent;
+import io.netty.util.ReferenceCountUtil;
 import java.io.ByteArrayOutputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -129,12 +137,54 @@ class S3LargeObjectTest {
         put.headers().set(HttpHeaderNames.CONTENT_LENGTH, INLINE + 1);
         ch.writeInbound(put);
 
-        assertThat((Object) ch.readInbound()).isNull();
         FullHttpResponse r = ch.readOutbound();
         assertThat(r.status().code()).isEqualTo(400);
         assertThat(r.content().toString(StandardCharsets.UTF_8)).contains("<Code>EntityTooLarge</Code>");
         r.release();
+        // The body still in flight is dropped, and the connection closes once it has all arrived.
+        HttpContent part = new DefaultHttpContent(Unpooled.wrappedBuffer(new byte[INLINE]));
+        ch.writeInbound(part);
+        assertThat(part.refCnt()).isZero();
+        assertThat(ch.isOpen()).isTrue();
+        ch.writeInbound(new DefaultLastHttpContent(Unpooled.wrappedBuffer(new byte[1])));
+        assertThat((Object) ch.readInbound()).isNull();
         assertThat(ch.isOpen()).isFalse();
+    }
+
+    @Test
+    void oversizedPutAwaitingContinueIsClosedAtOnce() {
+        EmbeddedChannel ch = new EmbeddedChannel(new S3BodyLimitHandler(INLINE));
+        HttpRequest put = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.PUT, "/big/huge");
+        put.headers().set(HttpHeaderNames.CONTENT_LENGTH, INLINE + 1);
+        put.headers().set(HttpHeaderNames.EXPECT, HttpHeaderValues.CONTINUE);
+        ch.writeInbound(put);
+        FullHttpResponse r = ch.readOutbound();
+        assertThat(r.status().code()).isEqualTo(400);
+        r.release();
+        assertThat(ch.isOpen()).isFalse();
+    }
+
+    @Test
+    void clientThatStopsReadingHoldsNoWorkerAndAtMostTwoSlices() {
+        S3GatewayConfig config = S3GatewayConfig.fromProperties(baseProps(), Map.of());
+        // Swallows every body write without completing it, like a socket whose peer stopped reading.
+        EmbeddedChannel ch = new EmbeddedChannel(new ChannelOutboundHandlerAdapter() {
+            @Override
+            public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
+                if (msg instanceof HttpContent) {
+                    ReferenceCountUtil.release(msg);
+                } else {
+                    ctx.write(msg, promise);
+                }
+            }
+        }, new S3Handler(store, config));
+        ch.writeInbound(new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/big/obj",
+                Unpooled.EMPTY_BUFFER)); // returns: the handler is not parked on the stalled write
+        ch.runPendingTasks();
+        HttpResponse head = ch.readOutbound();
+        assertThat(head.status().code()).isEqualTo(200);
+        assertThat(store.rangeReads).isEqualTo(2); // the slice being written plus one prefetched
+        ch.finishAndReleaseAll();
     }
 
     @Test
@@ -185,6 +235,15 @@ class S3LargeObjectTest {
         }
     }
 
+    @Test
+    void frameCapMustLeaveRoomForData() {
+        Properties p = baseProps();
+        p.setProperty("max.frame.size.bytes", Integer.toString(Message.INLINE_DATA_OVERHEAD_BYTES));
+        assertThatThrownBy(() -> S3GatewayConfig.fromProperties(p, Map.of()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("max.frame.size.bytes");
+    }
+
     private static Properties baseProps() {
         Properties p = new Properties();
         p.setProperty("zookeeper.connect", "unused:2181");
@@ -203,6 +262,7 @@ class S3LargeObjectTest {
             req.headers().set(HttpHeaderNames.RANGE, range);
         }
         ch.writeInbound(req);
+        ch.runPendingTasks();
         HttpResponse head = ch.readOutbound();
         ByteArrayOutputStream body = new ByteArrayOutputStream();
         boolean complete = head instanceof FullHttpResponse;
