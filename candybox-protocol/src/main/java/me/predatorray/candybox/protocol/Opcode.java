@@ -72,6 +72,11 @@ public enum Opcode {
     /** The target Box is owned by another node; the client should re-route (see routing, WS5). */
     RESPONSE_MOVED(27),
     RESPONSE_BOX_LIST(28),
+    /**
+     * The partition exists but no node currently serves it (an ownership handover gap). Retriable,
+     * unlike {@link #RESPONSE_NOT_FOUND}.
+     */
+    RESPONSE_UNAVAILABLE(29),
     RESPONSE_CREATE_MULTIPART(40),
     RESPONSE_UPLOAD_PART(41),
     RESPONSE_LIST_MULTIPART_UPLOADS(42),

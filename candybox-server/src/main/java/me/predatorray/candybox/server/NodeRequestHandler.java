@@ -66,6 +66,9 @@ final class NodeRequestHandler implements RequestHandler {
 
     private static final Logger LOG = LoggerFactory.getLogger(NodeRequestHandler.class);
 
+    /** Retry hint for a request that lands in a partition's ownership handover gap. */
+    private static final long UNOWNED_RETRY_AFTER_MILLIS = 200;
+
     /** Relay tokens are server-minted UUIDs; anything else never names a relay key. */
     private static final Pattern RELAY_TOKEN =
             Pattern.compile("[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}");
@@ -106,7 +109,7 @@ final class NodeRequestHandler implements RequestHandler {
         } catch (CandyNotFoundException e) {
             return codec.encode(new Message.NotFoundResponse());
         } catch (NotOwnerException | BoxNotFoundException e) {
-            // We don't own this partition. If another node does, tell the client to re-route.
+            // We don't own this partition: re-route, retry later, or the Box is gone.
             return codec.encode(movedOrNotFound(message, e));
         } catch (CandyboxException e) {
             return codec.encode(new Message.ErrorResponse(e.getClass().getSimpleName(), safe(e.getMessage())));
@@ -194,7 +197,10 @@ final class NodeRequestHandler implements RequestHandler {
             if (owner.isPresent() && owner.get() != node.nodeId()) {
                 return new Message.MovedResponse(owner.get());
             }
-            return new Message.NotFoundResponse();
+            // No one else serves it. Only a missing Box is NOT_FOUND; otherwise it is a handover gap.
+            return node.boxExists(BoxName.of(box))
+                    ? new Message.UnavailableResponse(UNOWNED_RETRY_AFTER_MILLIS)
+                    : new Message.NotFoundResponse();
         }
         if (cause instanceof NotOwnerException) {
             // A Box-level request (e.g. deleteBox) that needs partitions another node still owns.
