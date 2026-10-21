@@ -15,6 +15,7 @@
  */
 package me.predatorray.candybox.client;
 
+import java.io.IOException;
 import java.net.ConnectException;
 import java.net.NoRouteToHostException;
 import java.net.SocketTimeoutException;
@@ -133,7 +134,7 @@ final class ClusterRouter implements Router {
     /**
      * Sends to the partition's owner, following {@code MOVED}. Throws {@link OwnerGap} when the owner
      * (or a redirect target) is unregistered or refuses connections: nothing was sent, so it is safe
-     * to retry. A failure mid-call is not retried (a write may have applied) but surfaces as a
+     * to retry. An I/O failure mid-call is not retried (a write may have applied) but surfaces as a
      * retriable {@link NotOwnerException}.
      */
     private Message sendToOwner(String box, int partition, String cacheKey, Message request) {
@@ -144,6 +145,9 @@ final class ClusterRouter implements Router {
             try {
                 response = send(address, request);
             } catch (ProtocolException e) {
+                if (!(e.getCause() instanceof IOException)) {
+                    throw e; // a frame-limit or decode error is not an ownership problem
+                }
                 partitionCache.invalidate(cacheKey);
                 NotOwnerException failure = new NotOwnerException("box " + box + " partition "
                         + partition + ": request to " + address.key() + " failed");

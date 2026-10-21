@@ -407,6 +407,7 @@ class ClusterRouterTest {
         final List<Integer> contacted = Collections.synchronizedList(new ArrayList<>());
         final List<Integer> refusedPorts = new ArrayList<>();
         final List<Integer> failingCallPorts = new ArrayList<>();
+        final List<Integer> rejectingCallPorts = new ArrayList<>();
         Throwable connectFailureCause = new java.net.ConnectException("Connection refused");
         private final List<Message> responses;
         private int next;
@@ -426,7 +427,10 @@ class ClusterRouterTest {
                 public Frame call(Frame request) {
                     contacted.add(port);
                     if (failingCallPorts.contains(port)) {
-                        throw new ProtocolException("RPC failed");
+                        throw new ProtocolException("RPC failed", new java.io.EOFException());
+                    }
+                    if (rejectingCallPorts.contains(port)) {
+                        throw new ProtocolException("Frame payload 20000000 exceeds max 16777216");
                     }
                     Message response = responses.get(Math.min(next++, responses.size() - 1));
                     return CODEC.encode(response);
@@ -590,6 +594,29 @@ class ClusterRouterTest {
                     .isInstanceOf(ProtocolException.class)
                     .hasCauseInstanceOf(javax.net.ssl.SSLHandshakeException.class);
             assertThat(sleeps).isEmpty();
+        }
+    }
+
+    @Test
+    void aNonIoProtocolErrorFromACallPropagatesAndKeepsTheRoute() {
+        ManualClock clock = new ManualClock(1_000);
+        InMemoryCoordinationService coordination = coordinationWithMembers();
+        coordination.create(CandyboxKeys.boxMetaKey("b"), new byte[0]);
+        coordination.tryAcquireLease(CandyboxKeys.ownerResource("b", 0), 1, 60_000);
+        ScriptedTransport transport = new ScriptedTransport(new Message.OkResponse());
+        transport.rejectingCallPorts.add(1001); // e.g. a request over the frame cap
+        try (ClusterRouter router = new ClusterRouter(transport, coordination, 60_000, clock, 15_000,
+                advancing(clock, new ArrayList<>(), () -> { }))) {
+            assertThatThrownBy(() -> router.callPartition("b", 0, new Message.GetCandyRequest("b", "k")))
+                    .isExactlyInstanceOf(ProtocolException.class)
+                    .hasMessageContaining("exceeds max");
+
+            // The route is still cached: with node 1 deregistered, a re-resolve would find no owner.
+            coordination.unregisterMember(1);
+            transport.rejectingCallPorts.clear();
+            assertThat(router.callPartition("b", 0, new Message.GetCandyRequest("b", "k")))
+                    .isInstanceOf(Message.OkResponse.class);
+            assertThat(transport.contacted).containsExactly(1001, 1001);
         }
     }
 }
