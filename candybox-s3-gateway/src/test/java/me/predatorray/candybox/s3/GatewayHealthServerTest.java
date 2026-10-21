@@ -82,6 +82,15 @@ class GatewayHealthServerTest {
         }
     }
 
+    @Test
+    void membershipReadFailureIsNotReady() {
+        ManualClock clock = new ManualClock(1_000);
+        GatewayReadiness readiness = new GatewayReadiness(() -> true, () -> {
+            throw new IllegalStateException("connection loss");
+        }, clock, 1_000);
+        assertThat(readiness.getAsBoolean()).isFalse();
+    }
+
     private static java.net.http.HttpResponse<String> get(HttpClient http, String url) throws Exception {
         return http.send(HttpRequest.newBuilder(URI.create(url)).GET().build(), BodyHandlers.ofString());
     }

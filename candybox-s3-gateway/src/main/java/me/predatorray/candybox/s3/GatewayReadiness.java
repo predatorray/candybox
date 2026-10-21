@@ -15,7 +15,9 @@
  */
 package me.predatorray.candybox.s3;
 
+import java.util.List;
 import java.util.function.BooleanSupplier;
+import java.util.function.Supplier;
 import me.predatorray.candybox.common.Clock;
 import me.predatorray.candybox.coordination.CoordinationService;
 
@@ -28,7 +30,8 @@ final class GatewayReadiness implements BooleanSupplier {
 
     static final long DEFAULT_TTL_MILLIS = 1_000;
 
-    private final CoordinationService coordination;
+    private final BooleanSupplier connected;
+    private final Supplier<List<Integer>> members;
     private final Clock clock;
     private final long ttlMillis;
     private boolean cachedHasMembers;
@@ -36,14 +39,20 @@ final class GatewayReadiness implements BooleanSupplier {
     private boolean cached;
 
     GatewayReadiness(CoordinationService coordination, Clock clock, long ttlMillis) {
-        this.coordination = coordination;
+        this(coordination::isConnected, coordination::members, clock, ttlMillis);
+    }
+
+    GatewayReadiness(BooleanSupplier connected, Supplier<List<Integer>> members, Clock clock,
+                     long ttlMillis) {
+        this.connected = connected;
+        this.members = members;
         this.clock = clock;
         this.ttlMillis = ttlMillis;
     }
 
     @Override
     public synchronized boolean getAsBoolean() {
-        if (!coordination.isConnected()) {
+        if (!connected.getAsBoolean()) {
             return false;
         }
         long now = clock.currentTimeMillis();
@@ -57,7 +66,7 @@ final class GatewayReadiness implements BooleanSupplier {
 
     private boolean hasMembers() {
         try {
-            return !coordination.members().isEmpty();
+            return !members.get().isEmpty();
         } catch (RuntimeException e) {
             return false;
         }

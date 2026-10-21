@@ -69,6 +69,11 @@ public interface DashboardData {
     // Implementations should throw {@link UnsupportedOperationException} when the backing surface
     // is not wired up (the stub mode) so callers can map it to a 503 rather than a silent 200.
 
+    /** Backs {@code /readyz}: whether the backend can currently serve. */
+    default boolean isReady() {
+        return true;
+    }
+
     /** Creates a new (empty) Box. Implementations should report "already exists" as a failure. */
     default void createBox(String name) {
         throw new UnsupportedOperationException("createBox is not supported by this backend");

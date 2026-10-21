@@ -73,6 +73,15 @@ class LiveDashboardDataTest {
     }
 
     @Test
+    void readyFollowsCoordinationConnectivity() {
+        InMemoryCoordinationService coord = new InMemoryCoordinationService();
+        LiveDashboardData data = new LiveDashboardData(coord, new FakeBoxClient());
+        assertThat(data.isReady()).isTrue();
+        coord.setConnected(false);
+        assertThat(data.isReady()).isFalse();
+    }
+
+    @Test
     void clusterTolerantToEmptyMemberInfo() {
         // A node registered with an empty payload still has to surface (registered ⇒ ready, with
         // address rendered as an empty string instead of throwing). The fake's registerMember
