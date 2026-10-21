@@ -15,6 +15,9 @@
  */
 package me.predatorray.candybox.client;
 
+import java.net.ConnectException;
+import java.net.NoRouteToHostException;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
@@ -92,36 +95,27 @@ final class ClusterRouter implements Router {
         long deadline = clock.currentTimeMillis() + unownedRetryMillis;
         long backoff = INITIAL_BACKOFF_MILLIS;
         while (true) {
-            Route route = resolveOwner(box, partition, cacheKey);
-            String gap = route.gap();
-            RuntimeException connectFailure = null;
-            boolean unavailableAnswer = false;
+            OwnerGap gap;
             long retryAfter = 0;
-            if (route.address() != null) {
-                // Connecting sends nothing, so a refused connection (e.g. a crashed owner whose lease
-                // has not lapsed yet) is safe to retry even for writes.
-                connectFailure = tryConnect(route.address());
-                if (connectFailure == null) {
-                    Message response = sendFollowingMoves(box, partition, cacheKey, route.address(),
-                            request);
-                    if (!(response instanceof Message.UnavailableResponse unavailable)) {
-                        return response;
-                    }
-                    unavailableAnswer = true; // the node checked the Box still exists
-                    retryAfter = unavailable.retryAfterMillis();
-                    gap = "has no current owner";
-                } else {
-                    gap = "owner at " + route.address().key() + " is unreachable";
+            try {
+                Message response = sendToOwner(box, partition, cacheKey, request);
+                if (!(response instanceof Message.UnavailableResponse unavailable)) {
+                    return response;
                 }
-                partitionCache.invalidate(cacheKey);
+                // The node checked the Box still exists, so skip that check below.
+                gap = new OwnerGap("has no current owner", null, true);
+                retryAfter = unavailable.retryAfterMillis();
+            } catch (OwnerGap g) {
+                gap = g;
             }
+            partitionCache.invalidate(cacheKey);
             long remaining = deadline - clock.currentTimeMillis();
             // A deleted Box has no owner either; don't wait out the budget for it.
-            if (remaining <= 0 || (!unavailableAnswer && !boxExists(box))) {
+            if (remaining <= 0 || (!gap.boxConfirmed && !boxExists(box))) {
                 NotOwnerException failure = new NotOwnerException("box " + box + " partition "
-                        + partition + " " + gap);
-                if (connectFailure != null) {
-                    failure.addSuppressed(connectFailure);
+                        + partition + " " + gap.getMessage());
+                if (gap.getCause() != null) {
+                    failure.addSuppressed(gap.getCause());
                 }
                 throw failure;
             }
@@ -136,12 +130,28 @@ final class ClusterRouter implements Router {
         }
     }
 
-    private Message sendFollowingMoves(String box, int partition, String cacheKey,
-                                       NodeAddress address, Message request) {
+    /**
+     * Sends to the partition's owner, following {@code MOVED}. Throws {@link OwnerGap} when the owner
+     * (or a redirect target) is unregistered or refuses connections: nothing was sent, so it is safe
+     * to retry. A failure mid-call is not retried (a write may have applied) but surfaces as a
+     * retriable {@link NotOwnerException}.
+     */
+    private Message sendToOwner(String box, int partition, String cacheKey, Message request) {
+        NodeAddress address = resolveOwner(box, partition, cacheKey);
         for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-            Message response = send(address, request);
+            connectOrGap(address);
+            Message response;
+            try {
+                response = send(address, request);
+            } catch (ProtocolException e) {
+                partitionCache.invalidate(cacheKey);
+                NotOwnerException failure = new NotOwnerException("box " + box + " partition "
+                        + partition + ": request to " + address.key() + " failed");
+                failure.initCause(e);
+                throw failure;
+            }
             if (response instanceof Message.MovedResponse moved) {
-                address = addressOfNode(moved.ownerNodeId());
+                address = memberAddress(moved.ownerNodeId());
                 partitionCache.put(cacheKey, address);
                 continue;
             }
@@ -178,34 +188,42 @@ final class ClusterRouter implements Router {
         return coordination.get(CandyboxKeys.boxMetaKey(box)).isPresent();
     }
 
-    /** The partition owner's address, or why there is none right now. */
-    private Route resolveOwner(String box, int partition, String cacheKey) {
+    /** The partition owner's address, or throws {@link OwnerGap} if there is none right now. */
+    private NodeAddress resolveOwner(String box, int partition, String cacheKey) {
         NodeAddress cached = partitionCache.getIfFresh(cacheKey).orElse(null);
         if (cached != null) {
-            return new Route(cached, null);
+            return cached;
         }
         LeaseInfo holder = coordination.leaseHolder(CandyboxKeys.ownerResource(box, partition))
-                .orElse(null);
-        if (holder == null) {
-            return new Route(null, "has no current owner");
-        }
-        byte[] info = coordination.memberInfo(holder.ownerNodeId()).orElse(null);
-        if (info == null) {
-            // The holder's session is gone (it crashed) but its lease has not lapsed yet.
-            return new Route(null, "owner node " + holder.ownerNodeId() + " is not registered");
-        }
-        NodeAddress address = NodeAddress.parse(new String(info, StandardCharsets.UTF_8));
+                .orElseThrow(() -> new OwnerGap("has no current owner", null, false));
+        NodeAddress address = memberAddress(holder.ownerNodeId());
         partitionCache.put(cacheKey, address);
-        return new Route(address, null);
+        return address;
     }
 
-    /** Opens (or reuses) a pooled connection; returns the failure if the node refuses it. */
-    private RuntimeException tryConnect(NodeAddress address) {
+    /** A partition owner's address; an unregistered owner (it crashed) is an {@link OwnerGap}. */
+    private NodeAddress memberAddress(int nodeId) {
+        byte[] info = coordination.memberInfo(nodeId)
+                .orElseThrow(() -> new OwnerGap("owner node " + nodeId + " is not registered", null,
+                        false));
+        return NodeAddress.parse(new String(info, StandardCharsets.UTF_8));
+    }
+
+    /**
+     * Opens (or reuses) a pooled connection. A refused, unroutable or timed-out connect (a crashed
+     * owner whose lease has not lapsed yet) is an {@link OwnerGap}; anything else, such as a TLS or
+     * SASL failure, propagates.
+     */
+    private void connectOrGap(NodeAddress address) {
         try {
             acquireConnection(address);
-            return null;
         } catch (ProtocolException e) {
-            return e;
+            if (e.getCause() instanceof ConnectException
+                    || e.getCause() instanceof NoRouteToHostException
+                    || e.getCause() instanceof SocketTimeoutException) {
+                throw new OwnerGap("owner at " + address.key() + " is unreachable", e, false);
+            }
+            throw e;
         }
     }
 
@@ -273,7 +291,14 @@ final class ClusterRouter implements Router {
         connections.clear();
     }
 
-    private record Route(NodeAddress address, String gap) {
+    /** No reachable owner right now; {@code boxConfirmed} if a node answered that the Box exists. */
+    private static final class OwnerGap extends RuntimeException {
+        final boolean boxConfirmed;
+
+        OwnerGap(String reason, Throwable cause, boolean boxConfirmed) {
+            super(reason, cause, false, false);
+            this.boxConfirmed = boxConfirmed;
+        }
     }
 
     private record NodeAddress(String host, int port) {

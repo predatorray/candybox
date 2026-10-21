@@ -406,6 +406,8 @@ class ClusterRouterTest {
     private static final class ScriptedTransport implements Transport {
         final List<Integer> contacted = Collections.synchronizedList(new ArrayList<>());
         final List<Integer> refusedPorts = new ArrayList<>();
+        final List<Integer> failingCallPorts = new ArrayList<>();
+        Throwable connectFailureCause = new java.net.ConnectException("Connection refused");
         private final List<Message> responses;
         private int next;
 
@@ -416,12 +418,16 @@ class ClusterRouterTest {
         @Override
         public Connection connect(String host, int port) {
             if (refusedPorts.contains(port)) {
-                throw new ProtocolException("Failed to connect to " + host + ":" + port);
+                throw new ProtocolException("Failed to connect to " + host + ":" + port,
+                        connectFailureCause);
             }
             return new Connection() {
                 @Override
                 public Frame call(Frame request) {
                     contacted.add(port);
+                    if (failingCallPorts.contains(port)) {
+                        throw new ProtocolException("RPC failed");
+                    }
                     Message response = responses.get(Math.min(next++, responses.size() - 1));
                     return CODEC.encode(response);
                 }
@@ -515,6 +521,75 @@ class ClusterRouterTest {
                     .satisfies(e -> assertThat(e.getSuppressed())
                             .hasAtLeastOneElementOfType(ProtocolException.class));
             assertThat(sleeps.stream().mapToLong(Long::longValue).sum()).isEqualTo(2_000);
+        }
+    }
+
+    @Test
+    void aMidCallFailureOnAPooledConnectionIsNotOwnerAndDropsTheRoute() {
+        ManualClock clock = new ManualClock(1_000);
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        coordination.registerMember(1, "127.0.0.1:1001".getBytes(StandardCharsets.UTF_8));
+        coordination.registerMember(2, "127.0.0.1:2002".getBytes(StandardCharsets.UTF_8));
+        coordination.create(CandyboxKeys.boxMetaKey("b"), new byte[0]);
+        coordination.tryAcquireLease(CandyboxKeys.ownerResource("b", 0), 1, 1_000);
+        ScriptedTransport transport = new ScriptedTransport(new Message.OkResponse());
+        try (ClusterRouter router = new ClusterRouter(transport, coordination, 60_000, clock, 15_000,
+                advancing(clock, new ArrayList<>(), () -> { }))) {
+            assertThat(router.callPartition("b", 0, new Message.GetCandyRequest("b", "k")))
+                    .isInstanceOf(Message.OkResponse.class); // pools a connection to node 1
+
+            transport.failingCallPorts.add(1001); // node 1 crashes under the pooled connection
+            assertThatThrownBy(() -> router.callPartition("b", 0, new Message.PutCandyRequest(
+                    "b", "k", null, java.util.Map.of(), null, new byte[] {1})))
+                    .isInstanceOf(NotOwnerException.class)
+                    .hasCauseInstanceOf(ProtocolException.class);
+
+            // The cached route was dropped, so the next call re-resolves to the new owner.
+            clock.advance(1_000);
+            coordination.tryAcquireLease(CandyboxKeys.ownerResource("b", 0), 2, 10_000);
+            assertThat(router.callPartition("b", 0, new Message.GetCandyRequest("b", "k")))
+                    .isInstanceOf(Message.OkResponse.class);
+            assertThat(transport.contacted).containsExactly(1001, 1001, 2002);
+        }
+    }
+
+    @Test
+    void waitsOutAMovedToAnUnregisteredOwner() {
+        ManualClock clock = new ManualClock(1_000);
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        coordination.registerMember(1, "127.0.0.1:1001".getBytes(StandardCharsets.UTF_8));
+        coordination.create(CandyboxKeys.boxMetaKey("b"), new byte[0]);
+        coordination.tryAcquireLease(CandyboxKeys.ownerResource("b", 0), 1, 60_000);
+        ScriptedTransport transport = new ScriptedTransport(new Message.MovedResponse(2),
+                new Message.OkResponse());
+        List<Long> sleeps = new ArrayList<>();
+        Runnable registerNode2 = () -> coordination.registerMember(2,
+                "127.0.0.1:2002".getBytes(StandardCharsets.UTF_8));
+        try (ClusterRouter router = new ClusterRouter(transport, coordination, 5_000, clock, 15_000,
+                advancing(clock, sleeps, registerNode2))) {
+            Message resp = router.callPartition("b", 0, new Message.GetCandyRequest("b", "k"));
+            assertThat(resp).isInstanceOf(Message.OkResponse.class);
+            assertThat(sleeps).hasSize(1);
+            assertThat(transport.contacted).containsExactly(1001, 1001);
+        }
+    }
+
+    @Test
+    void aConnectFailureThatIsNotARefusalFailsFast() {
+        ManualClock clock = new ManualClock(1_000);
+        InMemoryCoordinationService coordination = coordinationWithMembers();
+        coordination.create(CandyboxKeys.boxMetaKey("b"), new byte[0]);
+        coordination.tryAcquireLease(CandyboxKeys.ownerResource("b", 0), 1, 60_000);
+        ScriptedTransport transport = new ScriptedTransport(new Message.OkResponse());
+        transport.refusedPorts.add(1001);
+        transport.connectFailureCause = new javax.net.ssl.SSLHandshakeException("bad certificate");
+        List<Long> sleeps = new ArrayList<>();
+        try (ClusterRouter router = new ClusterRouter(transport, coordination, 5_000, clock, 15_000,
+                advancing(clock, sleeps, () -> { }))) {
+            assertThatThrownBy(() -> router.callPartition("b", 0, new Message.GetCandyRequest("b", "k")))
+                    .isInstanceOf(ProtocolException.class)
+                    .hasCauseInstanceOf(javax.net.ssl.SSLHandshakeException.class);
+            assertThat(sleeps).isEmpty();
         }
     }
 }
