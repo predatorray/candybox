@@ -219,6 +219,8 @@ public final class MessageCodec {
             w.writeVarLong(Math.max(0, m.createdAtMillis()));
         } else if (message instanceof Message.MovedResponse m) {
             w.writeInt(m.ownerNodeId());
+        } else if (message instanceof Message.UnavailableResponse m) {
+            w.writeVarLong(Math.max(0, m.retryAfterMillis()));
         } else if (message instanceof Message.BoxInfoResponse m) {
             w.writeVarInt(m.partitionCount());
         } else if (message instanceof Message.ListBoxesResponse m) {
@@ -342,6 +344,7 @@ public final class MessageCodec {
             case RESPONSE_HEAD -> new Message.HeadCandyResponse(r.readVarLong(), readNullable(r),
                     readMetadata(r), r.readInt(), r.readVarLong());
             case RESPONSE_MOVED -> new Message.MovedResponse(r.readInt());
+            case RESPONSE_UNAVAILABLE -> new Message.UnavailableResponse(r.readVarLong());
             case RESPONSE_BOX_INFO -> new Message.BoxInfoResponse(r.readVarInt());
             case RESPONSE_BOX_LIST -> decodeBoxList(r);
             case GET_BOX_ACL -> new Message.GetBoxAclRequest(r.readString());

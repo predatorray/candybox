@@ -302,6 +302,7 @@ public final class ServerConfig {
             applyLong("ownership.lease.ttl.millis", b::ownershipLeaseTtlMillis);
             applyLong("lease.renew.interval.millis", b::leaseRenewIntervalMillis);
             applyLong("router.cache.ttl.millis", b::routerCacheTtlMillis);
+            applyLong("router.unowned.retry.millis", b::routerUnownedRetryMillis);
             applyLong("compaction.interval.millis", b::compactionIntervalMillis);
             applyLong("max.clock.skew.millis", b::maxClockSkewMillis);
             applyLong("tombstone.gc.grace.millis", b::tombstoneGcGraceMillis);

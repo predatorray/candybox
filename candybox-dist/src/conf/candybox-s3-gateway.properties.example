@@ -26,6 +26,10 @@ s3.region=us-east-1
 # Box->owner resolution cache TTL (ms). Default: 5000.
 # s3.router-cache-ttl-ms=5000
 
+# How long a request waits for an unowned partition (ownership handover) to get an owner before
+# failing with 503 ServiceUnavailable (ms). Default: 15000.
+# s3.router-unowned-retry-ms=15000
+
 # HTTP port for /healthz, /readyz, /metrics. Default: 9712.
 # health.port=9712
 

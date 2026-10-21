@@ -138,6 +138,10 @@ class MessageCodecTest {
         Message.BusyResponse busy = (Message.BusyResponse) roundTrip(new Message.BusyResponse(250));
         assertThat(busy.retryAfterMillis()).isEqualTo(250);
 
+        Message.UnavailableResponse unavailable =
+                (Message.UnavailableResponse) roundTrip(new Message.UnavailableResponse(150));
+        assertThat(unavailable.retryAfterMillis()).isEqualTo(150);
+
         Message.ErrorResponse err = (Message.ErrorResponse) roundTrip(
                 new Message.ErrorResponse("ValidationException", "bad key"));
         assertThat(err.errorType()).isEqualTo("ValidationException");
