@@ -169,7 +169,7 @@ Routes:
 | `GET /api/lsm` | per-box manifest version + fencing token (coordination-derived) |
 | `GET /api/metrics` | passthrough of the latest scrape text |
 | `GET /api/metrics/timeseries?names=a,b,...` | the rolling per-series window |
-| `GET /healthz`, `GET /readyz` | mirror the per-node probes; `/readyz` is 503 while the ZooKeeper session is disconnected |
+| `GET /healthz`, `GET /readyz` | same paths as the node probes; `/readyz` is 503 while this process's ZooKeeper session is disconnected |
 | `GET /ui/*`, `GET /` | static SPA bundle (or a placeholder if `-Pfrontend` was off) |
 
 v1 has **no authentication** (matching the rest of candybox today); the deploy assumption is a

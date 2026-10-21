@@ -18,7 +18,7 @@ and configure each instance through the environment.
 | `zookeeper.connect` | ZooKeeper connect string, shared by BookKeeper and Candybox coordination. | `127.0.0.1:2181` |
 | `server.bind` | Address clients connect to. | `0.0.0.0:9709` |
 | `server.advertised` | Address published to the cluster for routing (set to a reachable hostname). | bind address |
-| `health.port` | HTTP port for `/healthz`, `/readyz`, `/metrics`. | `9710` |
+| `health.port` | HTTP port for `/healthz` (liveness), `/readyz` (503 while ZooKeeper is unreachable), `/metrics`. | `9710` |
 | `server.io.threads` | Netty event loops framing client traffic. `0` uses Netty's default (twice the available processors). | `0` |
 | `server.handler.threads` | Threads running the request handler, off the event loops. Each connection is pinned to one of them. | `max(32, cores × 4)` |
 | `server.max.inflight.per.connection` | Requests one connection may have queued for the handler before the node stops reading from it. | `8` |

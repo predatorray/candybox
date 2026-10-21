@@ -49,7 +49,8 @@ import org.slf4j.LoggerFactory;
  * <p>Route map (see {@code WEB_DASHBOARD_PLAN.md} for the full v1 contract):
  *
  * <ul>
- *   <li>{@code /healthz}, {@code /readyz} mirror the per-node endpoints so the same probes work.</li>
+ *   <li>{@code /healthz}, {@code /readyz} — same paths as the node probes; {@code /readyz} reflects
+ *       {@link DashboardData#isReady()}.</li>
  *   <li>{@code /api/cluster} — JSON cluster snapshot from {@link DashboardData}.</li>
  *   <li>{@code /api/boxes}, {@code /api/boxes/{name}}, {@code /api/boxes/{name}/objects} — box +
  *       candy listings.</li>
