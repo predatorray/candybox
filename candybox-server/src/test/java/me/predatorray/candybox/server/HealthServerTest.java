@@ -23,6 +23,10 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse.BodyHandlers;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
+import me.predatorray.candybox.bookkeeper.fake.InMemoryLedgerStore;
+import me.predatorray.candybox.common.ManualClock;
+import me.predatorray.candybox.common.config.CandyboxConfig;
+import me.predatorray.candybox.coordination.fake.InMemoryCoordinationService;
 import me.predatorray.candybox.lsm.engine.BoxEngineStats;
 import org.junit.jupiter.api.Test;
 
@@ -68,6 +72,30 @@ class HealthServerTest {
             ready.set(true);
             assertThat(status(port, "/readyz")).isEqualTo(200);
             assertThat(get(port, "/readyz")).contains("ready");
+        }
+    }
+
+    @Test
+    void readyzFollowsCoordinationConnectivityWhileHealthzStaysOk() throws Exception {
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService();
+        CandyboxNode node = new CandyboxNode(1, CandyboxConfig.defaults(), new InMemoryLedgerStore(),
+                coordination, new ManualClock(1000));
+        try (HealthServer server = new HealthServer(0, 1, node::isReady, Map::of)) {
+            server.start();
+            int port = server.port();
+
+            // Ready with no owned partitions: readiness must not depend on ownership.
+            assertThat(status(port, "/readyz")).isEqualTo(200);
+
+            coordination.setConnected(false);
+            assertThat(status(port, "/readyz")).isEqualTo(503);
+            assertThat(status(port, "/healthz")).isEqualTo(200);
+
+            coordination.setConnected(true);
+            assertThat(status(port, "/readyz")).isEqualTo(200);
+
+            node.close();
+            assertThat(status(port, "/readyz")).isEqualTo(503);
         }
     }
 

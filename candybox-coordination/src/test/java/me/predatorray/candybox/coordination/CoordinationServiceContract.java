@@ -59,6 +59,14 @@ public abstract class CoordinationServiceContract {
     }
 
     @Test
+    void connectedUntilClosed() {
+        assertThat(service.isConnected()).isTrue();
+        service.close();
+        assertThat(service.isConnected()).isFalse();
+        service = null;
+    }
+
+    @Test
     void createGetAndCompareAndSet() {
         long v0 = service.create("manifest", b("ledger-1"));
         assertThat(v0).isEqualTo(0);

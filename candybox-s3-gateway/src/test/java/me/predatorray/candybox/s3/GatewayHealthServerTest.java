@@ -22,6 +22,8 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse.BodyHandlers;
 import java.util.concurrent.atomic.AtomicBoolean;
+import me.predatorray.candybox.common.ManualClock;
+import me.predatorray.candybox.coordination.fake.InMemoryCoordinationService;
 import org.junit.jupiter.api.Test;
 
 class GatewayHealthServerTest {
@@ -44,6 +46,37 @@ class GatewayHealthServerTest {
             var metrics = get(http, base + "/metrics");
             assertThat(metrics.statusCode()).isEqualTo(200);
             assertThat(metrics.body()).contains("candybox_s3_gateway_up");
+        } finally {
+            health.close();
+        }
+    }
+
+    @Test
+    void readinessTracksCoordinationAndMembershipWhileLivenessStaysOk() throws Exception {
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService();
+        ManualClock clock = new ManualClock(1_000);
+        GatewayReadiness readiness = new GatewayReadiness(coordination, clock, 1_000);
+        GatewayHealthServer health = new GatewayHealthServer(0, readiness);
+        health.start();
+        try {
+            HttpClient http = HttpClient.newHttpClient();
+            String base = "http://127.0.0.1:" + health.port();
+
+            // No node to route to yet.
+            assertThat(get(http, base + "/readyz").statusCode()).isEqualTo(503);
+
+            coordination.registerMember(1, "127.0.0.1:9700".getBytes());
+            // The membership result is cached until the TTL passes.
+            assertThat(get(http, base + "/readyz").statusCode()).isEqualTo(503);
+            clock.advance(1_000);
+            assertThat(get(http, base + "/readyz").statusCode()).isEqualTo(200);
+
+            // Disconnection is never cached.
+            coordination.setConnected(false);
+            assertThat(get(http, base + "/readyz").statusCode()).isEqualTo(503);
+            assertThat(get(http, base + "/healthz").statusCode()).isEqualTo(200);
+            coordination.setConnected(true);
+            assertThat(get(http, base + "/readyz").statusCode()).isEqualTo(200);
         } finally {
             health.close();
         }

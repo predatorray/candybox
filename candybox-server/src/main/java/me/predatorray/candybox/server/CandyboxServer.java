@@ -99,8 +99,10 @@ public final class CandyboxServer {
                 handler, new FrameCodec(config.tuning().maxFrameSizeBytes()),
                 security.serverSslContext(), security.tlsClientAuth(), config.transportOptions());
 
+        // The transport is bound once constructed; the flag drops readiness first on shutdown.
         AtomicBoolean ready = new AtomicBoolean(true);
-        HealthServer health = new HealthServer(config.healthPort(), config.nodeId(), ready::get,
+        HealthServer health = new HealthServer(config.healthPort(), config.nodeId(),
+                () -> ready.get() && node.isReady(),
                 node::ownedBoxStats, security.metricsAuthToken());
         health.start();
 

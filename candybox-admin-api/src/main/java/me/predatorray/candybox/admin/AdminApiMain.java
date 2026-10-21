@@ -20,6 +20,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
+import java.util.function.BooleanSupplier;
 import me.predatorray.candybox.client.CandyboxClient;
 import me.predatorray.candybox.common.SystemClock;
 import me.predatorray.candybox.common.config.CandyboxConfig;
@@ -67,7 +68,7 @@ public final class AdminApiMain {
         AdminApiConfig config = fromEnv(System.getenv());
         // LIFO close: every component pushes itself; the shutdown hook pops them in reverse.
         Deque<AutoCloseable> stack = new ArrayDeque<>();
-        DashboardData data =
+        DataSource source =
                 buildDataSource(System.getenv("CANDYBOX_ADMIN_ZK"), stack, System.getenv());
 
         MetricsScraper scraper = buildScraper(System.getenv());
@@ -79,7 +80,7 @@ public final class AdminApiMain {
         SecurityConfig listenerSecurity = SecurityConfig.resolve(key -> java.util.Optional
                 .ofNullable(System.getenv("CANDYBOX_" + key.toUpperCase().replace('.', '_')))
                 .filter(v -> !v.isBlank()).map(String::trim));
-        AdminApiServer server = new AdminApiServer(config, () -> true, data, scraper, authToken,
+        AdminApiServer server = new AdminApiServer(config, source.ready(), source.data(), scraper, authToken,
                 listenerSecurity.serverSslContext());
         if (authToken == null) {
             LOG.warn("CANDYBOX_ADMIN_AUTH_TOKEN is not set — the admin API (including box "
@@ -129,11 +130,15 @@ public final class AdminApiMain {
                 orDefault(env.get("CANDYBOX_ADMIN_SCRAPE_TOKEN"), null));
     }
 
-    private static DashboardData buildDataSource(String zk, Deque<AutoCloseable> closeStack,
+    /** The dashboard's data plus the {@code /readyz} predicate that goes with it. */
+    private record DataSource(DashboardData data, BooleanSupplier ready) {
+    }
+
+    private static DataSource buildDataSource(String zk, Deque<AutoCloseable> closeStack,
                                                  java.util.Map<String, String> env) {
         if (zk == null || zk.isBlank()) {
             LOG.info("No CANDYBOX_ADMIN_ZK set — running with empty data source (UI-only demo).");
-            return new EmptyDashboardData();
+            return new DataSource(new EmptyDashboardData(), () -> true);
         }
         LOG.info("Wiring live data source against ZooKeeper {}", zk);
         // The shared auth.*/tls.*/zookeeper.auth.* surface, resolved from CANDYBOX_* env vars
@@ -154,7 +159,8 @@ public final class AdminApiMain {
         CandyboxClient client =
                 new CandyboxClient(transport, coordination, CandyboxConfig.builder().build());
         closeStack.push(client);
-        return new LiveDashboardData(coordination, client);
+        return new DataSource(new LiveDashboardData(coordination, client),
+                coordination::isConnected);
     }
 
     private static void closeAll(Deque<AutoCloseable> stack) {
