@@ -188,9 +188,9 @@ public final class CandyboxNode implements AutoCloseable {
     }
 
     /**
-     * Readiness: membership is registered (from construction until {@link #close}) and the
-     * coordination session is connected. Deliberately independent of partition ownership — a fresh
-     * node owns none.
+     * Readiness: not {@link #close}d (membership was registered at construction) and the
+     * coordination session is connected. Deliberately independent of partition ownership, since a
+     * fresh node owns none.
      */
     public boolean isReady() {
         return !closed && coordination.isConnected();

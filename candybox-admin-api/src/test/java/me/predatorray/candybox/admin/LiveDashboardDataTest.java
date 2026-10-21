@@ -73,12 +73,24 @@ class LiveDashboardDataTest {
     }
 
     @Test
-    void readyFollowsCoordinationConnectivity() {
+    void readyzFollowsCoordinationConnectivityWhileHealthzStaysOk() throws Exception {
         InMemoryCoordinationService coord = new InMemoryCoordinationService();
         LiveDashboardData data = new LiveDashboardData(coord, new FakeBoxClient());
-        assertThat(data.isReady()).isTrue();
-        coord.setConnected(false);
-        assertThat(data.isReady()).isFalse();
+        AdminApiConfig config = new AdminApiConfig(0, "127.0.0.1", "*", false);
+        try (AdminApiServer server = new AdminApiServer(config, data::isReady, data)) {
+            server.start();
+            assertThat(status(server.port(), "/readyz")).isEqualTo(200);
+            coord.setConnected(false);
+            assertThat(status(server.port(), "/readyz")).isEqualTo(503);
+            assertThat(status(server.port(), "/healthz")).isEqualTo(200);
+        }
+    }
+
+    private static int status(int port, String path) throws Exception {
+        return java.net.http.HttpClient.newHttpClient().send(
+                java.net.http.HttpRequest.newBuilder(
+                        java.net.URI.create("http://127.0.0.1:" + port + path)).GET().build(),
+                java.net.http.HttpResponse.BodyHandlers.discarding()).statusCode();
     }
 
     @Test

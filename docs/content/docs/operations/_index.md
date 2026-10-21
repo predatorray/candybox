@@ -35,6 +35,9 @@ for the full rules.
 
 Each node exposes an HTTP endpoint (default port `9710`) with `/healthz`, `/readyz`, and `/metrics`.
 Wire `/healthz` and `/readyz` to your liveness/readiness probes and scrape `/metrics`.
+`/healthz` is pure liveness. `/readyz` returns 503 while the ZooKeeper session is disconnected (on the
+S3 gateway, also while no node is registered), so a ZooKeeper blip takes a pod out of rotation
+without restarting it. The S3 gateway and the admin API serve the same pair.
 
 ### Admin / dashboard API
 

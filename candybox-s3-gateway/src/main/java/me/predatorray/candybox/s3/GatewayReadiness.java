@@ -16,6 +16,7 @@
 package me.predatorray.candybox.s3;
 
 import java.util.List;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 import me.predatorray.candybox.common.Clock;
@@ -34,9 +35,11 @@ final class GatewayReadiness implements BooleanSupplier {
     private final Supplier<List<Integer>> members;
     private final Clock clock;
     private final long ttlMillis;
-    private boolean cachedHasMembers;
-    private long cachedAtMillis;
-    private boolean cached;
+    private final ReentrantLock refreshLock = new ReentrantLock();
+    private volatile Snapshot snapshot;
+
+    private record Snapshot(boolean hasMembers, long atMillis) {
+    }
 
     GatewayReadiness(CoordinationService coordination, Clock clock, long ttlMillis) {
         this(coordination::isConnected, coordination::members, clock, ttlMillis);
@@ -51,17 +54,23 @@ final class GatewayReadiness implements BooleanSupplier {
     }
 
     @Override
-    public synchronized boolean getAsBoolean() {
+    public boolean getAsBoolean() {
         if (!connected.getAsBoolean()) {
             return false;
         }
+        Snapshot current = snapshot;
         long now = clock.currentTimeMillis();
-        if (!cached || now - cachedAtMillis >= ttlMillis) {
-            cachedHasMembers = hasMembers();
-            cachedAtMillis = now;
-            cached = true;
+        // One caller refreshes; concurrent probes answer from the last snapshot instead of queueing
+        // behind a slow ZooKeeper read.
+        if ((current == null || now - current.atMillis() >= ttlMillis) && refreshLock.tryLock()) {
+            try {
+                current = new Snapshot(hasMembers(), now);
+                snapshot = current;
+            } finally {
+                refreshLock.unlock();
+            }
         }
-        return cachedHasMembers;
+        return current != null && current.hasMembers();
     }
 
     private boolean hasMembers() {
