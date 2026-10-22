@@ -40,9 +40,9 @@ import me.predatorray.candybox.lsm.sstable.SSTableMeta;
  * the cross-partition rename-intent fields ({@code addedRenameIntents}, {@code removedRenameIntents}).
  * A v2 record (no rename-intent fields) still reads back as an edit with empty intent sets.
  * <b>v4 layout</b> appends the optional high-water {@code maxHlc}; v2/v3 records read back with
- * {@link Hlc#MIN}. <b>v5 layout</b> adds each table's optional range-tombstone span; v2–v4 tables read
- * back without one. Older v1 records cannot be read back; this is acceptable because the project has
- * no production data to migrate.
+ * {@link Hlc#MIN}. <b>v5 layout</b> adds each table's optional range-tombstone span and oldest point
+ * HLC; v2–v4 tables read back without either. Older v1 records cannot be read back; this is
+ * acceptable because the project has no production data to migrate.
  */
 public final class ManifestSerializer {
 
@@ -207,6 +207,10 @@ public final class ManifestSerializer {
             writeOptionalKey(w, span.end());
             w.writeBoolean(span.endInclusive());
         }
+        w.writeBoolean(t.minPointHlc() != null);
+        if (t.minPointHlc() != null) {
+            writeHlc(w, t.minPointHlc());
+        }
     }
 
     private static void writeOptionalKey(BinaryWriter w, CandyKey key) {
@@ -229,13 +233,17 @@ public final class ManifestSerializer {
         long sizeBytes = r.readVarLong();
         Set<Long> referencedSyrups = readLongSet(r);
         KeySpan span = null;
-        if (version >= 5 && r.readBoolean()) {
-            CandyKey start = readOptionalKey(r);
-            CandyKey end = readOptionalKey(r);
-            span = new KeySpan(start, end, r.readBoolean());
+        Hlc minPointHlc = null;
+        if (version >= 5) {
+            if (r.readBoolean()) {
+                CandyKey start = readOptionalKey(r);
+                CandyKey end = readOptionalKey(r);
+                span = new KeySpan(start, end, r.readBoolean());
+            }
+            minPointHlc = r.readBoolean() ? readHlc(r) : null;
         }
         return new SSTableMeta(ledgerId, level, minKey, maxKey, entryCount, sizeBytes, referencedSyrups,
-                span);
+                span, minPointHlc);
     }
 
     private static void writeUpload(BinaryWriter w, MultipartUploadState u) {

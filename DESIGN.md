@@ -156,9 +156,10 @@ RangeTombstone payload>`. Replay reports the max HLC across **both** kinds, so h
 | ownerFencingToken | addedUploads[] | upsertParts[] | removedUploads[] | addedRenameIntents[]
 | removedRenameIntents[] | (bool, hlc) maxHlc`, where each `SSTableMeta`
 is `varlong ledgerId | varint level | bytes minKey | bytes maxKey | varlong entryCount
-| varlong sizeBytes | referencedSyrups[] | (bool, span) rangeTombstoneSpan` (v5+: the keys its range
-tombstones cover, each bound optional, used to pick compaction inputs; older tables read back
-without one). The
+| varlong sizeBytes | referencedSyrups[] | (bool, span) rangeTombstoneSpan | (bool, hlc) minPointHlc`
+(v5+: the keys its range tombstones cover, each bound optional, used to pick compaction inputs; and
+the oldest HLC among its points, used by the range-tombstone drop rule; older tables read back
+without either). The
 multipart-tracking trailing fields (Phase 5) carry in-flight upload state: a `MultipartUploadState`
 record per `addedUpload`, a `(uploadId, partNumber, Part)` triple per `upsertParts`, and a string
 per `removedUpload`. The v3 trailing fields carry in-flight **rename intents** (one per cross-partition
@@ -354,8 +355,11 @@ at the **bottommost** level holding overlapping data **and** the tombstone is ol
 GC grace; otherwise it is preserved. Dropping early would resurrect deleted Candies. The same rule
 governs **range tombstones**: the compactor collects them from all inputs and carries them forward,
 except an aged one at the bottommost level, which is dropped. An aged range tombstone is still kept
-while any L1+ table outside the compaction overlaps its range, because that table may hold older
-points it must keep shadowing. L0 tables are always newer than L1+ data, so they never block the drop.
+while an L1+ table outside the compaction overlaps its range and may hold an older point (its
+`minPointHlc` is older than the tombstone, or unknown for a table recorded before v5), because that
+point must stay shadowed; with span-based input selection this only happens for pre-v5 tables or a
+late write stamped with an older HLC. L0 tables are always newer than L1+ data, so they never block
+the drop.
 Any point covered by a newer range tombstone among the inputs is dropped at any level, since the
 tombstone either still shadows older copies or has nothing left to shadow. Carried range tombstones
 are split across the outputs: each output keeps the part inside its slot of the key space (from its

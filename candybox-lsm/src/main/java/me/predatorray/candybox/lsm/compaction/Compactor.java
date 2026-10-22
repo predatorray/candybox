@@ -44,7 +44,8 @@ import me.predatorray.candybox.lsm.sstable.SSTableWriter;
  * resurrect the Candy. The same rule governs range tombstones: an aged range tombstone at the
  * bottommost level is dropped; younger or non-bottommost range tombstones are carried forward so they
  * keep shadowing. An aged range tombstone is also kept while a table outside the task overlaps its
- * range, since that table may hold points it still has to shadow. Points covered by a newer range
+ * range and may hold a point older than it (a table from before manifest v5, or a late write stamped
+ * with an older HLC), since that point must stay shadowed. Points covered by a newer range
  * tombstone among the inputs are dropped at any level. Each output keeps the parts of the carried
  * range tombstones that fall in its slot of the key space, so they travel with the points they cover.
  *
@@ -145,8 +146,13 @@ public final class Compactor {
         }
     }
 
+    /** Whether a table outside the task may hold a point older than {@code rt} that it covers. */
     private static boolean overlapsOtherTable(RangeTombstone rt, CompactionTask task) {
         for (SSTableMeta t : task.otherTables()) {
+            if (t.entryCount() == 0
+                    || (t.minPointHlc() != null && !rt.hlc().isAfter(t.minPointHlc()))) {
+                continue;
+            }
             boolean afterStart = rt.startInclusive() == null
                     || t.maxKey().compareTo(rt.startInclusive()) >= 0;
             boolean beforeEnd = rt.endExclusive() == null

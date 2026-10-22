@@ -41,7 +41,11 @@ final class SSTableFormat {
     static final int DEFAULT_DATA_BLOCK_TARGET_BYTES = 64 * 1024;
     /** Cap on a bounded table's bloom and index entries, well below BookKeeper's 5 MiB default entry limit. */
     static final int MAX_META_BLOCK_BYTES = 1 << 20;
-    /** Fail-fast cap on the range-tombstone entry, just below BookKeeper's 5 MiB default entry limit. */
+    /**
+     * Fail-fast cap on the range-tombstone entry, just below BookKeeper's 5 MiB default entry limit.
+     * Both caps assume that default; a cluster with a lower {@code nettyMaxFrameSizeBytes} needs them
+     * lowered too.
+     */
     static final int MAX_RANGE_DEL_BLOCK_BYTES = (5 << 20) - (64 << 10);
 
     private SSTableFormat() {

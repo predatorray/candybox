@@ -259,7 +259,7 @@ class CompactionTest {
     void leveledStrategyPullsInTablesCoveredByARangeTombstone() {
         LeveledCompactionStrategy strategy = new LeveledCompactionStrategy(100, 1000, 10);
         SSTableMeta withRange = new SSTableMeta(1, 1, CandyKey.of("a"), CandyKey.of("b"), 1, 2000,
-                java.util.Set.of(), new KeySpan(CandyKey.of("a"), CandyKey.of("m"), false));
+                java.util.Set.of(), new KeySpan(CandyKey.of("a"), CandyKey.of("m"), false), null);
         SSTableMeta covered = meta(2, 2, "f", "g", 100);
         SSTableMeta atEnd = meta(3, 2, "m", "z", 100);
         ManifestState state = ManifestState.empty().apply(ManifestEdit.builder()
@@ -359,6 +359,20 @@ class CompactionTest {
         SSTableMeta out2 = aged.compact(new CompactionTask(List.of(out, older), 2, true, List.of())).outputs().get(0);
         assertThat(keysOf(out2)).containsExactly("b");
         assertThat(rangeTombstonesOf(out2)).isEmpty();
+    }
+
+    @Test
+    void agedRangeTombstoneIsDroppedWhenOverlappingOutsideTablesHoldOnlyNewerPoints() {
+        SSTableMeta withRange = write(1, List.of(new Mutation(CandyKey.of("b"), put(hlc(10, 0, 1), 1, 5))),
+                List.of(new RangeTombstone(CandyKey.of("a"), CandyKey.of("z"), hlc(5, 0, 1))));
+        SSTableMeta newer = write(1, List.of(new Mutation(CandyKey.of("m"), put(hlc(6, 0, 1), 1, 5))));
+
+        Compactor aged = new Compactor(store, writer, cfg, 100, new ManualClock(1_000_000));
+        SSTableMeta out = aged.compact(new CompactionTask(List.of(withRange), 2, true, List.of(newer)))
+                .outputs().get(0);
+
+        assertThat(keysOf(out)).containsExactly("b");
+        assertThat(rangeTombstonesOf(out)).isEmpty();
     }
 
     /** Delegates to a store but fails its {@code createAt}-th ledger creation or {@code appendAt}-th append. */

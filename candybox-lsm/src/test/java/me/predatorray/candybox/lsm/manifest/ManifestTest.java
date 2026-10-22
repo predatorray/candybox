@@ -65,18 +65,18 @@ class ManifestTest {
     }
 
     @Test
-    void rangeTombstoneSpansRoundTrip() {
+    void rangeTombstoneSpansAndMinPointHlcsRoundTrip() {
         SSTableMeta unboundedStart = new SSTableMeta(1, 1, CandyKey.of("b"), CandyKey.of("c"), 2, 64,
-                Set.of(), new KeySpan(null, CandyKey.of("m"), false));
+                Set.of(), new KeySpan(null, CandyKey.of("m"), false), new Hlc(5, 1, 2));
         SSTableMeta unboundedEnd = new SSTableMeta(2, 1, CandyKey.of("x"), CandyKey.of("x"), 0, 0,
-                Set.of(), new KeySpan(CandyKey.of("p"), null, false));
+                Set.of(), new KeySpan(CandyKey.of("p"), null, false), null);
         ManifestEdit edit = ManifestEdit.builder()
                 .addedTables(List.of(unboundedStart, unboundedEnd, table(3, 2))).build();
         assertThat(ManifestSerializer.deserialize(ManifestSerializer.serialize(edit))).isEqualTo(edit);
     }
 
     @Test
-    void v4TablesDecodeWithoutARangeTombstoneSpan() {
+    void v4TablesDecodeWithoutASpanOrMinPointHlc() {
         BinaryWriter w = new BinaryWriter(64)
                 .writeByte(4)
                 .writeVarInt(1)

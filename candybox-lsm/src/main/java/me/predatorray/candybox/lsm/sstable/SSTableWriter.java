@@ -25,6 +25,7 @@ import me.predatorray.candybox.bookkeeper.LedgerConfig;
 import me.predatorray.candybox.bookkeeper.LedgerStore;
 import me.predatorray.candybox.bookkeeper.WritableLedger;
 import me.predatorray.candybox.common.CandyKey;
+import me.predatorray.candybox.common.Hlc;
 import me.predatorray.candybox.common.Mutation;
 import me.predatorray.candybox.common.RangeTombstone;
 import me.predatorray.candybox.common.SegmentRef;
@@ -112,6 +113,7 @@ public final class SSTableWriter {
             long numEntries = 0;
             long sizeBytes = 0;
             Set<Long> referencedSyrups = new LinkedHashSet<>();
+            Hlc minPointHlc = null;
 
             while (sorted.hasNext()) {
                 if (bounded && (sizeBytes + blockBytes >= targetDataBytes
@@ -138,6 +140,9 @@ public final class SSTableWriter {
                 blockLastKey = keyBytes;
                 bloom.add(keyBytes);
 
+                if (minPointHlc == null || minPointHlc.isAfter(m.hlc())) {
+                    minPointHlc = m.hlc();
+                }
                 if (minKey == null) {
                     minKey = keyBytes;
                 }
@@ -184,7 +189,7 @@ public final class SSTableWriter {
 
             return new SSTableMeta(ledger.ledgerId(), level, CandyKey.ofUtf8(minKey),
                     CandyKey.ofUtf8(maxKey), numEntries, sizeBytes, referencedSyrups,
-                    spanOf(rangeTombstones));
+                    spanOf(rangeTombstones), minPointHlc);
         } catch (RuntimeException e) {
             try {
                 ledger.close();

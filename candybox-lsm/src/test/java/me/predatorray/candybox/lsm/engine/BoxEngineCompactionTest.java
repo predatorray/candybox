@@ -156,9 +156,26 @@ class BoxEngineCompactionTest {
 
     @Test
     void rangeDeleteAcrossBoundedTablesIsReclaimedByCompaction() {
+        assertRangeDeleteIsReclaimed(List.of("m%02d-%03d"), 40, 100, 0);
+    }
+
+    @Test
+    void rangeDeleteIsReclaimedWhileWritesLandOnBothSidesOfIt() {
+        // Tables holding these keys straddle the deleted range without holding anything it covers,
+        // so they must not keep the aged range tombstone alive.
+        assertRangeDeleteIsReclaimed(List.of("j%03d-%02d", "l%03d-%02d"), 200, 25, 20);
+    }
+
+    /**
+     * Deletes a range spanning many bounded tables, then runs {@code rounds} rounds of writes with each
+     * key format; the range tombstone passes its GC grace at round {@code agedAtRound}.
+     */
+    private void assertRangeDeleteIsReclaimed(List<String> roundFormats, int rounds, int perFormat,
+                                              int agedAtRound) {
         engine = newEngine();
+        ManualClock compactorClock = new ManualClock(agedAtRound == 0 ? 1_000_000_000L : 1_000);
         Compactor compactor = new Compactor(store, new SSTableWriter(store, 10, 256), sstableConfig,
-                100, new ManualClock(1_000_000_000L), 2048);
+                100_000, compactorClock, 2048);
         putAll("k%03d", 300);
         engine.flush();
         compactUntilIdle(compactor);
@@ -166,8 +183,16 @@ class BoxEngineCompactionTest {
 
         engine.deleteRange(CandyKey.of("k000"), CandyKey.of("k300"));
         engine.flush();
-        for (int round = 0; round < 40; round++) {
-            putAll("m" + String.format("%02d", round) + "-%03d", 100);
+        for (int round = 0; round < rounds; round++) {
+            if (round == agedAtRound) {
+                compactorClock.setTime(1_000_000_000L);
+            }
+            for (String format : roundFormats) {
+                for (int i = 0; i < perFormat; i++) {
+                    String key = String.format(format, round, i);
+                    engine.putCandy(CandyKey.of(key), bytes("v-" + key), null, Map.of(), null);
+                }
+            }
             engine.flush();
             compactUntilIdle(compactor);
         }
@@ -175,8 +200,8 @@ class BoxEngineCompactionTest {
         assertThatThrownBy(() -> engine.getCandy(CandyKey.of("k123")))
                 .isInstanceOf(CandyNotFoundException.class);
         assertThat(engine.listCandies("k", null, 10).entries()).isEmpty();
-        assertThat(engine.listCandies("m07-", null, 1000).entries()).hasSize(100);
-        assertThat(engine.getCandy(CandyKey.of("m39-099"))).isEqualTo(bytes("v-m39-099"));
+        String last = String.format(roundFormats.get(0), rounds - 1, perFormat - 1);
+        assertThat(engine.getCandy(CandyKey.of(last))).isEqualTo(bytes("v-" + last));
 
         List<String> remaining = new ArrayList<>();
         int rangeTombstones = 0;
@@ -186,7 +211,7 @@ class BoxEngineCompactionTest {
                 rangeTombstones += r.rangeTombstones().size();
             }
         }
-        assertThat(remaining).noneMatch(k -> k.startsWith("k")).hasSize(4000);
+        assertThat(remaining).noneMatch(k -> k.startsWith("k")).hasSize(rounds * perFormat * roundFormats.size());
         assertThat(rangeTombstones).isZero();
     }
 
