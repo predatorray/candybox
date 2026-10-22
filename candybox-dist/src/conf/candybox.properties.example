@@ -95,6 +95,7 @@ data.dir=./data
 # ledger.gc.grace.millis=300000
 # l0.compaction.trigger=4
 # l0.stall.threshold=12
+# compaction.target.file.size.bytes=8388608
 
 # ---------------------------------------------------------------------------
 # Box partitioning & ownership balancing.

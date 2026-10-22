@@ -103,11 +103,13 @@ class ServerConfigTest {
         ServerConfig cfg = ServerConfig.fromProperties(
                 props("zookeeper.connect", "zk:2181", "node.id", "1",
                         "compaction.interval.millis", "5000",
-                        "memtable.flush.threshold.bytes", "1048576"),
+                        "memtable.flush.threshold.bytes", "1048576",
+                        "compaction.target.file.size.bytes", "2097152"),
                 Map.of());
 
         assertThat(cfg.tuning().compactionIntervalMillis()).isEqualTo(5000L);
         assertThat(cfg.tuning().memtableFlushThresholdBytes()).isEqualTo(1048576L);
+        assertThat(cfg.tuning().compactionTargetFileSizeBytes()).isEqualTo(2097152L);
     }
 
     @Test

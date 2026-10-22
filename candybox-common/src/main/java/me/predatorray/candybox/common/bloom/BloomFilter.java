@@ -15,6 +15,7 @@
  */
 package me.predatorray.candybox.common.bloom;
 
+import java.util.Arrays;
 import java.util.Collection;
 import me.predatorray.candybox.common.exception.SerializationException;
 import me.predatorray.candybox.common.serial.BinaryReader;
@@ -52,23 +53,60 @@ public final class BloomFilter {
      * @return an immutable filter answering {@link #mightContain(byte[])}
      */
     public static BloomFilter build(Collection<byte[]> keys, int bitsPerKey) {
-        if (bitsPerKey < 1) {
-            throw new IllegalArgumentException("bitsPerKey must be >= 1");
-        }
-        int n = Math.max(1, keys.size());
-        int numHashes = Math.max(1, Math.min(30, (int) Math.round(bitsPerKey * Math.log(2))));
-        long bitCount = (long) n * bitsPerKey;
-        int numBits = (int) Math.max(64, Math.min(Integer.MAX_VALUE - 64, bitCount));
-        byte[] bits = new byte[(numBits + 7) / 8];
-        BloomFilter filter = new BloomFilter(bits, numBits, numHashes);
+        Builder builder = new Builder(bitsPerKey);
         for (byte[] key : keys) {
-            filter.addInternal(key);
+            builder.add(key);
         }
-        return filter;
+        return builder.build();
     }
 
-    private void addInternal(byte[] key) {
-        int h = hash(key);
+    /**
+     * Accumulates keys for a filter whose size is only known once all keys are added. Keeps one
+     * 32-bit hash per key rather than the keys themselves.
+     */
+    public static final class Builder {
+
+        private final int bitsPerKey;
+        private int[] hashes = new int[64];
+        private int count;
+
+        public Builder(int bitsPerKey) {
+            if (bitsPerKey < 1) {
+                throw new IllegalArgumentException("bitsPerKey must be >= 1");
+            }
+            this.bitsPerKey = bitsPerKey;
+        }
+
+        public Builder add(byte[] key) {
+            if (count == hashes.length) {
+                hashes = Arrays.copyOf(hashes, count * 2);
+            }
+            hashes[count++] = hash(key);
+            return this;
+        }
+
+        /** The serialized size of the filter {@link #build()} would return now. */
+        public int serializedSizeEstimate() {
+            return (numBits(count, bitsPerKey) + 7) / 8 + 16;
+        }
+
+        public BloomFilter build() {
+            int numHashes = Math.max(1, Math.min(30, (int) Math.round(bitsPerKey * Math.log(2))));
+            int numBits = numBits(count, bitsPerKey);
+            BloomFilter filter = new BloomFilter(new byte[(numBits + 7) / 8], numBits, numHashes);
+            for (int i = 0; i < count; i++) {
+                filter.addHash(hashes[i]);
+            }
+            return filter;
+        }
+
+        private static int numBits(int count, int bitsPerKey) {
+            long bitCount = (long) Math.max(1, count) * bitsPerKey;
+            return (int) Math.max(64, Math.min(Integer.MAX_VALUE - 64, bitCount));
+        }
+    }
+
+    private void addHash(int h) {
         int delta = Integer.rotateRight(h, 17);
         for (int j = 0; j < numHashes; j++) {
             int bitpos = Integer.remainderUnsigned(h, numBits);

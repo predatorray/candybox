@@ -25,6 +25,7 @@ import me.predatorray.candybox.bookkeeper.LedgerConfig;
 import me.predatorray.candybox.bookkeeper.LedgerStore;
 import me.predatorray.candybox.bookkeeper.WritableLedger;
 import me.predatorray.candybox.common.CandyKey;
+import me.predatorray.candybox.common.Hlc;
 import me.predatorray.candybox.common.Mutation;
 import me.predatorray.candybox.common.RangeTombstone;
 import me.predatorray.candybox.common.SegmentRef;
@@ -32,6 +33,7 @@ import me.predatorray.candybox.common.bloom.BloomFilter;
 import me.predatorray.candybox.common.serial.BinaryWriter;
 import me.predatorray.candybox.common.serial.MutationSerializer;
 import me.predatorray.candybox.common.serial.RangeTombstoneSerializer;
+import me.predatorray.candybox.lsm.iterator.PeekingIterator;
 
 /**
  * Writes a sorted run of mutations into a new SSTable ledger in the {@link SSTableFormat} layout, then
@@ -72,80 +74,162 @@ public final class SSTableWriter {
      */
     public SSTableMeta write(LedgerConfig config, int level, Iterator<Mutation> sorted,
                              Collection<RangeTombstone> rangeTombstones) {
+        return write(config, level, sorted, rangeTombstones, Long.MAX_VALUE, null, null);
+    }
+
+    /**
+     * Writes the next table of a run split into key-disjoint tables. Like
+     * {@link #write(LedgerConfig, int, Iterator, Collection)}, but stops pulling from {@code sorted} once
+     * the table holds at least {@code targetDataBytes} of data blocks, or its bloom filter or index
+     * would outgrow {@link SSTableFormat#MAX_META_BLOCK_BYTES}; mutations not consumed stay in
+     * {@code sorted} for the next table. The table keeps only the parts of {@code rangeTombstones}
+     * inside its slot of the key space: from {@code slotStart} ({@code null} = unbounded) up to the
+     * next key left in {@code sorted} (unbounded if none). Successive slots tile the key space, so no
+     * range tombstone coverage is lost.
+     */
+    public SSTableMeta write(LedgerConfig config, int level, PeekingIterator<Mutation> sorted,
+                             Collection<RangeTombstone> rangeTombstones, CandyKey slotStart,
+                             long targetDataBytes) {
+        return write(config, level, sorted, rangeTombstones, targetDataBytes, sorted, slotStart);
+    }
+
+    private SSTableMeta write(LedgerConfig config, int level, Iterator<Mutation> sorted,
+                              Collection<RangeTombstone> rangeTombstones, long targetDataBytes,
+                              PeekingIterator<Mutation> splitRun, CandyKey slotStart) {
+        boolean bounded = splitRun != null;
         WritableLedger ledger = ledgerStore.createLedger(config);
+        try {
+            List<byte[]> indexLastKeys = new ArrayList<>();
+            List<Long> indexEntryIds = new ArrayList<>();
+            BloomFilter.Builder bloom = new BloomFilter.Builder(bloomBitsPerKey);
+            long indexBytes = 0;
 
-        List<byte[]> indexLastKeys = new ArrayList<>();
-        List<Long> indexEntryIds = new ArrayList<>();
-        List<byte[]> allKeys = new ArrayList<>();
+            List<byte[]> blockMutations = new ArrayList<>();
+            int blockBytes = 0;
+            byte[] blockLastKey = null;
 
-        List<byte[]> blockMutations = new ArrayList<>();
-        int blockBytes = 0;
-        byte[] blockLastKey = null;
+            byte[] minKey = null;
+            byte[] maxKey = null;
+            long numEntries = 0;
+            long sizeBytes = 0;
+            Set<Long> referencedSyrups = new LinkedHashSet<>();
+            Hlc minPointHlc = null;
 
-        byte[] minKey = null;
-        byte[] maxKey = null;
-        long numEntries = 0;
-        long sizeBytes = 0;
-        Set<Long> referencedSyrups = new LinkedHashSet<>();
+            while (sorted.hasNext()) {
+                if (bounded && (sizeBytes + blockBytes >= targetDataBytes
+                        || bloom.serializedSizeEstimate() >= SSTableFormat.MAX_META_BLOCK_BYTES
+                        || indexBytes >= SSTableFormat.MAX_META_BLOCK_BYTES)) {
+                    break;
+                }
+                Mutation m = sorted.next();
+                byte[] keyBytes = m.key().utf8Bytes();
+                for (SegmentRef seg : m.locator().segments()) {
+                    referencedSyrups.add(seg.syrupId());
+                }
+                byte[] mb = MutationSerializer.serialize(m);
 
-        while (sorted.hasNext()) {
-            Mutation m = sorted.next();
-            byte[] keyBytes = m.key().utf8Bytes();
-            for (SegmentRef seg : m.locator().segments()) {
-                referencedSyrups.add(seg.syrupId());
+                if (blockBytes > 0 && blockBytes + mb.length + 5 > dataBlockTargetBytes) {
+                    sizeBytes += flushBlock(ledger, blockMutations, blockLastKey, indexLastKeys, indexEntryIds);
+                    indexBytes += blockLastKey.length + 10;
+                    blockMutations = new ArrayList<>();
+                    blockBytes = 0;
+                }
+
+                blockMutations.add(mb);
+                blockBytes += mb.length + 5;
+                blockLastKey = keyBytes;
+                bloom.add(keyBytes);
+
+                if (minPointHlc == null || minPointHlc.isAfter(m.hlc())) {
+                    minPointHlc = m.hlc();
+                }
+                if (minKey == null) {
+                    minKey = keyBytes;
+                }
+                maxKey = keyBytes;
+                numEntries++;
             }
-            byte[] mb = MutationSerializer.serialize(m);
 
-            if (blockBytes > 0 && blockBytes + mb.length + 5 > dataBlockTargetBytes) {
-                sizeBytes += flushBlock(ledger, blockMutations, blockLastKey, indexLastKeys, indexEntryIds);
-                blockMutations = new ArrayList<>();
-                blockBytes = 0;
+            if (bounded) {
+                CandyKey slotEnd = splitRun.hasNext() ? splitRun.peek().key() : null;
+                rangeTombstones = clip(rangeTombstones, slotStart, slotEnd);
+            }
+            if (numEntries == 0 && rangeTombstones.isEmpty()) {
+                throw new IllegalArgumentException("Refusing to write an empty SSTable");
+            }
+            sizeBytes += flushBlock(ledger, blockMutations, blockLastKey, indexLastKeys, indexEntryIds);
+
+            long bloomEntryId = ledger.append(bloom.build().serialize());
+
+            long indexEntryId = ledger.append(serializeIndex(indexLastKeys, indexEntryIds));
+
+            long rangeDelEntryId = -1;
+            if (!rangeTombstones.isEmpty()) {
+                byte[] block = serializeRangeTombstones(rangeTombstones);
+                if (block.length > SSTableFormat.MAX_RANGE_DEL_BLOCK_BYTES) {
+                    throw new IllegalStateException("Range-tombstone block of " + block.length
+                            + " bytes exceeds " + SSTableFormat.MAX_RANGE_DEL_BLOCK_BYTES + " bytes ("
+                            + rangeTombstones.size() + " range tombstones)");
+                }
+                rangeDelEntryId = ledger.append(block);
             }
 
-            blockMutations.add(mb);
-            blockBytes += mb.length + 5;
-            blockLastKey = keyBytes;
-            allKeys.add(keyBytes);
-
-            if (minKey == null) {
-                minKey = keyBytes;
+            // A range-only table still needs concrete min/max keys for the manifest; they bound no point
+            // data (the read path consults range tombstones across all tables, never via these keys).
+            if (numEntries == 0) {
+                byte[] rep = representativeKey(rangeTombstones);
+                minKey = rep;
+                maxKey = rep;
             }
-            maxKey = keyBytes;
-            numEntries++;
-        }
 
-        if (numEntries == 0 && rangeTombstones.isEmpty()) {
+            int numDataBlocks = indexEntryIds.size();
+            ledger.append(serializeFooter(bloomEntryId, indexEntryId, rangeDelEntryId, numDataBlocks,
+                    numEntries, minKey, maxKey));
             ledger.close();
-            ledgerStore.deleteLedger(ledger.ledgerId());
-            throw new IllegalArgumentException("Refusing to write an empty SSTable");
+
+            return new SSTableMeta(ledger.ledgerId(), level, CandyKey.ofUtf8(minKey),
+                    CandyKey.ofUtf8(maxKey), numEntries, sizeBytes, referencedSyrups,
+                    spanOf(rangeTombstones), minPointHlc);
+        } catch (RuntimeException e) {
+            try {
+                ledger.close();
+                ledgerStore.deleteLedger(ledger.ledgerId());
+            } catch (RuntimeException cleanup) {
+                e.addSuppressed(cleanup);
+            }
+            throw e;
         }
-        sizeBytes += flushBlock(ledger, blockMutations, blockLastKey, indexLastKeys, indexEntryIds);
+    }
 
-        BloomFilter bloom = BloomFilter.build(allKeys, bloomBitsPerKey);
-        long bloomEntryId = ledger.append(bloom.serialize());
-
-        long indexEntryId = ledger.append(serializeIndex(indexLastKeys, indexEntryIds));
-
-        long rangeDelEntryId = -1;
-        if (!rangeTombstones.isEmpty()) {
-            rangeDelEntryId = ledger.append(serializeRangeTombstones(rangeTombstones));
+    /** The parts of {@code tombstones} inside {@code [slotStart, slotEnd)} (null bounds = unbounded). */
+    private static List<RangeTombstone> clip(Collection<RangeTombstone> tombstones, CandyKey slotStart,
+                                             CandyKey slotEnd) {
+        List<RangeTombstone> out = new ArrayList<>();
+        for (RangeTombstone rt : tombstones) {
+            CandyKey start = max(rt.startInclusive(), slotStart);
+            CandyKey end = rt.endExclusive() == null ? slotEnd
+                    : slotEnd == null || rt.endExclusive().compareTo(slotEnd) < 0 ? rt.endExclusive()
+                    : slotEnd;
+            if (start == null || end == null || start.compareTo(end) < 0) {
+                out.add(new RangeTombstone(start, end, rt.hlc()));
+            }
         }
+        return out;
+    }
 
-        // A range-only table still needs concrete min/max keys for the manifest; they bound no point
-        // data (the read path consults range tombstones across all tables, never via these keys).
-        if (numEntries == 0) {
-            byte[] rep = representativeKey(rangeTombstones);
-            minKey = rep;
-            maxKey = rep;
+    private static CandyKey max(CandyKey a, CandyKey b) {
+        if (a == null) {
+            return b;
         }
+        return b == null || a.compareTo(b) >= 0 ? a : b;
+    }
 
-        int numDataBlocks = indexEntryIds.size();
-        ledger.append(serializeFooter(bloomEntryId, indexEntryId, rangeDelEntryId, numDataBlocks,
-                numEntries, minKey, maxKey));
-        ledger.close();
-
-        return new SSTableMeta(ledger.ledgerId(), level, CandyKey.ofUtf8(minKey),
-                CandyKey.ofUtf8(maxKey), numEntries, sizeBytes, referencedSyrups);
+    private static KeySpan spanOf(Collection<RangeTombstone> tombstones) {
+        KeySpan span = null;
+        for (RangeTombstone rt : tombstones) {
+            span = span == null ? KeySpan.of(rt) : span.union(KeySpan.of(rt));
+        }
+        return span;
     }
 
     private static byte[] serializeRangeTombstones(Collection<RangeTombstone> tombstones) {

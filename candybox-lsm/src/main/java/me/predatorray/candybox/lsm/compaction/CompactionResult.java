@@ -15,20 +15,24 @@
  */
 package me.predatorray.candybox.lsm.compaction;
 
-import java.util.Optional;
+import java.util.List;
 import me.predatorray.candybox.lsm.manifest.ManifestEdit;
 import me.predatorray.candybox.lsm.sstable.SSTableMeta;
 
 /**
- * The outcome of running a {@link CompactionTask}: the output table (absent if the whole input merged
- * down to nothing — e.g. all tombstones aged out at the bottommost level) and the manifest edit that
- * the Box owner must commit (gated on its fencing token) to swap inputs for the output.
+ * The outcome of running a {@link CompactionTask}: the key-disjoint output tables (none if the whole
+ * input merged down to nothing — e.g. all tombstones aged out at the bottommost level) and the manifest
+ * edit that the Box owner must commit (gated on its fencing token) to swap inputs for the outputs.
  *
  * <p>The physical deletion of the now-obsolete input ledgers is performed later by reference-counted
  * GC, never here — see DESIGN.md §10 Phase 3.
  *
- * @param output the output table, if any
- * @param edit   the manifest edit removing the inputs and adding the output
+ * @param outputs the output tables in key order
+ * @param edit    the manifest edit removing the inputs and adding the outputs
  */
-public record CompactionResult(Optional<SSTableMeta> output, ManifestEdit edit) {
+public record CompactionResult(List<SSTableMeta> outputs, ManifestEdit edit) {
+
+    public CompactionResult {
+        outputs = List.copyOf(outputs);
+    }
 }

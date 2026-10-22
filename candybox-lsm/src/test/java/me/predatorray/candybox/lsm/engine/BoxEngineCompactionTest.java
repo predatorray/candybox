@@ -22,6 +22,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import me.predatorray.candybox.bookkeeper.LedgerConfig;
 import me.predatorray.candybox.bookkeeper.fake.InMemoryLedgerStore;
 import me.predatorray.candybox.common.BoxName;
@@ -35,6 +36,7 @@ import me.predatorray.candybox.common.exception.CandyNotFoundException;
 import me.predatorray.candybox.lsm.compaction.Compactor;
 import me.predatorray.candybox.lsm.compaction.CompactionResult;
 import me.predatorray.candybox.lsm.compaction.CompactionTask;
+import me.predatorray.candybox.lsm.compaction.LeveledCompactionStrategy;
 import me.predatorray.candybox.lsm.manifest.ManifestState;
 import me.predatorray.candybox.lsm.sstable.SSTableMeta;
 import me.predatorray.candybox.lsm.sstable.SSTableReader;
@@ -112,7 +114,8 @@ class BoxEngineCompactionTest {
         Clock compactorClock = new ManualClock(nowMillis);
         Compactor compactor = new Compactor(store, new SSTableWriter(store, 10, 256), sstableConfig,
                 graceMillis, compactorClock);
-        CompactionResult result = compactor.compact(new CompactionTask(inputs, outputLevel, bottommost));
+        CompactionResult result = compactor.compact(
+                new CompactionTask(inputs, outputLevel, bottommost, List.of()));
         engine.applyCompaction(result.edit());
     }
 
@@ -129,6 +132,87 @@ class BoxEngineCompactionTest {
             }
         }
         return keys;
+    }
+
+    /** Runs the real strategy with small, bounded output tables until it has nothing left to do. */
+    private void compactUntilIdle(Compactor compactor) {
+        LeveledCompactionStrategy strategy = new LeveledCompactionStrategy(1, 2000, 10);
+        for (int i = 0; i < 1000; i++) {
+            Optional<CompactionTask> task = strategy.pickCompaction(engine.manifestState());
+            if (task.isEmpty()) {
+                return;
+            }
+            engine.applyCompaction(compactor.compact(task.get()).edit());
+        }
+        throw new AssertionError("compaction did not settle");
+    }
+
+    private void putAll(String format, int count) {
+        for (int i = 0; i < count; i++) {
+            String key = String.format(format, i);
+            engine.putCandy(CandyKey.of(key), bytes("v-" + key), null, Map.of(), null);
+        }
+    }
+
+    @Test
+    void rangeDeleteAcrossBoundedTablesIsReclaimedByCompaction() {
+        assertRangeDeleteIsReclaimed(List.of("m%02d-%03d"), 40, 100, 0);
+    }
+
+    @Test
+    void rangeDeleteIsReclaimedWhileWritesLandOnBothSidesOfIt() {
+        // Tables holding these keys straddle the deleted range without holding anything it covers,
+        // so they must not keep the aged range tombstone alive.
+        assertRangeDeleteIsReclaimed(List.of("j%03d-%02d", "l%03d-%02d"), 200, 25, 20);
+    }
+
+    /**
+     * Deletes a range spanning many bounded tables, then runs {@code rounds} rounds of writes with each
+     * key format; the range tombstone passes its GC grace at round {@code agedAtRound}.
+     */
+    private void assertRangeDeleteIsReclaimed(List<String> roundFormats, int rounds, int perFormat,
+                                              int agedAtRound) {
+        engine = newEngine();
+        ManualClock compactorClock = new ManualClock(agedAtRound == 0 ? 1_000_000_000L : 1_000);
+        Compactor compactor = new Compactor(store, new SSTableWriter(store, 10, 256), sstableConfig,
+                100_000, compactorClock, 2048);
+        putAll("k%03d", 300);
+        engine.flush();
+        compactUntilIdle(compactor);
+        assertThat(engine.manifestState().tables()).hasSizeGreaterThan(3);
+
+        engine.deleteRange(CandyKey.of("k000"), CandyKey.of("k300"));
+        engine.flush();
+        for (int round = 0; round < rounds; round++) {
+            if (round == agedAtRound) {
+                compactorClock.setTime(1_000_000_000L);
+            }
+            for (String format : roundFormats) {
+                for (int i = 0; i < perFormat; i++) {
+                    String key = String.format(format, round, i);
+                    engine.putCandy(CandyKey.of(key), bytes("v-" + key), null, Map.of(), null);
+                }
+            }
+            engine.flush();
+            compactUntilIdle(compactor);
+        }
+
+        assertThatThrownBy(() -> engine.getCandy(CandyKey.of("k123")))
+                .isInstanceOf(CandyNotFoundException.class);
+        assertThat(engine.listCandies("k", null, 10).entries()).isEmpty();
+        String last = String.format(roundFormats.get(0), rounds - 1, perFormat - 1);
+        assertThat(engine.getCandy(CandyKey.of(last))).isEqualTo(bytes("v-" + last));
+
+        List<String> remaining = new ArrayList<>();
+        int rangeTombstones = 0;
+        for (SSTableMeta meta : engine.manifestState().tables()) {
+            try (SSTableReader r = new SSTableReader(store, meta.ledgerId())) {
+                r.scan(null).forEachRemaining(m -> remaining.add(m.key().value()));
+                rangeTombstones += r.rangeTombstones().size();
+            }
+        }
+        assertThat(remaining).noneMatch(k -> k.startsWith("k")).hasSize(rounds * perFormat * roundFormats.size());
+        assertThat(rangeTombstones).isZero();
     }
 
     @Test

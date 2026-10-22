@@ -54,6 +54,7 @@ All knobs are configurable; pick defaults unless a workload demands otherwise.
 | `compactionIntervalMillis` | 0 (disabled) | Background compaction+GC tick; **set > 0 in production**. |
 | `l0CompactionTrigger` | 4 | L0 SSTable count that triggers a compaction. |
 | `l0StallThreshold` | 12 | L0 SSTable count at which writes are rejected with `BUSY`. |
+| `compactionTargetFileSizeBytes` (`compaction.target.file.size.bytes`) | 8 MiB | Data size at which compaction starts a new output SSTable. Compaction also starts a new table early when its bloom filter or index would pass 1 MiB, so that every block fits in one BookKeeper entry (5 MiB by default). |
 | `maxClockSkewMillis` | 5 min | HLC skew-rejection bound on observed timestamps. |
 | `tombstoneGcGraceMillis` | 24 h | Late-write window before a bottommost tombstone may be dropped. |
 | `ledgerGcGraceMillis` | 5 min | Grace before an obsoleted ledger (compaction input, dead Syrup, rotated WAL) is deleted; also gates Box-global GC of cross-partition-shared Syrups. |
