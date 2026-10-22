@@ -27,6 +27,7 @@ import me.predatorray.candybox.client.CandyboxClient.PartListing;
 import me.predatorray.candybox.client.CandyboxClient.PartUploadInfo;
 import me.predatorray.candybox.client.CandyboxClient.RangeBytes;
 import me.predatorray.candybox.client.CandyboxClient.UploadEntry;
+import me.predatorray.candybox.common.CandyKey;
 import me.predatorray.candybox.common.auth.BoxAcl;
 import me.predatorray.candybox.common.auth.Grant;
 import me.predatorray.candybox.common.auth.ObjectAcl;
@@ -312,24 +313,28 @@ final class FakeCandyStore implements CandyStore {
     public MultipartListing listMultipartUploads(String box, String prefix, String keyMarker,
                                                  String uploadIdMarker, int maxUploads) {
         box(box);
-        List<UploadEntry> rows = new ArrayList<>();
-        Map<String, PendingUpload> ups = uploads.getOrDefault(box, new LinkedHashMap<>());
+        List<UploadEntry> matching = new ArrayList<>();
+        for (Map.Entry<String, PendingUpload> e
+                : uploads.getOrDefault(box, new LinkedHashMap<>()).entrySet()) {
+            String key = e.getValue().key;
+            if (prefix != null && !prefix.isEmpty() && !key.startsWith(prefix)) {
+                continue;
+            }
+            if (keyMarker != null && (CandyKey.compareUtf8(key, keyMarker) < 0 || (key.equals(keyMarker)
+                    && (uploadIdMarker == null || e.getKey().compareTo(uploadIdMarker) <= 0)))) {
+                continue;
+            }
+            matching.add(new UploadEntry(e.getKey(), key, e.getValue().createdAtMillis));
+        }
+        matching.sort(java.util.Comparator.comparing(UploadEntry::key, CandyKey::compareUtf8)
+                .thenComparing(UploadEntry::uploadId));
         int limit = maxUploads <= 0 ? 1000 : maxUploads;
+        List<UploadEntry> rows = new ArrayList<>(matching.subList(0, Math.min(limit, matching.size())));
         String nextKey = null;
         String nextUpl = null;
-        for (Map.Entry<String, PendingUpload> e : ups.entrySet()) {
-            if (prefix != null && !prefix.isEmpty() && !e.getValue().key.startsWith(prefix)) {
-                continue;
-            }
-            if (keyMarker != null && e.getValue().key.compareTo(keyMarker) < 0) {
-                continue;
-            }
-            if (rows.size() == limit) {
-                nextKey = e.getValue().key;
-                nextUpl = e.getKey();
-                break;
-            }
-            rows.add(new UploadEntry(e.getKey(), e.getValue().key, e.getValue().createdAtMillis));
+        if (matching.size() > limit) {
+            nextKey = rows.get(rows.size() - 1).key();
+            nextUpl = rows.get(rows.size() - 1).uploadId();
         }
         return new MultipartListing(rows, nextKey, nextUpl);
     }

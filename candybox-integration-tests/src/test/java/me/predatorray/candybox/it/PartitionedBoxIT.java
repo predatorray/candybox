@@ -281,6 +281,30 @@ class PartitionedBoxIT {
     }
 
     @Test
+    void listMultipartUploadsPagesVisitEveryUploadOnceInKeyOrder() {
+        // Each partition gets uploads for "mpu2", "mpu2", "mpu1", "mpu0" in that order: reverse key
+        // order, with a repeated key.
+        List<String> expected = new ArrayList<>();
+        for (int i = 4 * PARTITIONS - 1; i >= 0; i--) {
+            String key = keyIn(i % PARTITIONS, "mpu" + Math.min(i / PARTITIONS, 2));
+            expected.add(key + "/" + client.createMultipartUpload(BOX, key, null, Map.of()));
+        }
+        expected.sort(null);
+
+        List<String> seen = new ArrayList<>();
+        String keyMarker = null;
+        String uploadIdMarker = null;
+        do {
+            CandyboxClient.MultipartListing page =
+                    client.listMultipartUploads(BOX, null, keyMarker, uploadIdMarker, 2);
+            page.uploads().forEach(u -> seen.add(u.key() + "/" + u.uploadId()));
+            keyMarker = page.nextKeyMarker();
+            uploadIdMarker = page.nextUploadIdMarker();
+        } while (keyMarker != null);
+        assertThat(seen).containsExactlyElementsOf(expected);
+    }
+
+    @Test
     void uploadPartCopyAcrossPartitionsDegradesToClientSideCopy() {
         String src = keyIn(0, "upcsrc");   // node 1
         String target = keyIn(2, "upcdst"); // node 2

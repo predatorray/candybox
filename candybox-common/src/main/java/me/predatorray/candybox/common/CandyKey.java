@@ -78,6 +78,11 @@ public final class CandyKey implements Comparable<CandyKey> {
         return Bytes.compare(this.utf8, o.utf8);
     }
 
+    /** Compares raw key strings in the same UTF-8 byte order as {@link #compareTo}, without validating. */
+    public static int compareUtf8(String a, String b) {
+        return Bytes.compare(a.getBytes(StandardCharsets.UTF_8), b.getBytes(StandardCharsets.UTF_8));
+    }
+
     @Override
     public boolean equals(Object obj) {
         if (this == obj) {
