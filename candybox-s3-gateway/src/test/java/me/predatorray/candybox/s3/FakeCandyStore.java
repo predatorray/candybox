@@ -148,13 +148,18 @@ final class FakeCandyStore implements CandyStore {
                 Crc32c.of(data), System.currentTimeMillis()));
     }
 
-    @Override
     public byte[] getCandy(String box, String key) {
         return obj(box, key).data().clone();
     }
 
+    /** Range reads served so far. */
+    int rangeReads;
+    /** Runs before each range read is served, with the 1-based read count; lets a test race a write. */
+    java.util.function.IntConsumer beforeRangeRead = n -> { };
+
     @Override
     public RangeBytes getCandyRange(String box, String key, long firstByte, long lastByte) {
+        beforeRangeRead.accept(++rangeReads);
         Obj o = obj(box, key);
         long total = o.data().length;
         long resolvedFirst;

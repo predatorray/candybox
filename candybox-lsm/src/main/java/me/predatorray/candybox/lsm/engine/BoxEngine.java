@@ -51,6 +51,7 @@ import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.config.LedgerRole;
 import me.predatorray.candybox.common.exception.BusyException;
 import me.predatorray.candybox.common.exception.CandyNotFoundException;
+import me.predatorray.candybox.common.exception.LimitExceededException;
 import me.predatorray.candybox.common.exception.ValidationException;
 import me.predatorray.candybox.lsm.manifest.Manifest;
 import me.predatorray.candybox.lsm.manifest.ManifestEdit;
@@ -971,8 +972,19 @@ public final class BoxEngine implements AutoCloseable {
      * @throws CandyNotFoundException if there is no live Candy at {@code key}
      */
     public CandyMetadata getCandy(CandyKey key, OutputStream out) {
+        return getCandy(key, out, Long.MAX_VALUE);
+    }
+
+    /**
+     * {@link #getCandy(CandyKey, OutputStream)}, refusing up front (before any bytes are read) a
+     * Candy longer than {@code maxBytes}.
+     *
+     * @throws LimitExceededException if the Candy is longer than {@code maxBytes}
+     */
+    public CandyMetadata getCandy(CandyKey key, OutputStream out, long maxBytes) {
         CandyLocator locator = resolveLive(key)
                 .orElseThrow(() -> new CandyNotFoundException(box.value(), key.value()));
+        checkReadSize(locator.contentLength(), maxBytes);
         syrupReader.readParts(locator.parts(), out);
         getCount.incrementAndGet();
         return CandyMetadata.from(locator);
@@ -1003,6 +1015,17 @@ public final class BoxEngine implements AutoCloseable {
      */
     public RangeReadResult getCandyRange(CandyKey key, long firstByte, long lastByte,
                                          OutputStream out) {
+        return getCandyRange(key, firstByte, lastByte, out, Long.MAX_VALUE);
+    }
+
+    /**
+     * {@link #getCandyRange(CandyKey, long, long, OutputStream)}, refusing up front a resolved
+     * window longer than {@code maxBytes}.
+     *
+     * @throws LimitExceededException if the resolved window is longer than {@code maxBytes}
+     */
+    public RangeReadResult getCandyRange(CandyKey key, long firstByte, long lastByte,
+                                         OutputStream out, long maxBytes) {
         CandyLocator locator = resolveLive(key)
                 .orElseThrow(() -> new CandyNotFoundException(box.value(), key.value()));
         long total = locator.contentLength();
@@ -1039,9 +1062,18 @@ public final class BoxEngine implements AutoCloseable {
             throw new IllegalArgumentException("Range " + firstByte + "-" + lastByte
                     + " is empty after resolution");
         }
+        checkReadSize(resolvedLast - resolvedFirst + 1, maxBytes);
         syrupReader.readRange(locator.parts(), resolvedFirst, resolvedLast, out);
         getCount.incrementAndGet();
         return new RangeReadResult(resolvedFirst, resolvedLast, total, CandyMetadata.from(locator));
+    }
+
+    private static void checkReadSize(long length, long maxBytes) {
+        if (length > maxBytes) {
+            throw new LimitExceededException("Read of " + length
+                    + " bytes exceeds the single-response maximum of " + maxBytes
+                    + " bytes; use range reads");
+        }
     }
 
     /**

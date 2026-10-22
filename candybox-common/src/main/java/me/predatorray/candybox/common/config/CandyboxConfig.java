@@ -220,7 +220,7 @@ public final class CandyboxConfig {
         private int bloomBitsPerKey = 10;
         private long memtableFlushThresholdBytes = 4L << 20;   // 4 MiB
         private long syrupRolloverBytes = 1L << 30;            // 1 GiB
-        private int maxFrameSizeBytes = 16 << 20;              // 16 MiB protocol cap
+        private int maxFrameSizeBytes = (16 << 20) + (64 << 10); // a 16 MiB part + metadata
         private long ownershipLeaseTtlMillis = 10_000L;        // 10s lease
         private long leaseRenewIntervalMillis = 3_000L;        // renew well within the TTL; 0 disables
         private long routerCacheTtlMillis = 5_000L;            // client Box->owner cache TTL

@@ -30,7 +30,7 @@ class CandyboxConfigTest {
         assertThat(cfg.bloomBitsPerKey()).isEqualTo(10);
         assertThat(cfg.memtableFlushThresholdBytes()).isEqualTo(4L << 20);
         assertThat(cfg.syrupRolloverBytes()).isEqualTo(1L << 30);
-        assertThat(cfg.maxFrameSizeBytes()).isEqualTo(16 << 20);
+        assertThat(cfg.maxFrameSizeBytes()).isEqualTo((16 << 20) + (64 << 10));
         assertThat(cfg.ownershipLeaseTtlMillis()).isEqualTo(10_000L);
         assertThat(cfg.leaseRenewIntervalMillis()).isEqualTo(3_000L);
         assertThat(cfg.routerCacheTtlMillis()).isEqualTo(5_000L);

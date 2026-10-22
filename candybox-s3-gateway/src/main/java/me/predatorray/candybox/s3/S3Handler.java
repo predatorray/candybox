@@ -16,18 +16,25 @@
 package me.predatorray.candybox.s3;
 
 import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.handler.codec.http.DefaultFullHttpResponse;
+import io.netty.handler.codec.http.DefaultHttpContent;
+import io.netty.handler.codec.http.DefaultHttpResponse;
 import io.netty.handler.codec.http.FullHttpRequest;
 import io.netty.handler.codec.http.FullHttpResponse;
 import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpHeaderValues;
+import io.netty.handler.codec.http.HttpResponse;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
+import io.netty.handler.codec.http.LastHttpContent;
 import io.netty.handler.codec.http.QueryStringDecoder;
+import io.netty.util.ReferenceCountUtil;
+import java.util.ArrayDeque;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -50,6 +57,7 @@ import me.predatorray.candybox.common.auth.Grant;
 import me.predatorray.candybox.common.auth.ObjectAcl;
 import me.predatorray.candybox.common.auth.Principal;
 import me.predatorray.candybox.common.checksum.Crc32c;
+import me.predatorray.candybox.protocol.Message;
 import me.predatorray.candybox.s3.S3Router.S3Action;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -60,20 +68,28 @@ import org.slf4j.LoggerFactory;
  * (see {@link S3GatewayServer}) so the synchronous {@link CandyStore} calls never block an I/O event
  * loop.
  *
- * <p>v1 buffers whole request/response bodies (the underlying client API is itself buffer-based today),
- * path-style addressing only, anonymous (the {@code Authorization} header is accepted and ignored). See
- * {@code S3_GATEWAY_PLAN.md}.
+ * <p>Request bodies are aggregated (bounded by one node frame, see {@link S3BodyLimitHandler}); GET
+ * bodies larger than a frame are streamed as a sequence of range reads. Path-style addressing only,
+ * anonymous (the {@code Authorization} header is accepted and ignored). See {@code S3_GATEWAY_PLAN.md}.
  */
-final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
+final class S3Handler extends ChannelInboundHandlerAdapter {
 
     private static final Logger LOG = LoggerFactory.getLogger(S3Handler.class);
     private static final String META_PREFIX = "x-amz-meta-";
     private static final int DEFAULT_MAX_KEYS = 1000;
+    private static final int MAX_STREAM_CHUNK_BYTES = 8 << 20;
+    private static final int MAX_GET_ATTEMPTS = 3;
 
     private final CandyStore store;
     private final S3GatewayConfig config;
     private final S3Authenticator authenticator;
     private final S3AccessControl access;
+
+    // Per-connection state, touched only from this handler's executor. HTTP/1.1 responses must go
+    // out in request order, so requests that arrive while a GET body is streaming wait here.
+    private final ArrayDeque<Object> queued = new ArrayDeque<>();
+    private boolean streaming;
+    private boolean closing;
 
     /** Auth-disabled handler (anonymous full access) — the pre-SigV4 behavior, used by tests. */
     S3Handler(CandyStore store, S3GatewayConfig config) {
@@ -92,7 +108,80 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
     }
 
     @Override
-    protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest request) {
+    public void channelRead(ChannelHandlerContext ctx, Object msg) {
+        if (!(msg instanceof FullHttpRequest) && !(msg instanceof S3BodyLimitHandler.Rejected)) {
+            ctx.fireChannelRead(msg);
+        } else if (closing) {
+            release(msg);
+        } else if (streaming) {
+            queued.add(msg);
+        } else {
+            serve(ctx, msg);
+        }
+    }
+
+    @Override
+    public void channelInactive(ChannelHandlerContext ctx) {
+        abandon();
+        ctx.fireChannelInactive();
+    }
+
+    @Override
+    public void handlerRemoved(ChannelHandlerContext ctx) {
+        abandon();
+    }
+
+    private void serve(ChannelHandlerContext ctx, Object msg) {
+        if (msg instanceof S3BodyLimitHandler.Rejected rejected) {
+            // Close once the error is out and the client has finished sending the refused body.
+            closing = true;
+            abandon();
+            ctx.writeAndFlush(rejected.response()).addListener(
+                    f -> rejected.bodyDone().whenComplete((v, t) -> ctx.channel().close()));
+            return;
+        }
+        FullHttpRequest request = (FullHttpRequest) msg;
+        try {
+            handle(ctx, request);
+        } finally {
+            request.release();
+        }
+    }
+
+    /** Ends a streamed body: serves the requests that queued behind it, in order. */
+    private void streamEnded(ChannelHandlerContext ctx) {
+        streaming = false;
+        ctx.channel().config().setAutoRead(true);
+        Object next;
+        while (!streaming && !closing && (next = queued.poll()) != null) {
+            serve(ctx, next);
+        }
+    }
+
+    /** The stream was cut off and the connection is closing: nothing queued will be answered. */
+    private void streamAborted(ChannelHandlerContext ctx) {
+        streaming = false;
+        closing = true;
+        abandon();
+        ctx.close();
+    }
+
+    private void abandon() {
+        Object next;
+        while ((next = queued.poll()) != null) {
+            release(next);
+        }
+    }
+
+    private static void release(Object msg) {
+        if (msg instanceof S3BodyLimitHandler.Rejected rejected) {
+            rejected.response().release();
+        } else {
+            ReferenceCountUtil.release(msg);
+        }
+    }
+
+    private void handle(ChannelHandlerContext ctx, FullHttpRequest request) {
         String requestId = UUID.randomUUID().toString();
         String method = request.method().name().toUpperCase(Locale.ROOT);
         QueryStringDecoder decoder = new QueryStringDecoder(request.uri());
@@ -287,9 +376,9 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
             return;
         }
         byte[] body = bodyBytes(request, auth);
-        if (body.length > config.maxObjectBytes()) {
-            throw new S3Exception(S3ErrorCode.ENTITY_TOO_LARGE,
-                    "Object exceeds the configured maximum of " + config.maxObjectBytes() + " bytes");
+        if (body.length > config.maxRequestBodyBytes()) {
+            throw new S3Exception(S3ErrorCode.ENTITY_TOO_LARGE, "Object exceeds the maximum of "
+                    + config.maxRequestBodyBytes() + " bytes for a single PUT; use multipart upload");
         }
         String contentType = request.headers().get(HttpHeaderNames.CONTENT_TYPE);
         if (contentType == null || contentType.isBlank()) {
@@ -336,71 +425,182 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
                 S3Xml.copyObjectResult(Etag.unquoted(info.crc32c()), info.createdAtMillis()), requestId);
     }
 
+    /**
+     * Serves the whole object (200) or a {@code Range: bytes=…} window (206). An unparseable header
+     * that doesn't start with {@code bytes=} is ignored per RFC 9110 §14.2 and served as a full 200;
+     * multi-range is {@link S3ErrorCode#NOT_IMPLEMENTED}.
+     *
+     * <p>Headers come from one HEAD; the body is read as range slices of at most
+     * {@link #streamChunkBytes} (one node frame), each checked against that HEAD's ETag (CRC32C)
+     * and length. A window that needs several slices is streamed; if the content changes mid-stream
+     * the connection is closed rather than return mixed bytes. The check is content-based: an
+     * overwrite with identical bytes but new metadata is served with the HEAD's (older) headers.
+     */
     private void getObject(ChannelHandlerContext ctx, FullHttpRequest request, PathParts parts,
                            String requestId) {
         requireKey(parts);
         String rangeHeader = request.headers().get(HttpHeaderNames.RANGE);
-        if (rangeHeader == null || rangeHeader.isBlank()) {
-            // Full object, 200 OK.
-            CandyInfo info = store.headCandy(parts.bucket(), parts.key());
-            byte[] data = store.getCandy(parts.bucket(), parts.key());
-            FullHttpResponse r = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1,
-                    HttpResponseStatus.OK, Unpooled.wrappedBuffer(data));
-            applyObjectHeaders(r, info);
+        ParsedRange range = rangeHeader == null || rangeHeader.isBlank() ? null : parseRange(rangeHeader);
+        for (int attempt = 1; ; attempt++) {
+            try {
+                getObjectOnce(ctx, request, parts, range, requestId);
+                return;
+            } catch (ObjectChangedException e) {
+                if (attempt == MAX_GET_ATTEMPTS) {
+                    throw new S3Exception(S3ErrorCode.SERVICE_UNAVAILABLE,
+                            "Object kept changing while being read; retry", e);
+                }
+            }
+        }
+    }
+
+    private void getObjectOnce(ChannelHandlerContext ctx, FullHttpRequest request, PathParts parts,
+                               ParsedRange range, String requestId) {
+        CandyInfo info = store.headCandy(parts.bucket(), parts.key());
+        long total = info.contentLength();
+        long first;
+        long last;
+        if (range == null) {
+            first = 0;
+            last = total - 1;
+        } else {
+            if (range.firstByte < 0) {
+                first = Math.max(total - range.lastByte, 0);
+                last = total - 1;
+            } else {
+                first = range.firstByte;
+                last = range.lastByte < 0 ? total - 1 : Math.min(range.lastByte, total - 1);
+            }
+            if (total == 0 || first >= total) {
+                throw new S3Exception(S3ErrorCode.INVALID_RANGE, "Range is not satisfiable (object length "
+                        + total + ")");
+            }
+        }
+        long length = last - first + 1;
+        int chunk = streamChunkBytes();
+        // The first slice is read before any header is written, so a failure still gets a proper error.
+        byte[] firstSlice = length == 0 ? new byte[0]
+                : readSlice(parts, first, Math.min(last, first + chunk - 1), info);
+        HttpResponseStatus status = range == null ? HttpResponseStatus.OK
+                : HttpResponseStatus.PARTIAL_CONTENT;
+        if (firstSlice.length == length) {
+            FullHttpResponse r = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, status,
+                    Unpooled.wrappedBuffer(firstSlice));
+            applyObjectHeaders(r, info, range, first, last);
             send(ctx, request, r, requestId);
             return;
         }
-        getObjectRange(ctx, request, parts, rangeHeader, requestId);
+
+        HttpResponse head = new DefaultHttpResponse(HttpVersion.HTTP_1_1, status);
+        applyObjectHeaders(head, info, range, first, last);
+        head.headers().set("x-amz-request-id", requestId);
+        head.headers().set(HttpHeaderNames.SERVER, "Candybox");
+        head.headers().set(HttpHeaderNames.CONTENT_LENGTH, length);
+        boolean keepAlive = HttpUtil.isKeepAlive(request);
+        head.headers().set(HttpHeaderNames.CONNECTION,
+                keepAlive ? HttpHeaderValues.KEEP_ALIVE : HttpHeaderValues.CLOSE);
+        streaming = true;
+        ctx.channel().config().setAutoRead(false); // bound what a pipelining client can queue
+        ctx.write(head);
+        ChannelFuture written = ctx.writeAndFlush(new DefaultHttpContent(Unpooled.wrappedBuffer(firstSlice)));
+        long offset = first + firstSlice.length;
+        byte[] next = readSliceOrAbort(ctx, parts, offset, last, chunk, info, requestId);
+        if (next != null) {
+            streamAfter(ctx, written, parts, info, next, offset, last, chunk, keepAlive, requestId);
+        }
     }
 
     /**
-     * Handles {@code Range: bytes=…} with a 206 Partial Content response and a {@code Content-Range}
-     * header. Multi-range ({@code bytes=A-B,C-D}) is rejected with {@link S3ErrorCode#NOT_IMPLEMENTED}.
-     * An unparseable header that doesn't start with {@code bytes=} is ignored per RFC 9110 §14.2 and
-     * served as a full 200, matching mainstream S3 behavior.
+     * Once {@code pending} is on the wire, writes {@code slice} (at {@code offset}) and fetches the
+     * one after it while that write is in flight; the end of the window writes the last content.
+     * Each step runs as its own task on this handler's executor, so a client that reads slowly or
+     * not at all holds at most two slices of memory, never a worker thread.
      */
-    private void getObjectRange(ChannelHandlerContext ctx, FullHttpRequest request, PathParts parts,
-                                String rangeHeader, String requestId) {
-        ParsedRange range = parseRange(rangeHeader);
-        if (range == null) {
-            // Unparseable / non-bytes unit; per RFC 9110 §14.2 fall back to a full 200.
-            CandyInfo info = store.headCandy(parts.bucket(), parts.key());
-            byte[] data = store.getCandy(parts.bucket(), parts.key());
-            FullHttpResponse r = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1,
-                    HttpResponseStatus.OK, Unpooled.wrappedBuffer(data));
-            applyObjectHeaders(r, info);
-            send(ctx, request, r, requestId);
-            return;
+    private void streamAfter(ChannelHandlerContext ctx, ChannelFuture pending, PathParts parts,
+                             CandyInfo info, byte[] slice, long offset, long last, int chunk,
+                             boolean keepAlive, String requestId) {
+        pending.addListener(f -> ctx.executor().execute(() -> {
+            if (!f.isSuccess()) {
+                streamAborted(ctx); // the client went away
+                return;
+            }
+            if (offset > last) {
+                ChannelFuture done = ctx.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT);
+                if (keepAlive) {
+                    streamEnded(ctx);
+                } else {
+                    closing = true;
+                    abandon();
+                    done.addListener(ChannelFutureListener.CLOSE);
+                }
+                return;
+            }
+            ChannelFuture written = ctx.writeAndFlush(new DefaultHttpContent(Unpooled.wrappedBuffer(slice)));
+            long nextOffset = offset + slice.length;
+            byte[] next = readSliceOrAbort(ctx, parts, nextOffset, last, chunk, info, requestId);
+            if (next != null) {
+                streamAfter(ctx, written, parts, info, next, nextOffset, last, chunk, keepAlive,
+                        requestId);
+            }
+        }));
+    }
+
+    /**
+     * The slice starting at {@code offset} (empty past the window's end), or {@code null} after
+     * closing the connection because it could not be read as the version already promised.
+     */
+    private byte[] readSliceOrAbort(ChannelHandlerContext ctx, PathParts parts, long offset, long last,
+                                    int chunk, CandyInfo info, String requestId) {
+        if (offset > last) {
+            return new byte[0];
         }
+        try {
+            return readSlice(parts, offset, Math.min(last, offset + chunk - 1), info);
+        } catch (RuntimeException e) {
+            LOG.warn("Aborting GET {}/{} at byte {} (req {}): {}", parts.bucket(), parts.key(), offset,
+                    requestId, e.toString());
+            streamAborted(ctx);
+            return null;
+        }
+    }
+
+    /** Reads {@code [first, last]}, failing with {@link ObjectChangedException} if it is no longer
+     * the version {@code info} describes. */
+    private byte[] readSlice(PathParts parts, long first, long last, CandyInfo info) {
         RangeBytes slice;
         try {
-            slice = store.getCandyRange(parts.bucket(), parts.key(), range.firstByte,
-                    range.lastByte);
+            slice = store.getCandyRange(parts.bucket(), parts.key(), first, last);
         } catch (IllegalArgumentException e) {
-            // The engine raises IAE for an unsatisfiable range; surface as the S3 416 error code.
-            throw new S3Exception(S3ErrorCode.INVALID_RANGE, e.getMessage(), e);
+            throw new ObjectChangedException();
+        } catch (RuntimeException e) {
+            S3ErrorCode code = ErrorMapper.toS3(e).error();
+            if (code == S3ErrorCode.NO_SUCH_KEY || code == S3ErrorCode.INVALID_RANGE) {
+                throw new ObjectChangedException(); // deleted, or shrank below the window
+            }
+            if (code == S3ErrorCode.ENTITY_TOO_LARGE) {
+                throw new S3Exception(S3ErrorCode.INTERNAL_ERROR, "A node refused a "
+                        + (last - first + 1) + "-byte slice; the gateway's max.frame.size.bytes ("
+                        + config.maxFrameSizeBytes() + ") must not exceed the nodes'", e);
+            }
+            throw e;
         }
-        CandyInfo info = store.headCandy(parts.bucket(), parts.key());
-        long total = slice.totalLength();
-        long emittedFirst;
-        long emittedLast;
-        if (range.firstByte < 0) {
-            // Suffix range: server clamps to start of object if suffix >= total.
-            emittedFirst = Math.max(total - range.lastByte, 0);
-            emittedLast = total - 1;
-        } else {
-            emittedFirst = range.firstByte;
-            emittedLast = Math.min(range.lastByte < 0 ? total - 1 : range.lastByte, total - 1);
+        if (slice.crc32c() != info.crc32c() || slice.totalLength() != info.contentLength()
+                || slice.data().length != last - first + 1) {
+            throw new ObjectChangedException();
         }
-        FullHttpResponse r = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1,
-                HttpResponseStatus.PARTIAL_CONTENT, Unpooled.wrappedBuffer(slice.data()));
-        applyObjectHeaders(r, info);
-        // Reset Content-Length to the slice length (the full-object applyObjectHeaders does not set it
-        // explicitly, but Netty's auto-set on the FullHttpResponse uses the body buffer, which is the
-        // slice).
-        r.headers().set(HttpHeaderNames.CONTENT_RANGE,
-                "bytes " + emittedFirst + "-" + emittedLast + "/" + total);
-        send(ctx, request, r, requestId);
+        return slice.data();
+    }
+
+    /** One node frame's worth of object bytes, capped so a GET holds a bounded buffer. */
+    private int streamChunkBytes() {
+        return Math.max(1, Math.min(MAX_STREAM_CHUNK_BYTES,
+                Message.maxInlineDataBytes(config.maxFrameSizeBytes())));
+    }
+
+    private static final class ObjectChangedException extends RuntimeException {
+        ObjectChangedException() {
+            super(null, null, false, false);
+        }
     }
 
     /**
@@ -467,7 +667,16 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
         send(ctx, request, r, requestId, true);
     }
 
-    private void applyObjectHeaders(FullHttpResponse r, CandyInfo info) {
+    private void applyObjectHeaders(HttpResponse r, CandyInfo info, ParsedRange range, long first,
+                                    long last) {
+        applyObjectHeaders(r, info);
+        if (range != null) {
+            r.headers().set(HttpHeaderNames.CONTENT_RANGE,
+                    "bytes " + first + "-" + last + "/" + info.contentLength());
+        }
+    }
+
+    private void applyObjectHeaders(HttpResponse r, CandyInfo info) {
         String contentType = info.contentType();
         r.headers().set(HttpHeaderNames.CONTENT_TYPE,
                 (contentType == null || contentType.isBlank()) ? "application/octet-stream" : contentType);
@@ -510,10 +719,9 @@ final class S3Handler extends SimpleChannelInboundHandler<FullHttpRequest> {
             return;
         }
         byte[] body = bodyBytes(request, auth);
-        if (body.length > config.maxObjectBytes()) {
-            // Per-part size: tracks the configured single-object cap until streaming lands.
+        if (body.length > config.maxRequestBodyBytes()) {
             throw new S3Exception(S3ErrorCode.ENTITY_TOO_LARGE,
-                    "Part exceeds the configured maximum of " + config.maxObjectBytes() + " bytes");
+                    "Part exceeds the maximum of " + config.maxRequestBodyBytes() + " bytes");
         }
         PartUploadInfo info = store.uploadPart(parts.bucket(), parts.key(), uploadId, partNumber,
                 body);

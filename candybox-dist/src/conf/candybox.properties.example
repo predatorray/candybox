@@ -83,7 +83,7 @@ data.dir=./data
 
 # memtable.flush.threshold.bytes=4194304
 # syrup.rollover.bytes=1073741824
-# max.frame.size.bytes=16777216
+# max.frame.size.bytes=16842752
 # bloom.bits.per.key=10
 # ownership.lease.ttl.millis=10000
 # lease.renew.interval.millis=3000

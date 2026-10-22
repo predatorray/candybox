@@ -409,7 +409,7 @@ Box drops its manifest pointer but does not yet reclaim that Box's SSTable/Syrup
 | Max multipart parts per upload | 10,000 | S3 parity; `multipart.max.parts` |
 | Multipart upload TTL | 7 days | sweeper auto-aborts; `multipart.upload.ttl.millis` |
 | Max Candy size | unlimited (`maxCandySizeBytes=0`) | configurable |
-| Max protocol frame | 16 MiB | `FrameCodec`, rejected before allocation |
+| Max protocol frame | 16 MiB + 64 KiB | `FrameCodec`, rejected before allocation; 64 KiB reserved for metadata |
 
 Per-role BK quorum (E/Qw/Qa) defaults: **WAL 3/3/2, Manifest 3/3/2, SSTable 3/2/2, Syrup 3/2/2**
 (`QuorumConfig`).
@@ -466,7 +466,7 @@ Per-role BK quorum (E/Qw/Qa) defaults: **WAL 3/3/2, Manifest 3/3/2, SSTable 3/2/
 - **No Syrup defragmentation** — see §9(d). Syrup compaction (copying survivors into a fresh Syrup)
   is future work.
 - **Buffered wire protocol** — PUT/GET/UploadPart bodies are inlined in one framed message (16 MiB
-  cap). Multipart upload partially substitutes for streaming, but each part is still bounded by the
+  of data per frame). Multipart upload partially substitutes for streaming, but each part is still bounded by the
   frame cap. True on-the-wire chunked streaming remains `TODO(phase-2)`.
 - **UploadPartCopy buffers in memory** — the engine reads the source slice and writes it as a fresh
   part rather than sharing Syrup segments when the range aligns to chunk boundaries; the optimization
