@@ -22,6 +22,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.function.Consumer;
 import me.predatorray.candybox.bookkeeper.fake.InMemoryLedgerStore;
 import me.predatorray.candybox.common.BoxName;
 import me.predatorray.candybox.common.CandyKey;
@@ -31,6 +33,8 @@ import me.predatorray.candybox.common.Partitioning;
 import me.predatorray.candybox.common.auth.ObjectAcl;
 import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.exception.CandyNotFoundException;
+import me.predatorray.candybox.common.exception.NotOwnerException;
+import me.predatorray.candybox.common.serial.BinaryWriter;
 import me.predatorray.candybox.coordination.CandyboxKeys;
 import me.predatorray.candybox.coordination.CasConflictException;
 import me.predatorray.candybox.coordination.CoordinationService;
@@ -133,6 +137,11 @@ class CrossPartitionGcAndRenameTest {
         assertDelayedZeroCopyPutStaysReadable(1, true);
     }
 
+    @Test
+    void pendingSamePartitionRenameRelayKeepsItsSyrupAlive() {
+        assertDelayedZeroCopyPutStaysReadable(0, true);
+    }
+
     /**
      * Resolves a relay, then deletes, compacts and GCs the source so its Syrup would be reclaimable,
      * and only then consumes the relay: the relay must have pinned the Syrup.
@@ -210,11 +219,6 @@ class CrossPartitionGcAndRenameTest {
     }
 
     @Test
-    void pendingSamePartitionRenameRelayKeepsItsSyrupAlive() {
-        assertDelayedZeroCopyPutStaysReadable(0, true);
-    }
-
-    @Test
     void undecodableRelaySkipsSyrupGcButNotSSTableGc() {
         InMemoryLedgerStore store = new InMemoryLedgerStore();
         InMemoryCoordinationService coordination = new InMemoryCoordinationService();
@@ -254,9 +258,9 @@ class CrossPartitionGcAndRenameTest {
             GarbageCollector gc = new GarbageCollector(store, 100, clock);
             clock.advance(500);
 
-            gc.collect(p0, java.util.Set.of(), 1000 + 99);
+            gc.collect(p0, Set.of(), 1000 + 99);
             assertThat(store.listLedgers()).contains(syrup);
-            gc.collect(p0, java.util.Set.of(), 1000 + 100);
+            gc.collect(p0, Set.of(), 1000 + 100);
             assertThat(store.listLedgers()).doesNotContain(syrup);
         }
         store.close();
@@ -331,8 +335,78 @@ class CrossPartitionGcAndRenameTest {
                 .leaseRenewIntervalMillis(0).build(), new InMemoryLedgerStore(),
                 new InMemoryCoordinationService(), new ManualClock(1000))) {
             assertThatThrownBy(() -> node.publishPartitionRefs(BOX, 0))
-                    .isInstanceOf(me.predatorray.candybox.common.exception.NotOwnerException.class);
+                    .isInstanceOf(NotOwnerException.class);
         }
+    }
+
+    @Test
+    void gcPublishDoesNotOverwriteAConcurrentZeroCopyPublishWithStaleRefs() {
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        FaultyCoordination coordination = new FaultyCoordination(new InMemoryCoordinationService());
+        try (CandyboxNode node = new CandyboxNode(1, aggressiveGcConfig(), store, coordination,
+                new ManualClock(1000))) {
+            node.createBox(BOX, PARTITIONS);
+            String src = keyIn(0, "src");
+            String dst = keyIn(1, "dst");
+            long syrup = putAndFlush(node, src);
+            RequestHandler handler = node.requestHandler();
+            String token = relayToken(handler, src);
+            orphanSource(node, src);
+
+            // The put lands while GC is publishing partition 1's refs, then deletes its relay.
+            String dstRefs = CandyboxKeys.partitionRefsKey(BOX.value(), 1);
+            coordination.beforeGet = key -> {
+                if (key.equals(dstRefs)) {
+                    coordination.beforeGet = k -> { };
+                    send(handler, new Message.ZeroCopyPutRequest(BOX.value(), dst, 0, token, null,
+                            List.of(), null));
+                }
+            };
+            node.collectGarbageOnce();
+
+            assertThat(store.listLedgers()).contains(syrup);
+            assertThat(node.enginePartition(BOX, 1).getCandy(CandyKey.of(dst)))
+                    .isEqualTo(bytes("payload"));
+        }
+        store.close();
+    }
+
+    @Test
+    void syrupGcWaitsForReferencesThatStopChangingDuringTheSnapshot() {
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        FaultyCoordination coordination = new FaultyCoordination(new InMemoryCoordinationService());
+        try (CandyboxNode node = new CandyboxNode(1, aggressiveGcConfig(), store, coordination,
+                new ManualClock(1000))) {
+            node.createBox(BOX, PARTITIONS);
+            String src = keyIn(0, "src");
+            long syrup = putAndFlush(node, src);
+            orphanSource(node, src);
+
+            // A sibling partition republishes while every snapshot is reading the relays.
+            String siblingRefs = CandyboxKeys.partitionRefsKey(BOX.value(), 3);
+            long[] bump = {1L << 40};
+            coordination.beforeChildren = path -> {
+                if (path.startsWith(CandyboxKeys.locatorRelaysPath(BOX.value(), 0))) {
+                    long version = coordination.get(siblingRefs).orElseThrow().version();
+                    coordination.compareAndSet(siblingRefs, encode(bump[0]++), version);
+                }
+            };
+            node.collectGarbageOnce();
+            assertThat(store.listLedgers()).contains(syrup);
+
+            coordination.beforeChildren = path -> { };
+            node.collectGarbageOnce();
+            assertThat(store.listLedgers()).doesNotContain(syrup);
+        }
+        store.close();
+    }
+
+    /** A one-element referenced-Syrup set in the published refs encoding. */
+    private static byte[] encode(long syrupId) {
+        BinaryWriter w = new BinaryWriter(16);
+        w.writeVarInt(1);
+        w.writeVarLong(syrupId);
+        return w.toByteArray();
     }
 
     /** Puts and flushes {@code key} in partition 0, returning the Syrup that holds its bytes. */
@@ -593,14 +667,16 @@ class CrossPartitionGcAndRenameTest {
 
     /**
      * Delegates to a real fake, but {@link #children} fails on demand (a ZooKeeper outage), writes
-     * to keys containing {@link #failWritesTo} lose a CAS race, and {@link #beforeCreate} runs
-     * before every create.
+     * to keys containing {@link #failWritesTo} lose a CAS race, and the {@code before*} hooks run
+     * before the corresponding calls.
      */
     private static final class FaultyCoordination implements CoordinationService {
         private final CoordinationService delegate;
         volatile boolean failChildren;
         volatile String failWritesTo;
-        volatile java.util.function.Consumer<String> beforeCreate = key -> { };
+        volatile Consumer<String> beforeCreate = key -> { };
+        volatile Consumer<String> beforeGet = key -> { };
+        volatile Consumer<String> beforeChildren = path -> { };
 
         FaultyCoordination(CoordinationService delegate) {
             this.delegate = delegate;
@@ -608,6 +684,7 @@ class CrossPartitionGcAndRenameTest {
 
         @Override
         public List<String> children(String path) {
+            beforeChildren.accept(path);
             if (failChildren) {
                 throw new IllegalStateException("connection loss");
             }
@@ -616,6 +693,7 @@ class CrossPartitionGcAndRenameTest {
 
         @Override
         public Optional<VersionedValue> get(String key) {
+            beforeGet.accept(key);
             return delegate.get(key);
         }
 

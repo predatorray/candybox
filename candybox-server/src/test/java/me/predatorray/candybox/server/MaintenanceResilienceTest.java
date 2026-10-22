@@ -150,6 +150,7 @@ class MaintenanceResilienceTest {
                 putAndFlush(node, keyIn(1, i));
             }
             assertThat(node.compactOwnedBoxesOnce()).isPositive();
+            putAndFlush(node, keyIn(0, 0)); // p0's refs change, so its next publish must write
             clock.advance(WINDOW + 1);
 
             // p0's published refs are now stale, so p1's obsolete ledgers must not be reclaimed yet.

@@ -447,7 +447,11 @@ final class NodeRequestHandler implements RequestHandler {
                 return relayLocator(engine, m.box(), m.srcKey(), principal, m.renameToken(),
                         m.dstKey(), locator);
             } catch (RuntimeException e) {
-                engine.clearRenameIntent(m.renameToken());
+                try {
+                    engine.clearRenameIntent(m.renameToken());
+                } catch (RuntimeException cleanup) {
+                    e.addSuppressed(cleanup); // the abandon sweep drops the intent instead
+                }
                 throw e;
             }
         } else if (message instanceof Message.ZeroCopyPutRequest m) {

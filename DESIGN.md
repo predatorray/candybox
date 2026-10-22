@@ -415,7 +415,8 @@ The detailed rules:
   references before dropping them from the live set. Only the claimed Syrups are deleted. A pending
   locator relay also pins its Syrups, so a source deleted and compacted before its relay is consumed
   cannot leave the destination dangling: GC reads the published sets, then every relay of the Box,
-  then the published sets again, and claims only Syrups orphaned a grace period before that read. A
+  then the published sets again, retries unless no set changed in between, and claims only Syrups
+  orphaned a grace period before that read (publishes compute the set after reading its version). A
   relay is re-checked against its source after it is written, and deleted only after the destination
   published its refs. What still rides `ledgerGcGraceMillis` is server-side: a consumer stalling
   between its relay freshness check (half the abandon window) and its commit past the reap (the full
