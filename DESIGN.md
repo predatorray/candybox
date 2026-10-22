@@ -412,9 +412,16 @@ The detailed rules:
   tracking is not monotonic: a re-referenced Syrup leaves the pending set (its grace period restarts
   in that partition if it is orphaned again; a sibling that also tracked it keeps its older timestamp,
   #66), and GC claims Syrups through one write-locked step that re-checks the partition's own
-  references before dropping them from the live set. Only the claimed Syrups are deleted. A source
-  locator resolved before its Syrup was claimed and zero-copy-put only afterwards is not yet guarded
-  against (#65).
+  references before dropping them from the live set. Only the claimed Syrups are deleted. A pending
+  locator relay also pins its Syrups, so a source deleted and compacted before its relay is consumed
+  cannot leave the destination dangling: GC reads the published sets, then every relay of the Box,
+  then the published sets again, retries unless no set changed in between, and claims only Syrups
+  orphaned a grace period before that read (publishes compute the set after reading its version). A
+  relay is re-checked against its source after it is written, and deleted only after the destination
+  published its refs. What still rides `ledgerGcGraceMillis` is server-side: a consumer stalling
+  between its relay freshness check (half the abandon window) and its commit past the reap (the full
+  window), clock skew beyond half the window, and the freshness of sibling partitions' published
+  sets. An undecodable relay makes its Box skip Syrup GC until it is removed (#103).
 
 The full compaction-then-GC cycle is covered end-to-end by `CompactionGcCycleIT`. One gap: deleting a
 Box drops its manifest pointer but does not yet reclaim that Box's SSTable/Syrup/WAL/manifest ledgers
