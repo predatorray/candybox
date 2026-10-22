@@ -223,6 +223,23 @@ class PartitionedRoutingClientTest {
     }
 
     @Test
+    void listMultipartUploadsMergesInUtf8KeyOrder() {
+        // UTF-16 order puts the emoji (surrogate pair) first; UTF-8 byte order puts it last.
+        String fullwidth = "\uFF5E";
+        String emoji = "\uD83D\uDE00";
+        StubNode node = new StubNode();
+        node.uploadPages = Map.of(
+                0, new Message.ListMultipartUploadsResponse(
+                        List.of(new Message.InProgressUpload("u1", emoji, 1)), null, null),
+                1, new Message.ListMultipartUploadsResponse(
+                        List.of(new Message.InProgressUpload("u2", fullwidth, 1)), null, null));
+        try (CandyboxClient client = new CandyboxClient(new LoopbackTransport(node), "x", 0)) {
+            assertThat(client.listMultipartUploads("box", null, null, null, 10).uploads())
+                    .extracting(CandyboxClient.UploadEntry::key).containsExactly(fullwidth, emoji);
+        }
+    }
+
+    @Test
     void crossPartitionCopyAndRenameStayZeroCopyViaTheLocatorRelay() {
         String src = keyIn(0, "src");
         String dst = keyIn(1, "dst");
