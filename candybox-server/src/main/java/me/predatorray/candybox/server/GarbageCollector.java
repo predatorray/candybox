@@ -76,9 +76,21 @@ public final class GarbageCollector {
      * the Box-global garbage collection of DESIGN §9.
      */
     public int collect(BoxEngine engine, Set<Long> foreignReferencedSyrups) {
-        long cutoff = clock.currentTimeMillis() - graceMillis;
+        return collect(engine, foreignReferencedSyrups, Long.MAX_VALUE);
+    }
+
+    /**
+     * As {@link #collect(BoxEngine, Set)}, with {@code foreignReferencedSyrups} read as of
+     * {@code referencesAsOfMillis}: only Syrups orphaned at least the grace period before then are
+     * claimed, so a Syrup orphaned after the references were read is never claimed against them.
+     */
+    public int collect(BoxEngine engine, Set<Long> foreignReferencedSyrups,
+                       long referencesAsOfMillis) {
+        long now = clock.currentTimeMillis();
+        long cutoff = now - graceMillis;
         int deleted = collectSSTables(engine, cutoff);
-        deleted += collectSyrups(engine, cutoff, foreignReferencedSyrups);
+        deleted += collectSyrups(engine, Math.min(now, referencesAsOfMillis) - graceMillis,
+                foreignReferencedSyrups);
         deleted += collectWals(engine, cutoff);
         return deleted;
     }

@@ -433,9 +433,9 @@ final class NodeRequestHandler implements RequestHandler {
             return new Message.HeadCandyResponse(meta.contentLength(), meta.contentType(),
                     meta.userMetadata(), meta.crc32c(), meta.createdAtMillis());
         } else if (message instanceof Message.GetCandyLocatorRequest m) {
-            CandyLocator locator = node.engine(BoxName.of(m.box()), m.key())
-                    .resolveLocator(CandyKey.of(m.key()));
-            return relayLocator(m.box(), m.key(), principal, null, null, locator);
+            BoxEngine engine = node.engine(BoxName.of(m.box()), m.key());
+            CandyLocator locator = engine.resolveLocator(CandyKey.of(m.key()));
+            return relayLocator(engine, m.box(), m.key(), principal, null, null, locator);
         } else if (message instanceof Message.PrepareRenameRequest m) {
             // The source partition's owner: resolve the locator (relayed to the destination) and
             // durably record the rename intent so the owed source delete survives a crash/handover.
@@ -443,7 +443,8 @@ final class NodeRequestHandler implements RequestHandler {
             CandyLocator locator = engine.resolveLocator(CandyKey.of(m.srcKey()));
             engine.recordRenameIntent(new RenameIntent(m.renameToken(), m.srcKey(), locator.hlc(),
                     m.dstKey(), m.dstPartition(), node.currentTimeMillis()));
-            return relayLocator(m.box(), m.srcKey(), principal, m.renameToken(), m.dstKey(), locator);
+            return relayLocator(engine, m.box(), m.srcKey(), principal, m.renameToken(), m.dstKey(),
+                    locator);
         } else if (message instanceof Message.ZeroCopyPutRequest m) {
             BoxName box = BoxName.of(m.box());
             BoxEngine engine = node.engine(box, m.dstKey());
@@ -625,13 +626,28 @@ final class NodeRequestHandler implements RequestHandler {
         return node.enginePartition(BoxName.of(box), dstPartition);
     }
 
-    /** Stashes a resolved source locator in coordination and answers with its relay handle. */
-    private Message.CandyLocatorResponse relayLocator(String box, String srcKey, Principal principal,
-                                                      String renameToken, String dstKey,
-                                                      CandyLocator locator) {
+    /**
+     * Stashes a resolved source locator in coordination and answers with its relay handle. The
+     * source is re-resolved once the relay exists, so the relay was written while the source still
+     * referenced its Syrups (Box-global GC pins relayed Syrups from then on).
+     */
+    private Message.CandyLocatorResponse relayLocator(BoxEngine engine, String box, String srcKey,
+                                                      Principal principal, String renameToken,
+                                                      String dstKey, CandyLocator locator) {
         int srcPartition = node.descriptor(BoxName.of(box)).partitionOf(srcKey);
         String token = node.writeLocatorRelay(box, srcPartition, new LocatorRelay(
                 principal.toString(), srcKey, renameToken, dstKey, node.currentTimeMillis(), locator));
+        boolean unchanged = false;
+        try {
+            unchanged = engine.resolveLocator(CandyKey.of(srcKey)).hlc().equals(locator.hlc());
+        } finally {
+            if (!unchanged) {
+                node.deleteLocatorRelay(box, srcPartition, token);
+            }
+        }
+        if (!unchanged) {
+            throw new BusyException("Source " + srcKey + " changed while its locator was relayed");
+        }
         return new Message.CandyLocatorResponse(token, locator.hlc());
     }
 

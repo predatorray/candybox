@@ -592,11 +592,18 @@ public final class CandyboxNode implements AutoCloseable {
                 }
                 BoxSyrupRefs refs = boxRefs.get(ownership.box().value());
                 if (refs == null) {
-                    refs = readBoxSyrupRefs(ownership.box().value());
+                    try {
+                        refs = readBoxSyrupRefs(ownership.box().value());
+                    } catch (RuntimeException e) {
+                        unpublished.add(ownership.box().value());
+                        LOG.warn("Referenced-Syrup read error on node {} for box {}: {}", nodeId,
+                                ownership.box(), e.getMessage());
+                        continue;
+                    }
                     boxRefs.put(ownership.box().value(), refs);
                 }
                 deleted += garbageCollector.collect(ownership.engine(),
-                        refs.foreignTo(ownership.partition()));
+                        refs.foreignTo(ownership.partition()), refs.readAtMillis());
             } catch (NotOwnerException lostOwnership) {
                 LOG.info("Skipping GC of a partition on node {}: {}", nodeId,
                         lostOwnership.getMessage());
@@ -797,14 +804,16 @@ public final class CandyboxNode implements AutoCloseable {
      * every Syrup a pending locator relay points at, since a zero-copy put may still commit it.
      * The refs are read both before and after the relays: a relay is only written while its source
      * is still in the source partition's refs, and is only deleted after the destination published
-     * its refs, so no reference can fall between the reads.
+     * its refs, so no reference can fall between the reads. Costs one read per pending relay of
+     * the Box, bounded by the relay caps.
      */
     private BoxSyrupRefs readBoxSyrupRefs(String box) {
+        long readAt = clock.currentTimeMillis();
         int partitionCount;
         try {
             partitionCount = descriptor(BoxName.of(box)).partitionCount();
         } catch (BoxNotFoundException gone) {
-            return new BoxSyrupRefs(List.of(), Set.of());
+            return new BoxSyrupRefs(List.of(), Set.of(), readAt);
         }
         List<Set<Long>> published = new ArrayList<>(partitionCount);
         for (int p = 0; p < partitionCount; p++) {
@@ -813,17 +822,26 @@ public final class CandyboxNode implements AutoCloseable {
         Set<Long> relayed = new HashSet<>();
         for (int p = 0; p < partitionCount; p++) {
             for (String token : coordination.children(CandyboxKeys.locatorRelaysPath(box, p))) {
-                coordination.get(CandyboxKeys.locatorRelayKey(box, p, token)).ifPresent(v -> {
-                    for (SegmentRef seg : LocatorRelay.deserialize(v.value()).locator().segments()) {
-                        relayed.add(seg.syrupId());
-                    }
-                });
+                String key = CandyboxKeys.locatorRelayKey(box, p, token);
+                Optional<VersionedValue> value = coordination.get(key);
+                if (value.isEmpty()) {
+                    continue;
+                }
+                LocatorRelay relay;
+                try {
+                    relay = LocatorRelay.deserialize(value.get().value());
+                } catch (RuntimeException e) {
+                    throw new IllegalStateException("Undecodable locator relay " + key, e);
+                }
+                for (SegmentRef seg : relay.locator().segments()) {
+                    relayed.add(seg.syrupId());
+                }
             }
         }
         for (int p = 0; p < partitionCount; p++) {
             published.get(p).addAll(publishedPartitionRefs(box, p));
         }
-        return new BoxSyrupRefs(published, relayed);
+        return new BoxSyrupRefs(published, relayed, readAt);
     }
 
     private Set<Long> publishedPartitionRefs(String box, int partition) {
@@ -832,7 +850,8 @@ public final class CandyboxNode implements AutoCloseable {
                 .orElseGet(HashSet::new);
     }
 
-    private record BoxSyrupRefs(List<Set<Long>> publishedByPartition, Set<Long> relayed) {
+    private record BoxSyrupRefs(List<Set<Long>> publishedByPartition, Set<Long> relayed,
+                                long readAtMillis) {
 
         /** The Syrups GC of {@code partition} must keep: other partitions' refs and all relays. */
         Set<Long> foreignTo(int partition) {

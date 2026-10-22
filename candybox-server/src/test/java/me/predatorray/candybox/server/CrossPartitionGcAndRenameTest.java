@@ -119,49 +119,112 @@ class CrossPartitionGcAndRenameTest {
 
     @Test
     void pendingRelayKeepsItsSyrupAliveAfterTheSourceIsDeleted() {
-        assertDelayedZeroCopyPutStaysReadable(1);
+        assertDelayedZeroCopyPutStaysReadable(1, false);
     }
 
     @Test
     void pendingRelayKeepsItsSyrupAliveForASamePartitionDestination() {
-        assertDelayedZeroCopyPutStaysReadable(0);
+        assertDelayedZeroCopyPutStaysReadable(0, false);
+    }
+
+    @Test
+    void pendingRenameRelayKeepsItsSyrupAliveAfterTheSourceIsDeleted() {
+        assertDelayedZeroCopyPutStaysReadable(1, true);
     }
 
     /**
      * Resolves a relay, then deletes, compacts and GCs the source so its Syrup would be reclaimable,
      * and only then consumes the relay: the relay must have pinned the Syrup.
      */
-    private static void assertDelayedZeroCopyPutStaysReadable(int dstPartition) {
+    private static void assertDelayedZeroCopyPutStaysReadable(int dstPartition, boolean rename) {
         InMemoryLedgerStore store = new InMemoryLedgerStore();
         try (CandyboxNode node = new CandyboxNode(1, aggressiveGcConfig(), store,
                 new InMemoryCoordinationService(), new ManualClock(1000))) {
             node.createBox(BOX, PARTITIONS);
             String src = keyIn(0, "src");
             String dst = keyIn(dstPartition, "dst");
-            BoxEngine p0 = node.enginePartition(BOX, 0);
-            p0.putCandy(CandyKey.of(src), bytes("payload"), "text/plain", Map.of(), null);
-            p0.flush();
-            long syrup = p0.resolveLocator(CandyKey.of(src)).parts().get(0).segments().get(0)
-                    .syrupId();
+            long syrup = putAndFlush(node, src);
             RequestHandler handler = node.requestHandler();
-            String token = relayToken(handler, src);
+            String renameToken = rename ? "late-rename" : null;
+            String token = rename
+                    ? ((Message.CandyLocatorResponse) send(handler, new Message.PrepareRenameRequest(
+                            BOX.value(), src, dst, dstPartition, renameToken))).relayToken()
+                    : relayToken(handler, src);
 
-            p0.deleteCandy(CandyKey.of(src));
-            p0.putCandy(CandyKey.of(keyIn(0, "other")), bytes("x"), null, Map.of(), null); // rolls S
-            p0.flush();
-            for (int i = 0; i < 5; i++) {
-                node.compactOwnedBoxesOnce();
-            }
+            orphanSource(node, src);
             node.collectGarbageOnce();
             assertThat(store.listLedgers()).contains(syrup);
 
             assertThat(send(handler, new Message.ZeroCopyPutRequest(BOX.value(), dst, 0, token,
-                    null, List.of(), null))).isInstanceOf(Message.HeadCandyResponse.class);
+                    null, List.of(), renameToken))).isInstanceOf(Message.HeadCandyResponse.class);
             node.collectGarbageOnce();
             assertThat(node.enginePartition(BOX, dstPartition).getCandy(CandyKey.of(dst)))
                     .isEqualTo(bytes("payload"));
         }
         store.close();
+    }
+
+    @Test
+    void reapedRelayNoLongerPinsItsSyrup() {
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        ManualClock clock = new ManualClock(1000);
+        try (CandyboxNode node = new CandyboxNode(1, aggressiveGcConfig(), store,
+                new InMemoryCoordinationService(), clock)) {
+            node.createBox(BOX, PARTITIONS);
+            String src = keyIn(0, "src");
+            long syrup = putAndFlush(node, src);
+            relayToken(node.requestHandler(), src);
+            orphanSource(node, src);
+            node.collectGarbageOnce();
+            assertThat(store.listLedgers()).contains(syrup);
+
+            clock.advance(aggressiveGcConfig().renameIntentAbandonMillis() + 1);
+            assertThat(node.sweepStaleLocatorRelaysOnce()).isEqualTo(1);
+            node.collectGarbageOnce();
+            assertThat(store.listLedgers()).doesNotContain(syrup);
+        }
+        store.close();
+    }
+
+    @Test
+    void boxSitsOutGcWhenItsRelaysCannotBeRead() {
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        FailingChildren coordination = new FailingChildren(new InMemoryCoordinationService());
+        try (CandyboxNode node = new CandyboxNode(1, aggressiveGcConfig(), store, coordination,
+                new ManualClock(1000))) {
+            node.createBox(BOX, PARTITIONS);
+            String src = keyIn(0, "src");
+            long syrup = putAndFlush(node, src);
+            orphanSource(node, src);
+
+            coordination.failChildren = true;
+            assertThat(node.collectGarbageOnce()).isZero();
+            assertThat(store.listLedgers()).contains(syrup);
+
+            coordination.failChildren = false;
+            node.collectGarbageOnce();
+            assertThat(store.listLedgers()).doesNotContain(syrup);
+        }
+        store.close();
+    }
+
+    /** Puts and flushes {@code key} in partition 0, returning the Syrup that holds its bytes. */
+    private static long putAndFlush(CandyboxNode node, String key) {
+        BoxEngine p0 = node.enginePartition(BOX, 0);
+        p0.putCandy(CandyKey.of(key), bytes("payload"), "text/plain", Map.of(), null);
+        p0.flush();
+        return p0.resolveLocator(CandyKey.of(key)).parts().get(0).segments().get(0).syrupId();
+    }
+
+    /** Deletes {@code key} from partition 0 and compacts until its Syrup is a pending orphan. */
+    private static void orphanSource(CandyboxNode node, String key) {
+        BoxEngine p0 = node.enginePartition(BOX, 0);
+        p0.deleteCandy(CandyKey.of(key));
+        p0.putCandy(CandyKey.of(keyIn(0, "other")), bytes("x"), null, Map.of(), null); // rolls S
+        p0.flush();
+        for (int i = 0; i < 5; i++) {
+            node.compactOwnedBoxesOnce();
+        }
     }
 
     @Test
