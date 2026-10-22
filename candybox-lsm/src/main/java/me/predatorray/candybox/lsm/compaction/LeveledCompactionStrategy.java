@@ -18,8 +18,8 @@ package me.predatorray.candybox.lsm.compaction;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
-import me.predatorray.candybox.common.CandyKey;
 import me.predatorray.candybox.lsm.manifest.ManifestState;
+import me.predatorray.candybox.lsm.sstable.KeySpan;
 import me.predatorray.candybox.lsm.sstable.SSTableMeta;
 
 /**
@@ -30,7 +30,9 @@ import me.predatorray.candybox.lsm.sstable.SSTableMeta;
  *       overlapping L1 tables are merged into L1.</li>
  *   <li>Each level L≥1 has a byte budget {@code levelBaseBytes × levelMultiplier^(L-1)}. The level
  *       whose total size most exceeds its budget is compacted: one of its tables and the overlapping
- *       L+1 tables are merged into L+1.</li>
+ *       L+1 tables are merged into L+1. The table picked is one holding range tombstones if any,
+ *       else the one with the fewest overlapping L+1 bytes per byte of its own (RocksDB's
+ *       {@code kMinOverlappingRatio}), which keeps write amplification low.</li>
  * </ul>
  *
  * <p>The {@code bottommost} flag on the produced task is true iff no level above the output level
@@ -77,8 +79,25 @@ public final class LeveledCompactionStrategy implements CompactionStrategy {
         if (bestLevel < 0) {
             return Optional.empty();
         }
-        List<SSTableMeta> tables = state.level(bestLevel);
-        return Optional.of(buildTask(List.of(tables.get(0)), state, bestLevel + 1));
+        List<SSTableMeta> next = state.level(bestLevel + 1);
+        SSTableMeta pick = null;
+        double pickRatio = Double.MAX_VALUE;
+        for (SSTableMeta t : state.level(bestLevel)) {
+            long overlapping = 0;
+            for (SSTableMeta n : next) {
+                if (n.span().overlaps(t.span())) {
+                    overlapping += n.sizeBytes();
+                }
+            }
+            // A table holding range tombstones goes first: compacting it reclaims what they cover.
+            double ratio = t.rangeTombstoneSpan() != null ? -1
+                    : (double) overlapping / Math.max(1, t.sizeBytes());
+            if (ratio < pickRatio) {
+                pickRatio = ratio;
+                pick = t;
+            }
+        }
+        return Optional.of(buildTask(List.of(pick), state, bestLevel + 1));
     }
 
     private long maxBytesForLevel(int level) {
@@ -97,25 +116,29 @@ public final class LeveledCompactionStrategy implements CompactionStrategy {
         return total;
     }
 
+    /**
+     * Seeds plus every output-level table overlapping them. Spans include range tombstones, so the
+     * tables a seed's range tombstone covers join the task and lose their covered points.
+     */
     private CompactionTask buildTask(List<SSTableMeta> seedInputs, ManifestState state, int outputLevel) {
-        CandyKey min = null;
-        CandyKey max = null;
+        KeySpan seedSpan = null;
         for (SSTableMeta t : seedInputs) {
-            if (min == null || t.minKey().compareTo(min) < 0) {
-                min = t.minKey();
-            }
-            if (max == null || t.maxKey().compareTo(max) > 0) {
-                max = t.maxKey();
-            }
+            seedSpan = seedSpan == null ? t.span() : seedSpan.union(t.span());
         }
         List<SSTableMeta> inputs = new ArrayList<>(seedInputs);
         for (SSTableMeta t : state.level(outputLevel)) {
-            if (t.overlaps(min, max)) {
+            if (t.span().overlaps(seedSpan)) {
                 inputs.add(t);
             }
         }
         boolean bottommost = noTablesAboveLevel(state, outputLevel);
-        return new CompactionTask(inputs, outputLevel, bottommost);
+        List<SSTableMeta> others = new ArrayList<>();
+        for (SSTableMeta t : state.tables()) {
+            if (t.level() > 0 && !inputs.contains(t)) {
+                others.add(t);
+            }
+        }
+        return new CompactionTask(inputs, outputLevel, bottommost, others);
     }
 
     private static boolean noTablesAboveLevel(ManifestState state, int level) {

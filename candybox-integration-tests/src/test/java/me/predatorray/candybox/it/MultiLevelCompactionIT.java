@@ -142,7 +142,7 @@ class MultiLevelCompactionIT {
             ManifestState state = engine.manifestState();
             List<SSTableMeta> inputs = new ArrayList<>(state.level0());
             inputs.addAll(state.level(2));
-            engine.applyCompaction(compactor.compact(new CompactionTask(inputs, 2, true)).edit());
+            engine.applyCompaction(compactor.compact(new CompactionTask(inputs, 2, true, List.of())).edit());
 
             assertThatThrownBy(() -> engine.getCandy(CandyKey.of("k1")))
                     .isInstanceOf(CandyNotFoundException.class);
@@ -188,7 +188,8 @@ class MultiLevelCompactionIT {
             }
         }
         boolean bottommost = state.tables().stream().noneMatch(t -> t.level() > outputLevel);
-        engine.applyCompaction(compactor.compact(new CompactionTask(inputs, outputLevel, bottommost)).edit());
+        engine.applyCompaction(compactor.compact(
+                new CompactionTask(inputs, outputLevel, bottommost, List.of())).edit());
     }
 
     private static void assertReadable(BoxEngine engine, int count) {

@@ -28,6 +28,7 @@ import me.predatorray.candybox.common.SegmentRef;
 import me.predatorray.candybox.common.exception.SerializationException;
 import me.predatorray.candybox.common.serial.BinaryReader;
 import me.predatorray.candybox.common.serial.BinaryWriter;
+import me.predatorray.candybox.lsm.sstable.KeySpan;
 import me.predatorray.candybox.lsm.sstable.SSTableMeta;
 
 /**
@@ -39,12 +40,13 @@ import me.predatorray.candybox.lsm.sstable.SSTableMeta;
  * the cross-partition rename-intent fields ({@code addedRenameIntents}, {@code removedRenameIntents}).
  * A v2 record (no rename-intent fields) still reads back as an edit with empty intent sets.
  * <b>v4 layout</b> appends the optional high-water {@code maxHlc}; v2/v3 records read back with
- * {@link Hlc#MIN}. Older v1 records cannot be read back; this is acceptable because the project has
- * no production data to migrate.
+ * {@link Hlc#MIN}. <b>v5 layout</b> adds each table's optional range-tombstone span and oldest point
+ * HLC; v2–v4 tables read back without either. Older v1 records cannot be read back; this is
+ * acceptable because the project has no production data to migrate.
  */
 public final class ManifestSerializer {
 
-    public static final byte FORMAT_VERSION = 4;
+    public static final byte FORMAT_VERSION = 5;
 
     private ManifestSerializer() {
     }
@@ -114,7 +116,7 @@ public final class ManifestSerializer {
         int tableCount = r.readVarInt();
         List<SSTableMeta> tables = new ArrayList<>(tableCount);
         for (int i = 0; i < tableCount; i++) {
-            tables.add(readTable(r));
+            tables.add(readTable(r, version));
         }
         Set<Long> removedTables = readLongSet(r);
         Set<Long> addedSyrups = readLongSet(r);
@@ -198,9 +200,31 @@ public final class ManifestSerializer {
         w.writeVarLong(t.entryCount());
         w.writeVarLong(t.sizeBytes());
         writeLongSet(w, t.referencedSyrups());
+        KeySpan span = t.rangeTombstoneSpan();
+        w.writeBoolean(span != null);
+        if (span != null) {
+            writeOptionalKey(w, span.start());
+            writeOptionalKey(w, span.end());
+            w.writeBoolean(span.endInclusive());
+        }
+        w.writeBoolean(t.minPointHlc() != null);
+        if (t.minPointHlc() != null) {
+            writeHlc(w, t.minPointHlc());
+        }
     }
 
-    private static SSTableMeta readTable(BinaryReader r) {
+    private static void writeOptionalKey(BinaryWriter w, CandyKey key) {
+        w.writeBoolean(key != null);
+        if (key != null) {
+            w.writeBytes(key.utf8Bytes());
+        }
+    }
+
+    private static CandyKey readOptionalKey(BinaryReader r) {
+        return r.readBoolean() ? CandyKey.ofUtf8(r.readBytes()) : null;
+    }
+
+    private static SSTableMeta readTable(BinaryReader r, int version) {
         long ledgerId = r.readVarLong();
         int level = r.readVarInt();
         CandyKey minKey = CandyKey.ofUtf8(r.readBytes());
@@ -208,7 +232,18 @@ public final class ManifestSerializer {
         long entryCount = r.readVarLong();
         long sizeBytes = r.readVarLong();
         Set<Long> referencedSyrups = readLongSet(r);
-        return new SSTableMeta(ledgerId, level, minKey, maxKey, entryCount, sizeBytes, referencedSyrups);
+        KeySpan span = null;
+        Hlc minPointHlc = null;
+        if (version >= 5) {
+            if (r.readBoolean()) {
+                CandyKey start = readOptionalKey(r);
+                CandyKey end = readOptionalKey(r);
+                span = new KeySpan(start, end, r.readBoolean());
+            }
+            minPointHlc = r.readBoolean() ? readHlc(r) : null;
+        }
+        return new SSTableMeta(ledgerId, level, minKey, maxKey, entryCount, sizeBytes, referencedSyrups,
+                span, minPointHlc);
     }
 
     private static void writeUpload(BinaryWriter w, MultipartUploadState u) {

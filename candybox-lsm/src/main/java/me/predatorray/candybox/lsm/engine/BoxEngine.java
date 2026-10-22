@@ -1535,6 +1535,11 @@ public final class BoxEngine implements AutoCloseable {
                 table.ledgerId(), table.entryCount());
     }
 
+    /** The quorum and metadata this Box's SSTable ledgers are created with, for compaction outputs. */
+    public LedgerConfig sstableLedgerConfig() {
+        return ledgerConfig(LedgerRole.SSTABLE);
+    }
+
     private LedgerConfig ledgerConfig(LedgerRole role) {
         return roleConfig(config, ledgerStore, box, role);
     }
