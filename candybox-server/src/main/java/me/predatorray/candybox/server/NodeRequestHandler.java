@@ -75,7 +75,7 @@ final class NodeRequestHandler implements RequestHandler {
 
     /** The listing order for in-flight uploads, shared with the client's cross-partition merge. */
     private static final java.util.Comparator<MultipartUploadState> UPLOAD_ORDER =
-            java.util.Comparator.comparing(MultipartUploadState::key)
+            java.util.Comparator.comparing(MultipartUploadState::key, CandyKey::compareUtf8)
                     .thenComparing(MultipartUploadState::uploadId);
 
     private final CandyboxNode node;
@@ -693,7 +693,7 @@ final class NodeRequestHandler implements RequestHandler {
         if (keyMarker == null) {
             return true;
         }
-        int c = u.key().compareTo(keyMarker);
+        int c = CandyKey.compareUtf8(u.key(), keyMarker);
         return c > 0 || (c == 0 && uploadIdMarker != null
                 && u.uploadId().compareTo(uploadIdMarker) > 0);
     }

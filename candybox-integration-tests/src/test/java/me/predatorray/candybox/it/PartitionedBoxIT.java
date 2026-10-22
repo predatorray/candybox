@@ -282,10 +282,11 @@ class PartitionedBoxIT {
 
     @Test
     void listMultipartUploadsPagesVisitEveryUploadOnceInKeyOrder() {
-        // Created in reverse key order, with repeated keys, so no partition's creation order matches.
+        // Each partition gets uploads for "mpu2", "mpu2", "mpu1", "mpu0" in that order: reverse key
+        // order, with a repeated key.
         List<String> expected = new ArrayList<>();
-        for (int i = 11; i >= 0; i--) {
-            String key = String.format("k%02d", i % 8);
+        for (int i = 4 * PARTITIONS - 1; i >= 0; i--) {
+            String key = keyIn(i % PARTITIONS, "mpu" + Math.min(i / PARTITIONS, 2));
             expected.add(key + "/" + client.createMultipartUpload(BOX, key, null, Map.of()));
         }
         expected.sort(null);

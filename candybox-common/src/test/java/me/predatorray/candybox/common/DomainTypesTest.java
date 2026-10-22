@@ -48,6 +48,18 @@ class DomainTypesTest {
     }
 
     @Test
+    void compareUtf8MatchesCandyKeyOrderWhereUtf16Differs() {
+        // U+FF5E (UTF-8 EF BD 9E) vs U+1F600 (surrogate pair D83D DE00; UTF-8 F0 9F 98 80):
+        // UTF-16 code units put the emoji first, UTF-8 bytes put it last.
+        String fullwidth = "～";
+        String emoji = "😀";
+        assertThat(fullwidth.compareTo(emoji)).isPositive();
+        assertThat(CandyKey.compareUtf8(fullwidth, emoji)).isNegative();
+        assertThat(Integer.signum(CandyKey.compareUtf8(fullwidth, emoji)))
+                .isEqualTo(Integer.signum(CandyKey.of(fullwidth).compareTo(CandyKey.of(emoji))));
+    }
+
+    @Test
     void candyKeyUtf8RoundTrips() {
         CandyKey original = CandyKey.of("片/路径/✓");
         CandyKey restored = CandyKey.ofUtf8(original.utf8Bytes());
