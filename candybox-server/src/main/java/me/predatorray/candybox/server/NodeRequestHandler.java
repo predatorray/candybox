@@ -119,6 +119,11 @@ final class NodeRequestHandler implements RequestHandler {
         }
     }
 
+    /** Reads larger than this would not fit in one response frame, so they are refused unread. */
+    private int maxInlineDataBytes() {
+        return Message.maxInlineDataBytes(node.config().maxFrameSizeBytes());
+    }
+
     /** What a request needs the caller to be allowed to do, or {@code null} for SASL frames. */
     private record Access(Operation operation, Resource resource) {
     }
@@ -385,7 +390,7 @@ final class NodeRequestHandler implements RequestHandler {
         } else if (message instanceof Message.GetCandyRequest m) {
             BoxEngine engine = node.engine(BoxName.of(m.box()), m.key());
             ByteArrayOutputStream out = new ByteArrayOutputStream();
-            CandyMetadata meta = engine.getCandy(CandyKey.of(m.key()), out);
+            CandyMetadata meta = engine.getCandy(CandyKey.of(m.key()), out, maxInlineDataBytes());
             return new Message.CandyDataResponse(meta.contentLength(), meta.contentType(),
                     meta.userMetadata(), meta.crc32c(), out.toByteArray());
         } else if (message instanceof Message.RangeGetCandyRequest m) {
@@ -393,7 +398,8 @@ final class NodeRequestHandler implements RequestHandler {
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             BoxEngine.RangeReadResult result;
             try {
-                result = engine.getCandyRange(CandyKey.of(m.key()), m.firstByte(), m.lastByte(), out);
+                result = engine.getCandyRange(CandyKey.of(m.key()), m.firstByte(), m.lastByte(), out,
+                        maxInlineDataBytes());
             } catch (IllegalArgumentException e) {
                 // S3's InvalidRange — surface as a typed error the gateway can map to 416.
                 throw new ValidationException("InvalidRange: " + e.getMessage());

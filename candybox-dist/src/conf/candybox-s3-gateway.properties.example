@@ -16,9 +16,15 @@ zookeeper.connect=127.0.0.1:2181
 # Region echoed in ?location and related responses.
 s3.region=us-east-1
 
-# Reject single PUTs larger than this many bytes (no multipart upload in v1). Note: the practical
-# ceiling is ~2 GiB because the request is buffered in full. Default: 5368709120 (5 GiB, capped to ~2 GiB).
+# Reject single PUTs and UploadParts larger than this many bytes (400 EntityTooLarge, before the
+# body is buffered). Also capped by what fits in one node frame (max.frame.size.bytes minus 64 KiB);
+# larger objects need multipart upload. Default: 5368709120 (5 GiB, so the frame cap applies).
 # s3.max-object-bytes=5368709120
+
+# Protocol frame cap; must match the nodes' max.frame.size.bytes. GETs of larger objects are
+# streamed as a sequence of frame-sized range reads. Default: 16842752 (16 MiB + 64 KiB, so the
+# largest PUT / part is exactly 16 MiB).
+# max.frame.size.bytes=16842752
 
 # Size of the blocking worker pool that issues Candybox client calls. Default: 2 x CPU cores (min 4).
 # s3.worker-threads=8

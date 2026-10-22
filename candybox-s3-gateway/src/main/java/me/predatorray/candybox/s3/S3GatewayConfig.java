@@ -24,6 +24,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
 import me.predatorray.candybox.common.config.SecurityConfig;
+import me.predatorray.candybox.protocol.FrameCodec;
+import me.predatorray.candybox.protocol.Message;
 
 /**
  * Deployment-facing configuration for the S3 gateway process, loaded from a {@code .properties} file
@@ -37,7 +39,7 @@ public final class S3GatewayConfig {
     public static final int DEFAULT_PORT = 9711;
     /** Default HTTP health/metrics port. */
     public static final int DEFAULT_HEALTH_PORT = 9712;
-    /** Default single-PUT ceiling (no multipart in v1): 5 GiB. */
+    /** Default single-PUT / part ceiling: 5 GiB, further capped by what fits in one node frame. */
     public static final long DEFAULT_MAX_OBJECT_BYTES = 5L * 1024 * 1024 * 1024;
 
     private static final String ENV_PREFIX = "CANDYBOX_";
@@ -48,6 +50,7 @@ public final class S3GatewayConfig {
     private final String zookeeperConnect;
     private final String region;
     private final long maxObjectBytes;
+    private final int maxFrameSizeBytes;
     private final int workerThreads;
     private final long routerCacheTtlMillis;
     private final long routerUnownedRetryMillis;
@@ -62,6 +65,7 @@ public final class S3GatewayConfig {
         this.zookeeperConnect = b.zookeeperConnect;
         this.region = b.region;
         this.maxObjectBytes = b.maxObjectBytes;
+        this.maxFrameSizeBytes = b.maxFrameSizeBytes;
         this.workerThreads = b.workerThreads;
         this.routerCacheTtlMillis = b.routerCacheTtlMillis;
         this.routerUnownedRetryMillis = b.routerUnownedRetryMillis;
@@ -90,6 +94,8 @@ public final class S3GatewayConfig {
                 .zookeeperConnect(r.require("zookeeper.connect"))
                 .region(r.get("s3.region").orElse("us-east-1"))
                 .maxObjectBytes(r.getLong("s3.max-object-bytes").orElse(DEFAULT_MAX_OBJECT_BYTES))
+                .maxFrameSizeBytes(r.getInt("max.frame.size.bytes")
+                        .orElse(FrameCodec.DEFAULT_MAX_FRAME_BYTES))
                 .workerThreads(r.getInt("s3.worker-threads")
                         .orElse(Math.max(4, Runtime.getRuntime().availableProcessors() * 2)))
                 .routerCacheTtlMillis(r.getLong("s3.router-cache-ttl-ms").orElse(5_000L))
@@ -123,6 +129,19 @@ public final class S3GatewayConfig {
 
     public long maxObjectBytes() {
         return maxObjectBytes;
+    }
+
+    /** The node protocol frame cap; must match the nodes' {@code max.frame.size.bytes}. */
+    public int maxFrameSizeBytes() {
+        return maxFrameSizeBytes;
+    }
+
+    /**
+     * The largest PUT / UploadPart body accepted: {@code s3.max-object-bytes}, capped by what fits
+     * in a single node frame. Larger objects need multipart upload.
+     */
+    public long maxRequestBodyBytes() {
+        return Math.min(maxObjectBytes, Message.maxInlineDataBytes(maxFrameSizeBytes));
     }
 
     public int workerThreads() {
@@ -205,6 +224,7 @@ public final class S3GatewayConfig {
         private String zookeeperConnect;
         private String region = "us-east-1";
         private long maxObjectBytes = DEFAULT_MAX_OBJECT_BYTES;
+        private int maxFrameSizeBytes = FrameCodec.DEFAULT_MAX_FRAME_BYTES;
         private SecurityConfig security = SecurityConfig.disabled();
         private boolean s3AuthEnabled = false;
         private boolean s3AllowAnonymous = true;
@@ -242,6 +262,11 @@ public final class S3GatewayConfig {
             return this;
         }
 
+        Builder maxFrameSizeBytes(int v) {
+            this.maxFrameSizeBytes = v;
+            return this;
+        }
+
         Builder workerThreads(int v) {
             this.workerThreads = v;
             return this;
@@ -273,6 +298,10 @@ public final class S3GatewayConfig {
         }
 
         S3GatewayConfig build() {
+            if (maxFrameSizeBytes <= Message.INLINE_DATA_OVERHEAD_BYTES) {
+                throw new IllegalArgumentException("max.frame.size.bytes must exceed "
+                        + Message.INLINE_DATA_OVERHEAD_BYTES + " (the per-frame metadata reserve)");
+            }
             return new S3GatewayConfig(this);
         }
     }

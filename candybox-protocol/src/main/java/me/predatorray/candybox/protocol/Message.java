@@ -29,6 +29,17 @@ import me.predatorray.candybox.common.Hlc;
  */
 public sealed interface Message {
 
+    /**
+     * Frame bytes reserved for everything but the inline {@code data} of a {@link PutCandyRequest}
+     * or {@link CandyDataResponse}: key, content type, user metadata, ACL and length fields.
+     */
+    int INLINE_DATA_OVERHEAD_BYTES = 64 << 10;
+
+    /** The largest inline {@code data} that fits in a frame of {@code maxFrameBytes}. */
+    static int maxInlineDataBytes(int maxFrameBytes) {
+        return Math.max(0, maxFrameBytes - INLINE_DATA_OVERHEAD_BYTES);
+    }
+
     /** The opcode that identifies this message on the wire. */
     Opcode opcode();
 

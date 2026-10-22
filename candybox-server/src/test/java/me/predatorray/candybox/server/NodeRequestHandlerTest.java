@@ -314,6 +314,44 @@ class NodeRequestHandlerTest {
     }
 
     @Test
+    void getLargerThanAFrameIsRefusedUnreadButRangesAreServed() {
+        int inline = 1000;
+        CandyboxConfig config = CandyboxConfig.builder().multipartMinPartBytes(0)
+                .maxFrameSizeBytes(Message.INLINE_DATA_OVERHEAD_BYTES + inline).build();
+        try (CandyboxNode node = new CandyboxNode(1, config, new InMemoryLedgerStore(),
+                new InMemoryCoordinationService(), new ManualClock(1000))) {
+            RequestHandler handler = node.requestHandler();
+            roundTrip(handler, new Message.CreateBoxRequest("big-box", 1));
+            String uploadId = ((Message.CreateMultipartUploadResponse) roundTrip(handler,
+                    new Message.CreateMultipartUploadRequest("big-box", "obj", null, Map.of())))
+                    .uploadId();
+            byte[] part = new byte[800];
+            java.util.Arrays.fill(part, (byte) 'x');
+            int crc1 = ((Message.UploadPartResponse) roundTrip(handler,
+                    new Message.UploadPartRequest("big-box", "obj", uploadId, 1, part))).crc32c();
+            int crc2 = ((Message.UploadPartResponse) roundTrip(handler,
+                    new Message.UploadPartRequest("big-box", "obj", uploadId, 2, part))).crc32c();
+            roundTrip(handler, new Message.CompleteMultipartUploadRequest("big-box", "obj", uploadId,
+                    List.of(new Message.CompletedPart(1, crc1), new Message.CompletedPart(2, crc2)),
+                    null));
+
+            Message get = roundTrip(handler, new Message.GetCandyRequest("big-box", "obj"));
+            assertThat(get).isInstanceOf(Message.ErrorResponse.class);
+            assertThat(((Message.ErrorResponse) get).errorType()).isEqualTo("LimitExceededException");
+
+            Message tooWide = roundTrip(handler,
+                    new Message.RangeGetCandyRequest("big-box", "obj", 0, inline));
+            assertThat(((Message.ErrorResponse) tooWide).errorType())
+                    .isEqualTo("LimitExceededException");
+
+            Message slice = roundTrip(handler,
+                    new Message.RangeGetCandyRequest("big-box", "obj", 600, 600 + inline - 1));
+            assertThat(((Message.CandyDataResponse) slice).data()).hasSize(inline);
+            assertThat(((Message.CandyDataResponse) slice).totalLength()).isEqualTo(1600);
+        }
+    }
+
+    @Test
     void multipartDispatchIncludingListings() {
         try (CandyboxNode node = new CandyboxNode(1, config(), new InMemoryLedgerStore(),
                 new InMemoryCoordinationService(), new ManualClock(1000))) {
