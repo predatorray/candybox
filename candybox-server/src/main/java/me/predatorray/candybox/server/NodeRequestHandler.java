@@ -73,6 +73,11 @@ final class NodeRequestHandler implements RequestHandler {
     private static final Pattern RELAY_TOKEN =
             Pattern.compile("[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}");
 
+    /** The listing order for in-flight uploads, shared with the client's cross-partition merge. */
+    private static final java.util.Comparator<MultipartUploadState> UPLOAD_ORDER =
+            java.util.Comparator.comparing(MultipartUploadState::key, CandyKey::compareUtf8)
+                    .thenComparing(MultipartUploadState::uploadId);
+
     private final CandyboxNode node;
     private final MessageCodec codec = new MessageCodec();
 
@@ -528,26 +533,26 @@ final class NodeRequestHandler implements RequestHandler {
             java.util.List<Message.InProgressUpload> rows = new java.util.ArrayList<>();
             String prefix = m.prefix() == null ? "" : m.prefix();
             int limit = m.maxUploads() <= 0 ? 1000 : m.maxUploads();
+            String keyMarker = m.keyMarker();
+            String uploadIdMarker = m.uploadIdMarker();
+            // Pages must hold this partition's smallest (key, uploadId) rows so the client's
+            // cross-partition merge cannot skip any; the manifest map is in creation order.
+            java.util.List<MultipartUploadState> matching = new java.util.ArrayList<>();
+            for (MultipartUploadState u : engine.listMultipartUploads()) {
+                if (u.key().startsWith(prefix) && afterUploadMarker(u, keyMarker, uploadIdMarker)) {
+                    matching.add(u);
+                }
+            }
+            matching.sort(UPLOAD_ORDER);
+            for (MultipartUploadState u : matching.subList(0, Math.min(limit, matching.size()))) {
+                rows.add(new Message.InProgressUpload(u.uploadId(), u.key(), u.createdAtMillis()));
+            }
             String nextKey = null;
             String nextUpl = null;
-            for (MultipartUploadState u : engine.listMultipartUploads()) {
-                if (!prefix.isEmpty() && !u.key().startsWith(prefix)) {
-                    continue;
-                }
-                if (m.keyMarker() != null && u.key().compareTo(m.keyMarker()) < 0) {
-                    continue;
-                }
-                if (m.keyMarker() != null && u.key().equals(m.keyMarker())
-                        && m.uploadIdMarker() != null
-                        && u.uploadId().compareTo(m.uploadIdMarker()) <= 0) {
-                    continue;
-                }
-                if (rows.size() == limit) {
-                    nextKey = u.key();
-                    nextUpl = u.uploadId();
-                    break;
-                }
-                rows.add(new Message.InProgressUpload(u.uploadId(), u.key(), u.createdAtMillis()));
+            if (matching.size() > limit) {
+                Message.InProgressUpload last = rows.get(rows.size() - 1);
+                nextKey = last.key();
+                nextUpl = last.uploadId();
             }
             return new Message.ListMultipartUploadsResponse(rows, nextKey, nextUpl);
         } else if (message instanceof Message.ListPartsRequest m) {
@@ -677,5 +682,19 @@ final class NodeRequestHandler implements RequestHandler {
 
     private static String safe(String s) {
         return s == null ? "" : s;
+    }
+
+    /**
+     * S3 marker semantics: with only {@code keyMarker}, keys strictly after it; with both, also
+     * uploads of {@code keyMarker} whose uploadId sorts after {@code uploadIdMarker}.
+     */
+    private static boolean afterUploadMarker(MultipartUploadState u, String keyMarker,
+                                             String uploadIdMarker) {
+        if (keyMarker == null) {
+            return true;
+        }
+        int c = CandyKey.compareUtf8(u.key(), keyMarker);
+        return c > 0 || (c == 0 && uploadIdMarker != null
+                && u.uploadId().compareTo(uploadIdMarker) > 0);
     }
 }

@@ -430,6 +430,43 @@ class NodeRequestHandlerTest {
     }
 
     @Test
+    void listMultipartUploadsPagesInKeyOrderRegardlessOfCreationOrder() {
+        try (CandyboxNode node = new CandyboxNode(1, config(), new InMemoryLedgerStore(),
+                new InMemoryCoordinationService(), new ManualClock(1000))) {
+            RequestHandler handler = node.requestHandler();
+            roundTrip(handler, new Message.CreateBoxRequest("order-box", 1));
+            List<String> created = new java.util.ArrayList<>();
+            for (String key : List.of("z", "m", "a", "m")) {
+                Message r = roundTrip(handler, new Message.CreateMultipartUploadRequest(
+                        "order-box", key, null, Map.of()));
+                created.add(key + "/" + ((Message.CreateMultipartUploadResponse) r).uploadId());
+            }
+            List<String> expected = new java.util.ArrayList<>(created);
+            expected.sort(null);
+
+            List<String> seen = new java.util.ArrayList<>();
+            String keyMarker = null;
+            String uploadIdMarker = null;
+            do {
+                Message.ListMultipartUploadsResponse page = (Message.ListMultipartUploadsResponse)
+                        roundTrip(handler, new Message.ListMultipartUploadsRequest(
+                                "order-box", 0, null, keyMarker, uploadIdMarker, 1));
+                page.uploads().forEach(u -> seen.add(u.key() + "/" + u.uploadId()));
+                keyMarker = page.nextKeyMarker();
+                uploadIdMarker = page.nextUploadIdMarker();
+            } while (keyMarker != null);
+            assertThat(seen).containsExactlyElementsOf(expected);
+
+            // key-marker alone lists only keys strictly after it.
+            Message.ListMultipartUploadsResponse afterM = (Message.ListMultipartUploadsResponse)
+                    roundTrip(handler, new Message.ListMultipartUploadsRequest(
+                            "order-box", 0, null, "m", null, 100));
+            assertThat(afterM.uploads()).extracting(Message.InProgressUpload::key)
+                    .containsExactly("z");
+        }
+    }
+
+    @Test
     void listPartsHonoursMarkerAndPaging() {
         try (CandyboxNode node = new CandyboxNode(1, config(), new InMemoryLedgerStore(),
                 new InMemoryCoordinationService(), new ManualClock(1000))) {

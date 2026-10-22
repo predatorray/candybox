@@ -264,6 +264,8 @@ consults range tombstones across all tables rather than pruning by point range.
   key in one fenced manifest edit; superseded parts (re-uploading the same `partNumber`) and
   aborted uploads enter the pending-orphan path for GC. The TTL sweeper on the
   compaction/GC worker aborts uploads older than `multipart.upload.ttl.millis` (default 7 days).
+  `ListMultipartUploads` orders by `(key, uploadId)` (key in UTF-8 byte order), not by initiation
+  time as S3 does, so each partition's page and the client's merge agree on one total order.
 
 The merged read path spans **all levels** (L0 plus the compaction-produced L1+); within a level keys
 are non-overlapping, while L0 tables may overlap, so L0 is consulted table-by-table. Under
