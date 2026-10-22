@@ -457,7 +457,8 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
                 anyTruncated = true;
             }
         }
-        all.sort(Comparator.comparing(UploadEntry::key).thenComparing(UploadEntry::uploadId));
+        all.sort(Comparator.comparing(UploadEntry::key, CandyKey::compareUtf8)
+                .thenComparing(UploadEntry::uploadId));
         boolean truncated = anyTruncated || all.size() > limit;
         List<UploadEntry> rows = all.size() > limit ? new ArrayList<>(all.subList(0, limit)) : all;
         UploadEntry last = rows.isEmpty() ? null : rows.get(rows.size() - 1);
