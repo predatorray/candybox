@@ -54,8 +54,6 @@ interface CandyStore {
         putCandy(box, key, data, contentType, userMetadata);
     }
 
-    byte[] getCandy(String box, String key);
-
     /**
      * Range GET: returns a byte window of an object. {@code firstByte}/{@code lastByte} follow the
      * HTTP {@code Range:} convention (inclusive on both ends, {@code -1} sentinel for "unbounded").

@@ -106,11 +106,6 @@ final class CandyboxClientStore implements CandyStore, AutoCloseable {
     }
 
     @Override
-    public byte[] getCandy(String box, String key) {
-        return client.getCandy(box, key);
-    }
-
-    @Override
     public RangeBytes getCandyRange(String box, String key, long firstByte, long lastByte) {
         return client.getCandyRange(box, key, firstByte, lastByte);
     }

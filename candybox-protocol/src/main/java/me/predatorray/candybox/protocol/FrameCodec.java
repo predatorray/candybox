@@ -25,7 +25,8 @@ import java.io.OutputStream;
  * The framed binary codec: {@code magic(2) | version(1) | opcode(1) | length(4) | payload}, all
  * big-endian.
  *
- * <p>It enforces a configurable maximum payload length (default 16 MiB) and validates the magic,
+ * <p>It enforces a configurable maximum payload length (default 16 MiB plus 64 KiB, so a 16 MiB
+ * object part fits alongside its metadata) and validates the magic,
  * version, and length prefix <em>before allocating</em> the payload buffer, so a hostile or corrupt
  * frame cannot drive a node to OOM. A length that is negative or exceeds the cap is rejected outright.
  */
@@ -34,7 +35,7 @@ public final class FrameCodec {
     public static final int MAGIC = 0xCB0F;
     public static final byte VERSION = 1;
     public static final int HEADER_BYTES = 8;
-    public static final int DEFAULT_MAX_FRAME_BYTES = 16 << 20;
+    public static final int DEFAULT_MAX_FRAME_BYTES = (16 << 20) + (64 << 10);
 
     private final int maxFrameBytes;
 

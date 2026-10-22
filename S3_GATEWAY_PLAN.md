@@ -343,7 +343,8 @@ Follow the node's `ServerConfig` pattern exactly: `conf/*.properties` keys overr
 | `s3.bind` | Address the gateway listens on (plain HTTP, behind the LB). | `0.0.0.0:9711` |
 | `zookeeper.connect` | ZooKeeper connect string for cluster routing (shared with the cluster). | `127.0.0.1:2181` |
 | `s3.region` | Value returned in `?location` and any region echoes. | `us-east-1` |
-| `s3.max-object-bytes` | Reject single PUTs larger than this (no multipart). | from `SizeLimits` / e.g. 5 GiB |
+| `s3.max-object-bytes` | Reject single PUTs / parts larger than this; also capped by one node frame. | 5 GiB |
+| `max.frame.size.bytes` | Node frame cap; bounds request bodies and the GET streaming slice. | 16 MiB + 64 KiB |
 | `s3.worker-threads` | Size of the blocking worker pool calling `CandyboxClient`. | `2 × cores` |
 | `s3.router-cache-ttl-ms` | Box→owner resolution cache TTL (passed to the cluster router). | client default |
 | `s3.router-unowned-retry-ms` | How long a request waits out a partition ownership gap before answering 503. | `15000` |
