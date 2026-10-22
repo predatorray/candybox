@@ -32,6 +32,7 @@ import me.predatorray.candybox.common.auth.ObjectAcl;
 import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.exception.CandyNotFoundException;
 import me.predatorray.candybox.coordination.CandyboxKeys;
+import me.predatorray.candybox.coordination.CasConflictException;
 import me.predatorray.candybox.coordination.CoordinationService;
 import me.predatorray.candybox.coordination.Lease;
 import me.predatorray.candybox.coordination.LeaseInfo;
@@ -189,7 +190,7 @@ class CrossPartitionGcAndRenameTest {
     @Test
     void boxSitsOutGcWhenItsRelaysCannotBeRead() {
         InMemoryLedgerStore store = new InMemoryLedgerStore();
-        FailingChildren coordination = new FailingChildren(new InMemoryCoordinationService());
+        FaultyCoordination coordination = new FaultyCoordination(new InMemoryCoordinationService());
         try (CandyboxNode node = new CandyboxNode(1, aggressiveGcConfig(), store, coordination,
                 new ManualClock(1000))) {
             node.createBox(BOX, PARTITIONS);
@@ -198,7 +199,7 @@ class CrossPartitionGcAndRenameTest {
             orphanSource(node, src);
 
             coordination.failChildren = true;
-            assertThat(node.collectGarbageOnce()).isZero();
+            node.collectGarbageOnce();
             assertThat(store.listLedgers()).contains(syrup);
 
             coordination.failChildren = false;
@@ -206,6 +207,132 @@ class CrossPartitionGcAndRenameTest {
             assertThat(store.listLedgers()).doesNotContain(syrup);
         }
         store.close();
+    }
+
+    @Test
+    void pendingSamePartitionRenameRelayKeepsItsSyrupAlive() {
+        assertDelayedZeroCopyPutStaysReadable(0, true);
+    }
+
+    @Test
+    void undecodableRelaySkipsSyrupGcButNotSSTableGc() {
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService();
+        try (CandyboxNode node = new CandyboxNode(1, aggressiveGcConfig(), store, coordination,
+                new ManualClock(1000))) {
+            node.createBox(BOX, PARTITIONS);
+            String src = keyIn(0, "src");
+            long syrup = putAndFlush(node, src);
+            orphanSource(node, src);
+            BoxEngine p0 = node.enginePartition(BOX, 0);
+            assertThat(p0.reclaimableSSTables(Long.MAX_VALUE)).isNotEmpty();
+            String junk = CandyboxKeys.locatorRelayKey(BOX.value(), 2, "junk");
+            coordination.create(junk, new byte[] {(byte) 0xff});
+
+            node.collectGarbageOnce();
+            assertThat(store.listLedgers()).contains(syrup);
+            assertThat(p0.reclaimableSSTables(Long.MAX_VALUE)).isEmpty();
+
+            coordination.delete(junk, coordination.get(junk).orElseThrow().version());
+            node.collectGarbageOnce();
+            assertThat(store.listLedgers()).doesNotContain(syrup);
+        }
+        store.close();
+    }
+
+    @Test
+    void syrupsOrphanedAfterTheReferenceSnapshotAreNotClaimed() {
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        ManualClock clock = new ManualClock(1000);
+        try (CandyboxNode node = new CandyboxNode(1, aggressiveGcConfig(), store,
+                new InMemoryCoordinationService(), clock)) {
+            node.createBox(BOX, PARTITIONS);
+            String src = keyIn(0, "src");
+            long syrup = putAndFlush(node, src);
+            orphanSource(node, src); // pending since 1000
+            BoxEngine p0 = node.enginePartition(BOX, 0);
+            GarbageCollector gc = new GarbageCollector(store, 100, clock);
+            clock.advance(500);
+
+            gc.collect(p0, java.util.Set.of(), 1000 + 99);
+            assertThat(store.listLedgers()).contains(syrup);
+            gc.collect(p0, java.util.Set.of(), 1000 + 100);
+            assertThat(store.listLedgers()).doesNotContain(syrup);
+        }
+        store.close();
+    }
+
+    @Test
+    void relayIsDroppedWhenTheSourceChangesWhileItIsWritten() {
+        FaultyCoordination coordination = new FaultyCoordination(new InMemoryCoordinationService());
+        try (CandyboxNode node = new CandyboxNode(1, CandyboxConfig.builder()
+                .leaseRenewIntervalMillis(0).build(), new InMemoryLedgerStore(), coordination,
+                new ManualClock(1000))) {
+            node.createBox(BOX, PARTITIONS);
+            String src = keyIn(0, "src");
+            BoxEngine p0 = node.enginePartition(BOX, 0);
+            p0.putCandy(CandyKey.of(src), bytes("v1"), null, Map.of(), null);
+            RequestHandler handler = node.requestHandler();
+            String relays = CandyboxKeys.locatorRelaysPath(BOX.value(), 0);
+
+            coordination.beforeCreate = key -> {
+                if (key.startsWith(relays)) {
+                    p0.putCandy(CandyKey.of(src), bytes("v2"), null, Map.of(), null);
+                }
+            };
+            assertThat(send(handler, new Message.GetCandyLocatorRequest(BOX.value(), src)))
+                    .isInstanceOf(Message.BusyResponse.class);
+            assertThat(coordination.children(relays)).isEmpty();
+
+            coordination.beforeCreate = key -> {
+                if (key.startsWith(relays)) {
+                    p0.deleteCandy(CandyKey.of(src));
+                }
+            };
+            assertThat(send(handler, new Message.PrepareRenameRequest(BOX.value(), src,
+                    keyIn(1, "dst"), 1, "changed-rename")))
+                    .isInstanceOf(Message.NotFoundResponse.class);
+            assertThat(coordination.children(relays)).isEmpty();
+            assertThat(p0.listRenameIntents()).isEmpty();
+        }
+    }
+
+    @Test
+    void zeroCopyPutKeepsItsRelayWhenItsRefsCannotBePublished() {
+        FaultyCoordination coordination = new FaultyCoordination(new InMemoryCoordinationService());
+        try (CandyboxNode node = new CandyboxNode(1, CandyboxConfig.builder()
+                .leaseRenewIntervalMillis(0).build(), new InMemoryLedgerStore(), coordination,
+                new ManualClock(1000))) {
+            node.createBox(BOX, PARTITIONS);
+            String src = keyIn(0, "src");
+            String dst = keyIn(1, "dst");
+            node.enginePartition(BOX, 0).putCandy(CandyKey.of(src), bytes("payload"), null,
+                    Map.of(), null);
+            RequestHandler handler = node.requestHandler();
+            String token = relayToken(handler, src);
+            Message put = new Message.ZeroCopyPutRequest(BOX.value(), dst, 0, token, null,
+                    List.of(), "put-1");
+
+            coordination.failWritesTo = CandyboxKeys.partitionRefsKey(BOX.value(), 1);
+            assertThat(send(handler, put)).isNotInstanceOf(Message.HeadCandyResponse.class);
+            assertThat(coordination.children(CandyboxKeys.locatorRelaysPath(BOX.value(), 0)))
+                    .containsExactly(token);
+
+            coordination.failWritesTo = null;
+            assertThat(send(handler, put)).isInstanceOf(Message.HeadCandyResponse.class);
+            assertThat(coordination.children(CandyboxKeys.locatorRelaysPath(BOX.value(), 0)))
+                    .isEmpty();
+        }
+    }
+
+    @Test
+    void publishingRefsOfAPartitionNotOwnedFails() {
+        try (CandyboxNode node = new CandyboxNode(1, CandyboxConfig.builder()
+                .leaseRenewIntervalMillis(0).build(), new InMemoryLedgerStore(),
+                new InMemoryCoordinationService(), new ManualClock(1000))) {
+            assertThatThrownBy(() -> node.publishPartitionRefs(BOX, 0))
+                    .isInstanceOf(me.predatorray.candybox.common.exception.NotOwnerException.class);
+        }
     }
 
     /** Puts and flushes {@code key} in partition 0, returning the Syrup that holds its bytes. */
@@ -454,7 +581,7 @@ class CrossPartitionGcAndRenameTest {
 
     @Test
     void relaySweepSurvivesACoordinationError() {
-        FailingChildren coordination = new FailingChildren(new InMemoryCoordinationService());
+        FaultyCoordination coordination = new FaultyCoordination(new InMemoryCoordinationService());
         try (CandyboxNode node = new CandyboxNode(1, CandyboxConfig.builder()
                 .leaseRenewIntervalMillis(0).build(), new InMemoryLedgerStore(), coordination,
                 new ManualClock(1000))) {
@@ -464,12 +591,18 @@ class CrossPartitionGcAndRenameTest {
         }
     }
 
-    /** Delegates to a real fake, but {@link #children} fails on demand (a ZooKeeper outage). */
-    private static final class FailingChildren implements CoordinationService {
+    /**
+     * Delegates to a real fake, but {@link #children} fails on demand (a ZooKeeper outage), writes
+     * to keys containing {@link #failWritesTo} lose a CAS race, and {@link #beforeCreate} runs
+     * before every create.
+     */
+    private static final class FaultyCoordination implements CoordinationService {
         private final CoordinationService delegate;
         volatile boolean failChildren;
+        volatile String failWritesTo;
+        volatile java.util.function.Consumer<String> beforeCreate = key -> { };
 
-        FailingChildren(CoordinationService delegate) {
+        FaultyCoordination(CoordinationService delegate) {
             this.delegate = delegate;
         }
 
@@ -488,12 +621,22 @@ class CrossPartitionGcAndRenameTest {
 
         @Override
         public long create(String key, byte[] value) {
+            beforeCreate.accept(key);
+            failIfTargeted(key);
             return delegate.create(key, value);
         }
 
         @Override
         public long compareAndSet(String key, byte[] value, long expectedVersion) {
+            failIfTargeted(key);
             return delegate.compareAndSet(key, value, expectedVersion);
+        }
+
+        private void failIfTargeted(String key) {
+            String target = failWritesTo;
+            if (target != null && key.contains(target)) {
+                throw new CasConflictException(key, 0, 1);
+            }
         }
 
         @Override

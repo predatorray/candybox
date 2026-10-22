@@ -584,26 +584,20 @@ public final class CandyboxNode implements AutoCloseable {
             }
         }
         int deleted = 0;
-        Map<String, BoxSyrupRefs> boxRefs = new HashMap<>();
+        // Per pass, each Box's references are read once; an empty Optional means they could not be,
+        // and the Box only collects SSTables and WALs, which do not depend on them.
+        Map<String, Optional<BoxSyrupRefs>> boxRefs = new HashMap<>();
         for (PartitionOwnership ownership : partitions.values()) {
             try {
-                if (unpublished.contains(ownership.box().value()) || !ownership.isOwner()) {
+                String box = ownership.box().value();
+                if (unpublished.contains(box) || !ownership.isOwner()) {
                     continue;
                 }
-                BoxSyrupRefs refs = boxRefs.get(ownership.box().value());
-                if (refs == null) {
-                    try {
-                        refs = readBoxSyrupRefs(ownership.box().value());
-                    } catch (RuntimeException e) {
-                        unpublished.add(ownership.box().value());
-                        LOG.warn("Referenced-Syrup read error on node {} for box {}: {}", nodeId,
-                                ownership.box(), e.getMessage());
-                        continue;
-                    }
-                    boxRefs.put(ownership.box().value(), refs);
-                }
-                deleted += garbageCollector.collect(ownership.engine(),
-                        refs.foreignTo(ownership.partition()), refs.readAtMillis());
+                Optional<BoxSyrupRefs> refs = boxRefs.computeIfAbsent(box, this::tryReadBoxSyrupRefs);
+                deleted += refs.isPresent()
+                        ? garbageCollector.collect(ownership.engine(),
+                                refs.get().foreignTo(ownership.partition()), refs.get().readAtMillis())
+                        : garbageCollector.collectWithoutSyrups(ownership.engine());
             } catch (NotOwnerException lostOwnership) {
                 LOG.info("Skipping GC of a partition on node {}: {}", nodeId,
                         lostOwnership.getMessage());
@@ -781,11 +775,20 @@ public final class CandyboxNode implements AutoCloseable {
     }
 
     /** Publishes one owned partition's referenced-Syrup set to coordination (Box-global GC input). */
+    /**
+     * Publishes a partition's referenced-Syrup set, or throws: a zero-copy put deletes its relay
+     * only after this, so the Box-global GC never loses sight of the Syrups it now references.
+     *
+     * @throws NotOwnerException if this node no longer owns the partition
+     */
     void publishPartitionRefs(BoxName box, int partition) {
         PartitionOwnership ownership = partitions.get(new BoxPartition(box.value(), partition));
-        if (ownership != null && ownership.isOwner()) {
-            publishPartitionRefs(ownership);
+        if (ownership == null || !ownership.isOwner()) {
+            throw new NotOwnerException(box.value());
         }
+        BoxEngine engine = ownership.engine();
+        CoordinationCas.upsert(coordination, CandyboxKeys.partitionRefsKey(box.value(), partition),
+                () -> encodeLongSet(engine.referencedSyrups()), 3);
     }
 
     private void publishPartitionRefs(PartitionOwnership ownership) {
@@ -799,13 +802,24 @@ public final class CandyboxNode implements AutoCloseable {
                 encodeLongSet(refs));
     }
 
+    private Optional<BoxSyrupRefs> tryReadBoxSyrupRefs(String box) {
+        try {
+            return Optional.of(readBoxSyrupRefs(box));
+        } catch (RuntimeException e) {
+            LOG.warn("Skipping Syrup GC of box {} on node {}: {}", box, nodeId, e.getMessage());
+            return Optional.empty();
+        }
+    }
+
     /**
      * The Syrups a Box's partitions reference, as seen by GC: each partition's published refs, plus
      * every Syrup a pending locator relay points at, since a zero-copy put may still commit it.
      * The refs are read both before and after the relays: a relay is only written while its source
      * is still in the source partition's refs, and is only deleted after the destination published
-     * its refs, so no reference can fall between the reads. Costs one read per pending relay of
-     * the Box, bounded by the relay caps.
+     * its refs, so no reference can fall between the reads. Syrups are then claimed only if orphaned
+     * a grace period before {@code readAtMillis}, which relies on every path that re-references a
+     * Syrup clearing its pending-orphan stamp (and a handover restarting it). Costs one read per
+     * pending relay of the Box, bounded by the relay caps.
      */
     private BoxSyrupRefs readBoxSyrupRefs(String box) {
         long readAt = clock.currentTimeMillis();

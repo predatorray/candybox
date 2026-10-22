@@ -443,8 +443,13 @@ final class NodeRequestHandler implements RequestHandler {
             CandyLocator locator = engine.resolveLocator(CandyKey.of(m.srcKey()));
             engine.recordRenameIntent(new RenameIntent(m.renameToken(), m.srcKey(), locator.hlc(),
                     m.dstKey(), m.dstPartition(), node.currentTimeMillis()));
-            return relayLocator(engine, m.box(), m.srcKey(), principal, m.renameToken(), m.dstKey(),
-                    locator);
+            try {
+                return relayLocator(engine, m.box(), m.srcKey(), principal, m.renameToken(),
+                        m.dstKey(), locator);
+            } catch (RuntimeException e) {
+                engine.clearRenameIntent(m.renameToken());
+                throw e;
+            }
         } else if (message instanceof Message.ZeroCopyPutRequest m) {
             BoxName box = BoxName.of(m.box());
             BoxEngine engine = node.engine(box, m.dstKey());
@@ -637,15 +642,15 @@ final class NodeRequestHandler implements RequestHandler {
         int srcPartition = node.descriptor(BoxName.of(box)).partitionOf(srcKey);
         String token = node.writeLocatorRelay(box, srcPartition, new LocatorRelay(
                 principal.toString(), srcKey, renameToken, dstKey, node.currentTimeMillis(), locator));
-        boolean unchanged = false;
+        CandyLocator current;
         try {
-            unchanged = engine.resolveLocator(CandyKey.of(srcKey)).hlc().equals(locator.hlc());
-        } finally {
-            if (!unchanged) {
-                node.deleteLocatorRelay(box, srcPartition, token);
-            }
+            current = engine.resolveLocator(CandyKey.of(srcKey));
+        } catch (RuntimeException e) {
+            node.deleteLocatorRelay(box, srcPartition, token);
+            throw e;
         }
-        if (!unchanged) {
+        if (!current.hlc().equals(locator.hlc())) {
+            node.deleteLocatorRelay(box, srcPartition, token);
             throw new BusyException("Source " + srcKey + " changed while its locator was relayed");
         }
         return new Message.CandyLocatorResponse(token, locator.hlc());

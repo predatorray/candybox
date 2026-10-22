@@ -95,6 +95,12 @@ public final class GarbageCollector {
         return deleted;
     }
 
+    /** Collects only obsolete SSTables and WALs, for a Box whose Syrup references are unknown. */
+    public int collectWithoutSyrups(BoxEngine engine) {
+        long cutoff = clock.currentTimeMillis() - graceMillis;
+        return collectSSTables(engine, cutoff) + collectWals(engine, cutoff);
+    }
+
     private int collectWals(BoxEngine engine, long cutoff) {
         int deleted = 0;
         for (long ledgerId : engine.reclaimableWals(cutoff)) {
