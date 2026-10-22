@@ -357,9 +357,10 @@ governs **range tombstones**: the compactor collects them from all inputs and ca
 except an aged one at the bottommost level, which is dropped. An aged range tombstone is still kept
 while an L1+ table outside the compaction overlaps its range and may hold an older point (its
 `minPointHlc` is older than the tombstone, or unknown for a table recorded before v5), because that
-point must stay shadowed; with span-based input selection this only happens for pre-v5 tables or a
-late write stamped with an older HLC. L0 tables are always newer than L1+ data, so they never block
-the drop.
+point must stay shadowed. With span-based input selection a covered older point can only survive
+from history written before v5; the check is conservative, so a table that straddles the range with
+older points only outside it also delays the drop until that table is compacted down. L0 tables are
+always newer than L1+ data, so they never block the drop.
 Any point covered by a newer range tombstone among the inputs is dropped at any level, since the
 tombstone either still shadows older copies or has nothing left to shadow. Carried range tombstones
 are split across the outputs: each output keeps the part inside its slot of the key space (from its

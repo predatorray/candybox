@@ -16,9 +16,11 @@
 package me.predatorray.candybox.lsm.compaction;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.PriorityQueue;
 import java.util.Set;
 import me.predatorray.candybox.bookkeeper.LedgerConfig;
 import me.predatorray.candybox.bookkeeper.LedgerStore;
@@ -44,10 +46,12 @@ import me.predatorray.candybox.lsm.sstable.SSTableWriter;
  * resurrect the Candy. The same rule governs range tombstones: an aged range tombstone at the
  * bottommost level is dropped; younger or non-bottommost range tombstones are carried forward so they
  * keep shadowing. An aged range tombstone is also kept while a table outside the task overlaps its
- * range and may hold a point older than it (a table from before manifest v5, or a late write stamped
- * with an older HLC), since that point must stay shadowed. Points covered by a newer range
- * tombstone among the inputs are dropped at any level. Each output keeps the parts of the carried
- * range tombstones that fall in its slot of the key space, so they travel with the points they cover.
+ * range and may hold a point older than it, since that point must stay shadowed. With span-based
+ * input selection such a point can only come from tables written before manifest v5, but the check
+ * is conservative and can also delay the drop for a newer table that straddles the range. Points
+ * covered by a newer range tombstone among the inputs are dropped at any level. Each output keeps the
+ * parts of the carried range tombstones that fall in its slot of the key space, so they travel with
+ * the points they cover.
  *
  * <p>This is the reusable execution core; distributed scheduling (ZK task claims/leases) and the
  * fenced commit + reference-counted GC live in the server in Phase 3.
@@ -146,7 +150,11 @@ public final class Compactor {
         }
     }
 
-    /** Whether a table outside the task may hold a point older than {@code rt} that it covers. */
+    /**
+     * Whether a table outside the task may hold a point older than {@code rt} that it covers. This is
+     * conservative: it judges by the table's key range and oldest point, so a table that straddles
+     * the range with older points only outside it also delays the drop until it is compacted down.
+     */
     private static boolean overlapsOtherTable(RangeTombstone rt, CompactionTask task) {
         for (SSTableMeta t : task.otherTables()) {
             if (t.entryCount() == 0
@@ -172,12 +180,19 @@ public final class Compactor {
     /**
      * Drops any point covered by a newer range tombstone among the inputs: the tombstone is either
      * carried forward, where it keeps shadowing older copies, or dropped because nothing it could
-     * shadow is left. At the bottommost level, also drops aged point tombstones.
+     * shadow is left. At the bottommost level, also drops aged point tombstones. Range tombstones are
+     * swept alongside the ascending key stream, so each point is checked only against those covering it.
      */
     private Iterator<Mutation> dropDeadEntries(Iterator<Mutation> delegate,
                                                List<RangeTombstone> ranges, boolean bottommost) {
         long now = clock.currentTimeMillis();
+        List<RangeTombstone> byStart = new ArrayList<>(ranges);
+        byStart.sort(Comparator.comparing(RangeTombstone::startInclusive,
+                Comparator.nullsFirst(Comparator.naturalOrder())));
+        PriorityQueue<RangeTombstone> active = new PriorityQueue<>(Comparator.comparing(
+                RangeTombstone::endExclusive, Comparator.nullsLast(Comparator.naturalOrder())));
         return new Iterator<>() {
+            private int nextRange;
             private Mutation nextOut;
             private boolean computed;
 
@@ -217,8 +232,17 @@ public final class Compactor {
             }
 
             private boolean coveredByRange(Mutation m) {
-                for (RangeTombstone rt : ranges) {
-                    if (rt.hlc().isAfter(m.hlc()) && rt.covers(m.key())) {
+                CandyKey key = m.key();
+                while (nextRange < byStart.size() && (byStart.get(nextRange).startInclusive() == null
+                        || byStart.get(nextRange).startInclusive().compareTo(key) <= 0)) {
+                    active.add(byStart.get(nextRange++));
+                }
+                while (!active.isEmpty() && active.peek().endExclusive() != null
+                        && active.peek().endExclusive().compareTo(key) <= 0) {
+                    active.poll();
+                }
+                for (RangeTombstone rt : active) {
+                    if (rt.hlc().isAfter(m.hlc())) {
                         return true;
                     }
                 }
