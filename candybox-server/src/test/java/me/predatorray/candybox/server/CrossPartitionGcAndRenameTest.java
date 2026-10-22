@@ -118,6 +118,53 @@ class CrossPartitionGcAndRenameTest {
     }
 
     @Test
+    void pendingRelayKeepsItsSyrupAliveAfterTheSourceIsDeleted() {
+        assertDelayedZeroCopyPutStaysReadable(1);
+    }
+
+    @Test
+    void pendingRelayKeepsItsSyrupAliveForASamePartitionDestination() {
+        assertDelayedZeroCopyPutStaysReadable(0);
+    }
+
+    /**
+     * Resolves a relay, then deletes, compacts and GCs the source so its Syrup would be reclaimable,
+     * and only then consumes the relay: the relay must have pinned the Syrup.
+     */
+    private static void assertDelayedZeroCopyPutStaysReadable(int dstPartition) {
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        try (CandyboxNode node = new CandyboxNode(1, aggressiveGcConfig(), store,
+                new InMemoryCoordinationService(), new ManualClock(1000))) {
+            node.createBox(BOX, PARTITIONS);
+            String src = keyIn(0, "src");
+            String dst = keyIn(dstPartition, "dst");
+            BoxEngine p0 = node.enginePartition(BOX, 0);
+            p0.putCandy(CandyKey.of(src), bytes("payload"), "text/plain", Map.of(), null);
+            p0.flush();
+            long syrup = p0.resolveLocator(CandyKey.of(src)).parts().get(0).segments().get(0)
+                    .syrupId();
+            RequestHandler handler = node.requestHandler();
+            String token = relayToken(handler, src);
+
+            p0.deleteCandy(CandyKey.of(src));
+            p0.putCandy(CandyKey.of(keyIn(0, "other")), bytes("x"), null, Map.of(), null); // rolls S
+            p0.flush();
+            for (int i = 0; i < 5; i++) {
+                node.compactOwnedBoxesOnce();
+            }
+            node.collectGarbageOnce();
+            assertThat(store.listLedgers()).contains(syrup);
+
+            assertThat(send(handler, new Message.ZeroCopyPutRequest(BOX.value(), dst, 0, token,
+                    null, List.of(), null))).isInstanceOf(Message.HeadCandyResponse.class);
+            node.collectGarbageOnce();
+            assertThat(node.enginePartition(BOX, dstPartition).getCandy(CandyKey.of(dst)))
+                    .isEqualTo(bytes("payload"));
+        }
+        store.close();
+    }
+
+    @Test
     void renameIntentIsFinalizedWhenTheRendezvousMarkerIsPresent() {
         InMemoryLedgerStore store = new InMemoryLedgerStore();
         ManualClock clock = new ManualClock(1000);

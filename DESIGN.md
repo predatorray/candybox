@@ -412,9 +412,11 @@ The detailed rules:
   tracking is not monotonic: a re-referenced Syrup leaves the pending set (its grace period restarts
   in that partition if it is orphaned again; a sibling that also tracked it keeps its older timestamp,
   #66), and GC claims Syrups through one write-locked step that re-checks the partition's own
-  references before dropping them from the live set. Only the claimed Syrups are deleted. A source
-  locator resolved before its Syrup was claimed and zero-copy-put only afterwards is not yet guarded
-  against (#65).
+  references before dropping them from the live set. Only the claimed Syrups are deleted. A pending
+  locator relay also pins its Syrups, so a source deleted and compacted before its relay is consumed
+  cannot leave the destination dangling: GC reads the published sets, then every relay of the Box,
+  then the published sets again (a relay is written while its source is referenced and deleted only
+  after the destination published its refs), and relays expire well before they are reaped.
 
 The full compaction-then-GC cycle is covered end-to-end by `CompactionGcCycleIT`. One gap: deleting a
 Box drops its manifest pointer but does not yet reclaim that Box's SSTable/Syrup/WAL/manifest ledgers

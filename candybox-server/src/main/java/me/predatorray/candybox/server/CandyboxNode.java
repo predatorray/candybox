@@ -17,8 +17,10 @@ package me.predatorray.candybox.server;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -34,6 +36,7 @@ import me.predatorray.candybox.common.BoxName;
 import me.predatorray.candybox.common.CandyKey;
 import me.predatorray.candybox.common.Clock;
 import me.predatorray.candybox.common.Hlc;
+import me.predatorray.candybox.common.SegmentRef;
 import me.predatorray.candybox.common.SystemClock;
 import me.predatorray.candybox.common.auth.Authorizer;
 import me.predatorray.candybox.common.config.CandyboxConfig;
@@ -581,14 +584,19 @@ public final class CandyboxNode implements AutoCloseable {
             }
         }
         int deleted = 0;
+        Map<String, BoxSyrupRefs> boxRefs = new HashMap<>();
         for (PartitionOwnership ownership : partitions.values()) {
             try {
                 if (unpublished.contains(ownership.box().value()) || !ownership.isOwner()) {
                     continue;
                 }
-                Set<Long> foreign = syrupsReferencedByOtherPartitions(ownership.box().value(),
-                        ownership.partition());
-                deleted += garbageCollector.collect(ownership.engine(), foreign);
+                BoxSyrupRefs refs = boxRefs.get(ownership.box().value());
+                if (refs == null) {
+                    refs = readBoxSyrupRefs(ownership.box().value());
+                    boxRefs.put(ownership.box().value(), refs);
+                }
+                deleted += garbageCollector.collect(ownership.engine(),
+                        refs.foreignTo(ownership.partition()));
             } catch (NotOwnerException lostOwnership) {
                 LOG.info("Skipping GC of a partition on node {}: {}", nodeId,
                         lostOwnership.getMessage());
@@ -784,23 +792,58 @@ public final class CandyboxNode implements AutoCloseable {
                 encodeLongSet(refs));
     }
 
-    /** The union of every <em>other</em> partition's published referenced-Syrup set for a Box. */
-    private Set<Long> syrupsReferencedByOtherPartitions(String box, int excludePartition) {
-        BoxDescriptor descriptor;
+    /**
+     * The Syrups a Box's partitions reference, as seen by GC: each partition's published refs, plus
+     * every Syrup a pending locator relay points at, since a zero-copy put may still commit it.
+     * The refs are read both before and after the relays: a relay is only written while its source
+     * is still in the source partition's refs, and is only deleted after the destination published
+     * its refs, so no reference can fall between the reads.
+     */
+    private BoxSyrupRefs readBoxSyrupRefs(String box) {
+        int partitionCount;
         try {
-            descriptor = descriptor(BoxName.of(box));
+            partitionCount = descriptor(BoxName.of(box)).partitionCount();
         } catch (BoxNotFoundException gone) {
-            return Set.of();
+            return new BoxSyrupRefs(List.of(), Set.of());
         }
-        Set<Long> referenced = new HashSet<>();
-        for (int p = 0; p < descriptor.partitionCount(); p++) {
-            if (p == excludePartition) {
-                continue;
+        List<Set<Long>> published = new ArrayList<>(partitionCount);
+        for (int p = 0; p < partitionCount; p++) {
+            published.add(publishedPartitionRefs(box, p));
+        }
+        Set<Long> relayed = new HashSet<>();
+        for (int p = 0; p < partitionCount; p++) {
+            for (String token : coordination.children(CandyboxKeys.locatorRelaysPath(box, p))) {
+                coordination.get(CandyboxKeys.locatorRelayKey(box, p, token)).ifPresent(v -> {
+                    for (SegmentRef seg : LocatorRelay.deserialize(v.value()).locator().segments()) {
+                        relayed.add(seg.syrupId());
+                    }
+                });
             }
-            coordination.get(CandyboxKeys.partitionRefsKey(box, p))
-                    .ifPresent(v -> referenced.addAll(decodeLongSet(v.value())));
         }
-        return referenced;
+        for (int p = 0; p < partitionCount; p++) {
+            published.get(p).addAll(publishedPartitionRefs(box, p));
+        }
+        return new BoxSyrupRefs(published, relayed);
+    }
+
+    private Set<Long> publishedPartitionRefs(String box, int partition) {
+        return coordination.get(CandyboxKeys.partitionRefsKey(box, partition))
+                .map(v -> decodeLongSet(v.value()))
+                .orElseGet(HashSet::new);
+    }
+
+    private record BoxSyrupRefs(List<Set<Long>> publishedByPartition, Set<Long> relayed) {
+
+        /** The Syrups GC of {@code partition} must keep: other partitions' refs and all relays. */
+        Set<Long> foreignTo(int partition) {
+            Set<Long> referenced = new HashSet<>(relayed);
+            for (int p = 0; p < publishedByPartition.size(); p++) {
+                if (p != partition) {
+                    referenced.addAll(publishedByPartition.get(p));
+                }
+            }
+            return referenced;
+        }
     }
 
     /**
