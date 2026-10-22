@@ -77,7 +77,7 @@ class LargeCompactionIT {
 
             Compactor compactor = new Compactor(store, writer, cfg, 0, SystemClock.INSTANCE);
             CompactionResult result = compactor.compact(
-                    new CompactionTask(List.of(even, odd), 1, true));
+                    new CompactionTask(List.of(even, odd), 1, true, List.of()));
 
             List<SSTableMeta> outputs = result.edit().addedTables();
             assertThat(outputs).hasSizeGreaterThan(1);

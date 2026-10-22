@@ -26,6 +26,8 @@ import me.predatorray.candybox.common.CandyKey;
 import me.predatorray.candybox.common.Hlc;
 import me.predatorray.candybox.common.config.LedgerRole;
 import me.predatorray.candybox.common.exception.FencedException;
+import me.predatorray.candybox.common.serial.BinaryWriter;
+import me.predatorray.candybox.lsm.sstable.KeySpan;
 import me.predatorray.candybox.lsm.sstable.SSTableMeta;
 import org.junit.jupiter.api.Test;
 
@@ -60,6 +62,36 @@ class ManifestTest {
                 .build();
         byte[] bytes = ManifestSerializer.serialize(edit);
         assertThat(ManifestSerializer.deserialize(bytes)).isEqualTo(edit);
+    }
+
+    @Test
+    void rangeTombstoneSpansRoundTrip() {
+        SSTableMeta unboundedStart = new SSTableMeta(1, 1, CandyKey.of("b"), CandyKey.of("c"), 2, 64,
+                Set.of(), new KeySpan(null, CandyKey.of("m"), false));
+        SSTableMeta unboundedEnd = new SSTableMeta(2, 1, CandyKey.of("x"), CandyKey.of("x"), 0, 0,
+                Set.of(), new KeySpan(CandyKey.of("p"), null, false));
+        ManifestEdit edit = ManifestEdit.builder()
+                .addedTables(List.of(unboundedStart, unboundedEnd, table(3, 2))).build();
+        assertThat(ManifestSerializer.deserialize(ManifestSerializer.serialize(edit))).isEqualTo(edit);
+    }
+
+    @Test
+    void v4TablesDecodeWithoutARangeTombstoneSpan() {
+        BinaryWriter w = new BinaryWriter(64)
+                .writeByte(4)
+                .writeVarInt(1)
+                .writeVarLong(7).writeVarInt(1)
+                .writeBytes(CandyKey.of("a").utf8Bytes()).writeBytes(CandyKey.of("z").utf8Bytes())
+                .writeVarLong(10).writeVarLong(1024)
+                .writeVarInt(0)                                  // referencedSyrups
+                .writeVarInt(0).writeVarInt(0).writeVarInt(0)    // removed tables, added/removed syrups
+                .writeBoolean(false).writeVarLong(0)             // new WAL, fencing token
+                .writeVarInt(0).writeVarInt(0).writeVarInt(0)    // multipart
+                .writeVarInt(0).writeVarInt(0)                   // rename intents
+                .writeBoolean(false);                            // maxHlc
+        ManifestEdit edit = ManifestSerializer.deserialize(w.toByteArray());
+        assertThat(edit.addedTables()).containsExactly(
+                new SSTableMeta(7, 1, CandyKey.of("a"), CandyKey.of("z"), 10, 1024, Set.of()));
     }
 
     @Test

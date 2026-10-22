@@ -22,6 +22,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import me.predatorray.candybox.bookkeeper.LedgerConfig;
 import me.predatorray.candybox.bookkeeper.fake.InMemoryLedgerStore;
 import me.predatorray.candybox.common.BoxName;
@@ -35,6 +36,7 @@ import me.predatorray.candybox.common.exception.CandyNotFoundException;
 import me.predatorray.candybox.lsm.compaction.Compactor;
 import me.predatorray.candybox.lsm.compaction.CompactionResult;
 import me.predatorray.candybox.lsm.compaction.CompactionTask;
+import me.predatorray.candybox.lsm.compaction.LeveledCompactionStrategy;
 import me.predatorray.candybox.lsm.manifest.ManifestState;
 import me.predatorray.candybox.lsm.sstable.SSTableMeta;
 import me.predatorray.candybox.lsm.sstable.SSTableReader;
@@ -112,7 +114,8 @@ class BoxEngineCompactionTest {
         Clock compactorClock = new ManualClock(nowMillis);
         Compactor compactor = new Compactor(store, new SSTableWriter(store, 10, 256), sstableConfig,
                 graceMillis, compactorClock);
-        CompactionResult result = compactor.compact(new CompactionTask(inputs, outputLevel, bottommost));
+        CompactionResult result = compactor.compact(
+                new CompactionTask(inputs, outputLevel, bottommost, List.of()));
         engine.applyCompaction(result.edit());
     }
 
@@ -129,6 +132,62 @@ class BoxEngineCompactionTest {
             }
         }
         return keys;
+    }
+
+    /** Runs the real strategy with small, bounded output tables until it has nothing left to do. */
+    private void compactUntilIdle(Compactor compactor) {
+        LeveledCompactionStrategy strategy = new LeveledCompactionStrategy(1, 2000, 10);
+        for (int i = 0; i < 1000; i++) {
+            Optional<CompactionTask> task = strategy.pickCompaction(engine.manifestState());
+            if (task.isEmpty()) {
+                return;
+            }
+            engine.applyCompaction(compactor.compact(task.get()).edit());
+        }
+        throw new AssertionError("compaction did not settle");
+    }
+
+    private void putAll(String format, int count) {
+        for (int i = 0; i < count; i++) {
+            String key = String.format(format, i);
+            engine.putCandy(CandyKey.of(key), bytes("v-" + key), null, Map.of(), null);
+        }
+    }
+
+    @Test
+    void rangeDeleteAcrossBoundedTablesIsReclaimedByCompaction() {
+        engine = newEngine();
+        Compactor compactor = new Compactor(store, new SSTableWriter(store, 10, 256), sstableConfig,
+                100, new ManualClock(1_000_000_000L), 2048);
+        putAll("k%03d", 300);
+        engine.flush();
+        compactUntilIdle(compactor);
+        assertThat(engine.manifestState().tables()).hasSizeGreaterThan(3);
+
+        engine.deleteRange(CandyKey.of("k000"), CandyKey.of("k300"));
+        engine.flush();
+        for (int round = 0; round < 40; round++) {
+            putAll("m" + String.format("%02d", round) + "-%03d", 100);
+            engine.flush();
+            compactUntilIdle(compactor);
+        }
+
+        assertThatThrownBy(() -> engine.getCandy(CandyKey.of("k123")))
+                .isInstanceOf(CandyNotFoundException.class);
+        assertThat(engine.listCandies("k", null, 10).entries()).isEmpty();
+        assertThat(engine.listCandies("m07-", null, 1000).entries()).hasSize(100);
+        assertThat(engine.getCandy(CandyKey.of("m39-099"))).isEqualTo(bytes("v-m39-099"));
+
+        List<String> remaining = new ArrayList<>();
+        int rangeTombstones = 0;
+        for (SSTableMeta meta : engine.manifestState().tables()) {
+            try (SSTableReader r = new SSTableReader(store, meta.ledgerId())) {
+                r.scan(null).forEachRemaining(m -> remaining.add(m.key().value()));
+                rangeTombstones += r.rangeTombstones().size();
+            }
+        }
+        assertThat(remaining).noneMatch(k -> k.startsWith("k")).hasSize(4000);
+        assertThat(rangeTombstones).isZero();
     }
 
     @Test

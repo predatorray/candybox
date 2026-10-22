@@ -24,6 +24,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import me.predatorray.candybox.bookkeeper.LedgerConfig;
+import me.predatorray.candybox.bookkeeper.LedgerEntry;
 import me.predatorray.candybox.bookkeeper.LedgerStore;
 import me.predatorray.candybox.bookkeeper.ReadableLedger;
 import me.predatorray.candybox.bookkeeper.WritableLedger;
@@ -36,6 +37,7 @@ import me.predatorray.candybox.common.RangeTombstone;
 import me.predatorray.candybox.common.config.LedgerRole;
 import me.predatorray.candybox.lsm.manifest.ManifestEdit;
 import me.predatorray.candybox.lsm.manifest.ManifestState;
+import me.predatorray.candybox.lsm.sstable.KeySpan;
 import me.predatorray.candybox.lsm.sstable.SSTableMeta;
 import me.predatorray.candybox.lsm.sstable.SSTableReader;
 import me.predatorray.candybox.lsm.sstable.SSTableWriter;
@@ -112,7 +114,7 @@ class CompactionTest {
         SSTableMeta b = write(0, List.of(
                 new Mutation(CandyKey.of("k"), CandyLocator.tombstone(hlc(5, 0, 1), 1000L)),
                 new Mutation(CandyKey.of("z"), put(hlc(1, 0, 1), 1, 5))));
-        CompactionTask task = new CompactionTask(List.of(a, b), 1, true);
+        CompactionTask task = new CompactionTask(List.of(a, b), 1, true, List.of());
 
         // now=2000, grace=100 => tombstone (created 1000) is aged out and dropped.
         Compactor aged = new Compactor(store, writer, cfg, 100, new ManualClock(2000));
@@ -126,7 +128,7 @@ class CompactionTest {
                 new Mutation(CandyKey.of("k"), CandyLocator.tombstone(hlc(5, 0, 1), 1000L)),
                 new Mutation(CandyKey.of("z"), put(hlc(1, 0, 1), 1, 5))));
         Compactor young = new Compactor(store, writer, cfg, 100, new ManualClock(1050));
-        SSTableMeta out2 = young.compact(new CompactionTask(List.of(a2, b2), 1, true))
+        SSTableMeta out2 = young.compact(new CompactionTask(List.of(a2, b2), 1, true, List.of()))
                 .outputs().get(0);
         assertThat(keysOf(out2)).containsExactly("a", "k", "z");
     }
@@ -138,21 +140,21 @@ class CompactionTest {
                 new Mutation(CandyKey.of("k"), CandyLocator.tombstone(hlc(5, 0, 1), 0L))));
         // bottommost=false even though tombstone is ancient.
         Compactor c = new Compactor(store, writer, cfg, 100, new ManualClock(1_000_000));
-        SSTableMeta out = c.compact(new CompactionTask(List.of(a, b), 1, false)).outputs().get(0);
+        SSTableMeta out = c.compact(new CompactionTask(List.of(a, b), 1, false, List.of())).outputs().get(0);
         assertThat(keysOf(out)).containsExactly("k");
     }
 
     @Test
-    void nonBottommostCompactionCarriesRangeTombstoneAndKeepsCoveredPoint() {
+    void nonBottommostCompactionCarriesRangeTombstoneAndDropsCoveredPoint() {
         SSTableMeta a = write(0, List.of(new Mutation(CandyKey.of("c"), put(hlc(1, 0, 1), 1, 5))));
         SSTableMeta b = write(0, List.of(),
                 List.of(new RangeTombstone(CandyKey.of("b"), CandyKey.of("d"), hlc(5, 0, 1))));
 
         // Ancient range tombstone, but non-bottommost: nothing may be dropped.
         Compactor c = new Compactor(store, writer, cfg, 100, new ManualClock(1_000_000));
-        SSTableMeta out = c.compact(new CompactionTask(List.of(a, b), 1, false)).outputs().get(0);
+        SSTableMeta out = c.compact(new CompactionTask(List.of(a, b), 1, false, List.of())).outputs().get(0);
 
-        assertThat(keysOf(out)).containsExactly("c");          // covered point preserved
+        assertThat(keysOf(out)).isEmpty();                     // the carried tombstone still shadows "c"
         assertThat(rangeTombstonesOf(out)).hasSize(1);         // range tombstone carried forward
     }
 
@@ -165,23 +167,23 @@ class CompactionTest {
                 List.of(new RangeTombstone(CandyKey.of("b"), CandyKey.of("d"), hlc(1000, 0, 1))));
 
         Compactor aged = new Compactor(store, writer, cfg, 100, new ManualClock(1_000_000));
-        SSTableMeta out = aged.compact(new CompactionTask(List.of(a, b), 1, true)).outputs().get(0);
+        SSTableMeta out = aged.compact(new CompactionTask(List.of(a, b), 1, true, List.of())).outputs().get(0);
 
         assertThat(keysOf(out)).containsExactly("z");          // "c" covered+aged => dropped
         assertThat(rangeTombstonesOf(out)).isEmpty();          // aged range tombstone dropped
     }
 
     @Test
-    void bottommostCompactionKeepsYoungRangeTombstoneAndCoveredPoint() {
+    void bottommostCompactionKeepsYoungRangeTombstoneButDropsCoveredPoint() {
         SSTableMeta a = write(0, List.of(new Mutation(CandyKey.of("c"), put(hlc(1, 0, 1), 1, 5))));
         // Range tombstone HLC physical=1000; now=1050, grace=100 => too young to drop.
         SSTableMeta b = write(0, List.of(),
                 List.of(new RangeTombstone(CandyKey.of("b"), CandyKey.of("d"), hlc(1000, 0, 1))));
 
         Compactor young = new Compactor(store, writer, cfg, 100, new ManualClock(1050));
-        SSTableMeta out = young.compact(new CompactionTask(List.of(a, b), 1, true)).outputs().get(0);
+        SSTableMeta out = young.compact(new CompactionTask(List.of(a, b), 1, true, List.of())).outputs().get(0);
 
-        assertThat(keysOf(out)).containsExactly("c");          // covered point preserved (young)
+        assertThat(keysOf(out)).isEmpty();                     // shadowed by the carried tombstone
         assertThat(rangeTombstonesOf(out)).hasSize(1);         // carried forward
     }
 
@@ -198,7 +200,7 @@ class CompactionTest {
                 List.of(new RangeTombstone(CandyKey.of("x"), CandyKey.of("y"), hlc(5, 0, 1))));
 
         Compactor c = new Compactor(store, writer, cfg, 100, new ManualClock(0), 2048);
-        CompactionResult result = c.compact(new CompactionTask(List.of(a, b), 1, false));
+        CompactionResult result = c.compact(new CompactionTask(List.of(a, b), 1, false, List.of()));
 
         List<SSTableMeta> outputs = result.outputs();
         assertThat(outputs).hasSizeGreaterThan(2);
@@ -212,9 +214,61 @@ class CompactionTest {
                 assertThat(outputs.get(i - 1).maxKey()).isLessThan(out.minKey());
             }
             merged.addAll(keysOf(out));
-            assertThat(rangeTombstonesOf(out)).hasSize(i == 0 ? 1 : 0);
+            // [x, y) lies past every point key, so only the last table's slot holds it.
+            assertThat(rangeTombstonesOf(out)).hasSize(i == outputs.size() - 1 ? 1 : 0);
         }
         assertThat(merged).hasSize(400).isSorted();
+    }
+
+    @Test
+    void carriedRangeTombstoneIsSplitAcrossTheOutputsItSpans() {
+        List<Mutation> points = new ArrayList<>();
+        for (int i = 0; i < 200; i++) {
+            points.add(new Mutation(CandyKey.of(String.format("k%04d", i)), put(hlc(9, 0, 1), 1, 5)));
+        }
+        SSTableMeta a = write(0, points);
+        SSTableMeta b = write(0, List.of(),
+                List.of(new RangeTombstone(null, CandyKey.of("k0150"), hlc(5, 0, 1))));
+
+        Compactor c = new Compactor(store, writer, cfg, 100, new ManualClock(0), 1024);
+        List<SSTableMeta> outputs = c.compact(new CompactionTask(List.of(a, b), 1, false, List.of()))
+                .outputs();
+
+        assertThat(outputs).hasSizeGreaterThan(2);
+        for (int i = 0; i < outputs.size(); i++) {
+            SSTableMeta out = outputs.get(i);
+            List<RangeTombstone> fragments = rangeTombstonesOf(out);
+            if (out.minKey().compareTo(CandyKey.of("k0150")) >= 0) {
+                assertThat(fragments).isEmpty();
+                continue;
+            }
+            assertThat(fragments).hasSize(1);
+            RangeTombstone f = fragments.get(0);
+            assertThat(f.startInclusive()).isEqualTo(i == 0 ? null : out.minKey());
+            CandyKey slotEnd = outputs.get(i + 1).minKey();
+            assertThat(f.endExclusive()).isEqualTo(
+                    slotEnd.compareTo(CandyKey.of("k0150")) < 0 ? slotEnd : CandyKey.of("k0150"));
+            assertThat(out.rangeTombstoneSpan()).isEqualTo(KeySpan.of(f));
+        }
+        for (int i = 1; i < outputs.size(); i++) {
+            assertThat(outputs.get(i - 1).span().overlaps(outputs.get(i).span())).isFalse();
+        }
+    }
+
+    @Test
+    void leveledStrategyPullsInTablesCoveredByARangeTombstone() {
+        LeveledCompactionStrategy strategy = new LeveledCompactionStrategy(100, 1000, 10);
+        SSTableMeta withRange = new SSTableMeta(1, 1, CandyKey.of("a"), CandyKey.of("b"), 1, 2000,
+                java.util.Set.of(), new KeySpan(CandyKey.of("a"), CandyKey.of("m"), false));
+        SSTableMeta covered = meta(2, 2, "f", "g", 100);
+        SSTableMeta atEnd = meta(3, 2, "m", "z", 100);
+        ManifestState state = ManifestState.empty().apply(ManifestEdit.builder()
+                .addedTables(List.of(withRange, covered, atEnd)).build());
+
+        CompactionTask task = strategy.pickCompaction(state).orElseThrow();
+
+        assertThat(task.inputs()).containsExactly(withRange, covered);
+        assertThat(task.otherTables()).containsExactly(atEnd);
     }
 
     @Test
@@ -227,7 +281,7 @@ class CompactionTest {
         SSTableMeta in = wideBloom.write(cfg, 0, sorted.iterator());
 
         Compactor c = new Compactor(store, wideBloom, cfg, 100, new ManualClock(0));
-        List<SSTableMeta> outputs = c.compact(new CompactionTask(List.of(in), 1, false)).outputs();
+        List<SSTableMeta> outputs = c.compact(new CompactionTask(List.of(in), 1, false, List.of())).outputs();
 
         assertThat(outputs).hasSizeGreaterThan(1);
         assertThat(outputs).allSatisfy(out -> assertThat(out.entryCount()).isLessThan(9000));
@@ -239,10 +293,23 @@ class CompactionTest {
         SSTableMeta in = write(0, List.of(new Mutation(CandyKey.of("a"), put(hlc(1, 0, 1), 1, 5)),
                 new Mutation(CandyKey.of("b"), put(hlc(1, 0, 1), 1, 5))));
         List<Long> before = store.listLedgers();
-        FailingStore failing = new FailingStore(store, 2); // one key per output; the second fails
+        FailingStore failing = new FailingStore(store, 2, -1); // one key per output; the second fails
         Compactor c = new Compactor(failing, new SSTableWriter(failing, 10, 256), cfg, 100,
                 new ManualClock(0), 1);
-        assertThatThrownBy(() -> c.compact(new CompactionTask(List.of(in), 1, false)))
+        assertThatThrownBy(() -> c.compact(new CompactionTask(List.of(in), 1, false, List.of())))
+                .isInstanceOf(IllegalStateException.class);
+        assertThat(store.listLedgers()).containsExactlyInAnyOrderElementsOf(before);
+    }
+
+    @Test
+    void compactionDeletesTheTableItFailsPartwayThrough() {
+        SSTableMeta in = write(0, List.of(new Mutation(CandyKey.of("a"), put(hlc(1, 0, 1), 1, 5)),
+                new Mutation(CandyKey.of("b"), put(hlc(1, 0, 1), 1, 5))));
+        List<Long> before = store.listLedgers();
+        FailingStore failing = new FailingStore(store, -1, 2); // the bloom append of the only output
+        Compactor c = new Compactor(failing, new SSTableWriter(failing, 10, 1 << 16), cfg, 100,
+                new ManualClock(0));
+        assertThatThrownBy(() -> c.compact(new CompactionTask(List.of(in), 1, false, List.of())))
                 .isInstanceOf(IllegalStateException.class);
         assertThat(store.listLedgers()).containsExactlyInAnyOrderElementsOf(before);
     }
@@ -289,28 +356,75 @@ class CompactionTest {
         assertThat(rangeTombstonesOf(out)).hasSize(1);
 
         // Once nothing outside the task overlaps it, the aged range tombstone is dropped.
-        SSTableMeta out2 = aged.compact(new CompactionTask(List.of(out, older), 2, true)).outputs().get(0);
+        SSTableMeta out2 = aged.compact(new CompactionTask(List.of(out, older), 2, true, List.of())).outputs().get(0);
         assertThat(keysOf(out2)).containsExactly("b");
         assertThat(rangeTombstonesOf(out2)).isEmpty();
     }
 
-    /** Delegates to a store but fails its {@code failAt}-th {@code createLedger}. */
+    /** Delegates to a store but fails its {@code createAt}-th ledger creation or {@code appendAt}-th append. */
     private static final class FailingStore implements LedgerStore {
         private final LedgerStore delegate;
-        private final int failAt;
+        private final int createAt;
+        private final int appendAt;
         private int created;
+        private int appended;
 
-        FailingStore(LedgerStore delegate, int failAt) {
+        FailingStore(LedgerStore delegate, int createAt, int appendAt) {
             this.delegate = delegate;
-            this.failAt = failAt;
+            this.createAt = createAt;
+            this.appendAt = appendAt;
         }
 
         @Override
         public WritableLedger createLedger(LedgerConfig config) {
-            if (++created == failAt) {
+            if (++created == createAt) {
                 throw new IllegalStateException("injected createLedger failure");
             }
-            return delegate.createLedger(config);
+            WritableLedger ledger = delegate.createLedger(config);
+            return new WritableLedger() {
+                @Override
+                public long append(byte[] data) {
+                    if (++appended == appendAt) {
+                        throw new IllegalStateException("injected append failure");
+                    }
+                    return ledger.append(data);
+                }
+
+                @Override
+                public LedgerEntry read(long entryId) {
+                    return ledger.read(entryId);
+                }
+
+                @Override
+                public List<LedgerEntry> readRange(long firstEntryId, long lastEntryId) {
+                    return ledger.readRange(firstEntryId, lastEntryId);
+                }
+
+                @Override
+                public long ledgerId() {
+                    return ledger.ledgerId();
+                }
+
+                @Override
+                public long lastAddConfirmed() {
+                    return ledger.lastAddConfirmed();
+                }
+
+                @Override
+                public boolean isSealed() {
+                    return ledger.isSealed();
+                }
+
+                @Override
+                public java.util.Map<String, byte[]> customMetadata() {
+                    return ledger.customMetadata();
+                }
+
+                @Override
+                public void close() {
+                    ledger.close();
+                }
+            };
         }
 
         @Override

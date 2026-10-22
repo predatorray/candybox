@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Set;
 import me.predatorray.candybox.bookkeeper.LedgerConfig;
 import me.predatorray.candybox.bookkeeper.LedgerStore;
+import me.predatorray.candybox.common.CandyKey;
 import me.predatorray.candybox.common.Clock;
 import me.predatorray.candybox.common.Mutation;
 import me.predatorray.candybox.common.RangeTombstone;
@@ -41,10 +42,11 @@ import me.predatorray.candybox.lsm.sstable.SSTableWriter;
  * the bottommost level <em>and</em> the tombstone is older than the configured GC grace; otherwise it
  * is preserved so it keeps shadowing older PUTs in lower levels and so an in-flight late write cannot
  * resurrect the Candy. The same rule governs range tombstones: an aged range tombstone at the
- * bottommost level is dropped together with the (necessarily older) point locators it covers; younger
- * or non-bottommost range tombstones are carried forward into the output so they keep shadowing. An
- * aged range tombstone is also kept while a table outside the task overlaps its range, since that
- * table may hold points it still has to shadow. Carried range tombstones go into the first output.
+ * bottommost level is dropped; younger or non-bottommost range tombstones are carried forward so they
+ * keep shadowing. An aged range tombstone is also kept while a table outside the task overlaps its
+ * range, since that table may hold points it still has to shadow. Points covered by a newer range
+ * tombstone among the inputs are dropped at any level. Each output keeps the parts of the carried
+ * range tombstones that fall in its slot of the key space, so they travel with the points they cover.
  *
  * <p>This is the reusable execution core; distributed scheduling (ZK task claims/leases) and the
  * fenced commit + reference-counted GC live in the server in Phase 3.
@@ -92,32 +94,30 @@ public final class Compactor {
                 removed.add(input.ledgerId());
             }
 
-            long now = clock.currentTimeMillis();
-            // At the bottommost level, aged range tombstones (and the points they cover) are dropped;
-            // younger or non-bottommost ones are carried forward so they keep shadowing lower levels.
-            List<RangeTombstone> dropping = new ArrayList<>();
+            // At the bottommost level, aged range tombstones are dropped; younger or non-bottommost
+            // ones are carried forward so they keep shadowing lower levels.
             List<RangeTombstone> carriedForward = new ArrayList<>();
             for (RangeTombstone rt : inputRangeTombstones) {
-                if (task.bottommost() && isAged(rt) && !overlapsOtherTable(rt, task)) {
-                    dropping.add(rt);
-                } else {
+                if (!(task.bottommost() && isAged(rt) && !overlapsOtherTable(rt, task))) {
                     carriedForward.add(rt);
                 }
             }
 
             Iterator<Mutation> merged = new MergingIterator(sources, false);
-            Iterator<Mutation> filtered = task.bottommost()
-                    ? dropDeadEntries(merged, dropping) : merged;
-            PeekingIterator<Mutation> peek = new PeekingIterator<>(filtered);
+            PeekingIterator<Mutation> peek = new PeekingIterator<>(
+                    dropDeadEntries(merged, inputRangeTombstones, task.bottommost()));
 
             List<SSTableMeta> outputs = new ArrayList<>();
-            List<RangeTombstone> pendingRanges = carriedForward;
+            if (!peek.hasNext() && carriedForward.isEmpty()) {
+                return new CompactionResult(outputs,
+                        ManifestEdit.builder().removedTableLedgerIds(removed).build());
+            }
             try {
-                while (peek.hasNext() || !pendingRanges.isEmpty()) {
-                    outputs.add(writer.write(sstableConfig, task.outputLevel(), peek, pendingRanges,
-                            targetFileSizeBytes));
-                    pendingRanges = List.of();
-                }
+                do {
+                    CandyKey slotStart = outputs.isEmpty() ? null : peek.peek().key();
+                    outputs.add(writer.write(sstableConfig, task.outputLevel(), peek, carriedForward,
+                            slotStart, targetFileSizeBytes));
+                } while (peek.hasNext());
             } catch (RuntimeException e) {
                 // The edit was never returned, so nothing will reference or GC these ledgers.
                 for (SSTableMeta output : outputs) {
@@ -164,12 +164,12 @@ public final class Compactor {
     }
 
     /**
-     * Drops, at the bottommost level: aged point tombstones, and any point locator covered by a
-     * range tombstone that is being dropped this compaction (the covering tombstone has a higher HLC,
-     * so the covered point is provably dead and safe to discard alongside it).
+     * Drops any point covered by a newer range tombstone among the inputs: the tombstone is either
+     * carried forward, where it keeps shadowing older copies, or dropped because nothing it could
+     * shadow is left. At the bottommost level, also drops aged point tombstones.
      */
     private Iterator<Mutation> dropDeadEntries(Iterator<Mutation> delegate,
-                                               List<RangeTombstone> droppingRanges) {
+                                               List<RangeTombstone> ranges, boolean bottommost) {
         long now = clock.currentTimeMillis();
         return new Iterator<>() {
             private Mutation nextOut;
@@ -198,20 +198,20 @@ public final class Compactor {
             private Mutation advance() {
                 while (delegate.hasNext()) {
                     Mutation m = delegate.next();
-                    if (m.isTombstone()
+                    if (bottommost && m.isTombstone()
                             && now - m.locator().createdAtMillis() >= tombstoneGcGraceMillis) {
-                        continue; // aged point tombstone at bottommost level: safe to drop
+                        continue;
                     }
-                    if (coveredByDropping(m)) {
-                        continue; // covered by an aged range tombstone being dropped this round
+                    if (coveredByRange(m)) {
+                        continue;
                     }
                     return m;
                 }
                 return null;
             }
 
-            private boolean coveredByDropping(Mutation m) {
-                for (RangeTombstone rt : droppingRanges) {
+            private boolean coveredByRange(Mutation m) {
+                for (RangeTombstone rt : ranges) {
                     if (rt.hlc().isAfter(m.hlc()) && rt.covers(m.key())) {
                         return true;
                     }

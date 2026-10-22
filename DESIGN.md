@@ -151,11 +151,14 @@ RangeTombstone payload>`. Replay reports the max HLC across **both** kinds, so h
 
 **Syrup chunk entry**: `int crc32c | payload[<= chunkSize]`. The crc covers the payload only.
 
-**ManifestEdit** (`ManifestSerializer`, **version 4**): `version | addedTables[]
+**ManifestEdit** (`ManifestSerializer`, **version 5**): `version | addedTables[]
 | removedTableLedgerIds[] | addedSyrups[] | removedSyrups[] | (bool, varlong) newWalLedgerId
 | ownerFencingToken | addedUploads[] | upsertParts[] | removedUploads[] | addedRenameIntents[]
 | removedRenameIntents[] | (bool, hlc) maxHlc`, where each `SSTableMeta`
-is `varlong ledgerId | varint level | bytes minKey | bytes maxKey | varlong entryCount`. The
+is `varlong ledgerId | varint level | bytes minKey | bytes maxKey | varlong entryCount
+| varlong sizeBytes | referencedSyrups[] | (bool, span) rangeTombstoneSpan` (v5+: the keys its range
+tombstones cover, each bound optional, used to pick compaction inputs; older tables read back
+without one). The
 multipart-tracking trailing fields (Phase 5) carry in-flight upload state: a `MultipartUploadState`
 record per `addedUpload`, a `(uploadId, partNumber, Part)` triple per `upsertParts`, and a string
 per `removedUpload`. The v3 trailing fields carry in-flight **rename intents** (one per cross-partition
@@ -329,12 +332,14 @@ means the Box or key is really gone.
 the default (`LeveledCompactionStrategy`): L0 is scored by **file count** — reaching the trigger
 count merges all L0 (+ overlapping L1) into L1 — while each level L≥1 has a **byte budget**
 (`levelBaseBytes × levelMultiplier^(L-1)`, defaults 10 MiB × 10); the level most over budget has one
-table (+ overlapping L+1) merged into L+1. That table is the one with the fewest overlapping L+1 bytes
-per byte of its own (RocksDB's `kMinOverlappingRatio`), so a compaction rewrites a bounded slice of
-the next level, not all of it. The `Compactor` opens the inputs, merges by LWW, and writes the result
+table (+ overlapping L+1) merged into L+1. That table is one holding range tombstones if there is
+one, else the one with the fewest overlapping L+1 bytes per byte of its own (RocksDB's
+`kMinOverlappingRatio`), so a compaction rewrites a bounded slice of the next level, not all of it.
+Overlap is judged on each table's span: its point keys plus the keys its range tombstones cover. The `Compactor` opens the inputs, merges by LWW, and writes the result
 as key-disjoint output SSTables. It starts a new table after `compaction.target.file.size.bytes`
 (default 8 MiB) of data, or earlier if the bloom filter or index would pass 1 MiB, which keeps every
-block within one BookKeeper entry. It then returns the `ManifestEdit` to commit. Outputs use the
+block within one BookKeeper entry; an oversized range-tombstone block fails the compaction with a
+clear error. It then returns the `ManifestEdit` to commit. Outputs use the
 Box's configured `SSTABLE` quorum and ledger metadata, the same as flushes. `CompactionService`
 (server) runs one step end-to-end; `CandyboxNode` drives it on a background worker (`compactionIntervalMillis`), running
 a **bounded** number of passes per owned Box per tick so one Box can't starve the others, then a GC
@@ -347,12 +352,16 @@ owner) is still **TODO(phase-3)**; today each owner compacts its own Boxes in-pr
 **Tombstone-drop rule** (LevelDB + late-write window): a DELETE is dropped only when the compaction is
 at the **bottommost** level holding overlapping data **and** the tombstone is older than the configured
 GC grace; otherwise it is preserved. Dropping early would resurrect deleted Candies. The same rule
-governs **range tombstones**: the compactor collects them from all inputs and carries them forward
-into the first output table, except an aged one at the bottommost level — which is dropped together
-with the (necessarily older) point locators it covers, so nothing is resurrected. An aged range
-tombstone is still kept while any L1+ table outside the compaction overlaps its range, because that
-table may hold older points it must keep shadowing. L0 tables are always newer than L1+ data, so they
-never block the drop. Covered by `CompactionTest`.
+governs **range tombstones**: the compactor collects them from all inputs and carries them forward,
+except an aged one at the bottommost level, which is dropped. An aged range tombstone is still kept
+while any L1+ table outside the compaction overlaps its range, because that table may hold older
+points it must keep shadowing. L0 tables are always newer than L1+ data, so they never block the drop.
+Any point covered by a newer range tombstone among the inputs is dropped at any level, since the
+tombstone either still shadows older copies or has nothing left to shadow. Carried range tombstones
+are split across the outputs: each output keeps the part inside its slot of the key space (from its
+first key up to the next output's), so a tombstone travels with the points it covers and its span
+pulls the deeper tables it covers into the next compaction. Covered by `CompactionTest` and
+`BoxEngineCompactionTest`.
 
 ## 9. Garbage collection (`GarbageCollector`, server)
 

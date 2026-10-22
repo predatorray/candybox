@@ -38,9 +38,4 @@ public record CompactionTask(List<SSTableMeta> inputs, int outputLevel, boolean 
             throw new IllegalArgumentException("a compaction task must have at least one input");
         }
     }
-
-    /** A task whose inputs are every L1+ table of the tree. */
-    public CompactionTask(List<SSTableMeta> inputs, int outputLevel, boolean bottommost) {
-        this(inputs, outputLevel, bottommost, List.of());
-    }
 }
