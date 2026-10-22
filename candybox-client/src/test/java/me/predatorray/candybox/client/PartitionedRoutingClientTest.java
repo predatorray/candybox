@@ -202,6 +202,27 @@ class PartitionedRoutingClientTest {
     }
 
     @Test
+    void listMultipartUploadsReportsTruncationWhenOnlyOnePartitionIsTruncated() {
+        StubNode node = new StubNode();
+        node.uploadPages = Map.of(
+                0, new Message.ListMultipartUploadsResponse(List.of(
+                        new Message.InProgressUpload("u1", "a", 1),
+                        new Message.InProgressUpload("u3", "c", 1)), "c", "u3"),
+                1, new Message.ListMultipartUploadsResponse(
+                        List.of(new Message.InProgressUpload("u2", "b", 1)), null, null));
+        try (CandyboxClient client = new CandyboxClient(new LoopbackTransport(node), "x", 0)) {
+            CandyboxClient.MultipartListing merged =
+                    client.listMultipartUploads("box", null, null, null, 2);
+            // The next page resumes after the last merged row, so "c" is re-fetched, not skipped.
+            assertThat(merged.uploads()).extracting(CandyboxClient.UploadEntry::key)
+                    .containsExactly("a", "b");
+            assertThat(merged.isTruncated()).isTrue();
+            assertThat(merged.nextKeyMarker()).isEqualTo("b");
+            assertThat(merged.nextUploadIdMarker()).isEqualTo("u2");
+        }
+    }
+
+    @Test
     void crossPartitionCopyAndRenameStayZeroCopyViaTheLocatorRelay() {
         String src = keyIn(0, "src");
         String dst = keyIn(1, "dst");
