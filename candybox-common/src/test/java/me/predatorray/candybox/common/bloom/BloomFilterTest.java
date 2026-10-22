@@ -41,6 +41,19 @@ class BloomFilterTest {
     }
 
     @Test
+    void builderMatchesBatchBuild() {
+        List<byte[]> keys = new ArrayList<>();
+        BloomFilter.Builder builder = new BloomFilter.Builder(10);
+        for (int i = 0; i < 1000; i++) {
+            keys.add(key(i));
+            builder.add(key(i));
+        }
+        BloomFilter built = builder.build();
+        assertThat(built.serialize()).isEqualTo(BloomFilter.build(keys, 10).serialize());
+        assertThat(builder.serializedSizeEstimate()).isGreaterThanOrEqualTo(built.serialize().length);
+    }
+
+    @Test
     void falsePositiveRateIsReasonable() {
         List<byte[]> keys = new ArrayList<>();
         for (int i = 0; i < 10_000; i++) {

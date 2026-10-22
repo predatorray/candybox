@@ -72,11 +72,29 @@ public final class SSTableWriter {
      */
     public SSTableMeta write(LedgerConfig config, int level, Iterator<Mutation> sorted,
                              Collection<RangeTombstone> rangeTombstones) {
+        return write(config, level, sorted, rangeTombstones, Long.MAX_VALUE, false);
+    }
+
+    /**
+     * Like {@link #write(LedgerConfig, int, Iterator, Collection)}, but stops pulling from
+     * {@code sorted} once the table holds at least {@code targetDataBytes} of data blocks, or its bloom
+     * filter or index would outgrow {@link SSTableFormat#MAX_META_BLOCK_BYTES}. Mutations not consumed
+     * stay in {@code sorted} for the next table.
+     */
+    public SSTableMeta write(LedgerConfig config, int level, Iterator<Mutation> sorted,
+                             Collection<RangeTombstone> rangeTombstones, long targetDataBytes) {
+        return write(config, level, sorted, rangeTombstones, targetDataBytes, true);
+    }
+
+    private SSTableMeta write(LedgerConfig config, int level, Iterator<Mutation> sorted,
+                              Collection<RangeTombstone> rangeTombstones, long targetDataBytes,
+                              boolean bounded) {
         WritableLedger ledger = ledgerStore.createLedger(config);
 
         List<byte[]> indexLastKeys = new ArrayList<>();
         List<Long> indexEntryIds = new ArrayList<>();
-        List<byte[]> allKeys = new ArrayList<>();
+        BloomFilter.Builder bloom = new BloomFilter.Builder(bloomBitsPerKey);
+        long indexBytes = 0;
 
         List<byte[]> blockMutations = new ArrayList<>();
         int blockBytes = 0;
@@ -89,6 +107,11 @@ public final class SSTableWriter {
         Set<Long> referencedSyrups = new LinkedHashSet<>();
 
         while (sorted.hasNext()) {
+            if (bounded && (sizeBytes + blockBytes >= targetDataBytes
+                    || bloom.serializedSizeEstimate() >= SSTableFormat.MAX_META_BLOCK_BYTES
+                    || indexBytes >= SSTableFormat.MAX_META_BLOCK_BYTES)) {
+                break;
+            }
             Mutation m = sorted.next();
             byte[] keyBytes = m.key().utf8Bytes();
             for (SegmentRef seg : m.locator().segments()) {
@@ -98,6 +121,7 @@ public final class SSTableWriter {
 
             if (blockBytes > 0 && blockBytes + mb.length + 5 > dataBlockTargetBytes) {
                 sizeBytes += flushBlock(ledger, blockMutations, blockLastKey, indexLastKeys, indexEntryIds);
+                indexBytes += blockLastKey.length + 10;
                 blockMutations = new ArrayList<>();
                 blockBytes = 0;
             }
@@ -105,7 +129,7 @@ public final class SSTableWriter {
             blockMutations.add(mb);
             blockBytes += mb.length + 5;
             blockLastKey = keyBytes;
-            allKeys.add(keyBytes);
+            bloom.add(keyBytes);
 
             if (minKey == null) {
                 minKey = keyBytes;
@@ -121,8 +145,7 @@ public final class SSTableWriter {
         }
         sizeBytes += flushBlock(ledger, blockMutations, blockLastKey, indexLastKeys, indexEntryIds);
 
-        BloomFilter bloom = BloomFilter.build(allKeys, bloomBitsPerKey);
-        long bloomEntryId = ledger.append(bloom.serialize());
+        long bloomEntryId = ledger.append(bloom.build().serialize());
 
         long indexEntryId = ledger.append(serializeIndex(indexLastKeys, indexEntryIds));
 

@@ -30,7 +30,9 @@ import me.predatorray.candybox.lsm.sstable.SSTableMeta;
  *       overlapping L1 tables are merged into L1.</li>
  *   <li>Each level L≥1 has a byte budget {@code levelBaseBytes × levelMultiplier^(L-1)}. The level
  *       whose total size most exceeds its budget is compacted: one of its tables and the overlapping
- *       L+1 tables are merged into L+1.</li>
+ *       L+1 tables are merged into L+1. The table picked is the one with the fewest overlapping L+1
+ *       bytes per byte of its own (RocksDB's {@code kMinOverlappingRatio}), which keeps write
+ *       amplification low.</li>
  * </ul>
  *
  * <p>The {@code bottommost} flag on the produced task is true iff no level above the output level
@@ -77,8 +79,23 @@ public final class LeveledCompactionStrategy implements CompactionStrategy {
         if (bestLevel < 0) {
             return Optional.empty();
         }
-        List<SSTableMeta> tables = state.level(bestLevel);
-        return Optional.of(buildTask(List.of(tables.get(0)), state, bestLevel + 1));
+        List<SSTableMeta> next = state.level(bestLevel + 1);
+        SSTableMeta pick = null;
+        double pickRatio = Double.MAX_VALUE;
+        for (SSTableMeta t : state.level(bestLevel)) {
+            long overlapping = 0;
+            for (SSTableMeta n : next) {
+                if (n.overlaps(t.minKey(), t.maxKey())) {
+                    overlapping += n.sizeBytes();
+                }
+            }
+            double ratio = (double) overlapping / Math.max(1, t.sizeBytes());
+            if (ratio < pickRatio) {
+                pickRatio = ratio;
+                pick = t;
+            }
+        }
+        return Optional.of(buildTask(List.of(pick), state, bestLevel + 1));
     }
 
     private long maxBytesForLevel(int level) {
@@ -115,7 +132,13 @@ public final class LeveledCompactionStrategy implements CompactionStrategy {
             }
         }
         boolean bottommost = noTablesAboveLevel(state, outputLevel);
-        return new CompactionTask(inputs, outputLevel, bottommost);
+        List<SSTableMeta> others = new ArrayList<>();
+        for (SSTableMeta t : state.tables()) {
+            if (t.level() > 0 && !inputs.contains(t)) {
+                others.add(t);
+            }
+        }
+        return new CompactionTask(inputs, outputLevel, bottommost, others);
     }
 
     private static boolean noTablesAboveLevel(ManifestState state, int level) {

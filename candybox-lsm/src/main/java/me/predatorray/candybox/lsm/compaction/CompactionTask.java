@@ -19,19 +19,28 @@ import java.util.List;
 import me.predatorray.candybox.lsm.sstable.SSTableMeta;
 
 /**
- * A unit of compaction work: merge {@code inputs} into a single output SSTable at {@code outputLevel}.
+ * A unit of compaction work: merge {@code inputs} into output SSTables at {@code outputLevel}.
  *
  * @param inputs        the SSTables to merge (from one or more levels)
  * @param outputLevel   the level the merged output is written to
  * @param bottommost    whether {@code outputLevel} is the bottommost level holding overlapping data;
  *                      only then may a sufficiently old tombstone be dropped (LevelDB rule)
+ * @param otherTables   the L1+ tables left out of the task; an aged range tombstone overlapping any of
+ *                      them is kept, since it may still shadow older points there
  */
-public record CompactionTask(List<SSTableMeta> inputs, int outputLevel, boolean bottommost) {
+public record CompactionTask(List<SSTableMeta> inputs, int outputLevel, boolean bottommost,
+                             List<SSTableMeta> otherTables) {
 
     public CompactionTask {
         inputs = List.copyOf(inputs);
+        otherTables = List.copyOf(otherTables);
         if (inputs.isEmpty()) {
             throw new IllegalArgumentException("a compaction task must have at least one input");
         }
+    }
+
+    /** A task whose inputs are every L1+ table of the tree. */
+    public CompactionTask(List<SSTableMeta> inputs, int outputLevel, boolean bottommost) {
+        this(inputs, outputLevel, bottommost, List.of());
     }
 }

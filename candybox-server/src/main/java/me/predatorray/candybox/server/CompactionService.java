@@ -16,11 +16,9 @@
 package me.predatorray.candybox.server;
 
 import java.util.Optional;
-import me.predatorray.candybox.bookkeeper.LedgerConfig;
 import me.predatorray.candybox.bookkeeper.LedgerStore;
 import me.predatorray.candybox.common.Clock;
 import me.predatorray.candybox.common.config.CandyboxConfig;
-import me.predatorray.candybox.common.config.LedgerRole;
 import me.predatorray.candybox.lsm.compaction.Compactor;
 import me.predatorray.candybox.lsm.compaction.CompactionResult;
 import me.predatorray.candybox.lsm.compaction.CompactionStrategy;
@@ -39,15 +37,18 @@ import me.predatorray.candybox.lsm.sstable.SSTableWriter;
  */
 public final class CompactionService {
 
+    private final LedgerStore ledgerStore;
+    private final CandyboxConfig config;
+    private final Clock clock;
     private final CompactionStrategy strategy;
-    private final Compactor compactor;
+    private final SSTableWriter writer;
 
     public CompactionService(LedgerStore ledgerStore, CandyboxConfig config, Clock clock) {
-        LedgerConfig sstableConfig = LedgerConfig.forRole(LedgerRole.SSTABLE);
-        SSTableWriter writer = new SSTableWriter(ledgerStore, config.bloomBitsPerKey());
+        this.ledgerStore = ledgerStore;
+        this.config = config;
+        this.clock = clock;
         this.strategy = new LeveledCompactionStrategy(config.l0CompactionTrigger());
-        this.compactor = new Compactor(ledgerStore, writer, sstableConfig,
-                config.tombstoneGcGraceMillis(), clock);
+        this.writer = new SSTableWriter(ledgerStore, config.bloomBitsPerKey());
     }
 
     /**
@@ -60,6 +61,8 @@ public final class CompactionService {
         if (task.isEmpty()) {
             return false;
         }
+        Compactor compactor = new Compactor(ledgerStore, writer, engine.sstableLedgerConfig(),
+                config.tombstoneGcGraceMillis(), clock, config.compactionTargetFileSizeBytes());
         CompactionResult result = compactor.compact(task.get());
         engine.applyCompaction(result.edit());
         return true;

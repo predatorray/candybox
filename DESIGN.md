@@ -329,9 +329,14 @@ means the Box or key is really gone.
 the default (`LeveledCompactionStrategy`): L0 is scored by **file count** — reaching the trigger
 count merges all L0 (+ overlapping L1) into L1 — while each level L≥1 has a **byte budget**
 (`levelBaseBytes × levelMultiplier^(L-1)`, defaults 10 MiB × 10); the level most over budget has one
-table (+ overlapping L+1) merged into L+1. The `Compactor` opens the inputs, merges by LWW, writes
-the output SSTable, and returns the `ManifestEdit` to commit. `CompactionService` (server) runs one
-step end-to-end; `CandyboxNode` drives it on a background worker (`compactionIntervalMillis`), running
+table (+ overlapping L+1) merged into L+1. That table is the one with the fewest overlapping L+1 bytes
+per byte of its own (RocksDB's `kMinOverlappingRatio`), so a compaction rewrites a bounded slice of
+the next level, not all of it. The `Compactor` opens the inputs, merges by LWW, and writes the result
+as key-disjoint output SSTables. It starts a new table after `compaction.target.file.size.bytes`
+(default 8 MiB) of data, or earlier if the bloom filter or index would pass 1 MiB, which keeps every
+block within one BookKeeper entry. It then returns the `ManifestEdit` to commit. Outputs use the
+Box's configured `SSTABLE` quorum and ledger metadata, the same as flushes. `CompactionService`
+(server) runs one step end-to-end; `CandyboxNode` drives it on a background worker (`compactionIntervalMillis`), running
 a **bounded** number of passes per owned Box per tick so one Box can't starve the others, then a GC
 pass (§9). The commit is **fencing-gated** by the manifest, so a Box whose ownership was lost
 mid-round fails its commit (`FencedException`) and is skipped — a zombie owner cannot corrupt state.
@@ -343,8 +348,11 @@ owner) is still **TODO(phase-3)**; today each owner compacts its own Boxes in-pr
 at the **bottommost** level holding overlapping data **and** the tombstone is older than the configured
 GC grace; otherwise it is preserved. Dropping early would resurrect deleted Candies. The same rule
 governs **range tombstones**: the compactor collects them from all inputs and carries them forward
-into the output, except an aged one at the bottommost level — which is dropped together with the
-(necessarily older) point locators it covers, so nothing is resurrected. Covered by `CompactionTest`.
+into the first output table, except an aged one at the bottommost level — which is dropped together
+with the (necessarily older) point locators it covers, so nothing is resurrected. An aged range
+tombstone is still kept while any L1+ table outside the compaction overlaps its range, because that
+table may hold older points it must keep shadowing. L0 tables are always newer than L1+ data, so they
+never block the drop. Covered by `CompactionTest`.
 
 ## 9. Garbage collection (`GarbageCollector`, server)
 
@@ -428,6 +436,7 @@ Per-role BK quorum (E/Qw/Qa) defaults: **WAL 3/3/2, Manifest 3/3/2, SSTable 3/2/
 | Syrup rollover | 1 GiB | Bounds per-ledger size; large objects span multiple Syrups. |
 | L0 compaction trigger / stall | 4 tables / 12 tables | Trigger starts compaction; stall returns `BUSY` (must be ≥ trigger). |
 | Leveled level base / multiplier | 10 MiB / 10× | LevelDB-style growing per-level byte budgets for L≥1. |
+| Compaction output size | 8 MiB target; bloom/index ≤ 1 MiB | Bounds write amplification per compaction and keeps each meta block within one BookKeeper entry. |
 | HLC logical width / skew bound | 32-bit logical; 5-min skew rejection | Overflow needs ~2.1e9 events/ms; bound stops a wild clock dragging us forward. |
 | Ownership lease TTL / renew / fencing token | 10 s TTL; 3 s renew; monotonic per-resource counter (ZK version) | Short TTL for quick failover; renew well inside it; strictly increasing tokens fence zombies. |
 | Partitions per Box | 8 (fixed at create; `createBox` may override) | Spreads one Box's writes over up to 8 nodes while bounding per-Box engine cost (each partition is a full WAL/memtable/manifest). Immutable: re-hashing would re-home every key. |

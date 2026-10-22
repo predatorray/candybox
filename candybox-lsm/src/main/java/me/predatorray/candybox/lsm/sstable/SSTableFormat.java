@@ -39,6 +39,8 @@ final class SSTableFormat {
     static final byte FORMAT_VERSION = 2;
     static final byte FORMAT_VERSION_NO_RANGE_DEL = 1;
     static final int DEFAULT_DATA_BLOCK_TARGET_BYTES = 64 * 1024;
+    /** Cap on a bounded table's bloom and index entries, well below BookKeeper's 5 MiB default entry limit. */
+    static final int MAX_META_BLOCK_BYTES = 1 << 20;
 
     private SSTableFormat() {
     }
