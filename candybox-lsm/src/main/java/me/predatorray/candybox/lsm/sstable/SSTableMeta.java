@@ -17,6 +17,7 @@ package me.predatorray.candybox.lsm.sstable;
 
 import java.util.Set;
 import me.predatorray.candybox.common.CandyKey;
+import me.predatorray.candybox.common.Hlc;
 
 /**
  * Manifest-level metadata describing one SSTable ledger: where it lives, its level, the key range it
@@ -31,12 +32,36 @@ import me.predatorray.candybox.common.CandyKey;
  * @param entryCount       number of mutations (unique keys) in the table
  * @param sizeBytes        approximate on-ledger data size (sum of data-block bytes), for byte-size scoring
  * @param referencedSyrups Syrup ledger ids this table's locators reference (empty for an all-tombstone run)
+ * @param rangeTombstoneSpan the union of the keys this table's range tombstones cover, or {@code null}
+ *                         if it has none
+ * @param minPointHlc      the oldest HLC among this table's points, or {@code null} if unknown (tables
+ *                         recorded before manifest v5) or the table has no points
  */
 public record SSTableMeta(long ledgerId, int level, CandyKey minKey, CandyKey maxKey, long entryCount,
-                          long sizeBytes, Set<Long> referencedSyrups) {
+                          long sizeBytes, Set<Long> referencedSyrups, KeySpan rangeTombstoneSpan,
+                          Hlc minPointHlc) {
 
     public SSTableMeta {
         referencedSyrups = referencedSyrups == null ? Set.of() : Set.copyOf(referencedSyrups);
+    }
+
+    /** A table without range tombstones whose point HLCs are unknown. */
+    public SSTableMeta(long ledgerId, int level, CandyKey minKey, CandyKey maxKey, long entryCount,
+                       long sizeBytes, Set<Long> referencedSyrups) {
+        this(ledgerId, level, minKey, maxKey, entryCount, sizeBytes, referencedSyrups, null, null);
+    }
+
+    /**
+     * Every key this table can affect: its point keys plus the keys its range tombstones cover.
+     * Compaction picks inputs by this span so a range tombstone meets the points it shadows.
+     */
+    public KeySpan span() {
+        if (rangeTombstoneSpan == null) {
+            return KeySpan.closed(minKey, maxKey);
+        }
+        // A range-only table's min/max are a placeholder, not data.
+        return entryCount == 0 ? rangeTombstoneSpan
+                : KeySpan.closed(minKey, maxKey).union(rangeTombstoneSpan);
     }
 
     /** Whether this table's key range overlaps {@code [from, to]} (inclusive bounds, nulls = unbounded). */

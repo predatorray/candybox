@@ -311,6 +311,7 @@ public final class ServerConfig {
             applyInt("max.frame.size.bytes", b::maxFrameSizeBytes);
             applyInt("l0.compaction.trigger", b::l0CompactionTrigger);
             applyInt("l0.stall.threshold", b::l0StallThreshold);
+            applyLong("compaction.target.file.size.bytes", b::compactionTargetFileSizeBytes);
             applyLong("multipart.min.part.bytes", b::multipartMinPartBytes);
             applyInt("multipart.max.parts", b::multipartMaxParts);
             applyLong("multipart.upload.ttl.millis", b::multipartUploadTtlMillis);
