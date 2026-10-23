@@ -110,7 +110,14 @@ public final class BoxEngine implements AutoCloseable {
     private final ConcurrentMap<Long, Long> pendingOrphanSyrups = new ConcurrentHashMap<>();
 
     // The prior owner's WAL, replayed into the memtable at recovery and obsolete once that is flushed.
+    // In memory only: if this owner never flushes, the prior WAL leaks (#105) — and holds the only copy
+    // of the replayed writes (#63). A #63 fix that makes the replay durable at recovery should mark the
+    // prior WAL superseded there instead.
     private long unflushedPriorWal = -1L;
+
+    // Syrups this owner wrote since the last flush, joined to the live set by the next flush even if
+    // nothing then references them (the Candy was overwritten, or its write failed), so GC sees them.
+    private final Set<Long> unflushedSyrups = new LinkedHashSet<>();
 
     // Lightweight operational counters (snapshotted via stats()).
     private final AtomicLong putCount = new AtomicLong();
@@ -293,7 +300,7 @@ public final class BoxEngine implements AutoCloseable {
                 return replay;
             }
             rejectIfStalled();
-            SyrupWriteResult written = syrupManager.writeCandy(data);
+            SyrupWriteResult written = trackWritten(syrupManager.writeCandy(data));
             Validation.checkCandySize(written.contentLength(), config.sizeLimits());
 
             Hlc stamp = hlc.tick();
@@ -375,7 +382,7 @@ public final class BoxEngine implements AutoCloseable {
                 throw new CandyNotFoundException(box.value(), uploadId);
             }
             // The bytes go to Syrups via the normal write path, exactly like a single PUT.
-            SyrupWriteResult written = syrupManager.writeCandy(data);
+            SyrupWriteResult written = trackWritten(syrupManager.writeCandy(data));
             Validation.checkCandySize(written.contentLength(), config.sizeLimits());
             Part newPart = new Part(written.contentLength(), config.sizeLimits().chunkSizeBytes(),
                     written.crc32c(), written.segments());
@@ -397,6 +404,13 @@ public final class BoxEngine implements AutoCloseable {
         } finally {
             lock.writeLock().unlock();
         }
+    }
+
+    private SyrupWriteResult trackWritten(SyrupWriteResult written) {
+        for (SegmentRef seg : written.segments()) {
+            unflushedSyrups.add(seg.syrupId());
+        }
+        return written;
     }
 
     /** A part's Syrups join the live set, so they become orphans once nothing references them. */
@@ -453,8 +467,8 @@ public final class BoxEngine implements AutoCloseable {
             java.io.ByteArrayOutputStream buffer = new java.io.ByteArrayOutputStream(
                     (int) Math.min(resolvedLast - resolvedFirst + 1, Integer.MAX_VALUE));
             syrupReader.readRange(source.parts(), resolvedFirst, resolvedLast, buffer);
-            SyrupWriteResult written = syrupManager.writeCandy(
-                    new java.io.ByteArrayInputStream(buffer.toByteArray()));
+            SyrupWriteResult written = trackWritten(syrupManager.writeCandy(
+                    new java.io.ByteArrayInputStream(buffer.toByteArray())));
             Validation.checkCandySize(written.contentLength(), config.sizeLimits());
             Part newPart = new Part(written.contentLength(), config.sizeLimits().chunkSizeBytes(),
                     written.crc32c(), written.segments());
@@ -791,8 +805,8 @@ public final class BoxEngine implements AutoCloseable {
             wal.append(mutation);
             active.put(mutation);
             // The parts may point at a Syrup this partition already counts as a pending orphan. Clear it
-            // here so its grace period restarts: flush does not recompute orphans, so a later recompute
-            // may never see it referenced, and claim-time re-validation only guards safety.
+            // here so its grace period restarts: the next recompute may only run once this reference is
+            // gone again and would keep the old stamp, and claim-time re-validation only guards safety.
             for (SegmentRef seg : dstLocator.segments()) {
                 pendingOrphanSyrups.remove(seg.syrupId());
             }
@@ -1310,6 +1324,7 @@ public final class BoxEngine implements AutoCloseable {
                         .addedPendingDeletes(claimed)
                         .build());
                 claimed.keySet().forEach(pendingOrphanSyrups::remove);
+                unflushedSyrups.removeAll(claimed.keySet());
             }
             return new java.util.ArrayList<>(claimed.keySet());
         } finally {
@@ -1333,18 +1348,26 @@ public final class BoxEngine implements AutoCloseable {
      * GC reclaim set for this partition. Defensively excludes any ledger the state still uses.
      */
     public java.util.List<Long> reclaimableLedgers(long asOfMillis) {
-        ManifestState state = manifest.current();
-        Set<Long> inUse = new java.util.HashSet<>(state.liveSyrups());
-        state.tables().forEach(t -> inUse.add(t.ledgerId()));
-        inUse.add(state.walLedgerId());
-        inUse.add(manifest.ledgerId());
-        java.util.List<Long> ids = new java.util.ArrayList<>();
-        for (Map.Entry<Long, Long> e : state.pendingDeletes().entrySet()) {
-            if (e.getValue() <= asOfMillis && !inUse.contains(e.getKey())) {
-                ids.add(e.getKey());
+        lock.readLock().lock();
+        try {
+            ManifestState state = manifest.current();
+            Set<Long> inUse = referencedSyrupsLocked();
+            inUse.addAll(state.liveSyrups());
+            state.tables().forEach(t -> inUse.add(t.ledgerId()));
+            inUse.add(state.walLedgerId());
+            inUse.add(wal.ledgerId());
+            inUse.add(unflushedPriorWal);
+            inUse.add(manifest.ledgerId());
+            java.util.List<Long> ids = new java.util.ArrayList<>();
+            for (Map.Entry<Long, Long> e : state.pendingDeletes().entrySet()) {
+                if (e.getValue() <= asOfMillis && !inUse.contains(e.getKey())) {
+                    ids.add(e.getKey());
+                }
             }
+            return ids;
+        } finally {
+            lock.readLock().unlock();
         }
-        return ids;
     }
 
     /** Drops ledger ids from the pending deletes once GC has physically deleted them (fenced). */
@@ -1583,7 +1606,7 @@ public final class BoxEngine implements AutoCloseable {
             return;
         }
         // Collect the Syrups referenced by this memtable (for live-Syrup tracking / GC) and its max HLC.
-        Set<Long> syrups = new LinkedHashSet<>();
+        Set<Long> syrups = new LinkedHashSet<>(unflushedSyrups);
         Hlc maxHlc = Hlc.MIN;
         Iterator<Mutation> scan = flushing.iterator();
         while (scan.hasNext()) {
@@ -1616,9 +1639,12 @@ public final class BoxEngine implements AutoCloseable {
         manifest.apply(ManifestEdit.flush(table, syrups, newWal.ledgerId(), maxHlc)
                 .withAddedPendingDeletes(obsoleteWals));
         unflushedPriorWal = -1L;
+        unflushedSyrups.clear();
         wal.close();
         wal = newWal;
         active = new Memtable();
+        // A Syrup whose Candies were all superseded before this flush is an orphan already.
+        recomputeOrphanSyrupsLocked(now);
 
         readers.put(table.ledgerId(), new SSTableReader(ledgerStore, table.ledgerId()));
         flushCount.incrementAndGet();

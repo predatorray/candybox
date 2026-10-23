@@ -106,9 +106,7 @@ public final class InMemoryLedgerStore implements LedgerStore {
     @Override
     public void deleteLedger(long ledgerId) {
         ensureOpen();
-        if (ledgers.remove(ledgerId) == null) {
-            throw new LedgerNotFoundException(ledgerId);
-        }
+        ledgers.remove(ledgerId);
     }
 
     @Override

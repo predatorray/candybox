@@ -392,7 +392,9 @@ failed delete is retried and a new owner inherits whatever the prior owner had n
 
 - **SSTables** removed from the manifest by a committed compaction;
 - **Syrups** no longer referenced by any SSTable, the memtable, an in-flight multipart upload, or the
-  open write Syrup — claimed from the live set into the pending deletes;
+  open write Syrup — claimed from the live set into the pending deletes. Each flush adds every Syrup
+  written since the previous one to the live set, so one whose Candies were all superseded before the
+  flush (or whose write failed) is still seen;
 - **WAL** ledgers rotated out at flush, whose mutations are now durable in an SSTable;
 - at handover, the prior owner's **manifest** ledger, and its **WAL** — at once if its replay was
   empty, else at the new owner's first flush. Both enter through the new manifest, so they are only
@@ -403,9 +405,10 @@ The detailed rules:
 - (a) the live-set-drop edit + the physical delete are fenced;
 - (b) a tombstone may be dropped only under the bottommost + time-bound rule (§8);
 - (c) orphaned-Syrup GC is driven by per-SSTable referenced-Syrup tracking plus an in-memory
-  **pending-orphan list**, recomputed from the live set on handover. Ledgers that no manifest ever
-  recorded (written by a flush, compaction or put that then failed, or created by a handover whose
-  pointer CAS lost) need an **enumeration backstop**, still **TODO(phase-3+)** (#105);
+  **pending-orphan list**, recomputed from the live set at flush and on handover. Ledgers that no
+  manifest ever recorded (written by a flush or compaction that then failed, by an owner that crashed
+  before flushing, or by a handover whose pointer CAS lost) need an **enumeration backstop**, still
+  **TODO(phase-3+)** (#105);
 - (d) **v1 Syrup reclamation policy**: because BookKeeper deletes whole ledgers only, a single live
   Candy pins an otherwise-dead Syrup. **v1 documents and accepts this** — a Syrup is reclaimed only
   once *every* segment in it is dead. Syrup defragmentation (copying survivors into a fresh Syrup) is

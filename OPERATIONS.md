@@ -115,6 +115,10 @@ Delimiter listings (S3 `CommonPrefixes`) are rolled up by the nodes as of 0.2. O
 still interoperate: a 0.2 gateway rolls up whatever a 0.1 node returns un-rolled, so until the nodes
 are upgraded, delimiter listings behave as in 0.1 (a prefix can repeat across pages).
 
+Manifest records are written in format v6, which older nodes cannot read. Once an upgraded node has
+owned a partition, an older node cannot take it over, so finish the node rollout promptly (or
+disable the balancer during it).
+
 ## Garbage collection
 
 Run only by a Box's owner, against the committed manifest, after `ledgerGcGraceMillis`:
@@ -142,8 +146,9 @@ in that partition once orphaned anew (siblings that also tracked it keep their o
 locator resolved before its Syrup was reclaimed and zero-copy-put afterwards is not yet guarded
 against (#65).
 
-Ledgers no manifest ever recorded (written by a flush, compaction or put that then failed, or by a
-handover that lost the manifest-pointer race) leak until an enumeration backstop is added (#105).
+Ledgers no manifest ever recorded (written by a flush or compaction that then failed, by an owner
+that crashed before flushing, or by a handover that lost the manifest-pointer race) leak until an
+enumeration backstop is added (#105).
 
 ## Observability
 

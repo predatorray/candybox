@@ -82,25 +82,61 @@ class LedgerReclamationTest {
         String uploadId = engine.createMultipartUpload(CandyKey.of("mpu"), null, Map.of());
         engine.uploadPart(uploadId, 1, bytes("part"));
         long partSyrup = engine.multipartUpload(uploadId).parts().get(1).segments().get(0).syrupId();
-        engine.putCandy(CandyKey.of("k"), bytes("v"), null, Map.of(), null); // seals the part's Syrup
+        engine.putCandy(CandyKey.of("a"), bytes("1"), null, Map.of(), null); // seals the part's Syrup
         engine.abortMultipartUpload(uploadId);
-        long rotatedWal = engine.manifestState().walLedgerId();
         engine.flush();
+        engine.putCandy(CandyKey.of("b"), bytes("2"), null, Map.of(), null);
+        engine.flush();
+        Set<Long> compacted = engine.manifestState().tables().stream().map(SSTableMeta::ledgerId)
+                .collect(Collectors.toSet());
+        assertThat(nodeA.compactOwnedBoxesOnce()).isPositive();
         clock.advance(GRACE + 1);
 
         store.failDeletes = true;
         assertThat(nodeA.collectGarbageOnce()).isZero();
-        assertThat(exists(rotatedWal)).isTrue();
-        assertThat(exists(partSyrup)).isTrue();
-        assertThat(engine.manifestState().pendingDeletes()).containsKeys(rotatedWal, partSyrup);
+        Set<Long> pending = Set.copyOf(engine.manifestState().pendingDeletes().keySet());
+        assertThat(pending).contains(partSyrup).containsAll(compacted).hasSizeGreaterThan(4);
+        assertThat(pending).allMatch(this::exists);
         assertThat(engine.manifestState().liveSyrups()).doesNotContain(partSyrup);
 
         store.failDeletes = false;
-        assertThat(nodeA.collectGarbageOnce()).isEqualTo(2);
-        assertThat(exists(rotatedWal)).isFalse();
-        assertThat(exists(partSyrup)).isFalse();
+        assertThat(nodeA.collectGarbageOnce()).isEqualTo(pending.size());
+        assertThat(pending).noneMatch(this::exists);
         assertThat(engine.manifestState().pendingDeletes()).isEmpty();
-        assertThat(engine.getCandy(CandyKey.of("k"))).isEqualTo(bytes("v"));
+        assertThat(engine.getCandy(CandyKey.of("a"))).isEqualTo(bytes("1"));
+        assertThat(engine.getCandy(CandyKey.of("b"))).isEqualTo(bytes("2"));
+    }
+
+    @Test
+    void anAlreadyDeletedPendingLedgerIsDroppedFromTheSet() {
+        nodeA.createBox(BOX, 1);
+        BoxEngine engine = nodeA.enginePartition(BOX, 0);
+        engine.putCandy(CandyKey.of("k"), bytes("v"), null, Map.of(), null);
+        long rotatedWal = engine.manifestState().walLedgerId();
+        engine.flush();
+        store.deleteLedger(rotatedWal); // e.g. deleted by a pass whose forget edit then failed
+        clock.advance(GRACE + 1);
+
+        nodeA.collectGarbageOnce();
+        assertThat(engine.manifestState().pendingDeletes()).doesNotContainKey(rotatedWal);
+    }
+
+    @Test
+    void aSyrupSupersededBeforeTheFirstFlushIsReclaimed() {
+        nodeA.createBox(BOX, 1);
+        BoxEngine engine = nodeA.enginePartition(BOX, 0);
+        engine.putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
+        long v1Syrup = engine.resolveLocator(CandyKey.of("k")).parts().get(0).segments().get(0)
+                .syrupId();
+        engine.putCandy(CandyKey.of("k"), bytes("v2"), null, Map.of(), null);
+        engine.putCandy(CandyKey.of("x"), bytes("v3"), null, Map.of(), null);
+        engine.flush();
+        clock.advance(GRACE + 1);
+
+        nodeA.collectGarbageOnce();
+        assertThat(exists(v1Syrup)).isFalse();
+        assertThat(engine.getCandy(CandyKey.of("k"))).isEqualTo(bytes("v2"));
+        assertThat(engine.getCandy(CandyKey.of("x"))).isEqualTo(bytes("v3"));
     }
 
     @Test
@@ -116,6 +152,8 @@ class LedgerReclamationTest {
         BoxEngine ownerB = nodeB.enginePartition(BOX, 0);
 
         clock.advance(GRACE + 1);
+        assertThat(nodeA.collectGarbageOnce()).isZero(); // the deposed owner reclaims nothing
+        assertThat(exists(priorManifest)).isTrue();
         nodeB.collectGarbageOnce();
         assertThat(exists(priorManifest)).isFalse();
         assertThat(exists(priorWal)).isTrue(); // still the only durable copy of "k"

@@ -18,10 +18,8 @@ package me.predatorray.candybox.server;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
-import me.predatorray.candybox.bookkeeper.LedgerNotFoundException;
 import me.predatorray.candybox.bookkeeper.LedgerStore;
 import me.predatorray.candybox.common.Clock;
-import me.predatorray.candybox.common.exception.StorageException;
 import me.predatorray.candybox.lsm.engine.BoxEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -121,12 +119,10 @@ public final class GarbageCollector {
         int deleted = 0;
         for (long ledgerId : engine.reclaimableLedgers(cutoff)) {
             try {
-                ledgerStore.deleteLedger(ledgerId);
+                ledgerStore.deleteLedger(ledgerId); // idempotent: an already-deleted ledger is gone
                 deleted++;
                 gone.add(ledgerId);
-            } catch (LedgerNotFoundException alreadyGone) {
-                gone.add(ledgerId);
-            } catch (StorageException e) {
+            } catch (RuntimeException e) {
                 // Stays pending, so it is retried on a later pass.
                 LOG.warn("GC delete of ledger {} failed: {}", ledgerId, e.getMessage());
             }

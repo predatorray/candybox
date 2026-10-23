@@ -63,10 +63,11 @@ public interface LedgerStore extends AutoCloseable {
     ReadableLedger recoverOpen(long ledgerId);
 
     /**
-     * Deletes a ledger and its entries permanently.
+     * Deletes a ledger and its entries permanently. Idempotent: deleting a ledger that no longer exists
+     * succeeds (as BookKeeper's own delete does), so GC can retry a delete whose outcome it lost.
      *
      * @param ledgerId the ledger id
-     * @throws LedgerNotFoundException if no such ledger exists
+     * @throws StorageException on failure
      */
     void deleteLedger(long ledgerId);
 
