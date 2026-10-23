@@ -29,6 +29,7 @@ import me.predatorray.candybox.common.exception.BusyException;
 import me.predatorray.candybox.common.exception.CandyNotFoundException;
 import me.predatorray.candybox.common.exception.FencedException;
 import me.predatorray.candybox.common.exception.ValidationException;
+import me.predatorray.candybox.lsm.manifest.ManifestState;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -495,6 +496,60 @@ class BoxEngineTest {
 
         assertThat(engine.getCandy(CandyKey.of("flushed"))).isEqualTo(bytes("v2"));
         assertThat(engine.getCandy(CandyKey.of("unflushed"))).isEqualTo(bytes("v2"));
+    }
+
+    @Test
+    void unflushedWritesSurviveTwoHandoversWithoutAFlush() {
+        BoxEngine ownerA = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1,
+                new ManualClock(1_000), 1L);
+        ownerA.putCandy(CandyKey.of("logs/a"), bytes("old"), null, Map.of(), null);
+        ownerA.flush();
+        ownerA.deleteRangeByPrefix("logs/");
+        ownerA.putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
+
+        // B takes over and crashes before writing or flushing anything.
+        BoxEngine ownerB = BoxEngine.recover(box, CandyboxConfig.defaults(), store, 2,
+                new ManualClock(1_000), ownerA.manifestLedgerId(), 2L);
+
+        engine = BoxEngine.recover(box, CandyboxConfig.defaults(), store, 3, new ManualClock(1_000),
+                ownerB.manifestLedgerId(), 3L);
+        assertThat(engine.getCandy(CandyKey.of("k"))).isEqualTo(bytes("v1"));
+        assertThatThrownBy(() -> engine.getCandy(CandyKey.of("logs/a")))
+                .isInstanceOf(CandyNotFoundException.class);
+    }
+
+    @Test
+    void recoveryFlushesANonEmptyReplayAndSupersedesThePriorWal() {
+        BoxEngine ownerA = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1,
+                new ManualClock(1_000), 1L);
+        ownerA.putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
+        long priorManifest = ownerA.manifestLedgerId();
+        long priorWal = ownerA.manifestState().walLedgerId();
+
+        engine = BoxEngine.recover(box, CandyboxConfig.defaults(), store, 2, new ManualClock(1_000),
+                priorManifest, 2L);
+
+        ManifestState state = engine.manifestState();
+        assertThat(state.tables()).singleElement().satisfies(t -> {
+            assertThat(t.level()).isZero();
+            assertThat(t.entryCount()).isEqualTo(1);
+        });
+        assertThat(state.walLedgerId()).isNotEqualTo(priorWal);
+        assertThat(state.pendingDeletes()).containsKeys(priorManifest, priorWal);
+        assertThat(engine.getCandy(CandyKey.of("k"))).isEqualTo(bytes("v1"));
+    }
+
+    @Test
+    void recoveryOfAnEmptyWalWritesNoTable() {
+        BoxEngine ownerA = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1,
+                new ManualClock(1_000), 1L);
+        long priorWal = ownerA.manifestState().walLedgerId();
+
+        engine = BoxEngine.recover(box, CandyboxConfig.defaults(), store, 2, new ManualClock(1_000),
+                ownerA.manifestLedgerId(), 2L);
+
+        assertThat(engine.manifestState().tables()).isEmpty();
+        assertThat(engine.manifestState().pendingDeletes()).containsKey(priorWal);
     }
 
     @Test

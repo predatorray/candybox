@@ -85,7 +85,7 @@ enough: right after a flush (which every graceful handover does) the WAL is empt
 live only in SSTables. So each flush records the max HLC of the flushed memtable (point mutations and
 range tombstones) as a monotonic high-water `maxHlc` in the manifest, the recovering owner observes
 `max(manifest maxHlc, WAL max)` even when the WAL is empty, and records that max in its own rotation
-edit. Like the WAL path, `observe` fails recovery loudly if the recorded HLC leads the local clock by
+edit (which also flushes a non-empty replay, §9). Like the WAL path, `observe` fails recovery loudly if the recorded HLC leads the local clock by
 more than `maxClockSkewMillis`.
 
 ## 4. Ledger roles & lifecycle
@@ -396,9 +396,10 @@ failed delete is retried and a new owner inherits whatever the prior owner had n
   created since the previous one to the live set, so one whose Candies were all superseded before the
   flush, or that a failed write left behind, is still seen;
 - **WAL** ledgers rotated out at flush, whose mutations are now durable in an SSTable;
-- at handover, the prior owner's **manifest** ledger, and its **WAL** — at once if its replay was
-  empty, else at the new owner's first flush. Both enter through the new manifest, so they are only
-  deleted if the manifest pointer moves to it.
+- at handover, the prior owner's **manifest** ledger and its **WAL**. A non-empty WAL replay is
+  flushed to an L0 SSTable in the same edit that rotates to the new WAL, so the replayed writes never
+  live only in the new owner's memtable (else a second handover before a flush would lose them). Both
+  enter through the new manifest, so they are only deleted if the manifest pointer moves to it.
 
 The detailed rules:
 
