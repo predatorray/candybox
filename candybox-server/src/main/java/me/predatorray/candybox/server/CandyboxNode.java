@@ -564,8 +564,8 @@ public final class CandyboxNode implements AutoCloseable {
     }
 
     /**
-     * Runs one GC pass over every partition this node owns, deleting ledgers obsoleted by committed
-     * compactions past the grace period. Exposed for manual/operational triggering.
+     * Runs one GC pass over every partition this node owns, deleting its pending-delete ledgers past
+     * the grace period after claiming orphaned Syrups. Exposed for manual/operational triggering.
      *
      * @return the number of ledgers deleted
      */
@@ -587,7 +587,7 @@ public final class CandyboxNode implements AutoCloseable {
         }
         int deleted = 0;
         // Per pass, each Box's references are read once; an empty Optional means they could not be,
-        // and the Box only collects SSTables and WALs, which do not depend on them.
+        // and the Box claims no Syrups, only deleting what is already pending.
         Map<String, Optional<BoxSyrupRefs>> boxRefs = new HashMap<>();
         for (PartitionOwnership ownership : partitions.values()) {
             try {

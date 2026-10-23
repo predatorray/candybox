@@ -229,13 +229,13 @@ class CrossPartitionGcAndRenameTest {
             long syrup = putAndFlush(node, src);
             orphanSource(node, src);
             BoxEngine p0 = node.enginePartition(BOX, 0);
-            assertThat(p0.reclaimableSSTables(Long.MAX_VALUE)).isNotEmpty();
+            assertThat(p0.reclaimableLedgers(Long.MAX_VALUE)).isNotEmpty();
             String junk = CandyboxKeys.locatorRelayKey(BOX.value(), 2, "junk");
             coordination.create(junk, new byte[] {(byte) 0xff});
 
             node.collectGarbageOnce();
             assertThat(store.listLedgers()).contains(syrup);
-            assertThat(p0.reclaimableSSTables(Long.MAX_VALUE)).isEmpty();
+            assertThat(p0.reclaimableLedgers(Long.MAX_VALUE)).isEmpty();
 
             coordination.delete(junk, coordination.get(junk).orElseThrow().version());
             node.collectGarbageOnce();

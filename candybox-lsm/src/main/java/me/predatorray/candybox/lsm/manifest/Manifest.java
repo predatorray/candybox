@@ -16,7 +16,9 @@
 package me.predatorray.candybox.lsm.manifest;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 import me.predatorray.candybox.bookkeeper.LedgerConfig;
 import me.predatorray.candybox.bookkeeper.LedgerStore;
 import me.predatorray.candybox.bookkeeper.ReadableLedger;
@@ -84,9 +86,11 @@ public final class Manifest implements AutoCloseable {
                     + " is below the committed max token " + maxReplayedToken);
         }
 
+        ManifestEdit checkpoint = checkpoint(recovered).withOwnerFencingToken(ownerFencingToken);
         ManifestLog fresh = ManifestLog.create(store, manifestConfig);
-        fresh.append(checkpoint(recovered).withOwnerFencingToken(ownerFencingToken));
-        return new Manifest(fresh, recovered, ownerFencingToken, ownerFencingToken);
+        fresh.append(checkpoint);
+        return new Manifest(fresh, ManifestState.empty().apply(checkpoint), ownerFencingToken,
+                ownerFencingToken);
     }
 
     /**
@@ -131,12 +135,17 @@ public final class Manifest implements AutoCloseable {
     private static ManifestEdit checkpoint(ManifestState state) {
         List<SSTableMeta> tables = new ArrayList<>(state.tables());
         Long wal = state.walLedgerId() < 0 ? null : state.walLedgerId();
+        // Part-only Syrups predating v6 were never added to the live set; adopt them so an aborted
+        // upload's Syrups become orphan candidates.
+        Set<Long> syrups = new LinkedHashSet<>(state.liveSyrups());
+        syrups.addAll(state.multipartReferencedSyrups());
         return ManifestEdit.builder()
                 .addedTables(tables)
-                .addedSyrups(state.liveSyrups())
+                .addedSyrups(syrups)
                 .newWalLedgerId(wal)
                 .addedUploads(new ArrayList<>(state.multipartUploads().values()))
                 .addedRenameIntents(new ArrayList<>(state.renameIntents().values()))
+                .addedPendingDeletes(state.pendingDeletes())
                 .maxHlc(state.maxHlc())
                 .build();
     }

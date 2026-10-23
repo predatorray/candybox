@@ -41,12 +41,14 @@ import me.predatorray.candybox.lsm.sstable.SSTableMeta;
  * A v2 record (no rename-intent fields) still reads back as an edit with empty intent sets.
  * <b>v4 layout</b> appends the optional high-water {@code maxHlc}; v2/v3 records read back with
  * {@link Hlc#MIN}. <b>v5 layout</b> adds each table's optional range-tombstone span and oldest point
- * HLC; v2–v4 tables read back without either. Older v1 records cannot be read back; this is
+ * HLC; v2–v4 tables read back without either. <b>v6 layout</b> appends the pending-delete ledgers
+ * ({@code addedPendingDeletes} as id/since-millis pairs, {@code removedPendingDeletes}); v2–v5 records
+ * read back with neither. Older v1 records cannot be read back; this is
  * acceptable because the project has no production data to migrate.
  */
 public final class ManifestSerializer {
 
-    public static final byte FORMAT_VERSION = 5;
+    public static final byte FORMAT_VERSION = 6;
 
     private ManifestSerializer() {
     }
@@ -104,6 +106,14 @@ public final class ManifestSerializer {
             w.writeBoolean(true);
             writeHlc(w, edit.maxHlc());
         }
+
+        // ---- pending deletes (v6) ------------------------------------------------------------
+        w.writeVarInt(edit.addedPendingDeletes().size());
+        for (Map.Entry<Long, Long> e : edit.addedPendingDeletes().entrySet()) {
+            w.writeVarLong(e.getKey());
+            w.writeVarLong(Math.max(0, e.getValue()));
+        }
+        writeLongSet(w, edit.removedPendingDeletes());
         return w.toByteArray();
     }
 
@@ -158,9 +168,19 @@ public final class ManifestSerializer {
 
         Hlc maxHlc = version >= 4 && r.readBoolean() ? readHlc(r) : Hlc.MIN;
 
+        Map<Long, Long> addedPendingDeletes = new LinkedHashMap<>();
+        Set<Long> removedPendingDeletes = Set.of();
+        if (version >= 6) {
+            int pendingCount = r.readVarInt();
+            for (int i = 0; i < pendingCount; i++) {
+                addedPendingDeletes.put(r.readVarLong(), r.readVarLong());
+            }
+            removedPendingDeletes = readLongSet(r);
+        }
+
         return new ManifestEdit(tables, removedTables, addedSyrups, removedSyrups, newWal,
-                addedUploads, upserts, removedUploads, addedIntents, removedIntents, maxHlc,
-                ownerFencingToken);
+                addedUploads, upserts, removedUploads, addedIntents, removedIntents,
+                addedPendingDeletes, removedPendingDeletes, maxHlc, ownerFencingToken);
     }
 
     private static void writeHlc(BinaryWriter w, Hlc hlc) {
