@@ -44,6 +44,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.UUID;
 import me.predatorray.candybox.client.CandyboxClient.CandyInfo;
 import me.predatorray.candybox.client.CandyboxClient.Listing;
@@ -52,6 +53,7 @@ import me.predatorray.candybox.client.CandyboxClient.PartListing;
 import me.predatorray.candybox.client.CandyboxClient.PartUploadInfo;
 import me.predatorray.candybox.client.CandyboxClient.RangeBytes;
 import me.predatorray.candybox.client.CandyboxClient.UploadEntry;
+import me.predatorray.candybox.common.CandyKey;
 import me.predatorray.candybox.common.auth.BoxAcl;
 import me.predatorray.candybox.common.auth.Grant;
 import me.predatorray.candybox.common.auth.ObjectAcl;
@@ -915,22 +917,22 @@ final class S3Handler extends ChannelInboundHandlerAdapter {
                 ? (continuationToken != null ? decodeToken(continuationToken) : startAfterParam)
                 : marker;
 
-        Listing listing = store.listCandies(bucket, prefix, startAfter, maxKeys);
-        List<S3Xml.Content> contents = new ArrayList<>();
-        Set<String> commonPrefixes = new LinkedHashSet<>();
-        rollUp(listing, prefix, delimiter, contents, commonPrefixes);
+        // The cursor is the page's last row; when that is a common prefix, the next page resumes past
+        // every key under it.
+        Listing listing = store.listCandies(bucket, prefix, startAfter, delimiter, maxKeys);
+        Page page = page(listing, prefix, delimiter);
 
         String xml;
         if (v2) {
             String nextToken = listing.isTruncated() ? encodeToken(listing.nextStartAfter()) : null;
-            xml = S3Xml.listBucketV2(bucket, prefix, delimiter, maxKeys, contents,
-                    new ArrayList<>(commonPrefixes), continuationToken, nextToken, startAfterParam);
+            xml = S3Xml.listBucketV2(bucket, prefix, delimiter, maxKeys, page.contents(),
+                    page.commonPrefixes(), continuationToken, nextToken, startAfterParam);
         } else {
             // S3 only returns NextMarker when a delimiter is in play; otherwise the client resumes from
             // the last returned key. Our resume cursor is exactly that last key, so the two agree.
             String nextMarker = (listing.isTruncated() && delimiter != null) ? listing.nextStartAfter() : null;
-            xml = S3Xml.listBucketV1(bucket, prefix, delimiter, maxKeys, contents,
-                    new ArrayList<>(commonPrefixes), marker, nextMarker, listing.isTruncated());
+            xml = S3Xml.listBucketV1(bucket, prefix, delimiter, maxKeys, page.contents(),
+                    page.commonPrefixes(), marker, nextMarker, listing.isTruncated());
         }
         sendXml(ctx, request, HttpResponseStatus.OK, xml, requestId);
     }
@@ -949,37 +951,37 @@ final class S3Handler extends ChannelInboundHandlerAdapter {
         int maxKeys = clampMaxKeys(first(q, "max-keys", null));
         String keyMarker = first(q, "key-marker", null);
 
-        Listing listing = store.listCandies(bucket, prefix, keyMarker, maxKeys);
-        List<S3Xml.Content> versions = new ArrayList<>();
-        Set<String> commonPrefixes = new LinkedHashSet<>();
-        rollUp(listing, prefix, delimiter, versions, commonPrefixes);
-
+        Listing listing = store.listCandies(bucket, prefix, keyMarker, delimiter, maxKeys);
         String nextKeyMarker = listing.isTruncated() ? listing.nextStartAfter() : null;
-        String xml = S3Xml.listVersions(bucket, prefix, delimiter, maxKeys, versions,
-                new ArrayList<>(commonPrefixes), keyMarker, nextKeyMarker);
+        Page page = page(listing, prefix, delimiter);
+        String xml = S3Xml.listVersions(bucket, prefix, delimiter, maxKeys, page.contents(),
+                page.commonPrefixes(), keyMarker, nextKeyMarker);
         sendXml(ctx, request, HttpResponseStatus.OK, xml, requestId);
     }
 
+    private record Page(List<S3Xml.Content> contents, List<String> commonPrefixes) {
+    }
+
     /**
-     * Folds a {@link Listing} page into object rows and synthesized common prefixes: a key whose first
-     * {@code delimiter} occurrence after {@code prefix} rolls it up into a {@code CommonPrefixes} entry,
-     * otherwise it becomes a content/version row. List entries carry no ETag (the listing API returns no
+     * Splits a listing page into object rows and sorted common prefixes. Nodes roll keys up
+     * themselves; an entry that still contains the delimiter after the prefix came from a 0.1 node
+     * (mid-upgrade) and is rolled up here. List entries carry no ETag (the listing API returns no
      * CRC32C; a HEAD on the key yields the deterministic ETag).
      */
-    private static void rollUp(Listing listing, String prefix, String delimiter,
-                               List<S3Xml.Content> rows, Set<String> commonPrefixes) {
+    private static Page page(Listing listing, String prefix, String delimiter) {
+        List<S3Xml.Content> contents = new ArrayList<>(listing.entries().size());
+        Set<String> commonPrefixes = new TreeSet<>(CandyKey::compareUtf8);
+        commonPrefixes.addAll(listing.commonPrefixes());
+        int from = prefix == null ? 0 : prefix.length();
         for (Listing.Entry e : listing.entries()) {
-            String key = e.key();
-            if (delimiter != null) {
-                int from = prefix == null ? 0 : prefix.length();
-                int idx = key.indexOf(delimiter, from);
-                if (idx >= 0) {
-                    commonPrefixes.add(key.substring(0, idx + delimiter.length()));
-                    continue;
-                }
+            int idx = delimiter == null || delimiter.isEmpty() ? -1 : e.key().indexOf(delimiter, from);
+            if (idx >= 0) {
+                commonPrefixes.add(e.key().substring(0, idx + delimiter.length()));
+            } else {
+                contents.add(new S3Xml.Content(e.key(), e.contentLength(), e.createdAtMillis(), null));
             }
-            rows.add(new S3Xml.Content(key, e.contentLength(), e.createdAtMillis(), null));
         }
+        return new Page(contents, new ArrayList<>(commonPrefixes));
     }
 
     private void deleteObjects(ChannelHandlerContext ctx, FullHttpRequest request, String bucket,

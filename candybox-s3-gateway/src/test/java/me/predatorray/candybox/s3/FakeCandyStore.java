@@ -214,26 +214,42 @@ final class FakeCandyStore implements CandyStore {
         return headCandy(box, dstKey);
     }
 
+    /** Simulates 0.1 nodes, which ignore the delimiter and return raw keys. */
+    boolean ignoreDelimiter;
+
     @Override
-    public Listing listCandies(String box, String prefix, String startAfter, int maxKeys) {
+    public Listing listCandies(String box, String prefix, String startAfter, String delimiter,
+                               int maxKeys) {
         TreeMap<String, Obj> b = box(box);
+        String p = prefix == null ? "" : prefix;
+        String delim = ignoreDelimiter || delimiter == null || delimiter.isEmpty() ? null : delimiter;
         List<Listing.Entry> entries = new ArrayList<>();
+        List<String> commonPrefixes = new ArrayList<>();
+        String last = null;
         String next = null;
         for (Map.Entry<String, Obj> e : b.entrySet()) {
             String key = e.getKey();
-            if (prefix != null && !prefix.isEmpty() && !key.startsWith(prefix)) {
+            if (!key.startsWith(p) || (startAfter != null && key.compareTo(startAfter) <= 0)) {
                 continue;
             }
-            if (startAfter != null && key.compareTo(startAfter) <= 0) {
-                continue;
+            int idx = delim == null ? -1 : key.indexOf(delim, p.length());
+            String rolled = idx < 0 ? null : key.substring(0, idx + delim.length());
+            if (rolled != null && (rolled.equals(last) || rolled.equals(startAfter))) {
+                continue; // already emitted, or the cursor is this common prefix
             }
-            if (entries.size() == maxKeys) {
-                next = entries.get(entries.size() - 1).key();
+            if (entries.size() + commonPrefixes.size() == maxKeys) {
+                next = last;
                 break;
             }
-            entries.add(new Listing.Entry(key, e.getValue().data().length, e.getValue().created()));
+            if (rolled != null) {
+                commonPrefixes.add(rolled);
+                last = rolled;
+            } else {
+                entries.add(new Listing.Entry(key, e.getValue().data().length, e.getValue().created()));
+                last = key;
+            }
         }
-        return new Listing(entries, next);
+        return new Listing(entries, next, commonPrefixes);
     }
 
     @Override

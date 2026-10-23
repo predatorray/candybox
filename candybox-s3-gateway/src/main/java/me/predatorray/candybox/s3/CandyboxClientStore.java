@@ -126,8 +126,9 @@ final class CandyboxClientStore implements CandyStore, AutoCloseable {
     }
 
     @Override
-    public Listing listCandies(String box, String prefix, String startAfter, int maxKeys) {
-        return client.listCandies(box, prefix, startAfter, maxKeys);
+    public Listing listCandies(String box, String prefix, String startAfter, String delimiter,
+                               int maxKeys) {
+        return client.listCandies(box, prefix, null, null, startAfter, false, delimiter, maxKeys);
     }
 
     @Override

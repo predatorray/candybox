@@ -504,7 +504,8 @@ final class NodeRequestHandler implements RequestHandler {
                 entries.add(new Message.ListedCandy(e.key().value(), e.contentLength(),
                         e.createdAtMillis()));
             }
-            return new Message.ListCandiesResponse(entries, result.nextStartAfter());
+            return new Message.ListCandiesResponse(entries, result.nextStartAfter(),
+                    result.commonPrefixes());
         } else if (message instanceof Message.ListBoxesRequest) {
             // Box names are only revealed to principals allowed to READ them.
             List<String> visible = node.listBoxes().stream()
@@ -702,7 +703,8 @@ final class NodeRequestHandler implements RequestHandler {
         CandyKey end = m.endKey() == null ? null : CandyKey.of(m.endKey());
         CandyKey cursor = m.startAfter() == null ? null : CandyKey.of(m.startAfter());
         ScanDirection direction = m.reverse() ? ScanDirection.REVERSE : ScanDirection.FORWARD;
-        return new ScanQuery(m.prefix(), start, end, cursor, direction, m.maxKeys());
+        return new ScanQuery(m.prefix(), start, end, cursor, direction, m.maxKeys(),
+                m.delimiter());
     }
 
     private static String safe(String s) {
