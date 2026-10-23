@@ -21,14 +21,20 @@ import me.predatorray.candybox.common.CandyKey;
 /**
  * A page of {@code listCandies} results over the merged, tombstone-suppressed view.
  *
- * @param entries        the keys on this page, ascending
+ * @param entries        the keys on this page, in scan order
  * @param nextStartAfter continuation cursor (pass as {@code startAfter} to resume), or {@code null}
  *                       when the listing is exhausted
+ * @param commonPrefixes the rolled-up prefixes on this page (delimiter scans only), in scan order
  */
-public record ListResult(List<ListEntry> entries, String nextStartAfter) {
+public record ListResult(List<ListEntry> entries, String nextStartAfter, List<String> commonPrefixes) {
 
     public ListResult {
         entries = List.copyOf(entries);
+        commonPrefixes = List.copyOf(commonPrefixes);
+    }
+
+    public ListResult(List<ListEntry> entries, String nextStartAfter) {
+        this(entries, nextStartAfter, List.of());
     }
 
     public boolean isTruncated() {

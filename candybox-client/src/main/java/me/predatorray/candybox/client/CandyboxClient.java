@@ -22,6 +22,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import me.predatorray.candybox.common.BoxName;
@@ -619,33 +620,61 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
      */
     public Listing listCandies(String box, String prefix, String startKey, String endKey,
                                String startAfter, boolean reverse, int maxKeys) {
+        return listCandies(box, prefix, startKey, endKey, startAfter, reverse, null, maxKeys);
+    }
+
+    /**
+     * {@link #listCandies(String, String, String, String, String, boolean, int)} with an optional
+     * {@code delimiter}: keys containing it after {@code prefix} roll up into common prefixes, each
+     * listed once even when it spans several partitions, and {@code maxKeys} bounds keys plus
+     * prefixes. {@code nextStartAfter} may then be a common prefix; passing it back resumes past it.
+     */
+    public Listing listCandies(String box, String prefix, String startKey, String endKey,
+                               String startAfter, boolean reverse, String delimiter, int maxKeys) {
         int n = partitionCount(box);
-        List<Listing.Entry> all = new ArrayList<>();
+        // One row per key or distinct common prefix; a common prefix maps to a null entry.
+        Comparator<CandyKey> order = reverse ? Comparator.reverseOrder() : Comparator.naturalOrder();
+        TreeMap<CandyKey, Listing.Entry> rows = new TreeMap<>(order);
         boolean anyTruncated = false;
         for (int p = 0; p < n; p++) {
             Message response = callPartition(box, p, new Message.ListCandiesRequest(
                     BoxName.of(box).value(), p, prefix, startAfter, maxKeys, startKey, endKey,
-                    reverse));
+                    reverse, delimiter));
             if (!(response instanceof Message.ListCandiesResponse page)) {
                 throw fanOutFailure(box, response);
             }
             for (Message.ListedCandy c : page.entries()) {
-                all.add(new Listing.Entry(c.key(), c.contentLength(), c.createdAtMillis()));
+                rows.put(CandyKey.of(c.key()),
+                        new Listing.Entry(c.key(), c.contentLength(), c.createdAtMillis()));
+            }
+            for (String commonPrefix : page.commonPrefixes()) {
+                rows.putIfAbsent(CandyKey.of(commonPrefix), null);
             }
             if (page.nextStartAfter() != null) {
                 anyTruncated = true;
             }
         }
-        // Each partition page holds its first maxKeys matches past the cursor, so the merged first
+        // Each partition page holds its first maxKeys rows past the cursor, so the merged first
         // maxKeys are globally correct: anything a truncated partition withheld sorts after its
-        // page's last (returned) key and therefore after the merged page too.
-        Comparator<Listing.Entry> byKey = Comparator.comparing(e -> CandyKey.of(e.key()));
-        all.sort(reverse ? byKey.reversed() : byKey);
-        boolean overflow = maxKeys > 0 && all.size() > maxKeys;
-        List<Listing.Entry> entries = overflow ? new ArrayList<>(all.subList(0, maxKeys)) : all;
-        boolean truncated = anyTruncated || overflow;
-        String next = truncated && !entries.isEmpty() ? entries.get(entries.size() - 1).key() : null;
-        return new Listing(entries, next);
+        // page's last (returned) row and therefore after the merged page too.
+        List<Listing.Entry> entries = new ArrayList<>();
+        List<String> commonPrefixes = new ArrayList<>();
+        String last = null;
+        boolean overflow = false;
+        for (Map.Entry<CandyKey, Listing.Entry> row : rows.entrySet()) {
+            if (maxKeys > 0 && entries.size() + commonPrefixes.size() == maxKeys) {
+                overflow = true;
+                break;
+            }
+            if (row.getValue() == null) {
+                commonPrefixes.add(row.getKey().value());
+            } else {
+                entries.add(row.getValue());
+            }
+            last = row.getKey().value();
+        }
+        String next = (anyTruncated || overflow) ? last : null;
+        return new Listing(entries, next, commonPrefixes);
     }
 
     @Override
@@ -746,8 +775,19 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
                              Map<String, String> userMetadata, int crc32c) {
     }
 
-    /** A page of {@code listCandies} results. */
-    public record Listing(List<Entry> entries, String nextStartAfter) {
+    /**
+     * A page of {@code listCandies} results. {@code nextStartAfter} is the page's last row (a key or
+     * a common prefix), or {@code null} when the listing is exhausted.
+     */
+    public record Listing(List<Entry> entries, String nextStartAfter, List<String> commonPrefixes) {
+        public Listing {
+            commonPrefixes = commonPrefixes == null ? List.of() : List.copyOf(commonPrefixes);
+        }
+
+        public Listing(List<Entry> entries, String nextStartAfter) {
+            this(entries, nextStartAfter, List.of());
+        }
+
         public boolean isTruncated() {
             return nextStartAfter != null;
         }

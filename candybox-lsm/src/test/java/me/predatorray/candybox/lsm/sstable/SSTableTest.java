@@ -87,6 +87,33 @@ class SSTableTest {
     }
 
     @Test
+    void seekSkipsAheadWithinAndAcrossBlocksAndNeverBack() {
+        SSTableMeta meta = writeKeys(100); // tiny blocks
+        try (SSTableReader reader = new SSTableReader(store, meta.ledgerId())) {
+            var fwd = reader.scan(null);
+            fwd.next();
+            fwd.seek(CandyKey.of("key-00003")); // same block
+            assertThat(fwd.next().key().value()).isEqualTo("key-00003");
+            fwd.seek(CandyKey.of("key-00070x")); // a later block; lands on the next key up
+            assertThat(fwd.next().key().value()).isEqualTo("key-00071");
+            fwd.seek(CandyKey.of("key-00010")); // behind: no-op
+            assertThat(fwd.next().key().value()).isEqualTo("key-00072");
+            fwd.seek(CandyKey.of("zzz"));
+            assertThat(fwd.hasNext()).isFalse();
+
+            var rev = reader.scanReverse(null);
+            rev.seek(CandyKey.of("key-00080x"));
+            assertThat(rev.next().key().value()).isEqualTo("key-00080");
+            rev.seek(CandyKey.of("key-00005"));
+            assertThat(rev.next().key().value()).isEqualTo("key-00005");
+            rev.seek(CandyKey.of("key-00050")); // behind: no-op
+            assertThat(rev.next().key().value()).isEqualTo("key-00004");
+            rev.seek(CandyKey.of("a"));
+            assertThat(rev.hasNext()).isFalse();
+        }
+    }
+
+    @Test
     void reverseFullScanReturnsEverythingDescending() {
         SSTableMeta meta = writeKeys(50);
         try (SSTableReader reader = new SSTableReader(store, meta.ledgerId())) {

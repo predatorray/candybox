@@ -72,7 +72,12 @@ interface CandyStore {
         return copyCandy(box, srcKey, dstKey);
     }
 
-    Listing listCandies(String box, String prefix, String startAfter, int maxKeys);
+    /**
+     * Lists keys after {@code startAfter}; with a {@code delimiter} (nullable) keys roll up into
+     * common prefixes that count toward {@code maxKeys}, and a {@code startAfter} equal to a common
+     * prefix resumes past every key under it.
+     */
+    Listing listCandies(String box, String prefix, String startAfter, String delimiter, int maxKeys);
 
     // ---- ACLs ---------------------------------------------------------------------------------
 

@@ -26,7 +26,11 @@ import java.net.http.HttpRequest.BodyPublishers;
 import java.net.http.HttpResponse;
 import java.net.http.HttpResponse.BodyHandlers;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Properties;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import me.predatorray.candybox.bookkeeper.bk.BookKeeperLedgerStore;
 import me.predatorray.candybox.client.CandyboxClient;
 import me.predatorray.candybox.common.BoxName;
@@ -229,6 +233,59 @@ class S3GatewayIT {
         assertThat(send("DELETE", "/photos/hello.txt", null).statusCode()).isEqualTo(204);
         assertThat(send("DELETE", "/photos/copy.txt", null).statusCode()).isEqualTo(204);
         assertThat(send("DELETE", "/photos", null).statusCode()).isEqualTo(204);
+    }
+
+    @Test
+    void delimiterListingEmitsEachCommonPrefixOnceAcrossPagesAndPartitions() throws Exception {
+        client.createBox("dirs", 4); // "a/" spans every partition
+        for (int i = 0; i < 200; i++) {
+            send("PUT", "/dirs/a/" + i, "v".getBytes(StandardCharsets.UTF_8));
+        }
+        send("PUT", "/dirs/b/1", "v".getBytes(StandardCharsets.UTF_8));
+        send("PUT", "/dirs/c", "v".getBytes(StandardCharsets.UTF_8));
+
+        List<String> v2Rows = new ArrayList<>();
+        String token = null;
+        int pages = 0;
+        do {
+            String body = send("GET", "/dirs?list-type=2&delimiter=/&max-keys=2"
+                    + (token == null ? "" : "&continuation-token=" + token), null).body();
+            v2Rows.addAll(rows(body));
+            token = body.contains("<NextContinuationToken>")
+                    ? between(body, "<NextContinuationToken>", "</NextContinuationToken>") : null;
+            pages++;
+        } while (token != null);
+        assertThat(v2Rows).containsExactly("a/", "b/", "c");
+        assertThat(pages).isEqualTo(2);
+
+        List<String> v1Rows = new ArrayList<>();
+        String marker = null;
+        do {
+            String body = send("GET", "/dirs?delimiter=/&max-keys=1"
+                    + (marker == null ? "" : "&marker=" + marker), null).body();
+            v1Rows.addAll(rows(body));
+            marker = body.contains("<NextMarker>") ? between(body, "<NextMarker>", "</NextMarker>") : null;
+        } while (marker != null);
+        assertThat(v1Rows).containsExactly("a/", "b/", "c");
+    }
+
+    /** The listing's common prefixes followed by its keys. */
+    private static List<String> rows(String body) {
+        List<String> rows = new ArrayList<>();
+        Matcher m = Pattern.compile("<CommonPrefixes><Prefix>([^<]*)</Prefix>").matcher(body);
+        while (m.find()) {
+            rows.add(m.group(1));
+        }
+        m = Pattern.compile("<Key>([^<]*)</Key>").matcher(body);
+        while (m.find()) {
+            rows.add(m.group(1));
+        }
+        return rows;
+    }
+
+    private static String between(String s, String open, String close) {
+        int from = s.indexOf(open) + open.length();
+        return s.substring(from, s.indexOf(close, from));
     }
 
     @Test

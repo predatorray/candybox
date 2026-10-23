@@ -20,7 +20,8 @@ import me.predatorray.candybox.common.CandyKey;
 /**
  * A parameterized listing over the sorted keyspace: an optional {@code [startInclusive, endExclusive)}
  * window, optionally narrowed to a {@code prefix}, walked in either {@link ScanDirection}, with a
- * continuation {@code cursorExclusive} and a page size.
+ * continuation {@code cursorExclusive} and a page size. With a {@code delimiter}, keys that contain it
+ * after the prefix roll up into common prefixes, each counted once toward the page size.
  *
  * <p>All key bounds are nullable: a null lower bound means "from the start of the keyspace", a null
  * upper bound means "to the end". {@code prefix} is a convenience that intersects the window with the
@@ -34,6 +35,7 @@ import me.predatorray.candybox.common.CandyKey;
  * @param cursorExclusive continuation cursor, exclusive in the scan direction (nullable)
  * @param direction       scan order
  * @param maxKeys         page size; values {@code <= 0} fall back to {@link #DEFAULT_MAX_KEYS}
+ * @param delimiter       optional roll-up delimiter (nullable or empty = none)
  */
 public record ScanQuery(
         String prefix,
@@ -41,7 +43,8 @@ public record ScanQuery(
         CandyKey endExclusive,
         CandyKey cursorExclusive,
         ScanDirection direction,
-        int maxKeys) {
+        int maxKeys,
+        String delimiter) {
 
     public static final int DEFAULT_MAX_KEYS = 1000;
 
@@ -49,6 +52,14 @@ public record ScanQuery(
         if (direction == null) {
             throw new IllegalArgumentException("direction is required");
         }
+        if (delimiter != null && delimiter.isEmpty()) {
+            delimiter = null;
+        }
+    }
+
+    public ScanQuery(String prefix, CandyKey startInclusive, CandyKey endExclusive,
+                     CandyKey cursorExclusive, ScanDirection direction, int maxKeys) {
+        this(prefix, startInclusive, endExclusive, cursorExclusive, direction, maxKeys, null);
     }
 
     /** The classic forward listing: prefix + exclusive {@code startAfter} cursor. */

@@ -111,6 +111,10 @@ znode is ephemeral; one left persistent by an older version is converted when th
 and must be deleted by hand if the node never comes back. With it disabled, recovery requires some
 node to take over unowned partitions manually (`CandyboxNode.openPartition` / `openBox`).
 
+Delimiter listings (S3 `CommonPrefixes`) are rolled up by the nodes as of 0.2. Old and new peers
+still interoperate: a 0.2 gateway rolls up whatever a 0.1 node returns un-rolled, so until the nodes
+are upgraded, delimiter listings behave as in 0.1 (a prefix can repeat across pages).
+
 ## Garbage collection
 
 Run only by a Box's owner, against the committed manifest, after `ledgerGcGraceMillis`:
