@@ -318,7 +318,7 @@ public final class MessageCodec {
                     readNullable(r), readNullable(r), readNullable(r));
             case LIST_CANDIES -> new Message.ListCandiesRequest(r.readString(), r.readVarInt(),
                     readNullable(r), readNullable(r), r.readInt(), readNullable(r), readNullable(r),
-                    r.readBoolean(), readNullable(r));
+                    r.readBoolean(), r.hasRemaining() ? readNullable(r) : null); // 0.1 has no delimiter
             case CREATE_MULTIPART_UPLOAD -> new Message.CreateMultipartUploadRequest(r.readString(),
                     r.readString(), readNullable(r), readMetadata(r));
             case UPLOAD_PART -> new Message.UploadPartRequest(r.readString(), r.readString(),
@@ -450,7 +450,9 @@ public final class MessageCodec {
             entries.add(new Message.ListedCandy(r.readString(), r.readVarLong(), r.readVarLong()));
         }
         String next = readNullable(r);
-        return new Message.ListCandiesResponse(entries, next, readStrings(r));
+        // A 0.1 node sends no common prefixes.
+        return new Message.ListCandiesResponse(entries, next,
+                r.hasRemaining() ? readStrings(r) : List.of());
     }
 
     private static void writeHlc(BinaryWriter w, Hlc hlc) {

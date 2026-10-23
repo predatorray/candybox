@@ -87,6 +87,12 @@ public final class BoxEngine implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(BoxEngine.class);
     private static final int IDEMPOTENCY_CACHE_SIZE = 1024;
+    /**
+     * Keys a delimiter scan steps over inside an emitted common prefix before re-seeking past it. A
+     * re-seek rebuilds the merged view, reading a block from every overlapping SSTable, so small
+     * prefixes are cheaper to walk.
+     */
+    private static final int SKIP_STEPS_BEFORE_SEEK = 16;
 
     private final BoxName box;
     private final CandyboxConfig config;
@@ -1112,7 +1118,8 @@ public final class BoxEngine implements AutoCloseable {
      * next page in the same direction (or {@code null} when exhausted).
      *
      * <p>With a delimiter, a key containing it after the prefix rolls up into a common prefix that
-     * counts as one row, and the scan seeks past the rest of that prefix instead of walking it. The
+     * counts as one row, and the scan skips the rest of that prefix, re-seeking past it when it is
+     * large (see {@link #SKIP_STEPS_BEFORE_SEEK}). The
      * cursor may then be a common prefix (the last row of a previous page); the scan resumes past it.
      */
     public ListResult scanCandies(ScanQuery query) {
@@ -1150,9 +1157,31 @@ public final class BoxEngine implements AutoCloseable {
             List<String> commonPrefixes = new ArrayList<>();
             String last = null;
             String next = null;
+            String skipping = null; // the common prefix just emitted, whose keys are stepped over
+            int skipped = 0;
             while (merged.hasNext()) {
                 Mutation m = merged.next();
                 CandyKey key = m.key();
+                if (skipping != null) {
+                    if (key.value().startsWith(skipping)) {
+                        if (++skipped < SKIP_STEPS_BEFORE_SEEK) {
+                            continue;
+                        }
+                        // A large prefix: re-seek past it rather than walk it.
+                        if (forward) {
+                            lower = prefixSuccessor(skipping);
+                            if (lower == null) {
+                                break;
+                            }
+                        } else {
+                            upper = CandyKey.of(skipping);
+                        }
+                        merged = mergedView(lower, upper, cursor, query.direction());
+                        skipping = null;
+                        continue;
+                    }
+                    skipping = null;
+                }
                 if (isShadowedByRange(rangeTombstones, key, m.hlc())) {
                     continue; // a newer range tombstone deletes this key
                 }
@@ -1192,16 +1221,8 @@ public final class BoxEngine implements AutoCloseable {
                 }
                 commonPrefixes.add(rolled);
                 last = rolled;
-                // Seek past the rest of this common prefix.
-                if (forward) {
-                    lower = prefixSuccessor(rolled);
-                    if (lower == null) {
-                        break;
-                    }
-                } else {
-                    upper = CandyKey.of(rolled);
-                }
-                merged = mergedView(lower, upper, cursor, query.direction());
+                skipping = rolled;
+                skipped = 0;
             }
             listCount.incrementAndGet();
             return new ListResult(entries, next, commonPrefixes);

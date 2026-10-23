@@ -169,6 +169,28 @@ class MessageCodecTest {
     }
 
     @Test
+    void listMessagesFromA01PeerWithoutTheTrailingFieldsStillDecode() {
+        // A 0.1 body is the current one minus its last byte: a null delimiter / an empty prefix list.
+        Message.ListCandiesRequest req = (Message.ListCandiesRequest) codec.decode(withoutLastByte(
+                codec.encode(new Message.ListCandiesRequest("box", 1, "p/", "p/c", 10, null, null,
+                        true))));
+        assertThat(req.reverse()).isTrue();
+        assertThat(req.delimiter()).isNull();
+
+        Message.ListCandiesResponse resp = (Message.ListCandiesResponse) codec.decode(withoutLastByte(
+                codec.encode(new Message.ListCandiesResponse(
+                        List.of(new Message.ListedCandy("a", 1, 1)), "a"))));
+        assertThat(resp.entries()).hasSize(1);
+        assertThat(resp.nextStartAfter()).isEqualTo("a");
+        assertThat(resp.commonPrefixes()).isEmpty();
+    }
+
+    private static Frame withoutLastByte(Frame frame) {
+        return new Frame(frame.opcode(),
+                java.util.Arrays.copyOf(frame.payload(), frame.payload().length - 1));
+    }
+
+    @Test
     void listResponseRoundTripsCommonPrefixes() {
         Message.ListCandiesResponse resp = new Message.ListCandiesResponse(
                 List.of(new Message.ListedCandy("c", 1, 1)), "d/", List.of("a/", "d/"));

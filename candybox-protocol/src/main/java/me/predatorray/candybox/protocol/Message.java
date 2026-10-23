@@ -467,6 +467,10 @@ public sealed interface Message {
     /** {@code nextStartAfter} is the page's last row, a key or a common prefix. */
     record ListCandiesResponse(List<ListedCandy> entries, String nextStartAfter,
                                List<String> commonPrefixes) implements Message {
+        public ListCandiesResponse {
+            commonPrefixes = commonPrefixes == null ? List.of() : List.copyOf(commonPrefixes);
+        }
+
         public Opcode opcode() {
             return Opcode.RESPONSE_LIST;
         }

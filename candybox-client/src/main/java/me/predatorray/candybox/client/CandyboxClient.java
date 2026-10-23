@@ -780,6 +780,10 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
      * a common prefix), or {@code null} when the listing is exhausted.
      */
     public record Listing(List<Entry> entries, String nextStartAfter, List<String> commonPrefixes) {
+        public Listing {
+            commonPrefixes = commonPrefixes == null ? List.of() : List.copyOf(commonPrefixes);
+        }
+
         public Listing(List<Entry> entries, String nextStartAfter) {
             this(entries, nextStartAfter, List.of());
         }

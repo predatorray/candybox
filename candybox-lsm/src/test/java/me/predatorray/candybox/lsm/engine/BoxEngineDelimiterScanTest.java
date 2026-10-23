@@ -18,9 +18,14 @@ package me.predatorray.candybox.lsm.engine;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
+import me.predatorray.candybox.bookkeeper.LedgerConfig;
+import me.predatorray.candybox.bookkeeper.LedgerEntry;
+import me.predatorray.candybox.bookkeeper.LedgerStore;
+import me.predatorray.candybox.bookkeeper.ReadableLedger;
+import me.predatorray.candybox.bookkeeper.WritableLedger;
 import me.predatorray.candybox.bookkeeper.fake.InMemoryLedgerStore;
 import me.predatorray.candybox.common.BoxName;
 import me.predatorray.candybox.common.CandyKey;
@@ -33,7 +38,7 @@ import org.junit.jupiter.api.Test;
 /** {@link BoxEngine#scanCandies} with a delimiter: common-prefix roll-up, skip-ahead and paging. */
 class BoxEngineDelimiterScanTest {
 
-    private final InMemoryLedgerStore store = new InMemoryLedgerStore();
+    private final CountingLedgerStore store = new CountingLedgerStore(new InMemoryLedgerStore());
     private BoxEngine engine;
 
     @BeforeEach
@@ -120,19 +125,83 @@ class BoxEngineDelimiterScanTest {
         putDirectory("c/", 500);
         engine.flush();
 
-        List<String> rows = new ArrayList<>();
-        String cursor = null;
-        int pages = 0;
-        do {
-            ListResult r = reverse(null, cursor, 2);
-            // Within one page, prefixes and keys interleave in descending order.
-            rows.addAll(r.commonPrefixes());
-            rows.addAll(keys(r));
-            cursor = r.nextStartAfter();
-            pages++;
-        } while (cursor != null);
-        assertThat(rows).containsExactlyInAnyOrder("d/", "c/", "b", "a/");
-        assertThat(pages).isEqualTo(2);
+        ListResult p1 = reverse(null, null, 2);
+        assertThat(p1.commonPrefixes()).containsExactly("d/", "c/");
+        assertThat(p1.entries()).isEmpty();
+        assertThat(p1.nextStartAfter()).isEqualTo("c/");
+
+        ListResult p2 = reverse(null, p1.nextStartAfter(), 2);
+        assertThat(keys(p2)).containsExactly("b");
+        assertThat(p2.commonPrefixes()).containsExactly("a/");
+        assertThat(p2.isTruncated()).isFalse();
+    }
+
+    @Test
+    void cursorPrefixSkipsKeysThisPartitionNeverEmitted() {
+        // Another partition emitted "a/" as its page's last row; this one resumes past all of "a/".
+        putDirectory("a/", 20);
+        put("b");
+        ListResult r = forward(null, "a/", 10);
+        assertThat(r.commonPrefixes()).isEmpty();
+        assertThat(keys(r)).containsExactly("b");
+    }
+
+    @Test
+    void windowEndingInsideAPrefixStopsAtTheWindow() {
+        putDirectory("a/", 40);
+        put("b/1", "c");
+        engine.flush();
+        CandyKey start = CandyKey.of("a/0010");
+        CandyKey end = CandyKey.of("a/0020");
+
+        ListResult fwd = engine.scanCandies(new ScanQuery(null, start, end, null,
+                ScanDirection.FORWARD, 10, "/"));
+        assertThat(fwd.commonPrefixes()).containsExactly("a/");
+        assertThat(fwd.entries()).isEmpty();
+        assertThat(fwd.isTruncated()).isFalse();
+
+        ListResult rev = engine.scanCandies(new ScanQuery(null, CandyKey.of("a/0030"),
+                CandyKey.of("c"), null, ScanDirection.REVERSE, 10, "/"));
+        assertThat(rev.commonPrefixes()).containsExactly("b/", "a/");
+        assertThat(rev.isTruncated()).isFalse();
+    }
+
+    @Test
+    void manySmallPrefixesAreSteppedOverWithoutReseeking() {
+        // 10 SSTables, each holding one key of every directory.
+        for (int t = 0; t < 10; t++) {
+            for (int d = 0; d < 300; d++) {
+                put(String.format("d%04d/%d", d, t));
+            }
+            engine.flush();
+        }
+        store.reads.set(0);
+        engine.scanCandies(ScanQuery.forward(null, null, 1000));
+        long flatReads = store.reads.get();
+
+        store.reads.set(0);
+        ListResult r = forward(null, null, 1000);
+        assertThat(r.commonPrefixes()).hasSize(300);
+        assertThat(store.reads.get()).isLessThanOrEqualTo(flatReads * 2);
+    }
+
+    @Test
+    void aLargePrefixIsSeekedPastNotWalked() {
+        for (int i = 0; i < 20_000; i++) {
+            put(String.format("a/%05d", i));
+        }
+        put("b");
+        engine.flush();
+        store.reads.set(0);
+        engine.scanCandies(ScanQuery.forward(null, null, 20_001)); // walks every block
+        long walkReads = store.reads.get();
+
+        store.reads.set(0);
+        ListResult r = forward(null, null, 10);
+        assertThat(r.commonPrefixes()).containsExactly("a/");
+        assertThat(keys(r)).containsExactly("b");
+        assertThat(walkReads).isGreaterThan(10);
+        assertThat(store.reads.get()).isLessThanOrEqualTo(3);
     }
 
     @Test
@@ -169,5 +238,83 @@ class BoxEngineDelimiterScanTest {
                 ScanDirection.FORWARD, 10, ""));
         assertThat(keys(r)).containsExactly("a/1", "a/2");
         assertThat(r.commonPrefixes()).isEmpty();
+    }
+
+    /** Counts entry reads on ledgers opened for reading (SSTable blocks). */
+    private static final class CountingLedgerStore implements LedgerStore {
+        final AtomicLong reads = new AtomicLong();
+        private final LedgerStore delegate;
+
+        CountingLedgerStore(LedgerStore delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public WritableLedger createLedger(LedgerConfig config) {
+            return delegate.createLedger(config);
+        }
+
+        @Override
+        public ReadableLedger openLedger(long ledgerId) {
+            ReadableLedger ledger = delegate.openLedger(ledgerId);
+            return new ReadableLedger() {
+                @Override
+                public LedgerEntry read(long entryId) {
+                    reads.incrementAndGet();
+                    return ledger.read(entryId);
+                }
+
+                @Override
+                public List<LedgerEntry> readRange(long firstEntryId, long lastEntryId) {
+                    reads.incrementAndGet();
+                    return ledger.readRange(firstEntryId, lastEntryId);
+                }
+
+                @Override
+                public long ledgerId() {
+                    return ledger.ledgerId();
+                }
+
+                @Override
+                public long lastAddConfirmed() {
+                    return ledger.lastAddConfirmed();
+                }
+
+                @Override
+                public boolean isSealed() {
+                    return ledger.isSealed();
+                }
+
+                @Override
+                public Map<String, byte[]> customMetadata() {
+                    return ledger.customMetadata();
+                }
+
+                @Override
+                public void close() {
+                    ledger.close();
+                }
+            };
+        }
+
+        @Override
+        public ReadableLedger recoverOpen(long ledgerId) {
+            return delegate.recoverOpen(ledgerId);
+        }
+
+        @Override
+        public void deleteLedger(long ledgerId) {
+            delegate.deleteLedger(ledgerId);
+        }
+
+        @Override
+        public List<Long> listLedgers() {
+            return delegate.listLedgers();
+        }
+
+        @Override
+        public void close() {
+            delegate.close();
+        }
     }
 }
