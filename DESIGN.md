@@ -217,9 +217,15 @@ consults range tombstones across all tables rather than pruning by point range.
   suppressed), driven by a `ScanQuery` — an optional `[start, end)` window, optional prefix,
   **forward or reverse** direction, page size, and a continuation cursor (`lastKey`, exclusive in
   the scan direction). Keys covered by a newer range tombstone are suppressed too (the union of
-  range tombstones across the memtable and all SSTables is gathered per scan; they are few). The
-  **client scatter-gathers** every partition for each page and merge-sorts by key; the `lastKey`
-  cursor still works because every partition is re-queried past it.
+  range tombstones across the memtable and all SSTables is gathered per scan; they are few). With
+  an optional **delimiter**, a key containing it after the prefix rolls up into a common prefix that
+  counts as one row, and the merged iterator seeks in place past the rest of that prefix. An
+  SSTable source reads a block only when the target lies past the one it has loaded, so a
+  directory listing visits O(directories) rows and never reads more blocks than a flat walk. The
+  **client scatter-gathers** every partition for each page and merge-sorts by key, de-duplicating
+  common prefixes (hash partitioning spreads one over many partitions); the `lastKey` cursor still
+  works because every partition is re-queried past it. A cursor equal to a common prefix resumes
+  past every key under it.
 - **deleteRange**: stamp one HLC and append a single `RangeTombstone` `[start, end)` to the WAL +
   memtable — an O(1) delete of the whole interval *per partition* (the client fans the request out;
   idempotent to retry, not atomic across partitions). Shadowed keys are reclaimed lazily at

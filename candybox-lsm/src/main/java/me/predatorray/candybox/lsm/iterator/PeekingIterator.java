@@ -38,6 +38,11 @@ public final class PeekingIterator<T> implements Iterator<T> {
         return peeked;
     }
 
+    /** Whether the head element has been pulled from the delegate by {@link #peek()}. */
+    public boolean hasPeeked() {
+        return hasPeeked;
+    }
+
     @Override
     public boolean hasNext() {
         return hasPeeked || delegate.hasNext();

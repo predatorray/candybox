@@ -237,11 +237,11 @@ Map S3 `ListObjectsV2` params onto `listCandies(prefix, startAfter, maxKeys)`:
 - `max-keys` → `maxKeys` (clamp to 1000 default like S3).
 - `Listing.isTruncated()` / `nextStartAfter` → `<IsTruncated>` + `<NextContinuationToken>`.
 
-**`delimiter` (CommonPrefixes) is synthesized in the gateway:** when a delimiter is supplied, after
-fetching a page, group keys by their first delimiter occurrence *after the prefix*; collapse each group
-into a `<CommonPrefixes><Prefix>` entry and suppress the individual keys. Because rollup happens
-post-fetch, a page may yield fewer than `max-keys` `Contents` entries — that is S3-legal. (A future
-engine-level delimiter scan would make this cheaper; see §16.)
+**`delimiter` (CommonPrefixes) is pushed down to the engine:** each partition's scan rolls keys up by
+their first delimiter occurrence *after the prefix* and seeks past the rest of each common prefix; the
+client merges and de-duplicates prefixes across partitions. `max-keys` counts `Contents` plus
+`CommonPrefixes`, and the continuation cursor is the page's last row, so a cursor that is a common
+prefix resumes past it and never re-emits it.
 
 XML: `ListBucketResult` with `Name`, `Prefix`, `Delimiter`, `MaxKeys`, `KeyCount`, `IsTruncated`,
 `Contents[]` (`Key`, `LastModified` from `createdAtMillis`, `ETag` from crc32c, `Size`,
@@ -450,6 +450,5 @@ gateway code:
 
 4. **Other S3 surface (further out):** virtual-host addressing (needs wildcard DNS/cert at the LB),
    SigV4 authentication + a credential store, object versioning (the LSM tree is LWW today),
-   bucket policies/ACLs/CORS/lifecycle/tagging, and an engine-level delimiter scan to make
-   `CommonPrefixes` cheap.
+   and bucket policies/ACLs/CORS/lifecycle/tagging.
 ```
