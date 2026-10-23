@@ -581,6 +581,24 @@ class BoxEngineTest {
     }
 
     @Test
+    void aReplayHoldingOnlyARangeDeleteIsFlushedAtRecovery() {
+        BoxEngine ownerA = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1,
+                new ManualClock(1_000), 1L);
+        ownerA.putCandy(CandyKey.of("logs/a"), bytes("old"), null, Map.of(), null);
+        ownerA.flush();
+        ownerA.deleteRangeByPrefix("logs/"); // the WAL holds only this range tombstone
+
+        BoxEngine ownerB = BoxEngine.recover(box, CandyboxConfig.defaults(), store, 2,
+                new ManualClock(1_000), ownerA.manifestLedgerId(), 2L);
+        assertThat(ownerB.manifestState().tables()).hasSize(2);
+
+        engine = BoxEngine.recover(box, CandyboxConfig.defaults(), store, 3, new ManualClock(1_000),
+                ownerB.manifestLedgerId(), 3L);
+        assertThatThrownBy(() -> engine.getCandy(CandyKey.of("logs/a")))
+                .isInstanceOf(CandyNotFoundException.class);
+    }
+
+    @Test
     void recoveryOfAnEmptyWalWritesNoTable() {
         BoxEngine ownerA = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1,
                 new ManualClock(1_000), 1L);

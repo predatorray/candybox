@@ -186,6 +186,7 @@ public final class BoxEngine implements AutoCloseable {
             Set<Long> replayedSyrups = new LinkedHashSet<>();
             Hlc highWater = state.maxHlc();
             long priorWalId = state.walLedgerId();
+            int replayedEntries = 0;
             if (priorWalId >= 0) {
                 // recover-open fences the prior WAL so a resurrected old owner cannot keep appending.
                 ReadableLedger priorWal = ledgerStore.recoverOpen(priorWalId);
@@ -195,6 +196,7 @@ public final class BoxEngine implements AutoCloseable {
                 } finally {
                     priorWal.close();
                 }
+                replayedEntries = replay.entries().size();
                 for (WalEntry e : replay.entries()) {
                     if (e instanceof WalEntry.PointMutation pm) {
                         memtable.put(pm.mutation());
@@ -249,7 +251,7 @@ public final class BoxEngine implements AutoCloseable {
                         new SSTableReader(ledgerStore, table.meta().ledgerId()));
                 engine.flushCount.incrementAndGet();
                 LOG.info("Recovery flushed {} replayed entries of box {} to SSTable ledger {}",
-                        table.meta().entryCount(), box, table.meta().ledgerId());
+                        replayedEntries, box, table.meta().ledgerId());
             }
             // Catch Syrups already orphaned before this handover (e.g. by a prior owner that crashed
             // pre-GC) so they are not leaked.
