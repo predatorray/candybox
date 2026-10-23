@@ -519,10 +519,27 @@ class BoxEngineTest {
     }
 
     @Test
+    void doubleHandoverWithRegressedClockDoesNotLoseLatestWrite() {
+        BoxEngine ownerA = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1,
+                new ManualClock(10_000), 1L);
+        CandyMetadata v1 = ownerA.putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
+
+        // B takes over (no writes); C's clock is behind A's, so it must rely on B's high-water.
+        BoxEngine ownerB = BoxEngine.recover(box, CandyboxConfig.defaults(), store, 2,
+                new ManualClock(9_000), ownerA.manifestLedgerId(), 2L);
+        engine = BoxEngine.recover(box, CandyboxConfig.defaults(), store, 3, new ManualClock(8_000),
+                ownerB.manifestLedgerId(), 3L);
+        CandyMetadata v2 = engine.putCandy(CandyKey.of("k"), bytes("v2"), null, Map.of(), null);
+
+        assertThat(v2.hlc().isAfter(v1.hlc())).isTrue();
+        assertThat(engine.getCandy(CandyKey.of("k"))).isEqualTo(bytes("v2"));
+    }
+
+    @Test
     void recoveryFlushesANonEmptyReplayAndSupersedesThePriorWal() {
         BoxEngine ownerA = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1,
                 new ManualClock(1_000), 1L);
-        ownerA.putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
+        CandyMetadata v1 = ownerA.putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
         long priorManifest = ownerA.manifestLedgerId();
         long priorWal = ownerA.manifestState().walLedgerId();
 
@@ -536,6 +553,7 @@ class BoxEngineTest {
         });
         assertThat(state.walLedgerId()).isNotEqualTo(priorWal);
         assertThat(state.pendingDeletes()).containsKeys(priorManifest, priorWal);
+        assertThat(state.maxHlc()).isGreaterThanOrEqualTo(v1.hlc());
         assertThat(engine.getCandy(CandyKey.of("k"))).isEqualTo(bytes("v1"));
     }
 

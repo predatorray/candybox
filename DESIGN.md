@@ -85,8 +85,8 @@ enough: right after a flush (which every graceful handover does) the WAL is empt
 live only in SSTables. So each flush records the max HLC of the flushed memtable (point mutations and
 range tombstones) as a monotonic high-water `maxHlc` in the manifest, the recovering owner observes
 `max(manifest maxHlc, WAL max)` even when the WAL is empty, and records that max in its own rotation
-edit (which also flushes a non-empty replay, §9). Like the WAL path, `observe` fails recovery loudly if the recorded HLC leads the local clock by
-more than `maxClockSkewMillis`.
+edit (which also flushes a non-empty replay, §9). Like the WAL path, `observe` fails recovery loudly
+if the recorded HLC leads the local clock by more than `maxClockSkewMillis`.
 
 ## 4. Ledger roles & lifecycle
 
@@ -412,8 +412,8 @@ The detailed rules:
 - (c) orphaned-Syrup GC is driven by per-SSTable referenced-Syrup tracking plus an in-memory
   **pending-orphan list**, recomputed from the live set at flush and on handover. Ledgers that no
   manifest ever recorded (written by a flush or compaction that then failed, by an owner that crashed
-  before flushing, or by a handover whose pointer CAS lost) need an **enumeration backstop**, still
-  **TODO(phase-3+)** (#105);
+  before flushing, or by a recovery that failed or whose pointer CAS lost) need an **enumeration
+  backstop**, still **TODO(phase-3+)** (#105);
 - (d) **v1 Syrup reclamation policy**: because BookKeeper deletes whole ledgers only, a single live
   Candy pins an otherwise-dead Syrup. **v1 documents and accepts this** — a Syrup is reclaimed only
   once *every* segment in it is dead. Syrup defragmentation (copying survivors into a fresh Syrup) is

@@ -162,8 +162,9 @@ public final class BoxEngine implements AutoCloseable {
 
     /**
      * Recovers ownership of a Box on handover: replays the prior owner's manifest and WAL (fencing
-     * both), flushes the replayed WAL to an L0 SSTable, and — critically — advances the HLC past the maximum HLC durably
-     * recorded so a regressed wall clock cannot stamp a newer write with a lower timestamp.
+     * both), flushes the replayed WAL to an L0 SSTable, and — critically — advances the HLC past
+     * the maximum HLC durably recorded so a regressed wall clock cannot stamp a newer write with a
+     * lower timestamp.
      *
      * @param priorManifestLedgerId the prior owner's manifest ledger id
      * @param fencingToken          this owner's lease fencing token; a stale (lower) token is rejected
@@ -216,34 +217,45 @@ public final class BoxEngine implements AutoCloseable {
         WriteAheadLog newWal = WriteAheadLog.create(ledgerStore,
                 roleConfig(config, ledgerStore, box, LedgerRole.WAL));
         BoxEngine engine = new BoxEngine(box, config, ledgerStore, hlc, clock, manifest, newWal);
-        engine.openReadersFor(state);
-        // The prior manifest and WAL are superseded by this one: the rotation below leaves the prior
-        // WAL unreachable, so a non-empty replay is flushed to L0 in the same edit, or the next owner
-        // would lose it (#63). This edit only takes effect if the manifest pointer moves here, and
-        // nothing reads a superseded manifest or WAL again.
-        long now = clock.currentTimeMillis();
-        Map<Long, Long> superseded = new LinkedHashMap<>();
-        superseded.put(priorManifestLedgerId, now);
-        if (priorWalId >= 0) {
-            superseded.put(priorWalId, now);
-        }
-        if (memtable.isEmpty()) {
-            manifest.apply(ManifestEdit.builder().newWalLedgerId(newWal.ledgerId()).maxHlc(highWater)
-                    .addedPendingDeletes(superseded).build());
-        } else {
-            L0Table table = engine.writeL0(memtable);
-            manifest.apply(ManifestEdit.flush(table.meta(), table.syrups(), newWal.ledgerId(),
-                    highWater).withAddedPendingDeletes(superseded));
-            engine.readers.put(table.meta().ledgerId(),
-                    new SSTableReader(ledgerStore, table.meta().ledgerId()));
-        }
-        // Catch Syrups already orphaned before this handover (e.g. by a prior owner that crashed
-        // pre-GC) so they are not leaked.
-        engine.lock.writeLock().lock();
         try {
-            engine.recomputeOrphanSyrupsLocked(clock.currentTimeMillis());
-        } finally {
-            engine.lock.writeLock().unlock();
+            engine.openReadersFor(state);
+            // The prior manifest and WAL are superseded by this one: the rotation below leaves the
+            // prior WAL unreachable, so a non-empty replay is flushed to L0 in the same edit, or the
+            // next owner would lose it (#63). This edit only takes effect if the manifest pointer
+            // moves here, and nothing reads a superseded manifest or WAL again.
+            long now = clock.currentTimeMillis();
+            Map<Long, Long> superseded = new LinkedHashMap<>();
+            superseded.put(priorManifestLedgerId, now);
+            if (priorWalId >= 0) {
+                superseded.put(priorWalId, now);
+            }
+            if (memtable.isEmpty()) {
+                manifest.apply(ManifestEdit.builder().newWalLedgerId(newWal.ledgerId())
+                        .maxHlc(highWater).addedPendingDeletes(superseded).build());
+            } else {
+                L0Table table = engine.writeL0(memtable);
+                manifest.apply(ManifestEdit.flush(table.meta(), table.syrups(), newWal.ledgerId(),
+                        highWater).withAddedPendingDeletes(superseded));
+                engine.readers.put(table.meta().ledgerId(),
+                        new SSTableReader(ledgerStore, table.meta().ledgerId()));
+            }
+            // Catch Syrups already orphaned before this handover (e.g. by a prior owner that crashed
+            // pre-GC) so they are not leaked.
+            engine.lock.writeLock().lock();
+            try {
+                engine.recomputeOrphanSyrupsLocked(clock.currentTimeMillis());
+            } finally {
+                engine.lock.writeLock().unlock();
+            }
+        } catch (RuntimeException e) {
+            // The pointer never moves here, so nothing references this owner's ledgers; they leak
+            // (#105), but their handles must not.
+            try {
+                engine.close();
+            } catch (RuntimeException closeFailure) {
+                e.addSuppressed(closeFailure);
+            }
+            throw e;
         }
         return engine;
     }

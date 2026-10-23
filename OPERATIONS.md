@@ -149,8 +149,8 @@ locator resolved before its Syrup was reclaimed and zero-copy-put afterwards is 
 against (#65).
 
 Ledgers no manifest ever recorded (written by a flush or compaction that then failed, by an owner
-that crashed before flushing, or by a handover that lost the manifest-pointer race) leak until an
-enumeration backstop is added (#105).
+that crashed before flushing, or by a handover that failed or lost the manifest-pointer race) leak
+until an enumeration backstop is added (#105).
 
 ## Observability
 
