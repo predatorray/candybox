@@ -16,7 +16,10 @@
 package me.predatorray.candybox.server;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
@@ -32,6 +35,7 @@ import me.predatorray.candybox.common.CandyKey;
 import me.predatorray.candybox.common.ManualClock;
 import me.predatorray.candybox.common.SegmentRef;
 import me.predatorray.candybox.common.config.CandyboxConfig;
+import me.predatorray.candybox.common.exception.FencedException;
 import me.predatorray.candybox.common.exception.StorageException;
 import me.predatorray.candybox.coordination.fake.InMemoryCoordinationService;
 import me.predatorray.candybox.lsm.engine.BoxEngine;
@@ -84,8 +88,10 @@ class LedgerReclamationTest {
         long partSyrup = engine.multipartUpload(uploadId).parts().get(1).segments().get(0).syrupId();
         engine.putCandy(CandyKey.of("a"), bytes("1"), null, Map.of(), null); // seals the part's Syrup
         engine.abortMultipartUpload(uploadId);
+        long firstWal = engine.manifestState().walLedgerId();
         engine.flush();
         engine.putCandy(CandyKey.of("b"), bytes("2"), null, Map.of(), null);
+        long secondWal = engine.manifestState().walLedgerId();
         engine.flush();
         Set<Long> compacted = engine.manifestState().tables().stream().map(SSTableMeta::ledgerId)
                 .collect(Collectors.toSet());
@@ -95,7 +101,9 @@ class LedgerReclamationTest {
         store.failDeletes = true;
         assertThat(nodeA.collectGarbageOnce()).isZero();
         Set<Long> pending = Set.copyOf(engine.manifestState().pendingDeletes().keySet());
-        assertThat(pending).contains(partSyrup).containsAll(compacted).hasSizeGreaterThan(4);
+        Set<Long> expected = new java.util.HashSet<>(compacted);
+        expected.addAll(List.of(partSyrup, firstWal, secondWal));
+        assertThat(pending).containsExactlyInAnyOrderElementsOf(expected);
         assertThat(pending).allMatch(this::exists);
         assertThat(engine.manifestState().liveSyrups()).doesNotContain(partSyrup);
 
@@ -152,7 +160,7 @@ class LedgerReclamationTest {
         BoxEngine ownerB = nodeB.enginePartition(BOX, 0);
 
         clock.advance(GRACE + 1);
-        assertThat(nodeA.collectGarbageOnce()).isZero(); // the deposed owner reclaims nothing
+        assertThat(nodeA.collectGarbageOnce()).isZero(); // its lease gate skips the partition
         assertThat(exists(priorManifest)).isTrue();
         nodeB.collectGarbageOnce();
         assertThat(exists(priorManifest)).isFalse();
@@ -163,6 +171,70 @@ class LedgerReclamationTest {
         nodeB.collectGarbageOnce();
         assertThat(exists(priorWal)).isFalse();
         assertThat(ownerB.getCandy(CandyKey.of("k"))).isEqualTo(bytes("v1"));
+    }
+
+    @Test
+    void aSyrupCreatedByAWriteThatFailedMidStreamIsReclaimed() {
+        nodeA.createBox(BOX, 1);
+        BoxEngine engine = nodeA.enginePartition(BOX, 0);
+        engine.putCandy(CandyKey.of("a"), bytes("1"), null, Map.of(), null);
+        Set<Long> before = Set.copyOf(store.listLedgers());
+        int chunk = config.sizeLimits().chunkSizeBytes();
+        InputStream disconnecting = new InputStream() {
+            private long remaining = 2L * chunk;
+
+            @Override
+            public int read() throws IOException {
+                if (remaining-- <= 0) {
+                    throw new IOException("client disconnected");
+                }
+                return 'x';
+            }
+        };
+        assertThatThrownBy(() -> engine.putCandy(CandyKey.of("big"), disconnecting, null, Map.of(),
+                null)).isInstanceOf(StorageException.class);
+        Set<Long> orphaned = store.listLedgers().stream().filter(id -> !before.contains(id))
+                .collect(Collectors.toSet());
+        assertThat(orphaned).isNotEmpty();
+
+        engine.putCandy(CandyKey.of("b"), bytes("2"), null, Map.of(), null); // rolls off the last one
+        engine.flush();
+        clock.advance(GRACE + 1);
+        nodeA.collectGarbageOnce();
+        Set<Long> leftover = new java.util.HashSet<>(orphaned);
+        leftover.remove(engine.resolveLocator(CandyKey.of("b")).parts().get(0).segments().get(0)
+                .syrupId());
+        leftover.retainAll(store.listLedgers());
+        assertThat(leftover).isEmpty();
+        assertThat(engine.getCandy(CandyKey.of("a"))).isEqualTo(bytes("1"));
+        assertThat(engine.getCandy(CandyKey.of("b"))).isEqualTo(bytes("2"));
+    }
+
+    @Test
+    void aDeposedOwnerThatMissedItsLeaseLossOnlyDeletesWhatTheNewOwnerAlsoTreatsAsPending() {
+        nodeA.createBox(BOX, 1);
+        BoxEngine ownerA = nodeA.enginePartition(BOX, 0);
+        ownerA.putCandy(CandyKey.of("a"), bytes("1"), null, Map.of(), null);
+        long rotatedWal = ownerA.manifestState().walLedgerId();
+        ownerA.flush();
+        ownerA.putCandy(CandyKey.of("b"), bytes("2"), null, Map.of(), null); // only in A's WAL
+
+        clock.advance(11_000); // A's lease lapses
+        nodeB.openBox(BOX);
+        BoxEngine ownerB = nodeB.enginePartition(BOX, 0);
+        assertThat(ownerB.manifestState().pendingDeletes()).containsKey(rotatedWal);
+        clock.advance(GRACE + 1);
+
+        // A stale A (e.g. resuming from a pause) bypasses the lease gate: its forget edit is fenced.
+        GarbageCollector staleGc = new GarbageCollector(store, GRACE, clock);
+        assertThatThrownBy(() -> staleGc.collectWithoutSyrups(ownerA))
+                .isInstanceOf(FencedException.class);
+        assertThat(exists(rotatedWal)).isFalse();
+        assertThat(ownerB.getCandy(CandyKey.of("a"))).isEqualTo(bytes("1"));
+        assertThat(ownerB.getCandy(CandyKey.of("b"))).isEqualTo(bytes("2"));
+
+        nodeB.collectGarbageOnce();
+        assertThat(ownerB.manifestState().pendingDeletes()).doesNotContainKey(rotatedWal);
     }
 
     @Test

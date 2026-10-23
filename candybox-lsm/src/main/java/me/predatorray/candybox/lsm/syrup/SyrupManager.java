@@ -19,6 +19,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.LongConsumer;
 import me.predatorray.candybox.bookkeeper.LedgerConfig;
 import me.predatorray.candybox.bookkeeper.LedgerStore;
 import me.predatorray.candybox.bookkeeper.WritableLedger;
@@ -47,15 +48,26 @@ public final class SyrupManager implements AutoCloseable {
     private final int chunkSize;
     private final long rolloverBytes;
     private final LedgerConfig syrupConfig;
+    private final LongConsumer onSyrupCreated;
 
     private WritableLedger currentSyrup;
     private long bytesInCurrentSyrup;
 
     public SyrupManager(LedgerStore ledgerStore, CandyboxConfig config, LedgerConfig syrupConfig) {
+        this(ledgerStore, config, syrupConfig, id -> { });
+    }
+
+    /**
+     * @param onSyrupCreated told each new Syrup's id as soon as it is created, so the owner can
+     *                       reclaim it even if the write that created it fails
+     */
+    public SyrupManager(LedgerStore ledgerStore, CandyboxConfig config, LedgerConfig syrupConfig,
+                        LongConsumer onSyrupCreated) {
         this.ledgerStore = ledgerStore;
         this.chunkSize = config.sizeLimits().chunkSizeBytes();
         this.rolloverBytes = config.syrupRolloverBytes();
         this.syrupConfig = syrupConfig;
+        this.onSyrupCreated = onSyrupCreated;
     }
 
     /**
@@ -136,13 +148,17 @@ public final class SyrupManager implements AutoCloseable {
 
     private void rollIfNeeded(int entryLength) {
         if (currentSyrup == null) {
-            currentSyrup = ledgerStore.createLedger(syrupConfig);
-            bytesInCurrentSyrup = 0;
+            openFreshSyrup();
         } else if (bytesInCurrentSyrup > 0 && bytesInCurrentSyrup + entryLength > rolloverBytes) {
             currentSyrup.close();
-            currentSyrup = ledgerStore.createLedger(syrupConfig);
-            bytesInCurrentSyrup = 0;
+            openFreshSyrup();
         }
+    }
+
+    private void openFreshSyrup() {
+        currentSyrup = ledgerStore.createLedger(syrupConfig);
+        bytesInCurrentSyrup = 0;
+        onSyrupCreated.accept(currentSyrup.ledgerId());
     }
 
     /** Reads up to {@code buf.length} bytes, returning the count (0 only at immediate EOF). */

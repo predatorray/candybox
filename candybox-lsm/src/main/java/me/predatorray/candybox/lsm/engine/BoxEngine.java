@@ -115,8 +115,9 @@ public final class BoxEngine implements AutoCloseable {
     // prior WAL superseded there instead.
     private long unflushedPriorWal = -1L;
 
-    // Syrups this owner wrote since the last flush, joined to the live set by the next flush even if
+    // Syrups this owner created since the last flush, joined to the live set by the next flush even if
     // nothing then references them (the Candy was overwritten, or its write failed), so GC sees them.
+    // Guarded by the write lock, which every Syrup write holds.
     private final Set<Long> unflushedSyrups = new LinkedHashSet<>();
 
     // Lightweight operational counters (snapshotted via stats()).
@@ -142,7 +143,8 @@ public final class BoxEngine implements AutoCloseable {
         this.clock = clock;
         this.manifest = manifest;
         this.wal = wal;
-        this.syrupManager = new SyrupManager(ledgerStore, config, ledgerConfig(LedgerRole.SYRUP));
+        this.syrupManager = new SyrupManager(ledgerStore, config, ledgerConfig(LedgerRole.SYRUP),
+                unflushedSyrups::add);
         this.sstableWriter = new SSTableWriter(ledgerStore, config.bloomBitsPerKey());
         this.syrupReader = new SyrupReader(ledgerStore);
     }
@@ -300,7 +302,7 @@ public final class BoxEngine implements AutoCloseable {
                 return replay;
             }
             rejectIfStalled();
-            SyrupWriteResult written = trackWritten(syrupManager.writeCandy(data));
+            SyrupWriteResult written = syrupManager.writeCandy(data);
             Validation.checkCandySize(written.contentLength(), config.sizeLimits());
 
             Hlc stamp = hlc.tick();
@@ -382,7 +384,7 @@ public final class BoxEngine implements AutoCloseable {
                 throw new CandyNotFoundException(box.value(), uploadId);
             }
             // The bytes go to Syrups via the normal write path, exactly like a single PUT.
-            SyrupWriteResult written = trackWritten(syrupManager.writeCandy(data));
+            SyrupWriteResult written = syrupManager.writeCandy(data);
             Validation.checkCandySize(written.contentLength(), config.sizeLimits());
             Part newPart = new Part(written.contentLength(), config.sizeLimits().chunkSizeBytes(),
                     written.crc32c(), written.segments());
@@ -404,13 +406,6 @@ public final class BoxEngine implements AutoCloseable {
         } finally {
             lock.writeLock().unlock();
         }
-    }
-
-    private SyrupWriteResult trackWritten(SyrupWriteResult written) {
-        for (SegmentRef seg : written.segments()) {
-            unflushedSyrups.add(seg.syrupId());
-        }
-        return written;
     }
 
     /** A part's Syrups join the live set, so they become orphans once nothing references them. */
@@ -467,8 +462,8 @@ public final class BoxEngine implements AutoCloseable {
             java.io.ByteArrayOutputStream buffer = new java.io.ByteArrayOutputStream(
                     (int) Math.min(resolvedLast - resolvedFirst + 1, Integer.MAX_VALUE));
             syrupReader.readRange(source.parts(), resolvedFirst, resolvedLast, buffer);
-            SyrupWriteResult written = trackWritten(syrupManager.writeCandy(
-                    new java.io.ByteArrayInputStream(buffer.toByteArray())));
+            SyrupWriteResult written = syrupManager.writeCandy(
+                    new java.io.ByteArrayInputStream(buffer.toByteArray()));
             Validation.checkCandySize(written.contentLength(), config.sizeLimits());
             Part newPart = new Part(written.contentLength(), config.sizeLimits().chunkSizeBytes(),
                     written.crc32c(), written.segments());

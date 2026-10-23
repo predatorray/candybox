@@ -393,8 +393,8 @@ failed delete is retried and a new owner inherits whatever the prior owner had n
 - **SSTables** removed from the manifest by a committed compaction;
 - **Syrups** no longer referenced by any SSTable, the memtable, an in-flight multipart upload, or the
   open write Syrup — claimed from the live set into the pending deletes. Each flush adds every Syrup
-  written since the previous one to the live set, so one whose Candies were all superseded before the
-  flush (or whose write failed) is still seen;
+  created since the previous one to the live set, so one whose Candies were all superseded before the
+  flush, or that a failed write left behind, is still seen;
 - **WAL** ledgers rotated out at flush, whose mutations are now durable in an SSTable;
 - at handover, the prior owner's **manifest** ledger, and its **WAL** — at once if its replay was
   empty, else at the new owner's first flush. Both enter through the new manifest, so they are only
