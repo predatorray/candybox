@@ -85,7 +85,22 @@ class MergingIteratorTest {
         return new ReopeningIterator(target -> sorted.stream()
                 .filter(m -> target == null || (ascending ? m.key().compareTo(target) >= 0
                         : m.key().compareTo(target) <= 0))
-                .iterator(), null);
+                .iterator(), null, ascending ? ScanDirection.FORWARD : ScanDirection.REVERSE);
+    }
+
+    @Test
+    void seekingToTheKeyJustReturnedNeverRepeatsIt() {
+        List<Mutation> s1 = List.of(putMutation("a", hlc(1, 0, 1)), putMutation("b", hlc(1, 0, 1)));
+        MergingIterator fwd = new MergingIterator(List.of(seekable(s1)), true);
+        assertThat(fwd.next().key().value()).isEqualTo("a");
+        fwd.seek(CandyKey.of("a"));
+        assertThat(drain(fwd)).extracting(m -> m.key().value()).containsExactly("b");
+
+        MergingIterator rev = new MergingIterator(List.of(seekable(reversed(s1))), true,
+                ScanDirection.REVERSE);
+        assertThat(rev.next().key().value()).isEqualTo("b");
+        rev.seek(CandyKey.of("b"));
+        assertThat(drain(rev)).extracting(m -> m.key().value()).containsExactly("a");
     }
 
     @Test

@@ -19,6 +19,7 @@ import java.util.Iterator;
 import java.util.function.Function;
 import me.predatorray.candybox.common.CandyKey;
 import me.predatorray.candybox.common.Mutation;
+import me.predatorray.candybox.lsm.engine.ScanDirection;
 
 /**
  * Makes a cheaply re-openable source (e.g. a memtable view) seekable by re-opening it at the target.
@@ -27,15 +28,25 @@ import me.predatorray.candybox.common.Mutation;
 public final class ReopeningIterator implements SeekableIterator {
 
     private final Function<CandyKey, Iterator<Mutation>> open;
+    private final ScanDirection direction;
     private Iterator<Mutation> current;
+    private CandyKey lastReturned;
 
-    public ReopeningIterator(Function<CandyKey, Iterator<Mutation>> open, CandyKey start) {
+    public ReopeningIterator(Function<CandyKey, Iterator<Mutation>> open, CandyKey start,
+                             ScanDirection direction) {
         this.open = open;
+        this.direction = direction;
         this.current = open.apply(start);
     }
 
     @Override
     public void seek(CandyKey target) {
+        if (lastReturned != null) {
+            int c = target.compareTo(lastReturned);
+            if (direction == ScanDirection.FORWARD ? c <= 0 : c >= 0) {
+                return; // already past the target
+            }
+        }
         current = open.apply(target);
     }
 
@@ -46,6 +57,8 @@ public final class ReopeningIterator implements SeekableIterator {
 
     @Override
     public Mutation next() {
-        return current.next();
+        Mutation m = current.next();
+        lastReturned = m.key();
+        return m;
     }
 }

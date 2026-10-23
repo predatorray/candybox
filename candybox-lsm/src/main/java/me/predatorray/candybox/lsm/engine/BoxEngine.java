@@ -1463,7 +1463,8 @@ public final class BoxEngine implements AutoCloseable {
         Memtable mem = active;
         if (direction == ScanDirection.FORWARD) {
             CandyKey seek = maxKey(lower, cursor);
-            sources.add(new ReopeningIterator(k -> k == null ? mem.iterator() : mem.iterator(k), seek));
+            sources.add(new ReopeningIterator(k -> k == null ? mem.iterator() : mem.iterator(k), seek,
+                    direction));
             for (SSTableReader reader : readers.values()) {
                 if (overlapsWindow(reader.minKey(), reader.maxKey(), lower, upper)) {
                     sources.add(reader.scan(seek));
@@ -1472,7 +1473,7 @@ public final class BoxEngine implements AutoCloseable {
         } else {
             CandyKey seekUpper = minKey(upper, cursor);
             sources.add(new ReopeningIterator(k -> k == null ? mem.descendingIterator()
-                    : mem.descendingIterator(k), seekUpper));
+                    : mem.descendingIterator(k), seekUpper, direction));
             for (SSTableReader reader : readers.values()) {
                 if (overlapsWindow(reader.minKey(), reader.maxKey(), lower, upper)) {
                     sources.add(reader.scanReverse(seekUpper));

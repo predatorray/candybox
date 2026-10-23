@@ -221,10 +221,11 @@ consults range tombstones across all tables rather than pruning by point range.
   an optional **delimiter**, a key containing it after the prefix rolls up into a common prefix that
   counts as one row, and the merged iterator seeks in place past the rest of that prefix. An
   SSTable source reads a block only when the target lies past the one it has loaded, so a
-  directory listing visits O(directories) rows and never reads more blocks than a flat walk. The **client scatter-gathers** every partition for each page
-  and merge-sorts by key, de-duplicating common prefixes (hash partitioning spreads one over many
-  partitions); the `lastKey` cursor still works because every partition is re-queried past it. A
-  cursor equal to a common prefix resumes past every key under it.
+  directory listing visits O(directories) rows and never reads more blocks than a flat walk. The
+  **client scatter-gathers** every partition for each page and merge-sorts by key, de-duplicating
+  common prefixes (hash partitioning spreads one over many partitions); the `lastKey` cursor still
+  works because every partition is re-queried past it. A cursor equal to a common prefix resumes
+  past every key under it.
 - **deleteRange**: stamp one HLC and append a single `RangeTombstone` `[start, end)` to the WAL +
   memtable — an O(1) delete of the whole interval *per partition* (the client fans the request out;
   idempotent to retry, not atomic across partitions). Shadowed keys are reclaimed lazily at

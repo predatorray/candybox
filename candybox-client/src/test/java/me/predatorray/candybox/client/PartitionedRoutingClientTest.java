@@ -189,6 +189,22 @@ class PartitionedRoutingClientTest {
     }
 
     @Test
+    void reverseDelimiterListingMergesPrefixesInDescendingOrder() {
+        StubNode node = new StubNode();
+        node.listPages = Map.of(
+                0, new Message.ListCandiesResponse(List.of(row("c")), null, List.of("d/", "a/")),
+                1, new Message.ListCandiesResponse(List.of(row("e"), row("b")), "b", List.of("d/")));
+        try (CandyboxClient client = new CandyboxClient(new LoopbackTransport(node), "x", 0)) {
+            CandyboxClient.Listing page = client.listCandies("box", null, null, null, null, true,
+                    "/", 3);
+            assertThat(page.entries()).extracting(CandyboxClient.Listing.Entry::key)
+                    .containsExactly("e", "c");
+            assertThat(page.commonPrefixes()).containsExactly("d/");
+            assertThat(page.nextStartAfter()).isEqualTo("c");
+        }
+    }
+
+    @Test
     void deleteRangeFansOutToEveryPartition() {
         StubNode node = new StubNode();
         try (CandyboxClient client = new CandyboxClient(new LoopbackTransport(node), "x", 0)) {
