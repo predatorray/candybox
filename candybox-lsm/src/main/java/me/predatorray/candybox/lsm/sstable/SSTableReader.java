@@ -33,6 +33,7 @@ import me.predatorray.candybox.common.serial.BinaryReader;
 import me.predatorray.candybox.common.serial.MutationSerializer;
 import me.predatorray.candybox.common.serial.RangeTombstoneSerializer;
 import me.predatorray.candybox.common.util.Bytes;
+import me.predatorray.candybox.lsm.iterator.SeekableIterator;
 
 /**
  * Reads an SSTable ledger written by {@link SSTableWriter}. The footer, index, and bloom filter are
@@ -146,10 +147,10 @@ public final class SSTableReader implements AutoCloseable {
      * Returns an iterator over mutations with key {@code >= start} (or all if {@code start} is null),
      * in ascending key order.
      */
-    public Iterator<Mutation> scan(CandyKey start) {
+    public SeekableIterator scan(CandyKey start) {
         int startBlock = start == null ? 0 : findBlock(start.utf8Bytes());
         if (startBlock < 0) {
-            return List.<Mutation>of().iterator();
+            return SeekableIterator.empty();
         }
         return new ScanIterator(startBlock, start);
     }
@@ -158,14 +159,14 @@ public final class SSTableReader implements AutoCloseable {
      * Returns an iterator over mutations with key {@code <= start} (or all if {@code start} is null),
      * in descending key order.
      */
-    public Iterator<Mutation> scanReverse(CandyKey start) {
+    public SeekableIterator scanReverse(CandyKey start) {
         int startBlock = start == null ? blockLastKeys.length - 1 : findBlock(start.utf8Bytes());
         if (startBlock < 0) {
             // start is beyond the table's last key: begin at the final block.
             startBlock = blockLastKeys.length - 1;
         }
         if (startBlock < 0) {
-            return List.<Mutation>of().iterator(); // empty table
+            return SeekableIterator.empty(); // empty table
         }
         return new ReverseScanIterator(startBlock, start);
     }
@@ -201,7 +202,7 @@ public final class SSTableReader implements AutoCloseable {
         return out;
     }
 
-    private final class ScanIterator implements Iterator<Mutation> {
+    private final class ScanIterator implements SeekableIterator {
         private int blockIndex;
         private List<Mutation> block;
         private int posInBlock;
@@ -222,6 +223,26 @@ public final class SSTableReader implements AutoCloseable {
                     posInBlock++;
                 }
                 startSkipped = true;
+            }
+        }
+
+        /** Reads a block only when the target lies past the loaded one. */
+        @Override
+        public void seek(CandyKey target) {
+            int targetBlock = findBlock(target.utf8Bytes());
+            if (targetBlock < 0) {
+                blockIndex = blockEntryIds.length;
+                block = List.of();
+                posInBlock = 0;
+                return;
+            }
+            if (targetBlock > blockIndex) {
+                blockIndex = targetBlock;
+                block = readBlock(blockIndex);
+                posInBlock = 0;
+            }
+            while (posInBlock < block.size() && block.get(posInBlock).key().compareTo(target) < 0) {
+                posInBlock++;
             }
         }
 
@@ -246,7 +267,7 @@ public final class SSTableReader implements AutoCloseable {
         }
     }
 
-    private final class ReverseScanIterator implements Iterator<Mutation> {
+    private final class ReverseScanIterator implements SeekableIterator {
         private int blockIndex;
         private List<Mutation> block;
         private int posInBlock;
@@ -267,6 +288,20 @@ public final class SSTableReader implements AutoCloseable {
                     posInBlock--;
                 }
                 startPositioned = true;
+            }
+        }
+
+        /** Reads a block only when the target lies before the loaded one. */
+        @Override
+        public void seek(CandyKey target) {
+            int targetBlock = findBlock(target.utf8Bytes());
+            if (targetBlock >= 0 && targetBlock < blockIndex) {
+                blockIndex = targetBlock;
+                block = readBlock(blockIndex);
+                posInBlock = block.size() - 1;
+            }
+            while (posInBlock >= 0 && block.get(posInBlock).key().compareTo(target) > 0) {
+                posInBlock--;
             }
         }
 

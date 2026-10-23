@@ -214,12 +214,15 @@ final class FakeCandyStore implements CandyStore {
         return headCandy(box, dstKey);
     }
 
+    /** Simulates 0.1 nodes, which ignore the delimiter and return raw keys. */
+    boolean ignoreDelimiter;
+
     @Override
     public Listing listCandies(String box, String prefix, String startAfter, String delimiter,
                                int maxKeys) {
         TreeMap<String, Obj> b = box(box);
         String p = prefix == null ? "" : prefix;
-        String delim = delimiter == null || delimiter.isEmpty() ? null : delimiter;
+        String delim = ignoreDelimiter || delimiter == null || delimiter.isEmpty() ? null : delimiter;
         List<Listing.Entry> entries = new ArrayList<>();
         List<String> commonPrefixes = new ArrayList<>();
         String last = null;

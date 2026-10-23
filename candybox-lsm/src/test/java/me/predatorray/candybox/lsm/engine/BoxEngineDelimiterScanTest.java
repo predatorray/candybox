@@ -167,22 +167,39 @@ class BoxEngineDelimiterScanTest {
     }
 
     @Test
-    void manySmallPrefixesAreSteppedOverWithoutReseeking() {
-        // 10 SSTables, each holding one key of every directory.
-        for (int t = 0; t < 10; t++) {
-            for (int d = 0; d < 300; d++) {
-                put(String.format("d%04d/%d", d, t));
+    void directoriesSpreadOverManyTablesCostNoMoreReadsThanAFlatWalk() {
+        assertDelimiterPageReadsAtMostAFlatWalk(10, 300, 1);
+    }
+
+    @Test
+    void directoriesLargerThanAFewKeysCostNoMoreReadsThanAFlatWalk() {
+        assertDelimiterPageReadsAtMostAFlatWalk(10, 300, 3);
+    }
+
+    @Test
+    void directoriesInOneCompactedTableCostNoMoreReadsThanAFlatWalk() {
+        assertDelimiterPageReadsAtMostAFlatWalk(1, 300, 30);
+    }
+
+    /** {@code dirs} directories, each with {@code keysPerTable} keys in each of {@code tables} SSTables. */
+    private void assertDelimiterPageReadsAtMostAFlatWalk(int tables, int dirs, int keysPerTable) {
+        for (int t = 0; t < tables; t++) {
+            for (int d = 0; d < dirs; d++) {
+                for (int k = 0; k < keysPerTable; k++) {
+                    put(String.format("d%04d/%02d%02d", d, t, k));
+                }
             }
             engine.flush();
         }
+        int keys = tables * dirs * keysPerTable;
         store.reads.set(0);
-        engine.scanCandies(ScanQuery.forward(null, null, 1000));
+        assertThat(engine.scanCandies(ScanQuery.forward(null, null, keys)).entries()).hasSize(keys);
         long flatReads = store.reads.get();
 
         store.reads.set(0);
         ListResult r = forward(null, null, 1000);
-        assertThat(r.commonPrefixes()).hasSize(300);
-        assertThat(store.reads.get()).isLessThanOrEqualTo(flatReads * 2);
+        assertThat(r.commonPrefixes()).hasSize(dirs);
+        assertThat(store.reads.get()).isLessThanOrEqualTo(flatReads);
     }
 
     @Test

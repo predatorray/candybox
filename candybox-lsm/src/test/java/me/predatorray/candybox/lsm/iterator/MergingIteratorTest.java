@@ -23,6 +23,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
+import me.predatorray.candybox.common.CandyKey;
 import me.predatorray.candybox.common.Mutation;
 import me.predatorray.candybox.lsm.engine.ScanDirection;
 import org.junit.jupiter.api.Test;
@@ -50,6 +51,41 @@ class MergingIteratorTest {
         assertThat(merged).extracting(m -> m.key().value()).containsExactly("a", "k", "z");
         Mutation k = merged.stream().filter(m -> m.key().value().equals("k")).findFirst().orElseThrow();
         assertThat(k.hlc()).isEqualTo(hlc(500, 0, 1)); // highest HLC won
+    }
+
+    @Test
+    void seekSkipsEverySourceAheadAndKeepsSourcesAlreadyPastTheTarget() {
+        List<Mutation> s1 = List.of(putMutation("a", hlc(1, 0, 1)), putMutation("b", hlc(1, 0, 1)),
+                putMutation("e", hlc(1, 0, 1)));
+        List<Mutation> s2 = List.of(putMutation("a", hlc(2, 0, 1)), putMutation("d", hlc(1, 0, 1)),
+                putMutation("f", hlc(1, 0, 1)));
+        MergingIterator it = new MergingIterator(List.of(seekable(s1), seekable(s2)), true);
+
+        assertThat(it.next().key().value()).isEqualTo("a");
+        assertThat(it.hasNext()).isTrue(); // "b" is computed, then skipped by the seek
+        it.seek(CandyKey.of("c"));
+        assertThat(drain(it)).extracting(m -> m.key().value()).containsExactly("d", "e", "f");
+
+        MergingIterator rev = new MergingIterator(List.of(seekable(reversed(s1)),
+                seekable(reversed(s2))), true, ScanDirection.REVERSE);
+        rev.seek(CandyKey.of("c"));
+        assertThat(drain(rev)).extracting(m -> m.key().value()).containsExactly("b", "a");
+    }
+
+    private static List<Mutation> reversed(List<Mutation> list) {
+        List<Mutation> out = new ArrayList<>(list);
+        java.util.Collections.reverse(out);
+        return out;
+    }
+
+    /** A sorted list source; seeking re-opens it at the target. */
+    private static SeekableIterator seekable(List<Mutation> sorted) {
+        boolean ascending = sorted.size() < 2
+                || sorted.get(0).key().compareTo(sorted.get(sorted.size() - 1).key()) < 0;
+        return new ReopeningIterator(target -> sorted.stream()
+                .filter(m -> target == null || (ascending ? m.key().compareTo(target) >= 0
+                        : m.key().compareTo(target) <= 0))
+                .iterator(), null);
     }
 
     @Test

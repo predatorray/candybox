@@ -53,6 +53,8 @@ import me.predatorray.candybox.common.exception.BusyException;
 import me.predatorray.candybox.common.exception.CandyNotFoundException;
 import me.predatorray.candybox.common.exception.LimitExceededException;
 import me.predatorray.candybox.common.exception.ValidationException;
+import me.predatorray.candybox.lsm.iterator.MergingIterator;
+import me.predatorray.candybox.lsm.iterator.ReopeningIterator;
 import me.predatorray.candybox.lsm.manifest.Manifest;
 import me.predatorray.candybox.lsm.manifest.ManifestEdit;
 import me.predatorray.candybox.lsm.manifest.ManifestState;
@@ -87,12 +89,6 @@ public final class BoxEngine implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(BoxEngine.class);
     private static final int IDEMPOTENCY_CACHE_SIZE = 1024;
-    /**
-     * Keys a delimiter scan steps over inside an emitted common prefix before re-seeking past it. A
-     * re-seek rebuilds the merged view, reading a block from every overlapping SSTable, so small
-     * prefixes are cheaper to walk.
-     */
-    private static final int SKIP_STEPS_BEFORE_SEEK = 16;
 
     private final BoxName box;
     private final CandyboxConfig config;
@@ -1118,8 +1114,8 @@ public final class BoxEngine implements AutoCloseable {
      * next page in the same direction (or {@code null} when exhausted).
      *
      * <p>With a delimiter, a key containing it after the prefix rolls up into a common prefix that
-     * counts as one row, and the scan skips the rest of that prefix, re-seeking past it when it is
-     * large (see {@link #SKIP_STEPS_BEFORE_SEEK}). The
+     * counts as one row, and the merged iterator seeks past the rest of that prefix in place: a
+     * target inside an already loaded SSTable block costs no read. The
      * cursor may then be a common prefix (the last row of a previous page); the scan resumes past it.
      */
     public ListResult scanCandies(ScanQuery query) {
@@ -1151,37 +1147,15 @@ public final class BoxEngine implements AutoCloseable {
                 lower = maxKey(lower, past);
             }
 
-            Iterator<Mutation> merged = mergedView(lower, upper, cursor, query.direction());
+            MergingIterator merged = mergedView(lower, upper, cursor, query.direction());
             List<RangeTombstone> rangeTombstones = gatherRangeTombstonesLocked();
             List<ListResult.ListEntry> entries = new ArrayList<>();
             List<String> commonPrefixes = new ArrayList<>();
             String last = null;
             String next = null;
-            String skipping = null; // the common prefix just emitted, whose keys are stepped over
-            int skipped = 0;
             while (merged.hasNext()) {
                 Mutation m = merged.next();
                 CandyKey key = m.key();
-                if (skipping != null) {
-                    if (key.value().startsWith(skipping)) {
-                        if (++skipped < SKIP_STEPS_BEFORE_SEEK) {
-                            continue;
-                        }
-                        // A large prefix: re-seek past it rather than walk it.
-                        if (forward) {
-                            lower = prefixSuccessor(skipping);
-                            if (lower == null) {
-                                break;
-                            }
-                        } else {
-                            upper = CandyKey.of(skipping);
-                        }
-                        merged = mergedView(lower, upper, cursor, query.direction());
-                        skipping = null;
-                        continue;
-                    }
-                    skipping = null;
-                }
                 if (isShadowedByRange(rangeTombstones, key, m.hlc())) {
                     continue; // a newer range tombstone deletes this key
                 }
@@ -1221,8 +1195,17 @@ public final class BoxEngine implements AutoCloseable {
                 }
                 commonPrefixes.add(rolled);
                 last = rolled;
-                skipping = rolled;
-                skipped = 0;
+                // Skip the rest of this common prefix; the window checks above drop any straggler.
+                if (forward) {
+                    lower = prefixSuccessor(rolled);
+                    if (lower == null) {
+                        break;
+                    }
+                    merged.seek(lower);
+                } else {
+                    upper = CandyKey.of(rolled);
+                    merged.seek(upper);
+                }
             }
             listCount.incrementAndGet();
             return new ListResult(entries, next, commonPrefixes);
@@ -1474,12 +1457,13 @@ public final class BoxEngine implements AutoCloseable {
      * direction, seeking each source to the appropriate bound and pruning SSTables that cannot overlap
      * the window. The caller still applies exact bound/cursor filtering on the emitted keys.
      */
-    private Iterator<Mutation> mergedView(CandyKey lower, CandyKey upper, CandyKey cursor,
-                                          ScanDirection direction) {
+    private MergingIterator mergedView(CandyKey lower, CandyKey upper, CandyKey cursor,
+                                       ScanDirection direction) {
         List<Iterator<Mutation>> sources = new ArrayList<>();
+        Memtable mem = active;
         if (direction == ScanDirection.FORWARD) {
             CandyKey seek = maxKey(lower, cursor);
-            sources.add(seek == null ? active.iterator() : active.iterator(seek));
+            sources.add(new ReopeningIterator(k -> k == null ? mem.iterator() : mem.iterator(k), seek));
             for (SSTableReader reader : readers.values()) {
                 if (overlapsWindow(reader.minKey(), reader.maxKey(), lower, upper)) {
                     sources.add(reader.scan(seek));
@@ -1487,15 +1471,15 @@ public final class BoxEngine implements AutoCloseable {
             }
         } else {
             CandyKey seekUpper = minKey(upper, cursor);
-            sources.add(seekUpper == null ? active.descendingIterator()
-                    : active.descendingIterator(seekUpper));
+            sources.add(new ReopeningIterator(k -> k == null ? mem.descendingIterator()
+                    : mem.descendingIterator(k), seekUpper));
             for (SSTableReader reader : readers.values()) {
                 if (overlapsWindow(reader.minKey(), reader.maxKey(), lower, upper)) {
                     sources.add(reader.scanReverse(seekUpper));
                 }
             }
         }
-        return new me.predatorray.candybox.lsm.iterator.MergingIterator(sources, true, direction);
+        return new MergingIterator(sources, true, direction);
     }
 
     /**

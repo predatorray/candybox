@@ -36,6 +36,7 @@ import me.predatorray.candybox.lsm.engine.ScanDirection;
  */
 public final class MergingIterator implements Iterator<Mutation> {
 
+    private final List<Iterator<Mutation>> raw;
     private final List<PeekingIterator<Mutation>> sources;
     private final boolean dropTombstones;
     private final ScanDirection direction;
@@ -49,6 +50,7 @@ public final class MergingIterator implements Iterator<Mutation> {
 
     public MergingIterator(List<Iterator<Mutation>> sources, boolean dropTombstones,
                            ScanDirection direction) {
+        this.raw = new ArrayList<>(sources);
         this.sources = new ArrayList<>(sources.size());
         for (Iterator<Mutation> s : sources) {
             this.sources.add(new PeekingIterator<>(s));
@@ -75,6 +77,30 @@ public final class MergingIterator implements Iterator<Mutation> {
         nextOut = null;
         computed = false;
         return result;
+    }
+
+    /**
+     * Skips ahead to the first merged entry at or past {@code target} in the merge direction. Every
+     * source must be a {@link SeekableIterator}. A source whose head is already at or past the target
+     * is left in place, so a target inside the blocks the sources have loaded costs no reads.
+     */
+    public void seek(CandyKey target) {
+        if (computed && (nextOut == null || !isAhead(nextOut.key(), target))) {
+            return; // exhausted, or already at or past the target
+        }
+        computed = false;
+        nextOut = null;
+        for (int i = 0; i < sources.size(); i++) {
+            PeekingIterator<Mutation> it = sources.get(i);
+            if (it.hasPeeked() && !isAhead(it.peek().key(), target)) {
+                continue;
+            }
+            if (!(raw.get(i) instanceof SeekableIterator seekable)) {
+                throw new UnsupportedOperationException("source " + i + " is not seekable");
+            }
+            seekable.seek(target);
+            sources.set(i, new PeekingIterator<>(seekable));
+        }
     }
 
     private Mutation computeNext() {

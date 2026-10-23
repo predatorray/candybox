@@ -169,6 +169,21 @@ class S3HandlerTest {
     }
 
     @Test
+    void delimiterListingAgainstNodesThatIgnoreTheDelimiterIsRolledUpByTheGateway() {
+        put("/photos");
+        put("/photos/a/sub/1", "v".getBytes(StandardCharsets.UTF_8), null);
+        put("/photos/a/x", "v".getBytes(StandardCharsets.UTF_8), null);
+        put("/photos/b/1", "v".getBytes(StandardCharsets.UTF_8), null);
+        put("/photos/c", "v".getBytes(StandardCharsets.UTF_8), null);
+        store.ignoreDelimiter = true;
+
+        Response r = get("/photos?list-type=2&delimiter=/");
+        assertThat(r.body).contains("<CommonPrefixes><Prefix>a/</Prefix></CommonPrefixes>"
+                        + "<CommonPrefixes><Prefix>b/</Prefix></CommonPrefixes>")
+                .contains("<Key>c</Key>").doesNotContain("<Key>a/").doesNotContain("<Key>b/");
+    }
+
+    @Test
     void listObjectsPaginatesWithContinuationToken() {
         put("/photos");
         for (String k : new String[]{"k1", "k2", "k3"}) {

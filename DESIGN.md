@@ -219,8 +219,9 @@ consults range tombstones across all tables rather than pruning by point range.
   the scan direction). Keys covered by a newer range tombstone are suppressed too (the union of
   range tombstones across the memtable and all SSTables is gathered per scan; they are few). With
   an optional **delimiter**, a key containing it after the prefix rolls up into a common prefix that
-  counts as one row, and the scan re-seeks past the rest of that prefix, so a directory listing
-  costs O(directories), not O(keys). The **client scatter-gathers** every partition for each page
+  counts as one row, and the merged iterator seeks in place past the rest of that prefix. An
+  SSTable source reads a block only when the target lies past the one it has loaded, so a
+  directory listing visits O(directories) rows and never reads more blocks than a flat walk. The **client scatter-gathers** every partition for each page
   and merge-sorts by key, de-duplicating common prefixes (hash partitioning spreads one over many
   partitions); the `lastKey` cursor still works because every partition is re-queried past it. A
   cursor equal to a common prefix resumes past every key under it.

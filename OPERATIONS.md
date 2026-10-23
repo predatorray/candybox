@@ -112,8 +112,8 @@ and must be deleted by hand if the node never comes back. With it disabled, reco
 node to take over unowned partitions manually (`CandyboxNode.openPartition` / `openBox`).
 
 Delimiter listings (S3 `CommonPrefixes`) are rolled up by the nodes as of 0.2. Old and new peers
-still interoperate, but while nodes run 0.1, a 0.2 gateway's delimiter listings return every key
-un-rolled, because a 0.1 node ignores the delimiter.
+still interoperate: a 0.2 gateway rolls up whatever a 0.1 node returns un-rolled, so until the nodes
+are upgraded, delimiter listings behave as in 0.1 (a prefix can repeat across pages).
 
 ## Garbage collection
 
