@@ -210,7 +210,8 @@ consults range tombstones across all tables rather than pruning by point range.
   append to WAL → apply to memtable (LWW). Auto-flush when the memtable exceeds its byte threshold.
 - **delete**: stamp HLC → write a DELETE tombstone the same way.
 - **flush**: seal the memtable into a new L0 SSTable, record referenced Syrups + the rotated WAL id in
-  one `ManifestEdit`, open a reader for the new table.
+  one `ManifestEdit`, open a reader for the new table. Handover flushes a non-empty WAL replay the
+  same way (§7).
 - **get/head**: resolve the key to the highest-HLC locator across the memtable and the overlapping
   SSTables at every level (range + bloom pre-filter); a point tombstone, a covering **range tombstone** newer than
   that locator, or absence ⇒ `CandyNotFound`. `getCandy` then streams bytes from Syrups and validates
@@ -291,6 +292,12 @@ The manifest is an **append-only metadata ledger**; a partition's manifest has e
 2. replay its edits to rebuild `ManifestState`;
 3. open a **fresh** manifest ledger (a sealed BK ledger can't be appended) and seed it with a
    self-contained checkpoint of the recovered state.
+
+`BoxEngine.recover` then recover-opens and replays the prior WAL, observes the HLC high-water (§3),
+and commits one edit that rotates to a fresh WAL and supersedes the prior WAL and manifest. If the
+replay is non-empty, the same edit adds it as an L0 SSTable, so the replayed writes never live only
+in the new owner's memtable, where a second handover before a flush would lose them (#63). A failed
+recovery leaves the pointer, and so the prior manifest and WAL, untouched for the next attempt.
 
 The ZK pointer to the current manifest ledger is advanced with a **compare-and-set on the expected
 ZK version** (never a blind set), and every state-mutating append carries the owner's **fencing
@@ -502,7 +509,7 @@ Per-role BK quorum (E/Qw/Qa) defaults: **WAL 3/3/2, Manifest 3/3/2, SSTable 3/2/
   never changes (changing it would re-home every key), and hash partitioning makes every ordered
   listing a scatter-gather fan-out (each page queries all partitions). Key-range partitions with
   splits, and re-partitioning, are future work. A partition is still unavailable during its own
-  handover fence+replay window (shrunk by the pre-handover flush).
+  handover fence+replay+flush window (shrunk by the pre-handover flush).
 - **Cross-partition copy/rename is zero-copy (resolved), but its rename is only *eventually* atomic**
   — the former byte-copy-through-the-client simplification is gone: cross-partition copy/rename now
   reuse the source's Syrup segments via the locator relay, kept safe by Box-global GC (§6, §9(f)). A

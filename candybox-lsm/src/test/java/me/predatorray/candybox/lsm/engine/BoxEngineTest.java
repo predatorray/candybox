@@ -558,6 +558,29 @@ class BoxEngineTest {
     }
 
     @Test
+    void recoveryWhosePointerNeverMovedIsRedoneFromTheSamePriorManifest() {
+        BoxEngine ownerA = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1,
+                new ManualClock(1_000), 1L);
+        ownerA.putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
+        long priorManifest = ownerA.manifestLedgerId();
+        long priorWal = ownerA.manifestState().walLedgerId();
+
+        // B commits its recovery flush but loses the pointer race, so the pointer still names A's.
+        BoxEngine ownerB = BoxEngine.recover(box, CandyboxConfig.defaults(), store, 2,
+                new ManualClock(1_000), priorManifest, 2L);
+        long bTable = ownerB.manifestState().tables().get(0).ledgerId();
+        ownerB.close();
+
+        engine = BoxEngine.recover(box, CandyboxConfig.defaults(), store, 3, new ManualClock(1_000),
+                priorManifest, 3L);
+        ManifestState state = engine.manifestState();
+        assertThat(state.tables()).singleElement()
+                .satisfies(t -> assertThat(t.ledgerId()).isNotEqualTo(bTable));
+        assertThat(state.pendingDeletes()).containsKeys(priorManifest, priorWal);
+        assertThat(engine.getCandy(CandyKey.of("k"))).isEqualTo(bytes("v1"));
+    }
+
+    @Test
     void recoveryOfAnEmptyWalWritesNoTable() {
         BoxEngine ownerA = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1,
                 new ManualClock(1_000), 1L);

@@ -176,48 +176,55 @@ public final class BoxEngine implements AutoCloseable {
         Manifest manifest = Manifest.recover(ledgerStore,
                 roleConfig(config, ledgerStore, box, LedgerRole.MANIFEST), priorManifestLedgerId,
                 fencingToken);
-        ManifestState state = manifest.current();
-
-        Memtable memtable = new Memtable();
-        Hlc highWater = state.maxHlc();
-        long priorWalId = state.walLedgerId();
-        if (priorWalId >= 0) {
-            // recover-open fences the prior WAL so a resurrected old owner cannot keep appending.
-            ReadableLedger priorWal = ledgerStore.recoverOpen(priorWalId);
-            WriteAheadLog.ReplayResult replay;
-            try {
-                replay = WriteAheadLog.replay(priorWal);
-            } finally {
-                priorWal.close();
-            }
-            for (WalEntry e : replay.entries()) {
-                if (e instanceof WalEntry.PointMutation pm) {
-                    memtable.put(pm.mutation());
-                } else if (e instanceof WalEntry.RangeDelete rd) {
-                    memtable.delete(rd.tombstone());
+        WriteAheadLog newWal = null;
+        BoxEngine engine = null;
+        try {
+            ManifestState state = manifest.current();
+            Memtable memtable = new Memtable();
+            // Every replayed write's Syrups, overwritten ones included: the prior owner tracked
+            // those only in memory, so the recovery flush adds them to the live set for GC.
+            Set<Long> replayedSyrups = new LinkedHashSet<>();
+            Hlc highWater = state.maxHlc();
+            long priorWalId = state.walLedgerId();
+            if (priorWalId >= 0) {
+                // recover-open fences the prior WAL so a resurrected old owner cannot keep appending.
+                ReadableLedger priorWal = ledgerStore.recoverOpen(priorWalId);
+                WriteAheadLog.ReplayResult replay;
+                try {
+                    replay = WriteAheadLog.replay(priorWal);
+                } finally {
+                    priorWal.close();
+                }
+                for (WalEntry e : replay.entries()) {
+                    if (e instanceof WalEntry.PointMutation pm) {
+                        memtable.put(pm.mutation());
+                        for (SegmentRef seg : pm.mutation().locator().segments()) {
+                            replayedSyrups.add(seg.syrupId());
+                        }
+                    } else if (e instanceof WalEntry.RangeDelete rd) {
+                        memtable.delete(rd.tombstone());
+                    }
+                }
+                if (replay.maxHlc().isAfter(highWater)) {
+                    highWater = replay.maxHlc();
                 }
             }
-            if (replay.maxHlc().isAfter(highWater)) {
-                highWater = replay.maxHlc();
+            // The WAL alone is not enough: right after a flush it is empty and the newest HLCs live
+            // only in SSTables, which the manifest's high-water mark covers.
+            if (highWater.isAfter(Hlc.MIN)) {
+                try {
+                    hlc.observe(highWater);
+                } catch (IllegalStateException e) {
+                    throw new IllegalStateException("Cannot recover box " + box + ": recorded HLC "
+                            + highWater + " (manifest high-water " + state.maxHlc() + ") leads the"
+                            + " local clock by more than maxClockSkewMillis; fix the clock or raise"
+                            + " the limit", e);
+                }
             }
-        }
-        // The WAL alone is not enough: right after a flush it is empty and the newest HLCs live only
-        // in SSTables, which the manifest's high-water mark covers.
-        if (highWater.isAfter(Hlc.MIN)) {
-            try {
-                hlc.observe(highWater);
-            } catch (IllegalStateException e) {
-                throw new IllegalStateException("Cannot recover box " + box + ": recorded HLC "
-                        + highWater + " (manifest high-water " + state.maxHlc() + ") leads the local"
-                        + " clock by more than maxClockSkewMillis; fix the clock or raise the limit",
-                        e);
-            }
-        }
 
-        WriteAheadLog newWal = WriteAheadLog.create(ledgerStore,
-                roleConfig(config, ledgerStore, box, LedgerRole.WAL));
-        BoxEngine engine = new BoxEngine(box, config, ledgerStore, hlc, clock, manifest, newWal);
-        try {
+            newWal = WriteAheadLog.create(ledgerStore,
+                    roleConfig(config, ledgerStore, box, LedgerRole.WAL));
+            engine = new BoxEngine(box, config, ledgerStore, hlc, clock, manifest, newWal);
             engine.openReadersFor(state);
             // The prior manifest and WAL are superseded by this one: the rotation below leaves the
             // prior WAL unreachable, so a non-empty replay is flushed to L0 in the same edit, or the
@@ -234,10 +241,15 @@ public final class BoxEngine implements AutoCloseable {
                         .maxHlc(highWater).addedPendingDeletes(superseded).build());
             } else {
                 L0Table table = engine.writeL0(memtable);
-                manifest.apply(ManifestEdit.flush(table.meta(), table.syrups(), newWal.ledgerId(),
-                        highWater).withAddedPendingDeletes(superseded));
+                Set<Long> syrups = new LinkedHashSet<>(table.syrups());
+                syrups.addAll(replayedSyrups);
+                manifest.apply(ManifestEdit.flush(table.meta(), syrups, newWal.ledgerId(), highWater)
+                        .withAddedPendingDeletes(superseded));
                 engine.readers.put(table.meta().ledgerId(),
                         new SSTableReader(ledgerStore, table.meta().ledgerId()));
+                engine.flushCount.incrementAndGet();
+                LOG.info("Recovery flushed {} replayed entries of box {} to SSTable ledger {}",
+                        table.meta().entryCount(), box, table.meta().ledgerId());
             }
             // Catch Syrups already orphaned before this handover (e.g. by a prior owner that crashed
             // pre-GC) so they are not leaked.
@@ -247,17 +259,24 @@ public final class BoxEngine implements AutoCloseable {
             } finally {
                 engine.lock.writeLock().unlock();
             }
+            return engine;
         } catch (RuntimeException e) {
             // The pointer never moves here, so nothing references this owner's ledgers; they leak
             // (#105), but their handles must not.
             try {
-                engine.close();
+                if (engine != null) {
+                    engine.close();
+                } else {
+                    if (newWal != null) {
+                        newWal.close();
+                    }
+                    manifest.close();
+                }
             } catch (RuntimeException closeFailure) {
                 e.addSuppressed(closeFailure);
             }
             throw e;
         }
-        return engine;
     }
 
     private void openReadersFor(ManifestState state) {

@@ -179,6 +179,8 @@ class LedgerReclamationTest {
         clock.advance(11_000);
         store.failCreatesOfRole = "SSTABLE";
         assertThatThrownBy(() -> nodeB.openBox(BOX)).isInstanceOf(StorageException.class);
+        assertThat(ManifestPointer.decode(coordination.get(PartitionOwnership.manifestKey(BOX, 0))
+                .orElseThrow().value()).ledgerId()).isEqualTo(priorManifest);
         assertThat(exists(priorManifest)).isTrue();
         assertThat(exists(priorWal)).isTrue();
 
@@ -188,6 +190,46 @@ class LedgerReclamationTest {
         nodeB.collectGarbageOnce();
         assertThat(exists(priorWal)).isFalse();
         assertThat(ownerB.getCandy(CandyKey.of("k"))).isEqualTo(bytes("v1"));
+    }
+
+    @Test
+    void aFailedFlushKeepsItsWalUntilARetrySucceeds() {
+        nodeA.createBox(BOX, 1);
+        BoxEngine engine = nodeA.enginePartition(BOX, 0);
+        engine.putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
+        long wal = engine.manifestState().walLedgerId();
+
+        store.failCreatesOfRole = "SSTABLE";
+        assertThatThrownBy(engine::flush).isInstanceOf(StorageException.class);
+        clock.advance(GRACE + 1);
+        nodeA.collectGarbageOnce();
+        assertThat(exists(wal)).isTrue();
+        assertThat(engine.manifestState().walLedgerId()).isEqualTo(wal);
+        assertThat(engine.manifestState().pendingDeletes()).doesNotContainKey(wal);
+
+        engine.flush();
+        clock.advance(GRACE + 1);
+        nodeA.collectGarbageOnce();
+        assertThat(exists(wal)).isFalse();
+        assertThat(engine.getCandy(CandyKey.of("k"))).isEqualTo(bytes("v1"));
+    }
+
+    @Test
+    void aSyrupSupersededInAReplayedWalIsReclaimedAfterHandover() {
+        nodeA.createBox(BOX, 1);
+        BoxEngine ownerA = nodeA.enginePartition(BOX, 0);
+        ownerA.putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
+        long v1Syrup = ownerA.resolveLocator(CandyKey.of("k")).parts().get(0).segments().get(0)
+                .syrupId();
+        ownerA.putCandy(CandyKey.of("k"), bytes("v2"), null, Map.of(), null); // A crashes unflushed
+
+        clock.advance(11_000);
+        nodeB.openBox(BOX);
+        BoxEngine ownerB = nodeB.enginePartition(BOX, 0);
+        clock.advance(GRACE + 1);
+        nodeB.collectGarbageOnce();
+        assertThat(exists(v1Syrup)).isFalse();
+        assertThat(ownerB.getCandy(CandyKey.of("k"))).isEqualTo(bytes("v2"));
     }
 
     @Test
