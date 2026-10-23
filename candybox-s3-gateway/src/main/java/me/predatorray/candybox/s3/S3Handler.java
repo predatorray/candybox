@@ -915,22 +915,22 @@ final class S3Handler extends ChannelInboundHandlerAdapter {
                 ? (continuationToken != null ? decodeToken(continuationToken) : startAfterParam)
                 : marker;
 
-        Listing listing = store.listCandies(bucket, prefix, startAfter, maxKeys);
-        List<S3Xml.Content> contents = new ArrayList<>();
-        Set<String> commonPrefixes = new LinkedHashSet<>();
-        rollUp(listing, prefix, delimiter, contents, commonPrefixes);
+        // The cursor is the page's last row; when that is a common prefix, the next page resumes past
+        // every key under it.
+        Listing listing = store.listCandies(bucket, prefix, startAfter, delimiter, maxKeys);
+        List<S3Xml.Content> contents = contents(listing);
 
         String xml;
         if (v2) {
             String nextToken = listing.isTruncated() ? encodeToken(listing.nextStartAfter()) : null;
             xml = S3Xml.listBucketV2(bucket, prefix, delimiter, maxKeys, contents,
-                    new ArrayList<>(commonPrefixes), continuationToken, nextToken, startAfterParam);
+                    listing.commonPrefixes(), continuationToken, nextToken, startAfterParam);
         } else {
             // S3 only returns NextMarker when a delimiter is in play; otherwise the client resumes from
             // the last returned key. Our resume cursor is exactly that last key, so the two agree.
             String nextMarker = (listing.isTruncated() && delimiter != null) ? listing.nextStartAfter() : null;
             xml = S3Xml.listBucketV1(bucket, prefix, delimiter, maxKeys, contents,
-                    new ArrayList<>(commonPrefixes), marker, nextMarker, listing.isTruncated());
+                    listing.commonPrefixes(), marker, nextMarker, listing.isTruncated());
         }
         sendXml(ctx, request, HttpResponseStatus.OK, xml, requestId);
     }
@@ -949,37 +949,23 @@ final class S3Handler extends ChannelInboundHandlerAdapter {
         int maxKeys = clampMaxKeys(first(q, "max-keys", null));
         String keyMarker = first(q, "key-marker", null);
 
-        Listing listing = store.listCandies(bucket, prefix, keyMarker, maxKeys);
-        List<S3Xml.Content> versions = new ArrayList<>();
-        Set<String> commonPrefixes = new LinkedHashSet<>();
-        rollUp(listing, prefix, delimiter, versions, commonPrefixes);
-
+        Listing listing = store.listCandies(bucket, prefix, keyMarker, delimiter, maxKeys);
         String nextKeyMarker = listing.isTruncated() ? listing.nextStartAfter() : null;
-        String xml = S3Xml.listVersions(bucket, prefix, delimiter, maxKeys, versions,
-                new ArrayList<>(commonPrefixes), keyMarker, nextKeyMarker);
+        String xml = S3Xml.listVersions(bucket, prefix, delimiter, maxKeys, contents(listing),
+                listing.commonPrefixes(), keyMarker, nextKeyMarker);
         sendXml(ctx, request, HttpResponseStatus.OK, xml, requestId);
     }
 
     /**
-     * Folds a {@link Listing} page into object rows and synthesized common prefixes: a key whose first
-     * {@code delimiter} occurrence after {@code prefix} rolls it up into a {@code CommonPrefixes} entry,
-     * otherwise it becomes a content/version row. List entries carry no ETag (the listing API returns no
-     * CRC32C; a HEAD on the key yields the deterministic ETag).
+     * The page's object rows. List entries carry no ETag (the listing API returns no CRC32C; a HEAD on
+     * the key yields the deterministic ETag).
      */
-    private static void rollUp(Listing listing, String prefix, String delimiter,
-                               List<S3Xml.Content> rows, Set<String> commonPrefixes) {
+    private static List<S3Xml.Content> contents(Listing listing) {
+        List<S3Xml.Content> rows = new ArrayList<>(listing.entries().size());
         for (Listing.Entry e : listing.entries()) {
-            String key = e.key();
-            if (delimiter != null) {
-                int from = prefix == null ? 0 : prefix.length();
-                int idx = key.indexOf(delimiter, from);
-                if (idx >= 0) {
-                    commonPrefixes.add(key.substring(0, idx + delimiter.length()));
-                    continue;
-                }
-            }
-            rows.add(new S3Xml.Content(key, e.contentLength(), e.createdAtMillis(), null));
+            rows.add(new S3Xml.Content(e.key(), e.contentLength(), e.createdAtMillis(), null));
         }
+        return rows;
     }
 
     private void deleteObjects(ChannelHandlerContext ctx, FullHttpRequest request, String bucket,

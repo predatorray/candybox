@@ -187,6 +187,7 @@ public final class MessageCodec {
             writeNullable(w, m.startKey());
             writeNullable(w, m.endKey());
             w.writeBoolean(m.reverse());
+            writeNullable(w, m.delimiter());
         } else if (message instanceof Message.OkResponse) {
             // no body
         } else if (message instanceof Message.ErrorResponse m) {
@@ -211,6 +212,7 @@ public final class MessageCodec {
                 w.writeVarLong(Math.max(0, e.createdAtMillis()));
             }
             writeNullable(w, m.nextStartAfter());
+            writeStrings(w, m.commonPrefixes());
         } else if (message instanceof Message.HeadCandyResponse m) {
             w.writeVarLong(m.contentLength());
             writeNullable(w, m.contentType());
@@ -316,7 +318,7 @@ public final class MessageCodec {
                     readNullable(r), readNullable(r), readNullable(r));
             case LIST_CANDIES -> new Message.ListCandiesRequest(r.readString(), r.readVarInt(),
                     readNullable(r), readNullable(r), r.readInt(), readNullable(r), readNullable(r),
-                    r.readBoolean());
+                    r.readBoolean(), readNullable(r));
             case CREATE_MULTIPART_UPLOAD -> new Message.CreateMultipartUploadRequest(r.readString(),
                     r.readString(), readNullable(r), readMetadata(r));
             case UPLOAD_PART -> new Message.UploadPartRequest(r.readString(), r.readString(),
@@ -447,7 +449,8 @@ public final class MessageCodec {
         for (int i = 0; i < count; i++) {
             entries.add(new Message.ListedCandy(r.readString(), r.readVarLong(), r.readVarLong()));
         }
-        return new Message.ListCandiesResponse(entries, readNullable(r));
+        String next = readNullable(r);
+        return new Message.ListCandiesResponse(entries, next, readStrings(r));
     }
 
     private static void writeHlc(BinaryWriter w, Hlc hlc) {

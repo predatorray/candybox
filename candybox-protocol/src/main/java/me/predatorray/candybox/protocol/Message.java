@@ -303,12 +303,21 @@ public sealed interface Message {
         }
     }
 
-    /** Lists live Candies in one partition of a Box; the client fans out and merge-sorts pages. */
+    /**
+     * Lists live Candies in one partition of a Box; the client fans out and merge-sorts pages. With a
+     * {@code delimiter}, keys roll up into common prefixes that count toward {@code maxKeys}.
+     */
     record ListCandiesRequest(String box, int partition, String prefix, String startAfter,
-                              int maxKeys, String startKey, String endKey, boolean reverse)
+                              int maxKeys, String startKey, String endKey, boolean reverse,
+                              String delimiter)
             implements Message {
         public Opcode opcode() {
             return Opcode.LIST_CANDIES;
+        }
+
+        public ListCandiesRequest(String box, int partition, String prefix, String startAfter,
+                                  int maxKeys, String startKey, String endKey, boolean reverse) {
+            this(box, partition, prefix, startAfter, maxKeys, startKey, endKey, reverse, null);
         }
 
         /** A plain forward prefix/startAfter listing of one partition. */
@@ -455,9 +464,15 @@ public sealed interface Message {
         }
     }
 
-    record ListCandiesResponse(List<ListedCandy> entries, String nextStartAfter) implements Message {
+    /** {@code nextStartAfter} is the page's last row, a key or a common prefix. */
+    record ListCandiesResponse(List<ListedCandy> entries, String nextStartAfter,
+                               List<String> commonPrefixes) implements Message {
         public Opcode opcode() {
             return Opcode.RESPONSE_LIST;
+        }
+
+        public ListCandiesResponse(List<ListedCandy> entries, String nextStartAfter) {
+            this(entries, nextStartAfter, List.of());
         }
     }
 

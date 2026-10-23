@@ -1110,6 +1110,10 @@ public final class BoxEngine implements AutoCloseable {
      * narrowed to a prefix, walked forward or in reverse, paged by the query's cursor and limit.
      * Tombstones are suppressed; the result's {@code nextStartAfter} is the continuation cursor for the
      * next page in the same direction (or {@code null} when exhausted).
+     *
+     * <p>With a delimiter, a key containing it after the prefix rolls up into a common prefix that
+     * counts as one row, and the scan seeks past the rest of that prefix instead of walking it. The
+     * cursor may then be a common prefix (the last row of a previous page); the scan resumes past it.
      */
     public ListResult scanCandies(ScanQuery query) {
         int limit = query.effectiveMaxKeys();
@@ -1128,10 +1132,23 @@ public final class BoxEngine implements AutoCloseable {
                 upper = minKey(upper, succ == null ? null : CandyKey.ofUtf8(succ));
             }
             CandyKey cursor = query.cursorExclusive();
+            String delimiter = query.delimiter();
+            String prefix = query.prefix() == null ? "" : query.prefix();
+            if (delimiter != null && forward && cursor != null
+                    && cursor.value().equals(commonPrefix(cursor.value(), prefix, delimiter))) {
+                // Reverse needs no skip: every key under the cursor prefix sorts at or above it.
+                CandyKey past = prefixSuccessor(cursor.value());
+                if (past == null) {
+                    return new ListResult(List.of(), null);
+                }
+                lower = maxKey(lower, past);
+            }
 
             Iterator<Mutation> merged = mergedView(lower, upper, cursor, query.direction());
             List<RangeTombstone> rangeTombstones = gatherRangeTombstonesLocked();
             List<ListResult.ListEntry> entries = new ArrayList<>();
+            List<String> commonPrefixes = new ArrayList<>();
+            String last = null;
             String next = null;
             while (merged.hasNext()) {
                 Mutation m = merged.next();
@@ -1160,15 +1177,34 @@ public final class BoxEngine implements AutoCloseable {
                         break; // descending: below the window's inclusive lower bound
                     }
                 }
-                if (entries.size() == limit) {
-                    next = entries.get(entries.size() - 1).key().value();
+                if (entries.size() + commonPrefixes.size() == limit) {
+                    next = last;
                     break;
                 }
-                CandyLocator loc = m.locator();
-                entries.add(new ListResult.ListEntry(key, loc.contentLength(), loc.createdAtMillis()));
+                String rolled = delimiter == null ? null
+                        : commonPrefix(key.value(), prefix, delimiter);
+                if (rolled == null) {
+                    CandyLocator loc = m.locator();
+                    entries.add(new ListResult.ListEntry(key, loc.contentLength(),
+                            loc.createdAtMillis()));
+                    last = key.value();
+                    continue;
+                }
+                commonPrefixes.add(rolled);
+                last = rolled;
+                // Seek past the rest of this common prefix.
+                if (forward) {
+                    lower = prefixSuccessor(rolled);
+                    if (lower == null) {
+                        break;
+                    }
+                } else {
+                    upper = CandyKey.of(rolled);
+                }
+                merged = mergedView(lower, upper, cursor, query.direction());
             }
             listCount.incrementAndGet();
-            return new ListResult(entries, next);
+            return new ListResult(entries, next, commonPrefixes);
         } finally {
             lock.readLock().unlock();
         }
@@ -1439,6 +1475,25 @@ public final class BoxEngine implements AutoCloseable {
             }
         }
         return new me.predatorray.candybox.lsm.iterator.MergingIterator(sources, true, direction);
+    }
+
+    /**
+     * The common prefix {@code key} rolls up into: {@code key} up to and including the first
+     * {@code delimiter} after {@code prefix}, or {@code null} if it has none (or lies outside the prefix).
+     */
+    private static String commonPrefix(String key, String prefix, String delimiter) {
+        if (!key.startsWith(prefix)) {
+            return null;
+        }
+        int idx = key.indexOf(delimiter, prefix.length());
+        return idx < 0 ? null : key.substring(0, idx + delimiter.length());
+    }
+
+    /** The smallest key above every key starting with {@code prefix}, or {@code null} if none. */
+    private static CandyKey prefixSuccessor(String prefix) {
+        byte[] succ = me.predatorray.candybox.common.util.Bytes
+                .prefixSuccessor(prefix.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        return succ == null ? null : CandyKey.ofUtf8(succ);
     }
 
     /** Whether {@code [minKey, maxKey]} overlaps the half-open window {@code [lower, upper)}. */

@@ -128,6 +128,14 @@ class MessageCodecTest {
         assertThat(out.endKey()).isEqualTo("p/z");
         assertThat(out.reverse()).isTrue();
         assertThat(out.startAfter()).isEqualTo("p/cursor");
+        assertThat(out.delimiter()).isNull();
+    }
+
+    @Test
+    void listCandiesRequestRoundTripsDelimiter() {
+        Message.ListCandiesRequest req = new Message.ListCandiesRequest("box", 0, "p/", null, 10,
+                null, null, false, "/");
+        assertThat(((Message.ListCandiesRequest) roundTrip(req)).delimiter()).isEqualTo("/");
     }
 
     @Test
@@ -157,6 +165,16 @@ class MessageCodecTest {
         assertThat(out.entries()).hasSize(2);
         assertThat(out.entries().get(1).key()).isEqualTo("b");
         assertThat(out.nextStartAfter()).isEqualTo("b");
+        assertThat(out.commonPrefixes()).isEmpty();
+    }
+
+    @Test
+    void listResponseRoundTripsCommonPrefixes() {
+        Message.ListCandiesResponse resp = new Message.ListCandiesResponse(
+                List.of(new Message.ListedCandy("c", 1, 1)), "d/", List.of("a/", "d/"));
+        Message.ListCandiesResponse out = (Message.ListCandiesResponse) roundTrip(resp);
+        assertThat(out.commonPrefixes()).containsExactly("a/", "d/");
+        assertThat(out.nextStartAfter()).isEqualTo("d/");
     }
 
     @Test

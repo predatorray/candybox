@@ -141,6 +141,34 @@ class S3HandlerTest {
     }
 
     @Test
+    void delimiterPagesEmitEachCommonPrefixOnceAndCountItTowardMaxKeys() {
+        put("/photos");
+        for (int i = 0; i < 50; i++) {
+            put("/photos/a/" + i, "v".getBytes(StandardCharsets.UTF_8), null);
+        }
+        put("/photos/b/1", "v".getBytes(StandardCharsets.UTF_8), null);
+        put("/photos/c", "v".getBytes(StandardCharsets.UTF_8), null);
+
+        Response v2 = get("/photos?list-type=2&delimiter=/&max-keys=2");
+        assertThat(v2.body).contains("<Prefix>a/</Prefix>").contains("<Prefix>b/</Prefix>")
+                .doesNotContain("<Key>").contains("<KeyCount>2</KeyCount>")
+                .contains("<IsTruncated>true</IsTruncated>");
+        String token = between(v2.body, "<NextContinuationToken>", "</NextContinuationToken>");
+        Response v2Next = get("/photos?list-type=2&delimiter=/&max-keys=2&continuation-token=" + token);
+        assertThat(v2Next.body).contains("<Key>c</Key>").doesNotContain("<CommonPrefixes>")
+                .contains("<KeyCount>1</KeyCount>").contains("<IsTruncated>false</IsTruncated>");
+
+        Response v1 = get("/photos?delimiter=/&max-keys=1");
+        assertThat(v1.body).contains("<Prefix>a/</Prefix>").contains("<NextMarker>a/</NextMarker>");
+        Response v1Next = get("/photos?delimiter=/&max-keys=1&marker=a/");
+        assertThat(v1Next.body).contains("<Prefix>b/</Prefix>").doesNotContain("<Prefix>a/</Prefix>");
+
+        Response versions = get("/photos?versions&delimiter=/&max-keys=1&key-marker=a/");
+        assertThat(versions.body).contains("<Prefix>b/</Prefix>").doesNotContain("<Prefix>a/</Prefix>")
+                .contains("<NextKeyMarker>b/</NextKeyMarker>");
+    }
+
+    @Test
     void listObjectsPaginatesWithContinuationToken() {
         put("/photos");
         for (String k : new String[]{"k1", "k2", "k3"}) {

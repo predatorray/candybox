@@ -164,6 +164,31 @@ class PartitionedRoutingClientTest {
     }
 
     @Test
+    void delimiterListingDeduplicatesPrefixesAcrossPartitionsAndCountsThemTowardMaxKeys() {
+        StubNode node = new StubNode();
+        node.listPages = Map.of(
+                0, new Message.ListCandiesResponse(List.of(row("c")), null, List.of("a/", "d/")),
+                1, new Message.ListCandiesResponse(List.of(row("b")), "d/", List.of("a/", "d/")));
+        try (CandyboxClient client = new CandyboxClient(new LoopbackTransport(node), "x", 0)) {
+            CandyboxClient.Listing page = client.listCandies("box", null, null, null, null, false,
+                    "/", 3);
+            assertThat(page.commonPrefixes()).containsExactly("a/");
+            assertThat(page.entries()).extracting(CandyboxClient.Listing.Entry::key)
+                    .containsExactly("b", "c");
+            assertThat(page.nextStartAfter()).isEqualTo("c");
+            assertThat(node.recorded(Message.ListCandiesRequest.class))
+                    .extracting(Message.ListCandiesRequest::delimiter).containsOnly("/");
+
+            CandyboxClient.Listing all = client.listCandies("box", null, null, null, null, false,
+                    "/", 10);
+            assertThat(all.commonPrefixes()).containsExactly("a/", "d/");
+            assertThat(all.entries()).hasSize(2);
+            // Partition 1 was truncated, so the page resumes after its last row, a prefix.
+            assertThat(all.nextStartAfter()).isEqualTo("d/");
+        }
+    }
+
+    @Test
     void deleteRangeFansOutToEveryPartition() {
         StubNode node = new StubNode();
         try (CandyboxClient client = new CandyboxClient(new LoopbackTransport(node), "x", 0)) {
