@@ -147,6 +147,18 @@ public abstract class LedgerStoreContract {
     }
 
     @Test
+    void deletingAnAlreadyDeletedLedgerIsANoOp() {
+        WritableLedger w = store.createLedger(config());
+        w.close();
+        long id = w.ledgerId();
+        store.deleteLedger(id);
+
+        // GC relies on this to retry a delete whose outcome it lost.
+        store.deleteLedger(id);
+        assertThat(store.listLedgers()).doesNotContain(id);
+    }
+
+    @Test
     void customMetadataIsPreserved() {
         LedgerConfig cfg = new LedgerConfig(config().quorum(),
                 java.util.Map.of("role", bytes("SSTABLE"), "box", bytes("my-box")));

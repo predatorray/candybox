@@ -15,7 +15,9 @@
  */
 package me.predatorray.candybox.lsm.manifest;
 
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import me.predatorray.candybox.common.Hlc;
 import me.predatorray.candybox.common.Part;
@@ -25,6 +27,10 @@ import me.predatorray.candybox.lsm.sstable.SSTableMeta;
  * One append-only change to the LSM state: a flush adds an SSTable (and the Syrups it referenced) and
  * may rotate the WAL; a compaction adds the output table and removes the inputs; GC removes obsoleted
  * tables/Syrups. Edits are serialized and appended to the manifest ledger by the Box's single owner.
+ *
+ * <p>A ledger that leaves the committed state (a compacted-away table, a rotated WAL, a prior manifest,
+ * a claimed Syrup) is recorded in {@link #addedPendingDeletes} until GC has physically deleted it
+ * ({@link #removedPendingDeletes}), so a failed delete is retried and a new owner inherits the set.
  *
  * <p>Multipart uploads (v2) also flow through this edit: {@link #addedUploads} introduces a freshly
  * created upload, {@link #upsertParts} adds or replaces a part within an upload (last-write-wins per
@@ -45,6 +51,9 @@ import me.predatorray.candybox.lsm.sstable.SSTableMeta;
  * @param removedUploads        upload ids dropped by this edit (CompleteMultipartUpload / Abort)
  * @param addedRenameIntents    in-flight cross-partition rename intents recorded by this edit (v3)
  * @param removedRenameIntents  rename intent tokens finalized/abandoned by this edit (v3)
+ * @param addedPendingDeletes   ledgers that left the committed state and await physical deletion by
+ *                              GC, mapped to the time they did (v6)
+ * @param removedPendingDeletes pending-delete ledger ids GC has physically deleted (v6)
  * @param maxHlc                highest HLC durably covered by this edit, folded monotonically into the
  *                              state so a recovering owner never stamps below committed data (v4);
  *                              {@link Hlc#MIN} if none
@@ -61,6 +70,8 @@ public record ManifestEdit(
         Set<String> removedUploads,
         List<RenameIntent> addedRenameIntents,
         Set<String> removedRenameIntents,
+        Map<Long, Long> addedPendingDeletes,
+        Set<Long> removedPendingDeletes,
         Hlc maxHlc,
         long ownerFencingToken) {
 
@@ -74,6 +85,8 @@ public record ManifestEdit(
         removedUploads = removedUploads == null ? Set.of() : Set.copyOf(removedUploads);
         addedRenameIntents = addedRenameIntents == null ? List.of() : List.copyOf(addedRenameIntents);
         removedRenameIntents = removedRenameIntents == null ? Set.of() : Set.copyOf(removedRenameIntents);
+        addedPendingDeletes = addedPendingDeletes == null ? Map.of() : Map.copyOf(addedPendingDeletes);
+        removedPendingDeletes = removedPendingDeletes == null ? Set.of() : Set.copyOf(removedPendingDeletes);
         maxHlc = maxHlc == null ? Hlc.MIN : maxHlc;
         if (ownerFencingToken < 0) {
             throw new IllegalArgumentException("ownerFencingToken must be non-negative");
@@ -88,14 +101,23 @@ public record ManifestEdit(
     public static ManifestEdit flush(SSTableMeta table, Set<Long> syrups, Long newWalLedgerId,
                                      Hlc maxHlc) {
         return new ManifestEdit(List.of(table), Set.of(), syrups, Set.of(), newWalLedgerId,
-                List.of(), List.of(), Set.of(), List.of(), Set.of(), maxHlc, 0L);
+                List.of(), List.of(), Set.of(), List.of(), Set.of(), Map.of(), Set.of(), maxHlc, 0L);
     }
 
     /** Returns a copy with the given owner fencing token (used by {@link Manifest#apply}). */
     public ManifestEdit withOwnerFencingToken(long token) {
         return new ManifestEdit(addedTables, removedTableLedgerIds, addedSyrups, removedSyrups,
                 newWalLedgerId, addedUploads, upsertParts, removedUploads, addedRenameIntents,
-                removedRenameIntents, maxHlc, token);
+                removedRenameIntents, addedPendingDeletes, removedPendingDeletes, maxHlc, token);
+    }
+
+    /** Returns a copy that additionally schedules {@code pendingDeletes} (ledger id to since-millis). */
+    public ManifestEdit withAddedPendingDeletes(Map<Long, Long> pendingDeletes) {
+        Map<Long, Long> merged = new LinkedHashMap<>(addedPendingDeletes);
+        merged.putAll(pendingDeletes);
+        return new ManifestEdit(addedTables, removedTableLedgerIds, addedSyrups, removedSyrups,
+                newWalLedgerId, addedUploads, upsertParts, removedUploads, addedRenameIntents,
+                removedRenameIntents, merged, removedPendingDeletes, maxHlc, ownerFencingToken);
     }
 
     /**
@@ -128,6 +150,8 @@ public record ManifestEdit(
         private Set<String> removedUploads = Set.of();
         private List<RenameIntent> addedRenameIntents = List.of();
         private Set<String> removedRenameIntents = Set.of();
+        private Map<Long, Long> addedPendingDeletes = Map.of();
+        private Set<Long> removedPendingDeletes = Set.of();
         private Hlc maxHlc = Hlc.MIN;
         private long ownerFencingToken = 0L;
 
@@ -189,6 +213,16 @@ public record ManifestEdit(
             return this;
         }
 
+        public Builder addedPendingDeletes(Map<Long, Long> v) {
+            this.addedPendingDeletes = v;
+            return this;
+        }
+
+        public Builder removedPendingDeletes(Set<Long> v) {
+            this.removedPendingDeletes = v;
+            return this;
+        }
+
         public Builder maxHlc(Hlc v) {
             this.maxHlc = v;
             return this;
@@ -218,7 +252,8 @@ public record ManifestEdit(
         public ManifestEdit build() {
             return new ManifestEdit(addedTables, removedTableLedgerIds, addedSyrups, removedSyrups,
                     newWalLedgerId, addedUploads, upsertParts, removedUploads, addedRenameIntents,
-                    removedRenameIntents, maxHlc, ownerFencingToken);
+                    removedRenameIntents, addedPendingDeletes, removedPendingDeletes, maxHlc,
+                    ownerFencingToken);
         }
     }
 
