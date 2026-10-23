@@ -1346,6 +1346,15 @@ public final class BoxEngine implements AutoCloseable {
         lock.readLock().lock();
         try {
             ManifestState state = manifest.current();
+            java.util.List<Long> ids = new java.util.ArrayList<>();
+            for (Map.Entry<Long, Long> e : state.pendingDeletes().entrySet()) {
+                if (e.getValue() <= asOfMillis) {
+                    ids.add(e.getKey());
+                }
+            }
+            if (ids.isEmpty()) {
+                return ids;
+            }
             Set<Long> inUse = referencedSyrupsLocked();
             inUse.addAll(state.liveSyrups());
             state.tables().forEach(t -> inUse.add(t.ledgerId()));
@@ -1353,10 +1362,12 @@ public final class BoxEngine implements AutoCloseable {
             inUse.add(wal.ledgerId());
             inUse.add(unflushedPriorWal);
             inUse.add(manifest.ledgerId());
-            java.util.List<Long> ids = new java.util.ArrayList<>();
-            for (Map.Entry<Long, Long> e : state.pendingDeletes().entrySet()) {
-                if (e.getValue() <= asOfMillis && !inUse.contains(e.getKey())) {
-                    ids.add(e.getKey());
+            for (Iterator<Long> it = ids.iterator(); it.hasNext(); ) {
+                long id = it.next();
+                if (inUse.contains(id)) {
+                    // A bookkeeping bug: something was scheduled for deletion while still in use.
+                    LOG.warn("Not deleting pending ledger {} of box {}: it is still in use", id, box);
+                    it.remove();
                 }
             }
             return ids;

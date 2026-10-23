@@ -116,8 +116,10 @@ still interoperate: a 0.2 gateway rolls up whatever a 0.1 node returns un-rolled
 are upgraded, delimiter listings behave as in 0.1 (a prefix can repeat across pages).
 
 Manifest records are written in format v6, which older nodes cannot read. Once an upgraded node has
-owned a partition, an older node cannot take it over, so finish the node rollout promptly (or
-disable the balancer during it).
+owned a partition, an older node cannot take it over, and the nodes cannot be rolled back to an older
+build either; finish the node rollout promptly (or disable the balancer during it). An older node
+given such a partition fences the manifest, fails to decode it and releases the lease, so the
+partition stays unowned (`RESPONSE_UNAVAILABLE`) until an upgraded node takes it. No data is lost.
 
 ## Garbage collection
 

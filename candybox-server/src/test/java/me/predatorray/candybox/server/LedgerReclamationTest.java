@@ -166,6 +166,13 @@ class LedgerReclamationTest {
         assertThat(exists(priorManifest)).isFalse();
         assertThat(exists(priorWal)).isTrue(); // still the only durable copy of "k"
 
+        store.failCreates = 1; // B's first flush fails before its manifest edit
+        assertThatThrownBy(ownerB::flush).isInstanceOf(StorageException.class);
+        clock.advance(GRACE + 1);
+        nodeB.collectGarbageOnce();
+        assertThat(exists(priorWal)).isTrue();
+        assertThat(ownerB.manifestState().pendingDeletes()).doesNotContainKey(priorWal);
+
         ownerB.flush();
         clock.advance(GRACE + 1);
         nodeB.collectGarbageOnce();
@@ -238,6 +245,24 @@ class LedgerReclamationTest {
     }
 
     @Test
+    void aPendingLedgerThatIsStillInUseIsNeverDeleted() {
+        nodeA.createBox(BOX, 1);
+        BoxEngine engine = nodeA.enginePartition(BOX, 0);
+        engine.putCandy(CandyKey.of("k"), bytes("v"), null, Map.of(), null);
+        engine.flush();
+        SSTableMeta table = engine.manifestState().tables().get(0);
+        // A (hypothetical) trivial-move compaction: the table is both removed and re-added.
+        engine.applyCompaction(me.predatorray.candybox.lsm.manifest.ManifestEdit.builder()
+                .removedTableLedgerIds(Set.of(table.ledgerId())).addedTables(List.of(table)).build());
+        assertThat(engine.manifestState().pendingDeletes()).containsKey(table.ledgerId());
+        clock.advance(GRACE + 1);
+
+        nodeA.collectGarbageOnce();
+        assertThat(exists(table.ledgerId())).isTrue();
+        assertThat(engine.manifestState().pendingDeletes()).containsKey(table.ledgerId());
+    }
+
+    @Test
     void plannedHandoverReclaimsThePriorWalAndInheritsPendingDeletes() {
         nodeA.createBox(BOX, 1);
         BoxEngine ownerA = nodeA.enginePartition(BOX, 0);
@@ -287,10 +312,11 @@ class LedgerReclamationTest {
         assertThat(exists(partSyrup)).isFalse();
     }
 
-    /** Delegates to a real store, optionally failing every delete. */
+    /** Delegates to a real store, optionally failing every delete or the next few creates. */
     private static final class FlakyLedgerStore implements LedgerStore {
         private final LedgerStore delegate;
         volatile boolean failDeletes;
+        volatile int failCreates;
 
         FlakyLedgerStore(LedgerStore delegate) {
             this.delegate = delegate;
@@ -298,6 +324,10 @@ class LedgerReclamationTest {
 
         @Override
         public WritableLedger createLedger(LedgerConfig config) {
+            if (failCreates > 0) {
+                failCreates--;
+                throw new StorageException("injected create failure");
+            }
             return delegate.createLedger(config);
         }
 

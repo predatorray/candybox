@@ -41,9 +41,19 @@ import org.slf4j.LoggerFactory;
  *   <li>the prior owner's <b>manifest</b> ledger, superseded at handover.</li>
  * </ul>
  *
- * <p>Safety: this runs only for a Box this node still owns (the caller checks ownership), so the
- * physical delete is effectively gated on the owner's fencing token, and the reclaimed ledgers are
- * already out of the committed manifest. Deletes are idempotent: a missing ledger is treated as gone.
+ * <p>Safety: the physical delete is not itself fenced (only the claim and forget edits are), so even a
+ * deposed owner that has not noticed its lease loss may delete. That is safe because:
+ * <ol>
+ *   <li>the manifest advances its in-memory state only after an append is acked, and a successor's
+ *       recover-open includes every acked entry, so a deposed owner's pending set is a subset of every
+ *       successor's;</li>
+ *   <li>an id leaves the set only after its delete succeeded (deletes are idempotent);</li>
+ *   <li>a ledger enters the set only once nothing uses it, and nothing uses it again: superseded
+ *       WALs and manifests and compaction inputs are never reopened, and a claimed Syrup passed the
+ *       Box-global reference gate. A change that could re-reference a pending ledger (e.g. a
+ *       trivial-move compaction re-adding a table id) breaks this.</li>
+ * </ol>
+ * So any owner deletes only what every later owner also treats as dead.
  *
  * <p>TODO(phase-3+): an enumeration backstop for ledgers no manifest ever recorded (e.g. written by an
  * operation that then failed, or by an owner that crashed before committing them).

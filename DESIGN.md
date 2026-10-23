@@ -402,7 +402,11 @@ failed delete is retried and a new owner inherits whatever the prior owner had n
 
 The detailed rules:
 
-- (a) the live-set-drop edit + the physical delete are fenced;
+- (a) the claim and forget edits are fenced, the physical delete is not: a deposed owner may still
+  delete, but only ids in its committed pending set, which is a subset of every successor's (state
+  advances only on an acked append, and recover-open includes every acked entry). An id leaves the
+  set only after its delete succeeded, and enters it only once nothing uses the ledger, which must
+  stay true for good (a trivial-move compaction re-adding a table id would break it);
 - (b) a tombstone may be dropped only under the bottommost + time-bound rule (§8);
 - (c) orphaned-Syrup GC is driven by per-SSTable referenced-Syrup tracking plus an in-memory
   **pending-orphan list**, recomputed from the live set at flush and on handover. Ledgers that no
