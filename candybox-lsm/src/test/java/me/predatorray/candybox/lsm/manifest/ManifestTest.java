@@ -209,9 +209,10 @@ class ManifestTest {
         assertThat(ManifestSerializer.deserialize(ManifestSerializer.serialize(withHlc)))
                 .isEqualTo(withHlc);
 
-        // A v3 record is a v4 record without the trailing maxHlc presence flag.
-        byte[] v4 = ManifestSerializer.serialize(ManifestEdit.builder().newWalLedgerId(5L).build());
-        byte[] v3 = java.util.Arrays.copyOf(v4, v4.length - 1);
+        // A v3 record is this record without the trailing maxHlc presence flag and the two empty v6
+        // pending-delete counts.
+        byte[] v6 = ManifestSerializer.serialize(ManifestEdit.builder().newWalLedgerId(5L).build());
+        byte[] v3 = java.util.Arrays.copyOf(v6, v6.length - 3);
         v3[0] = 3;
         ManifestEdit legacy = ManifestSerializer.deserialize(v3);
         assertThat(legacy.maxHlc()).isEqualTo(Hlc.MIN);
@@ -225,5 +226,54 @@ class ManifestTest {
         m.apply(ManifestEdit.builder().maxHlc(new Hlc(100, 0, 2)).build());
         m.apply(ManifestEdit.builder().removedTableLedgerIds(Set.of(1L)).build());
         assertThat(m.current().maxHlc()).isEqualTo(new Hlc(900, 0, 1));
+    }
+
+    @Test
+    void pendingDeletesRoundTripAndOlderVersionsReadBackWithout() {
+        ManifestEdit edit = ManifestEdit.builder()
+                .addedPendingDeletes(java.util.Map.of(11L, 1000L, 12L, 2000L))
+                .removedPendingDeletes(Set.of(13L))
+                .build();
+        assertThat(ManifestSerializer.deserialize(ManifestSerializer.serialize(edit))).isEqualTo(edit);
+
+        byte[] v6 = ManifestSerializer.serialize(ManifestEdit.builder().newWalLedgerId(5L).build());
+        byte[] v5 = java.util.Arrays.copyOf(v6, v6.length - 2);
+        v5[0] = 5;
+        ManifestEdit legacy = ManifestSerializer.deserialize(v5);
+        assertThat(legacy.addedPendingDeletes()).isEmpty();
+        assertThat(legacy.removedPendingDeletes()).isEmpty();
+        assertThat(legacy.newWalLedgerId()).isEqualTo(5L);
+    }
+
+    @Test
+    void pendingDeletesAreAppliedAndCarriedAcrossRecovery() {
+        Manifest a = Manifest.createNew(store, cfg, 1L);
+        a.apply(ManifestEdit.builder().addedPendingDeletes(java.util.Map.of(11L, 1000L, 12L, 2000L))
+                .build());
+        a.apply(ManifestEdit.builder().removedPendingDeletes(Set.of(11L)).build());
+        assertThat(a.current().pendingDeletes()).containsExactly(java.util.Map.entry(12L, 2000L));
+
+        Manifest b = Manifest.recover(store, cfg, a.ledgerId(), 2L);
+        assertThat(b.current().pendingDeletes()).containsExactly(java.util.Map.entry(12L, 2000L));
+        b.close();
+    }
+
+    @Test
+    void recoveryAdoptsPartOnlySyrupsIntoTheLiveSet() {
+        Manifest a = Manifest.createNew(store, cfg, 1L);
+        a.apply(ManifestEdit.builder().addUpload(new MultipartUploadState("upl-1", "k", null,
+                java.util.Map.of(), 1L, java.util.Map.of())).build());
+        // A pre-v6 part upsert that did not add its Syrup to the live set.
+        a.apply(ManifestEdit.builder().addPartUpsert("upl-1", 1,
+                new me.predatorray.candybox.common.Part(3, 16, 0,
+                        List.of(new me.predatorray.candybox.common.SegmentRef(77L, 0, 0)))).build());
+        assertThat(a.current().liveSyrups()).doesNotContain(77L);
+
+        Manifest b = Manifest.recover(store, cfg, a.ledgerId(), 2L);
+        assertThat(b.current().liveSyrups()).contains(77L);
+        b.close();
+        Manifest c = Manifest.recover(store, cfg, b.ledgerId(), 3L);
+        assertThat(c.current().liveSyrups()).contains(77L);
+        c.close();
     }
 }

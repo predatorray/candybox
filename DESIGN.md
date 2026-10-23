@@ -151,10 +151,11 @@ RangeTombstone payload>`. Replay reports the max HLC across **both** kinds, so h
 
 **Syrup chunk entry**: `int crc32c | payload[<= chunkSize]`. The crc covers the payload only.
 
-**ManifestEdit** (`ManifestSerializer`, **version 5**): `version | addedTables[]
+**ManifestEdit** (`ManifestSerializer`, **version 6**): `version | addedTables[]
 | removedTableLedgerIds[] | addedSyrups[] | removedSyrups[] | (bool, varlong) newWalLedgerId
 | ownerFencingToken | addedUploads[] | upsertParts[] | removedUploads[] | addedRenameIntents[]
-| removedRenameIntents[] | (bool, hlc) maxHlc`, where each `SSTableMeta`
+| removedRenameIntents[] | (bool, hlc) maxHlc | addedPendingDeletes[(varlong id, varlong since)]
+| removedPendingDeletes[]`, where each `SSTableMeta`
 is `varlong ledgerId | varint level | bytes minKey | bytes maxKey | varlong entryCount
 | varlong sizeBytes | referencedSyrups[] | (bool, span) rangeTombstoneSpan | (bool, hlc) minPointHlc`
 (v5+: the keys its range tombstones cover, each bound optional, used to pick compaction inputs; and
@@ -166,7 +167,8 @@ per `removedUpload`. The v3 trailing fields carry in-flight **rename intents** (
 `rename` the partition owns the source of, each pinning the source key and its HLC); like upload
 state they are replayed on handover, so a takeover finalizes (or abandons) a rename exactly where
 the prior owner left it. The v4 trailing `maxHlc` is the HLC high-water mark (see §3); v2/v3 records
-read back without one.
+read back without one. The v6 trailing fields are the ledgers awaiting physical deletion by GC (§9);
+v2–v5 records read back with none.
 
 **Protocol frame** (`FrameCodec`): `magic(2)=0xCB0F | version(1)=1 | opcode(1) | length(4) | payload`.
 **Message body** (`MessageCodec`): `bodyVersion(1) | <per-opcode fields>`.
@@ -267,8 +269,9 @@ consults range tombstones across all tables rather than pruning by point range.
   `ListMultipartUploads`/`ListParts`. In-flight state lives in the manifest's `multipartUploads`
   section (see §7), so it is fencing-gated, replayed on handover, and pins its parts' Syrups via
   the existing reference-count walk. `Complete` assembles a multi-part `CandyLocator` at the target
-  key in one fenced manifest edit; superseded parts (re-uploading the same `partNumber`) and
-  aborted uploads enter the pending-orphan path for GC. The TTL sweeper on the
+  key in one fenced manifest edit; a part's Syrups join the live set in its `UploadPart` edit, so
+  superseded parts (re-uploading the same `partNumber`) and aborted uploads enter the pending-orphan
+  path for GC. The TTL sweeper on the
   compaction/GC worker aborts uploads older than `multipart.upload.ttl.millis` (default 7 days).
   `ListMultipartUploads` orders by `(key, uploadId)` (key in UTF-8 byte order), not by initiation
   time as S3 does, so each partition's page and the client's merge agree on one total order.
@@ -380,23 +383,29 @@ pulls the deeper tables it covers into the next compaction. Covered by `Compacti
 
 Reference-counted GC of obsoleted ledgers, run **only by the Box's manifest owner against a committed
 manifest snapshot** (never a stale tail), gated on the owner's fencing token, after a grace period
-(`ledgerGcGraceMillis`, Pulsar-style — a margin for in-flight readers / continuation tokens). Three
-reclaim sources, each whole-ledger-deleted via `LedgerStore.deleteLedger` (idempotent — a missing
-ledger is treated as already gone), driven on the same background worker as compaction (§8):
+(`ledgerGcGraceMillis`, Pulsar-style — a margin for in-flight readers / continuation tokens), driven
+on the same background worker as compaction (§8). Every ledger that leaves the committed state enters
+the manifest's **pending deletes** (stamped with when it left) in the same fenced edit that drops it,
+and is whole-ledger-deleted via `LedgerStore.deleteLedger` once past the grace period. It leaves the
+set, by another fenced edit, only after the delete succeeded (a missing ledger counts as gone), so a
+failed delete is retried and a new owner inherits whatever the prior owner had not yet deleted:
 
 - **SSTables** removed from the manifest by a committed compaction;
-- **Syrups** no longer referenced by any SSTable, the memtable, or the open write Syrup — dropped from
-  the live set first via a fencing-gated manifest edit, then deleted;
-- **WAL** ledgers rotated out at flush, whose mutations are now durable in an SSTable.
+- **Syrups** no longer referenced by any SSTable, the memtable, an in-flight multipart upload, or the
+  open write Syrup — claimed from the live set into the pending deletes;
+- **WAL** ledgers rotated out at flush, whose mutations are now durable in an SSTable;
+- at handover, the prior owner's **manifest** ledger, and its **WAL** — at once if its replay was
+  empty, else at the new owner's first flush. Both enter through the new manifest, so they are only
+  deleted if the manifest pointer moves to it.
 
 The detailed rules:
 
 - (a) the live-set-drop edit + the physical delete are fenced;
 - (b) a tombstone may be dropped only under the bottommost + time-bound rule (§8);
-- (c) orphaned-Syrup GC is driven by per-SSTable referenced-Syrup tracking plus a **pending-orphan
-  list** recorded at supersede/dedupe time (a retried or conflicting put knows its losing segments
-  immediately); the pending sets are in-memory today, so an **enumeration backstop** for ledgers
-  orphaned by a *prior* owner that crashed before GC is still **TODO(phase-3+)**;
+- (c) orphaned-Syrup GC is driven by per-SSTable referenced-Syrup tracking plus an in-memory
+  **pending-orphan list**, recomputed from the live set on handover. Ledgers that no manifest ever
+  recorded (written by a flush, compaction or put that then failed, or created by a handover whose
+  pointer CAS lost) need an **enumeration backstop**, still **TODO(phase-3+)** (#105);
 - (d) **v1 Syrup reclamation policy**: because BookKeeper deletes whole ledgers only, a single live
   Candy pins an otherwise-dead Syrup. **v1 documents and accepts this** — a Syrup is reclaimed only
   once *every* segment in it is dead. Syrup defragmentation (copying survivors into a fresh Syrup) is
@@ -537,9 +546,8 @@ Kubernetes manifests). Fault-injection / failure-path hardening and operational 
   already fencing-gated).
 - **Watch-based coordination.** The `CoordinationService` callers poll today; ZK watches to avoid
   polling are `TODO(phase-2)`.
-- **GC enumeration backstop + Box-delete reclamation.** Pending-orphan sets are in-memory, so ledgers
-  orphaned by a prior owner that crashed before GC, and the ledgers of a deleted Box, are not yet
-  reclaimed (§9, `TODO(phase-3)`).
+- **GC enumeration backstop + Box-delete reclamation.** Ledgers that no manifest ever recorded, and
+  the ledgers of a deleted Box, are not yet reclaimed (§9, `TODO(phase-3)`, #105).
 - **Read scaling.** Sealed SSTables/Syrups are immutable and replicated, so any node *could* serve
   reads of flushed data; only unflushed-memtable read-your-writes needs the owner. Serving reads off
   the owner is not built in v1.
