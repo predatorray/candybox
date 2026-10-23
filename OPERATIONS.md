@@ -57,7 +57,7 @@ All knobs are configurable; pick defaults unless a workload demands otherwise.
 | `compactionTargetFileSizeBytes` (`compaction.target.file.size.bytes`) | 8 MiB | Data size at which compaction starts a new output SSTable. Compaction also starts a new table early when its bloom filter or index would pass 1 MiB, so that every block fits in one BookKeeper entry (5 MiB by default). |
 | `maxClockSkewMillis` | 5 min | HLC skew-rejection bound on observed timestamps. |
 | `tombstoneGcGraceMillis` | 24 h | Late-write window before a bottommost tombstone may be dropped. |
-| `ledgerGcGraceMillis` | 5 min | Grace before an obsoleted ledger (compaction input, dead Syrup, rotated WAL) is deleted; also gates Box-global GC of cross-partition-shared Syrups. |
+| `ledgerGcGraceMillis` | 5 min | Grace before an obsoleted ledger (compaction input, dead Syrup, rotated WAL, prior owner's manifest) is deleted; also gates Box-global GC of cross-partition-shared Syrups. |
 | `zero.copy.relay.budget.bytes` | 32 MiB | Bytes of cross-partition zero-copy locator relays one node may have pending in ZooKeeper; past it, cross-partition copy/rename answers BUSY. Env `CANDYBOX_ZERO_COPY_RELAY_BUDGET_BYTES`. |
 | `rename.intent.abandon.millis` | 60 s | Cross-partition rename: a rename intent whose rendezvous marker never appears is dropped after this (the source stays live, the rename never reached the destination); unconsumed zero-copy locator relays are reaped after the same age (by the maintenance tick, or inline once a partition reaches its cap of 1024 pending relays). A relay embeds the source locator, so `sizeLimits.maxLocatorBytes` must stay below ZooKeeper's `jute.maxbuffer` (1 MiB by default). Env `CANDYBOX_RENAME_INTENT_ABANDON_MILLIS`. |
 
@@ -115,15 +115,27 @@ Delimiter listings (S3 `CommonPrefixes`) are rolled up by the nodes as of 0.2. O
 still interoperate: a 0.2 gateway rolls up whatever a 0.1 node returns un-rolled, so until the nodes
 are upgraded, delimiter listings behave as in 0.1 (a prefix can repeat across pages).
 
+Manifest records are written in format v6, which older nodes cannot read. Once an upgraded node has
+owned a partition, an older node cannot take it over, and the nodes cannot be rolled back to an older
+build either; finish the node rollout promptly (or disable the balancer during it). An older node
+given such a partition fences the manifest, fails to decode it and releases the lease, so the
+partition stays unowned (`RESPONSE_UNAVAILABLE`) until an upgraded node takes it. No data is lost.
+
 ## Garbage collection
 
 Run only by a Box's owner, against the committed manifest, after `ledgerGcGraceMillis`:
 
 - **SSTables** removed by a committed compaction are deleted.
-- **Syrups** no longer referenced by any SSTable, the memtable, or the open write Syrup are
+- **Syrups** no longer referenced by any SSTable, the memtable, an in-flight multipart upload, or the
+  open write Syrup are
   whole-ledger-deleted (v1 reclaims a Syrup only once *every* segment in it is dead — no defragmentation,
   so deletes/overwrites cause Syrup space amplification until the whole ledger dies).
 - **WAL** ledgers rotated out at flush are deleted once their mutations are durable in an SSTable.
+- After a handover, the prior owner's **manifest** and **WAL** ledgers are deleted (the WAL only once
+  its replayed mutations are flushed).
+
+These ledgers are tracked as *pending deletes* in the manifest until the delete succeeds, so a failed
+delete is retried on a later pass and a new owner finishes whatever its predecessor left behind.
 
 **Box-global GC.** Because cross-partition zero-copy copy/rename lets a destination partition share a
 source partition's Syrup segments, each partition owner publishes its referenced-Syrup set to
@@ -136,8 +148,9 @@ in that partition once orphaned anew (siblings that also tracked it keep their o
 locator resolved before its Syrup was reclaimed and zero-copy-put afterwards is not yet guarded
 against (#65).
 
-GC tracking is in-memory, so ledgers orphaned by a prior owner that crashed before GC leak until an
-enumeration backstop is added (future).
+Ledgers no manifest ever recorded (written by a flush or compaction that then failed, by an owner
+that crashed before flushing, or by a handover that lost the manifest-pointer race) leak until an
+enumeration backstop is added (#105).
 
 ## Observability
 

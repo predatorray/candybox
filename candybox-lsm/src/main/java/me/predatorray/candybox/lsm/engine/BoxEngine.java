@@ -106,14 +106,19 @@ public final class BoxEngine implements AutoCloseable {
     private WriteAheadLog wal;
     private final ConcurrentMap<Long, SSTableReader> readers = new ConcurrentHashMap<>();
 
-    // SSTable ledgers dropped by a committed compaction, awaiting physical deletion by GC: id -> when.
-    private final ConcurrentMap<Long, Long> obsoleteSSTables = new ConcurrentHashMap<>();
-
     // Syrup ledgers no longer referenced by any SSTable/memtable, awaiting GC: id -> first-seen-orphan.
     private final ConcurrentMap<Long, Long> pendingOrphanSyrups = new ConcurrentHashMap<>();
 
-    // WAL ledgers rotated out at flush (data now durable in an SSTable), awaiting GC: id -> when.
-    private final ConcurrentMap<Long, Long> obsoleteWals = new ConcurrentHashMap<>();
+    // The prior owner's WAL, replayed into the memtable at recovery and obsolete once that is flushed.
+    // In memory only: if this owner never flushes, the prior WAL leaks (#105) — and holds the only copy
+    // of the replayed writes (#63). A #63 fix that makes the replay durable at recovery should mark the
+    // prior WAL superseded there instead.
+    private long unflushedPriorWal = -1L;
+
+    // Syrups this owner created since the last flush, joined to the live set by the next flush even if
+    // nothing then references them (the Candy was overwritten, or its write failed), so GC sees them.
+    // Guarded by the write lock, which every Syrup write holds.
+    private final Set<Long> unflushedSyrups = new LinkedHashSet<>();
 
     // Lightweight operational counters (snapshotted via stats()).
     private final AtomicLong putCount = new AtomicLong();
@@ -138,7 +143,8 @@ public final class BoxEngine implements AutoCloseable {
         this.clock = clock;
         this.manifest = manifest;
         this.wal = wal;
-        this.syrupManager = new SyrupManager(ledgerStore, config, ledgerConfig(LedgerRole.SYRUP));
+        this.syrupManager = new SyrupManager(ledgerStore, config, ledgerConfig(LedgerRole.SYRUP),
+                unflushedSyrups::add);
         this.sstableWriter = new SSTableWriter(ledgerStore, config.bloomBitsPerKey());
         this.syrupReader = new SyrupReader(ledgerStore);
     }
@@ -180,6 +186,7 @@ public final class BoxEngine implements AutoCloseable {
         Memtable memtable = new Memtable();
         Hlc highWater = state.maxHlc();
         long priorWalId = state.walLedgerId();
+        boolean priorWalReplayed = false;
         if (priorWalId >= 0) {
             // recover-open fences the prior WAL so a resurrected old owner cannot keep appending.
             ReadableLedger priorWal = ledgerStore.recoverOpen(priorWalId);
@@ -189,6 +196,7 @@ public final class BoxEngine implements AutoCloseable {
             } finally {
                 priorWal.close();
             }
+            priorWalReplayed = !replay.entries().isEmpty();
             for (WalEntry e : replay.entries()) {
                 if (e instanceof WalEntry.PointMutation pm) {
                     memtable.put(pm.mutation());
@@ -215,12 +223,22 @@ public final class BoxEngine implements AutoCloseable {
 
         WriteAheadLog newWal = WriteAheadLog.create(ledgerStore,
                 roleConfig(config, ledgerStore, box, LedgerRole.WAL));
+        // The prior manifest is superseded by this one, and the prior WAL too unless its entries still
+        // await a flush. This edit only takes effect if the manifest pointer moves here, and nothing
+        // reads a superseded manifest or WAL again.
+        long now = clock.currentTimeMillis();
+        Map<Long, Long> superseded = new LinkedHashMap<>();
+        superseded.put(priorManifestLedgerId, now);
+        if (priorWalId >= 0 && !priorWalReplayed) {
+            superseded.put(priorWalId, now);
+        }
         // Persist the replayed WAL's max too: its entries now live only in this owner's memtable.
         manifest.apply(ManifestEdit.builder().newWalLedgerId(newWal.ledgerId()).maxHlc(highWater)
-                .build());
+                .addedPendingDeletes(superseded).build());
 
         BoxEngine engine = new BoxEngine(box, config, ledgerStore, hlc, clock, manifest, newWal);
         engine.active = memtable;
+        engine.unflushedPriorWal = priorWalReplayed ? priorWalId : -1L;
         engine.openReadersFor(state);
         // Catch Syrups already orphaned before this handover (e.g. by a prior owner that crashed
         // pre-GC) so they are not leaked.
@@ -374,6 +392,7 @@ public final class BoxEngine implements AutoCloseable {
             Part previous = upload.parts().get(partNumber);
             manifest.apply(ManifestEdit.builder()
                     .addPartUpsert(uploadId, partNumber, newPart)
+                    .addedSyrups(syrupIds(newPart))
                     .build());
             recomputeOrphanSyrupsLocked(clock.currentTimeMillis());
             // Defensive: if we just superseded a part, its segments are reachable only through the
@@ -387,6 +406,15 @@ public final class BoxEngine implements AutoCloseable {
         } finally {
             lock.writeLock().unlock();
         }
+    }
+
+    /** A part's Syrups join the live set, so they become orphans once nothing references them. */
+    private static Set<Long> syrupIds(Part part) {
+        Set<Long> ids = new LinkedHashSet<>();
+        for (SegmentRef seg : part.segments()) {
+            ids.add(seg.syrupId());
+        }
+        return ids;
     }
 
     /** Convenience: byte[] form of {@link #uploadPart}. */
@@ -441,6 +469,7 @@ public final class BoxEngine implements AutoCloseable {
                     written.crc32c(), written.segments());
             manifest.apply(ManifestEdit.builder()
                     .addPartUpsert(uploadId, partNumber, newPart)
+                    .addedSyrups(syrupIds(newPart))
                     .build());
             recomputeOrphanSyrupsLocked(clock.currentTimeMillis());
             return new PartUploadResult(written.crc32c(), written.contentLength());
@@ -771,8 +800,8 @@ public final class BoxEngine implements AutoCloseable {
             wal.append(mutation);
             active.put(mutation);
             // The parts may point at a Syrup this partition already counts as a pending orphan. Clear it
-            // here so its grace period restarts: flush does not recompute orphans, so a later recompute
-            // may never see it referenced, and claim-time re-validation only guards safety.
+            // here so its grace period restarts: the next recompute may only run once this reference is
+            // gone again and would keep the old stamp, and claim-time re-validation only guards safety.
             for (SegmentRef seg : dstLocator.segments()) {
                 pendingOrphanSyrups.remove(seg.syrupId());
             }
@@ -1218,23 +1247,27 @@ public final class BoxEngine implements AutoCloseable {
 
     /**
      * Commits a compaction's manifest edit (swap inputs for output) and refreshes the SSTable readers.
-     * The removed input ledgers are recorded as obsolete (with the time they left the committed
-     * manifest) for GC to delete after the grace period; physical deletion is GC's job.
+     * The removed input ledgers become pending deletes in the same edit (stamped with the time they
+     * left the committed manifest) for GC to delete after the grace period.
      */
     public void applyCompaction(ManifestEdit edit) {
         lock.writeLock().lock();
         try {
-            manifest.apply(edit); // fencing-gated: throws if this owner has been superseded
+            long now = clock.currentTimeMillis();
+            Map<Long, Long> obsolete = new LinkedHashMap<>();
+            for (Long removed : edit.removedTableLedgerIds()) {
+                obsolete.put(removed, now);
+            }
+            // fencing-gated: throws if this owner has been superseded
+            manifest.apply(edit.withAddedPendingDeletes(obsolete));
             for (SSTableMeta added : edit.addedTables()) {
                 readers.computeIfAbsent(added.ledgerId(), id -> new SSTableReader(ledgerStore, id));
             }
-            long now = clock.currentTimeMillis();
             for (Long removed : edit.removedTableLedgerIds()) {
                 SSTableReader r = readers.remove(removed);
                 if (r != null) {
                     r.close();
                 }
-                obsoleteSSTables.put(removed, now);
             }
             recomputeOrphanSyrupsLocked(now);
             compactionCount.incrementAndGet();
@@ -1263,10 +1296,10 @@ public final class BoxEngine implements AutoCloseable {
 
     /**
      * Claims the orphaned Syrups that have been pending since at or before {@code asOfMillis} and are
-     * in neither this partition's current references nor {@code foreignReferencedSyrups}, dropping
-     * them from the live set via a fencing-gated manifest edit. References are re-validated under the
-     * write lock, so a Syrup re-referenced since it was orphaned is never claimed. The caller may then
-     * physically delete exactly the returned ledgers.
+     * in neither this partition's current references nor {@code foreignReferencedSyrups}, moving
+     * them from the live set to the pending deletes via a fencing-gated manifest edit (keeping their
+     * orphan time, so they are due at once). References are re-validated under the write lock, so a
+     * Syrup re-referenced since it was orphaned is never claimed.
      */
     public java.util.List<Long> claimReclaimableSyrups(long asOfMillis,
                                                        java.util.Set<Long> foreignReferencedSyrups) {
@@ -1274,19 +1307,21 @@ public final class BoxEngine implements AutoCloseable {
         try {
             java.util.Set<Long> referenced = referencedSyrupsLocked();
             pendingOrphanSyrups.keySet().removeIf(referenced::contains);
-            java.util.List<Long> claimed = new java.util.ArrayList<>();
+            Map<Long, Long> claimed = new LinkedHashMap<>();
             for (Map.Entry<Long, Long> e : pendingOrphanSyrups.entrySet()) {
                 if (e.getValue() <= asOfMillis && !foreignReferencedSyrups.contains(e.getKey())) {
-                    claimed.add(e.getKey());
+                    claimed.put(e.getKey(), e.getValue());
                 }
             }
             if (!claimed.isEmpty()) {
                 manifest.apply(ManifestEdit.builder()
-                        .removedSyrups(new java.util.LinkedHashSet<>(claimed))
+                        .removedSyrups(claimed.keySet())
+                        .addedPendingDeletes(claimed)
                         .build());
-                claimed.forEach(pendingOrphanSyrups::remove);
+                claimed.keySet().forEach(pendingOrphanSyrups::remove);
+                unflushedSyrups.removeAll(claimed.keySet());
             }
-            return claimed;
+            return new java.util.ArrayList<>(claimed.keySet());
         } finally {
             lock.writeLock().unlock();
         }
@@ -1303,38 +1338,56 @@ public final class BoxEngine implements AutoCloseable {
     }
 
     /**
-     * SSTable ledger ids dropped by a committed compaction at or before {@code asOfMillis} and not yet
-     * physically deleted — the GC reclaim set for this Box.
+     * Pending-delete ledger ids (compacted-away SSTables, rotated or superseded WALs, superseded
+     * manifests, claimed Syrups) that left the committed state at or before {@code asOfMillis} — the
+     * GC reclaim set for this partition. Defensively excludes any ledger the state still uses.
      */
-    public java.util.List<Long> reclaimableSSTables(long asOfMillis) {
-        java.util.List<Long> ids = new java.util.ArrayList<>();
-        for (Map.Entry<Long, Long> e : obsoleteSSTables.entrySet()) {
-            if (e.getValue() <= asOfMillis) {
-                ids.add(e.getKey());
+    public java.util.List<Long> reclaimableLedgers(long asOfMillis) {
+        lock.readLock().lock();
+        try {
+            ManifestState state = manifest.current();
+            java.util.List<Long> ids = new java.util.ArrayList<>();
+            for (Map.Entry<Long, Long> e : state.pendingDeletes().entrySet()) {
+                if (e.getValue() <= asOfMillis) {
+                    ids.add(e.getKey());
+                }
             }
-        }
-        return ids;
-    }
-
-    /** Drops a ledger id from the obsolete set once GC has physically deleted it. */
-    public void forgetObsoleteSSTable(long ledgerId) {
-        obsoleteSSTables.remove(ledgerId);
-    }
-
-    /** WAL ledger ids rotated out at or before {@code asOfMillis} and not yet deleted. */
-    public java.util.List<Long> reclaimableWals(long asOfMillis) {
-        java.util.List<Long> ids = new java.util.ArrayList<>();
-        for (Map.Entry<Long, Long> e : obsoleteWals.entrySet()) {
-            if (e.getValue() <= asOfMillis) {
-                ids.add(e.getKey());
+            if (ids.isEmpty()) {
+                return ids;
             }
+            Set<Long> inUse = referencedSyrupsLocked();
+            inUse.addAll(state.liveSyrups());
+            state.tables().forEach(t -> inUse.add(t.ledgerId()));
+            inUse.add(state.walLedgerId());
+            inUse.add(wal.ledgerId());
+            inUse.add(unflushedPriorWal);
+            inUse.add(manifest.ledgerId());
+            for (Iterator<Long> it = ids.iterator(); it.hasNext(); ) {
+                long id = it.next();
+                if (inUse.contains(id)) {
+                    // A bookkeeping bug: something was scheduled for deletion while still in use.
+                    LOG.warn("Not deleting pending ledger {} of box {}: it is still in use", id, box);
+                    it.remove();
+                }
+            }
+            return ids;
+        } finally {
+            lock.readLock().unlock();
         }
-        return ids;
     }
 
-    /** Drops a WAL ledger id from the obsolete set once GC has physically deleted it. */
-    public void forgetObsoleteWal(long ledgerId) {
-        obsoleteWals.remove(ledgerId);
+    /** Drops ledger ids from the pending deletes once GC has physically deleted them (fenced). */
+    public void forgetDeletedLedgers(java.util.Collection<Long> ledgerIds) {
+        if (ledgerIds.isEmpty()) {
+            return;
+        }
+        lock.writeLock().lock();
+        try {
+            manifest.apply(ManifestEdit.builder()
+                    .removedPendingDeletes(new LinkedHashSet<>(ledgerIds)).build());
+        } finally {
+            lock.writeLock().unlock();
+        }
     }
 
     /** A consistent snapshot of the current LSM state (for compaction picking / inspection). */
@@ -1559,7 +1612,7 @@ public final class BoxEngine implements AutoCloseable {
             return;
         }
         // Collect the Syrups referenced by this memtable (for live-Syrup tracking / GC) and its max HLC.
-        Set<Long> syrups = new LinkedHashSet<>();
+        Set<Long> syrups = new LinkedHashSet<>(unflushedSyrups);
         Hlc maxHlc = Hlc.MIN;
         Iterator<Mutation> scan = flushing.iterator();
         while (scan.hasNext()) {
@@ -1581,15 +1634,24 @@ public final class BoxEngine implements AutoCloseable {
                 flushing.iterator(), flushing.rangeTombstones());
 
         WriteAheadLog newWal = WriteAheadLog.create(ledgerStore, ledgerConfig(LedgerRole.WAL));
-        long obsoleteWalId = wal.ledgerId();
-        manifest.apply(ManifestEdit.flush(table, syrups, newWal.ledgerId(), maxHlc));
+        // The rotated WAL's mutations (and a replayed prior WAL's) are durable in the SSTable once this
+        // edit commits, and the manifest then points at the new WAL, so neither is a recovery source.
+        long now = clock.currentTimeMillis();
+        Map<Long, Long> obsoleteWals = new LinkedHashMap<>();
+        obsoleteWals.put(wal.ledgerId(), now);
+        if (unflushedPriorWal >= 0) {
+            obsoleteWals.put(unflushedPriorWal, now);
+        }
+        manifest.apply(ManifestEdit.flush(table, syrups, newWal.ledgerId(), maxHlc)
+                .withAddedPendingDeletes(obsoleteWals));
+        unflushedPriorWal = -1L;
+        unflushedSyrups.clear();
         wal.close();
         wal = newWal;
         active = new Memtable();
+        // A Syrup whose Candies were all superseded before this flush is an orphan already.
+        recomputeOrphanSyrupsLocked(now);
 
-        // The rotated WAL's mutations are now durable in the SSTable and the manifest points at the
-        // new WAL, so the old one is no longer a recovery source and may be GC'd.
-        obsoleteWals.put(obsoleteWalId, clock.currentTimeMillis());
         readers.put(table.ledgerId(), new SSTableReader(ledgerStore, table.ledgerId()));
         flushCount.incrementAndGet();
         LOG.debug("Flushed memtable of box {} to SSTable ledger {} ({} entries)", box,

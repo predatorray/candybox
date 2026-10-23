@@ -15,11 +15,11 @@
  */
 package me.predatorray.candybox.server;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import me.predatorray.candybox.bookkeeper.LedgerStore;
 import me.predatorray.candybox.common.Clock;
-import me.predatorray.candybox.common.exception.StorageException;
 import me.predatorray.candybox.lsm.engine.BoxEngine;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -27,22 +27,36 @@ import org.slf4j.LoggerFactory;
 /**
  * Reference-counted garbage collection of obsoleted ledgers.
  *
- * <p>Three reclaim sources, each after a grace period (Pulsar-style — a margin for in-flight readers /
- * continuation tokens), via {@link LedgerStore#deleteLedger(long)}:
+ * <p>Every ledger that leaves a partition's committed state is recorded in its manifest's pending
+ * deletes, so the set survives handover; GC deletes each via {@link LedgerStore#deleteLedger(long)}
+ * after a grace period (Pulsar-style — a margin for in-flight readers / continuation tokens), and only
+ * then drops it from the set, so a failed delete is retried on a later pass. Pending deletes are:
  * <ul>
  *   <li><b>SSTables</b> removed from the manifest by a committed compaction;</li>
- *   <li><b>Syrups</b> no longer referenced by any SSTable, the memtable, or the open write Syrup
- *       (dropped from the live set first via a fencing-gated manifest edit, then whole-ledger-deleted —
+ *   <li><b>Syrups</b> no longer referenced by any SSTable, the memtable, an in-flight multipart
+ *       upload, or the open write Syrup (claimed from the live set via a fencing-gated manifest edit —
  *       v1 reclaims a Syrup only once every segment in it is dead; no defragmentation);</li>
- *   <li><b>WAL</b> ledgers rotated out at flush, whose mutations are now durable in an SSTable.</li>
+ *   <li><b>WAL</b> ledgers rotated out at flush, whose mutations are now durable in an SSTable, and
+ *       the prior owner's WAL once nothing replayed from it is unflushed;</li>
+ *   <li>the prior owner's <b>manifest</b> ledger, superseded at handover.</li>
  * </ul>
  *
- * <p>Safety: this runs only for a Box this node still owns (the caller checks ownership), so the
- * physical delete is effectively gated on the owner's fencing token, and the reclaimed ledgers are
- * already out of the committed manifest. Deletes are idempotent: a missing ledger is treated as gone.
+ * <p>Safety: the physical delete is not itself fenced (only the claim and forget edits are), so even a
+ * deposed owner that has not noticed its lease loss may delete. That is safe because:
+ * <ol>
+ *   <li>the manifest advances its in-memory state only after an append is acked, and a successor's
+ *       recover-open includes every acked entry, so a deposed owner's pending set is a subset of every
+ *       successor's;</li>
+ *   <li>an id leaves the set only after its delete succeeded (deletes are idempotent);</li>
+ *   <li>a ledger enters the set only once nothing uses it, and nothing uses it again: superseded
+ *       WALs and manifests and compaction inputs are never reopened, and a claimed Syrup passed the
+ *       Box-global reference gate. A change that could re-reference a pending ledger (e.g. a
+ *       trivial-move compaction re-adding a table id) breaks this.</li>
+ * </ol>
+ * So any owner deletes only what every later owner also treats as dead.
  *
- * <p>TODO(phase-3+): an enumeration backstop so ledgers orphaned by a prior owner that crashed before
- * GC are eventually reclaimed (the pending sets are in-memory today).
+ * <p>TODO(phase-3+): an enumeration backstop for ledgers no manifest ever recorded (e.g. written by an
+ * operation that then failed, or by an owner that crashed before committing them).
  */
 public final class GarbageCollector {
 
@@ -59,8 +73,8 @@ public final class GarbageCollector {
     }
 
     /**
-     * Deletes obsolete SSTable ledgers for {@code engine} that have been out of the committed manifest
-     * for at least the grace period.
+     * Deletes the ledgers of {@code engine} that have been out of the committed manifest for at least
+     * the grace period, claiming orphaned Syrups first.
      *
      * @return the number of ledgers deleted
      */
@@ -87,75 +101,46 @@ public final class GarbageCollector {
     public int collect(BoxEngine engine, Set<Long> foreignReferencedSyrups,
                        long referencesAsOfMillis) {
         long now = clock.currentTimeMillis();
-        long cutoff = now - graceMillis;
-        int deleted = collectSSTables(engine, cutoff);
-        deleted += collectSyrups(engine, Math.min(now, referencesAsOfMillis) - graceMillis,
+        claimSyrups(engine, Math.min(now, referencesAsOfMillis) - graceMillis,
                 foreignReferencedSyrups);
-        deleted += collectWals(engine, cutoff);
-        return deleted;
+        return collectPendingDeletes(engine, now - graceMillis);
     }
 
-    /** Collects only obsolete SSTables and WALs, for a Box whose Syrup references are unknown. */
+    /**
+     * Deletes only the already pending ledgers, for a Box whose Syrup references are unknown (no
+     * Syrup is claimed; claimed ones were claimed against valid references).
+     */
     public int collectWithoutSyrups(BoxEngine engine) {
-        long cutoff = clock.currentTimeMillis() - graceMillis;
-        return collectSSTables(engine, cutoff) + collectWals(engine, cutoff);
+        return collectPendingDeletes(engine, clock.currentTimeMillis() - graceMillis);
     }
 
-    private int collectWals(BoxEngine engine, long cutoff) {
-        int deleted = 0;
-        for (long ledgerId : engine.reclaimableWals(cutoff)) {
-            if (deleteLedger(ledgerId)) {
-                deleted++;
-            }
-            engine.forgetObsoleteWal(ledgerId);
-        }
-        if (deleted > 0) {
-            LOG.debug("GC deleted {} rotated WAL ledger(s)", deleted);
-        }
-        return deleted;
-    }
-
-    private int collectSSTables(BoxEngine engine, long cutoff) {
-        int deleted = 0;
-        for (long ledgerId : engine.reclaimableSSTables(cutoff)) {
-            if (deleteLedger(ledgerId)) {
-                deleted++;
-            }
-            engine.forgetObsoleteSSTable(ledgerId);
-        }
-        if (deleted > 0) {
-            LOG.debug("GC deleted {} obsolete SSTable ledger(s)", deleted);
-        }
-        return deleted;
-    }
-
-    private int collectSyrups(BoxEngine engine, long cutoff, Set<Long> foreignReferencedSyrups) {
+    private void claimSyrups(BoxEngine engine, long cutoff, Set<Long> foreignReferencedSyrups) {
         // Box-global gate: a Syrup any sibling partition still references stays a pending orphan and is
         // retried on a later pass. The engine re-checks this partition's own references atomically with
-        // dropping the rest from the live set; only those are deleted (whole-ledger — v1 has no
-        // defragmentation).
-        List<Long> orphans = engine.claimReclaimableSyrups(cutoff, foreignReferencedSyrups);
-        if (orphans.isEmpty()) {
-            return 0;
+        // moving the rest to the pending deletes (whole-ledger — v1 has no defragmentation).
+        List<Long> claimed = engine.claimReclaimableSyrups(cutoff, foreignReferencedSyrups);
+        if (!claimed.isEmpty()) {
+            LOG.debug("GC claimed {} orphaned Syrup ledger(s)", claimed.size());
         }
-        int deleted = 0;
-        for (long syrupId : orphans) {
-            if (deleteLedger(syrupId)) {
-                deleted++;
-            }
-        }
-        LOG.debug("GC deleted {} orphaned Syrup ledger(s)", deleted);
-        return deleted;
     }
 
-    private boolean deleteLedger(long ledgerId) {
-        try {
-            ledgerStore.deleteLedger(ledgerId);
-            return true;
-        } catch (StorageException e) {
-            // Already gone (or transient): a real failure is retried on a later pass.
-            LOG.debug("GC delete of ledger {} did not succeed cleanly: {}", ledgerId, e.getMessage());
-            return false;
+    private int collectPendingDeletes(BoxEngine engine, long cutoff) {
+        List<Long> gone = new ArrayList<>();
+        int deleted = 0;
+        for (long ledgerId : engine.reclaimableLedgers(cutoff)) {
+            try {
+                ledgerStore.deleteLedger(ledgerId); // idempotent: an already-deleted ledger is gone
+                deleted++;
+                gone.add(ledgerId);
+            } catch (RuntimeException e) {
+                // Stays pending, so it is retried on a later pass.
+                LOG.warn("GC delete of ledger {} failed: {}", ledgerId, e.getMessage());
+            }
         }
+        engine.forgetDeletedLedgers(gone);
+        if (deleted > 0) {
+            LOG.debug("GC deleted {} obsolete ledger(s)", deleted);
+        }
+        return deleted;
     }
 }
