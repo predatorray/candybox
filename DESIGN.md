@@ -92,7 +92,7 @@ if the recorded HLC leads the local clock by more than `maxClockSkewMillis`.
 
 Three distinct ledger roles, kept separate in code:
 
-- **WAL ledger** — per-Box write-ahead log. Each entry is a serialized `Mutation`, appended (ack-quorum
+- **WAL ledger** — per-partition write-ahead log. Each entry is a serialized `Mutation`, appended (ack-quorum
   durable) before the memtable acknowledges. On handover the new owner uses **recover-open** (fence +
   seal at a deterministic LAC), *not* a plain read-open, so a resurrected old owner cannot keep
   appending. Rotated to a fresh ledger on each flush.
@@ -104,7 +104,7 @@ Three distinct ledger roles, kept separate in code:
 
 Integrity: WAL / SSTable-block / manifest entries rely on **BookKeeper's per-entry digest** (CRC32C).
 App-level CRC is used only for **end-to-end** Candy validation: a per-chunk crc on each Syrup entry
-(partial validation on streaming/retry) and a whole-object crc in the locator (checked on `getCandy`).
+(partial validation on streaming/retry) and a per-part crc32c in the locator (checked on read by `SyrupReader.readParts`).
 
 ## 5. Record formats (all versioned)
 
@@ -112,9 +112,9 @@ Every persisted record begins with a **format version byte** for forward compati
 big-endian via `BinaryWriter`/`BinaryReader`; length prefixes and small counts use unsigned LEB128
 varints, and every decode is bounds-checked (a corrupt buffer cannot over-read or over-allocate).
 
-**CandyLocator** (`CandyLocatorSerializer`, **version 2**), the LSM value, capped at 256 KiB:
+**CandyLocator** (`CandyLocatorSerializer`, **version 3**), the LSM value, capped at 256 KiB:
 ```
-byte    formatVersion (=2)
+byte    formatVersion (=3)
 byte    type (1=PUT, 2=DELETE tombstone)
 long    hlc.physicalMillis
 varint  hlc.logicalCounter
@@ -128,6 +128,8 @@ varint  part count           [+ Part records]
     varint  chunkSize
     int     crc32c (per-part end-to-end)
     varint  segment count    [+ {varlong syrupId, varlong firstEntryId, varlong lastEntryId}]
+byte    owner present?   [+ string "Type:name"]
+varint  grant count      [+ string "grantee:OP[+OP...]"]
 ```
 The locator is a list of *parts*. A single-PUT or `copy/rename` produces a one-element list; a
 multipart-uploaded Candy stitches its parts together in part-number order. Each Part is internally
@@ -215,7 +217,7 @@ consults range tombstones across all tables rather than pruning by point range.
 - **get/head**: resolve the key to the highest-HLC locator across the memtable and the overlapping
   SSTables at every level (range + bloom pre-filter); a point tombstone, a covering **range tombstone** newer than
   that locator, or absence ⇒ `CandyNotFound`. `getCandy` then streams bytes from Syrups and validates
-  the whole-object crc.
+  each part's crc32c.
 - **list / scan**: per partition, a `MergingIterator` over the memtable + SSTables (LWW, tombstones
   suppressed), driven by a `ScanQuery` — an optional `[start, end)` window, optional prefix,
   **forward or reverse** direction, page size, and a continuation cursor (`lastKey`, exclusive in
@@ -301,7 +303,7 @@ recovery leaves the pointer, and so the prior manifest and WAL, untouched for th
 
 The ZK pointer to the current manifest ledger is advanced with a **compare-and-set on the expected
 ZK version** (never a blind set), and every state-mutating append carries the owner's **fencing
-token** (the lease version). A zombie former owner's appends fail because its ledger was
+token** (a counter stored in the lease record, bumped on each fresh acquisition). A zombie former owner's appends fail because its ledger was
 recover-open-fenced — see `ManifestTest.fencedOwnerCannotCommitFurtherEdits`. The pointer and lease
 live in the `CoordinationService` SPI: an in-memory fake that models lease expiry, supersession, and
 CAS conflicts (so these tests are not vacuous — `InMemoryCoordinationServiceTest`), and the real
@@ -388,7 +390,7 @@ pulls the deeper tables it covers into the next compaction. Covered by `Compacti
 
 ## 9. Garbage collection (`GarbageCollector`, server)
 
-Reference-counted GC of obsoleted ledgers, run **only by the Box's manifest owner against a committed
+Reference-counted GC of obsoleted ledgers, run by **each partition's owner against a committed
 manifest snapshot** (never a stale tail), gated on the owner's fencing token, after a grace period
 (`ledgerGcGraceMillis`, Pulsar-style — a margin for in-flight readers / continuation tokens), driven
 on the same background worker as compaction (§8). Every ledger that leaves the committed state enters
@@ -434,7 +436,7 @@ The detailed rules:
 - (f) **Box-global GC** (what makes cross-partition zero-copy safe): a destination partition can now
   reuse a source partition's Syrup segments (§6), so within-manifest reference counting is
   generalized Box-wide. Each partition owner publishes its held-Syrup set (below) to coordination at
-  `boxes/<box>/partitions/<p>/refs`; the creating partition's GC skips any Syrup a sibling partition
+  `boxes/<box>/partitions/<p>/refs`; a partition's GC skips any Syrup a sibling partition
   still holds (references, or released less than `ledgerGcGraceMillis` ago), so a
   Syrup is physically reclaimed only once **no** partition of the Box references it. This supersedes
   the prior claim (under (e)) that cross-partition copy/rename cannot share segments. Because a
@@ -489,7 +491,7 @@ Per-role BK quorum (E/Qw/Qa) defaults: **WAL 3/3/2, Manifest 3/3/2, SSTable 3/2/
 | Serialization | Manual big-endian + LEB128 varints, version byte per record | Compact, dependency-free, forward-compatible, bounds-checked. |
 | SSTable block→entry | One block per ledger entry; ~64 KiB block target; footer at LAC | Simple, lets the reader find the footer with no side metadata. |
 | Bloom filter | 10 bits/key, k≈7, LevelDB hash | ~1% FPR; deterministic decode across nodes/arch. |
-| WAL granularity | Per-Box | Matches single-owner-per-Box; simplest correct recovery unit. |
+| WAL granularity | Per-partition | Matches single-owner-per-partition; simplest correct recovery unit. |
 | Memtable structure | `ConcurrentSkipListMap`, LWW merge | Sorted, lock-free reads during the flush scan. |
 | Manifest checkpoint | On handover (fresh ledger seeded with full-state checkpoint) | Bounds replay; aligns with "can't append a sealed ledger". |
 | Memtable flush threshold | 4 MiB | Bounds WAL replay and L0 table size. |
@@ -498,7 +500,7 @@ Per-role BK quorum (E/Qw/Qa) defaults: **WAL 3/3/2, Manifest 3/3/2, SSTable 3/2/
 | Leveled level base / multiplier | 10 MiB / 10× | LevelDB-style growing per-level byte budgets for L≥1. |
 | Compaction output size | 8 MiB target; bloom/index ≤ 1 MiB | Bounds write amplification per compaction and keeps each meta block within one BookKeeper entry. |
 | HLC logical width / skew bound | 32-bit logical; 5-min skew rejection | Overflow needs ~2.1e9 events/ms; bound stops a wild clock dragging us forward. |
-| Ownership lease TTL / renew / fencing token | 10 s TTL; 3 s renew; monotonic per-resource counter (ZK version) | Short TTL for quick failover; renew well inside it; strictly increasing tokens fence zombies. |
+| Ownership lease TTL / renew / fencing token | 10 s TTL; 3 s renew; monotonic per-resource counter stored in the lease record | Short TTL for quick failover; renew well inside it; strictly increasing tokens fence zombies. |
 | Partitions per Box | 8 (fixed at create; `createBox` may override) | Spreads one Box's writes over up to 8 nodes while bounding per-Box engine cost (each partition is a full WAL/memtable/manifest). Immutable: re-hashing would re-home every key. |
 | Balancer round interval / move rate | 5 s in shipped conf (0 = off, the unit-test default) / 4 moves per round | Frequent enough to converge quickly after joins/failures; the move cap keeps a node join from stampeding handovers (failover is never rate-limited). |
 | Compaction + GC worker interval | configurable; 0 disables | Background maintenance cadence on the owner. |

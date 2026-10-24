@@ -28,7 +28,7 @@ to move across partitions; what broke is purely the *bookkeeping* (GC liveness) 
 
 1. **Box-global Syrup GC (Option A).** A Syrup is physically reclaimed only once **no partition of
    the Box references it**. Each partition owner publishes its referenced-Syrup set to coordination;
-   the Syrup's creating partition deletes it only when it is in no sibling partition's published set.
+   a partition holding the Syrup deletes it only when it is in no sibling partition's published set.
    This subsumes the existing within-manifest reference counting and is safe by construction (the
    liveness decision is always recomputed from currently-committed references).
 2. **Cross-partition zero-copy via a coordination relay.** The source owner stashes the source's
