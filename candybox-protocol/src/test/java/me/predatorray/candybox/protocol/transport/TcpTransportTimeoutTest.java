@@ -44,6 +44,7 @@ class TcpTransportTimeoutTest {
         }
     }
 
+    // best effort: some networks refuse 10.255.255.1 at once instead of timing out
     @Test
     void connectToNonRoutableAddressFailsWithinTheTimeout() {
         try (TcpTransport transport = new TcpTransport(new FrameCodec(), null, true, 300, 300)) {
@@ -55,7 +56,7 @@ class TcpTransportTimeoutTest {
     }
 
     @Test
-    void invalidPortIsRejectedWithoutLeakingTheSocket() {
+    void invalidPortIsRejected() {
         try (TcpTransport transport = new TcpTransport()) {
             assertThatThrownBy(() -> transport.connect("127.0.0.1", 70_000))
                     .isInstanceOf(IllegalArgumentException.class);

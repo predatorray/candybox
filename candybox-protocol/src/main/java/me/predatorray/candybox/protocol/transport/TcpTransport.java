@@ -74,8 +74,9 @@ public final class TcpTransport implements Transport {
     /**
      * @param connectTimeoutMillis bound on the TCP connect and on each read of the TLS handshake (DNS
      *                             resolution is not covered); 0 means no limit
-     * @param readTimeoutMillis    bound on waiting for a response; on expiry the call fails and the
-     *                             connection must be discarded. 0 means no limit
+     * @param readTimeoutMillis    bound on each blocking read while awaiting a response (not the
+     *                             whole frame: a peer trickling bytes never trips it); on expiry
+     *                             the call fails and the connection is closed. 0 means no limit
      */
     public TcpTransport(FrameCodec codec, SSLContext sslContext, boolean verifyEndpoint,
             int connectTimeoutMillis, int readTimeoutMillis) {
