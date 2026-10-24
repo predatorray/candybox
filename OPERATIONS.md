@@ -36,7 +36,7 @@ All knobs are configurable; pick defaults unless a workload demands otherwise.
 | `sizeLimits.chunkSizeBytes` | 1 MiB | Syrup entry payload size. Must stay below BookKeeper's max frame size. |
 | `sizeLimits.maxCandyKeyBytes` | 1 KiB | Max CandyKey length (UTF-8). |
 | `sizeLimits.maxUserMetadataBytes` | 8 KiB | Max total user metadata per Candy. |
-| `sizeLimits.maxLocatorBytes` | 64 KiB | Hard cap on a serialized CandyLocator. |
+| `sizeLimits.maxLocatorBytes` | 256 KiB | Hard cap on a serialized CandyLocator. |
 | `sizeLimits.maxCandySizeBytes` | 0 (unbounded) | Max Candy size; `0` = no limit. |
 | quorum `WAL` / `MANIFEST` | 3/3/2 (E/Qw/Qa) | Recovery sources: all-replica write, majority ack. |
 | quorum `SSTABLE` / `SYRUP` | 3/2/2 | Durable but read/throughput-optimized; replaceable via re-compaction. |
@@ -123,7 +123,7 @@ partition stays unowned (`RESPONSE_UNAVAILABLE`) until an upgraded node takes it
 
 ## Garbage collection
 
-Run only by a Box's owner, against the committed manifest, after `ledgerGcGraceMillis`:
+Run by each partition's owner, against the committed manifest, after `ledgerGcGraceMillis`:
 
 - **SSTables** removed by a committed compaction are deleted.
 - **Syrups** no longer referenced by any SSTable, the memtable, an in-flight multipart upload, or the
@@ -139,7 +139,7 @@ delete is retried on a later pass and a new owner finishes whatever its predeces
 
 **Box-global GC.** Because cross-partition zero-copy copy/rename lets a destination partition share a
 source partition's Syrup segments, each partition owner publishes the Syrups it references to
-coordination (`boxes/<box>/partitions/<p>/refs`). The creating partition's GC skips any Syrup a
+coordination (`boxes/<box>/partitions/<p>/refs`). A partition's GC skips any Syrup a
 sibling partition still references, so a shared Syrup is reclaimed only once **no** partition of the
 Box references it (still gated by `ledgerGcGraceMillis`). A partition re-checks its own references
 when it claims a Syrup for deletion, and a Syrup that is referenced again restarts its grace period

@@ -56,7 +56,7 @@ import me.predatorray.candybox.common.exception.SerializationException;
  * <p>A {@code DELETE} tombstone serializes with {@code part count = 0}. A v1 single-part Candy is the
  * same shape with {@code part count = 1}.
  *
- * <p>Every encode is checked against the configured {@code maxLocatorBytes} (default 256 KiB in v2 —
+ * <p>Every encode is checked against the configured {@code maxLocatorBytes} (default 256 KiB —
  * enough room for the ~200 KiB needed to hold an S3-cap 10,000-part multipart object).
  */
 public final class CandyLocatorSerializer {
