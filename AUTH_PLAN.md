@@ -105,7 +105,9 @@ per-connection `ConnectionContext { state, principal }` in `TcpTransportServer`'
 
 `NodeRequestHandler` authorizes after decode: box ops map to READ (get/head/list/range-get) /
 WRITE (put/delete/delete-range/copy/rename/multipart) / ADMIN (create/delete box) on `Box:<name>`;
-`LIST_BOXES`/`CREATE_BOX` check `Cluster`. List results are filtered to readable boxes.
+`LIST_BOXES`/`CREATE_BOX` check `Cluster`. List results are filtered to readable boxes. Copy, rename
+and upload-part-copy also need READ on the source key (Box ACL or object grant), as S3 CopyObject
+does; otherwise a WRITE-only caller could copy an object into one it owns and read it.
 
 ## 5. Object ownership & ACLs — `CandyLocator` v3
 

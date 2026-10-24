@@ -717,7 +717,7 @@ final class S3Handler extends ChannelInboundHandlerAdapter {
         }
         String copySource = request.headers().get("x-amz-copy-source");
         if (copySource != null && !copySource.isBlank()) {
-            uploadPartCopy(ctx, request, parts, uploadId, partNumber, copySource, requestId);
+            uploadPartCopy(ctx, request, parts, uploadId, partNumber, copySource, requestId, auth);
             return;
         }
         byte[] body = bodyBytes(request, auth);
@@ -738,13 +738,18 @@ final class S3Handler extends ChannelInboundHandlerAdapter {
      * with {@link S3ErrorCode#NOT_IMPLEMENTED}, matching the existing {@code CopyObject} rule.
      */
     private void uploadPartCopy(ChannelHandlerContext ctx, FullHttpRequest request, PathParts parts,
-                                String uploadId, int partNumber, String copySource, String requestId) {
+                                String uploadId, int partNumber, String copySource, String requestId,
+                                S3Authenticator.S3Auth auth) {
         PathParts src = PathParts.parse(stripLeadingSlash(uriDecode(copySource)));
         if (src.bucket() == null || src.key() == null || src.key().isEmpty()) {
             throw new S3Exception(S3ErrorCode.INVALID_ARGUMENT, "Malformed x-amz-copy-source");
         }
         if (!src.bucket().equals(parts.bucket())) {
             throw new S3Exception(S3ErrorCode.NOT_IMPLEMENTED, "Cross-bucket UploadPartCopy is not supported");
+        }
+        if (access.enabled()) {
+            access.authorize(S3Action.GET_OBJECT, new PathParts(src.bucket(), src.key()),
+                    auth.principal());
         }
         String rangeHeader = request.headers().get("x-amz-copy-source-range");
         long firstByte = -1;
