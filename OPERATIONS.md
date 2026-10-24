@@ -173,6 +173,8 @@ directly. Single port (default `9713`); the SPA lives at `/ui/` and the JSON API
 | `CANDYBOX_ADMIN_CORS` | `*` | `Access-Control-Allow-Origin`. Tighten in production. |
 | `CANDYBOX_ADMIN_UI` | (enabled) | Set to `false` to disable `/ui/*` and run headless. |
 | `CANDYBOX_ADMIN_ZK` | (unset) | ZooKeeper connect string. Enables the live cluster/box reads; unset = empty-data demo mode. |
+| `CANDYBOX_NODE_CONNECT_TIMEOUT_MS` | `5000` | Bound on connecting to a node (TCP connect, each TLS handshake read). `0` = no limit. |
+| `CANDYBOX_NODE_READ_TIMEOUT_MS` | `120000` | Bound on each blocking read awaiting a node's response; a pooled connection to a lost host fails after this long. `0` = no limit. |
 | `CANDYBOX_ADMIN_SCRAPE_TARGETS` | (empty) | Comma-separated Prometheus URLs (e.g. each node's `http://host:9710/metrics`). Drives the Metrics page. |
 | `CANDYBOX_ADMIN_SCRAPE_INTERVAL_MS` | `5000` | Scrape interval. |
 | `CANDYBOX_ADMIN_SCRAPE_WINDOW` | `60` | Samples retained per series (≈ 5 minutes at the default interval). |
@@ -201,6 +203,14 @@ Candybox secures every channel with SASL authentication, per-Box/per-object ACLs
 TLS. The full design lives in [`AUTH_PLAN.md`](AUTH_PLAN.md); this section is the operator view.
 All keys below follow the usual convention: any key can come from the environment as
 `CANDYBOX_<KEY>` (dots to underscores, upper-cased).
+
+### Client timeouts
+
+The S3 gateway (`node.connect.timeout.ms`, default 5000, and `node.read.timeout.ms`, default 120000;
+env `CANDYBOX_NODE_CONNECT_TIMEOUT_MS` / `CANDYBOX_NODE_READ_TIMEOUT_MS`) and the admin API (the same
+env vars) bound how long a call to a lost host can stall. The read timeout applies to each blocking
+read, so keep it above the slowest legitimate request. On expiry the connection is closed and the
+router fails over or re-resolves.
 
 ### Clients / S3 gateway / admin API → storage nodes (SASL + TLS)
 

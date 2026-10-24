@@ -36,6 +36,15 @@ s3.region=us-east-1
 # failing with 503 ServiceUnavailable (ms). Default: 15000.
 # s3.router-unowned-retry-ms=15000
 
+# Bound on connecting to a node (TCP connect and each TLS handshake read), in ms. 0 = no limit.
+# Default: 5000.
+# node.connect.timeout.ms=5000
+
+# Bound on each blocking read while waiting for a node's response, in ms. 0 = no limit. Keep it
+# above the slowest legitimate request; a pooled connection to a lost host fails after this long.
+# Default: 120000.
+# node.read.timeout.ms=120000
+
 # HTTP port for /healthz, /readyz, /metrics. Default: 9712.
 # health.port=9712
 
