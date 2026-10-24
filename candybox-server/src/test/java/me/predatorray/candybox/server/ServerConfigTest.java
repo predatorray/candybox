@@ -66,6 +66,15 @@ class ServerConfigTest {
     }
 
     @Test
+    void backgroundMaintenanceIsOnByDefaultAndCanBeDisabled() {
+        assertThat(ServerConfig.fromProperties(props("zookeeper.connect", "zk:2181", "node.id", "1"), Map.of())
+                .tuning().compactionIntervalMillis()).isPositive();
+        assertThat(ServerConfig.fromProperties(
+                props("zookeeper.connect", "zk:2181", "node.id", "1", "compaction.interval.millis", "0"), Map.of())
+                .tuning().compactionIntervalMillis()).isZero();
+    }
+
+    @Test
     void resolvesNodeIdFromHostnameOrdinalWhenUnset() {
         ServerConfig cfg = ServerConfig.fromProperties(
                 props("zookeeper.connect", "zk:2181"),

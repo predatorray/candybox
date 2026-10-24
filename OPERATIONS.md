@@ -51,7 +51,7 @@ All knobs are configurable; pick defaults unless a workload demands otherwise.
 | `partitionsPerBoxDefault` | 8 | Hash-partition count for a new Box when the creator passes none; fixed for the Box's lifetime. |
 | `balancerIntervalMillis` | 0 (disabled) | Partition-balancing round period; **set > 0 in production** (shipped conf: 5 s). |
 | `balancerMaxMovesPerRound` | 4 | Max partitions migrated away from live owners per round (failover is unlimited). |
-| `compactionIntervalMillis` | 0 (disabled) | Background compaction+GC tick; **set > 0 in production**. |
+| `compactionIntervalMillis` (`compaction.interval.millis`) | 15 s (server; `0` in the bare `CandyboxConfig` builder) | Background maintenance tick: compaction, ledger GC, rename-intent finalize and the multipart/locator-relay sweeps. `0` disables it. |
 | `l0CompactionTrigger` | 4 | L0 SSTable count that triggers a compaction. |
 | `l0StallThreshold` | 12 | L0 SSTable count at which writes are rejected with `BUSY`. |
 | `compactionTargetFileSizeBytes` (`compaction.target.file.size.bytes`) | 8 MiB | Data size at which compaction starts a new output SSTable. Compaction also starts a new table early when its bloom filter or index would pass 1 MiB, so that every block fits in one BookKeeper entry (5 MiB by default). |
@@ -64,10 +64,11 @@ All knobs are configurable; pick defaults unless a workload demands otherwise.
 Leveled compaction also takes a per-level byte budget (`levelBaseBytes` 10 MiB, `levelMultiplier` 10):
 level N's budget is `levelBaseBytes × multiplier^(N-1)`.
 
-> **Important:** background compaction/GC are **off by default** (`compactionIntervalMillis = 0`) so
-> tests are deterministic. A production node must set it positive, otherwise L0 grows until writes hit
-> `BUSY` and nothing reclaims obsolete ledgers. Compaction and GC can also be triggered manually via
-> `CandyboxNode.compactOwnedBoxesOnce()` / `collectGarbageOnce()`.
+> **Important:** the server runs background maintenance every 15 s by default. Setting
+> `compaction.interval.millis=0` disables it, so L0 grows until writes hit `BUSY` and nothing reclaims
+> obsolete ledgers. A failure in one step is logged and does not stop the others. The bare
+> `CandyboxConfig` builder still defaults to `0` so tests are deterministic; the steps can also be run
+> manually via `CandyboxNode.compactOwnedBoxesOnce()` / `collectGarbageOnce()`.
 
 ## Consistency & backpressure
 
