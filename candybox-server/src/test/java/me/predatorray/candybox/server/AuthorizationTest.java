@@ -321,47 +321,50 @@ class AuthorizationTest {
     }
 
     @Test
-    void copyingNeedsReadOnTheSource() {
+    void copyingAndRenamingNeedReadOnTheSource() {
         try (CandyboxNode node = newAuthorizedNode()) {
             RequestHandler handler = node.requestHandler();
-            call(handler, ALICE, new Message.CreateBoxRequest("vault", 1));
+            call(handler, ALICE, new Message.CreateBoxRequest("vault", 2));
             call(handler, ALICE, new Message.SetBoxAclRequest("vault", "User:alice",
                     List.of("User:bob:WRITE")));
-            call(handler, ALICE, put("vault", "secret"));
+            String secret = keyIn(0, 2, "secret");
+            String mine = keyIn(0, 2, "mine");
+            String elsewhere = keyIn(1, 2, "elsewhere");
+            call(handler, ALICE, put("vault", secret));
             Message.CreateMultipartUploadResponse upload = (Message.CreateMultipartUploadResponse)
-                    call(handler, BOB, new Message.CreateMultipartUploadRequest("vault", "mine",
+                    call(handler, BOB, new Message.CreateMultipartUploadRequest("vault", mine,
                             null, Map.of()));
 
-            assertThat(call(handler, BOB, new Message.CopyCandyRequest("vault", "secret", "mine",
-                    null))).isInstanceOf(Message.AccessDeniedResponse.class);
-            assertThat(call(handler, BOB, new Message.GetCandyLocatorRequest("vault", "secret")))
-                    .isInstanceOf(Message.AccessDeniedResponse.class);
-            assertThat(call(handler, BOB, new Message.UploadPartCopyRequest("vault", "mine",
-                    upload.uploadId(), 1, "secret", -1, -1)))
-                    .isInstanceOf(Message.AccessDeniedResponse.class);
-            assertThat(call(handler, ALICE, new Message.GetCandyRequest("vault", "mine")))
+            // A rename answers with the source's head, so it needs READ just like a copy.
+            List<Message> sourceReads = List.of(
+                    new Message.CopyCandyRequest("vault", secret, mine, null),
+                    new Message.GetCandyLocatorRequest("vault", secret),
+                    new Message.UploadPartCopyRequest("vault", mine, upload.uploadId(), 1, secret,
+                            -1, -1),
+                    new Message.RenameCandyRequest("vault", secret, mine, null),
+                    new Message.PrepareRenameRequest("vault", secret, elsewhere, 1, "rename-1"));
+            for (Message request : sourceReads) {
+                assertThat(call(handler, BOB, request))
+                        .as(request.opcode().toString())
+                        .isInstanceOf(Message.AccessDeniedResponse.class);
+            }
+            assertThat(call(handler, ALICE, new Message.GetCandyRequest("vault", mine)))
                     .isInstanceOf(Message.NotFoundResponse.class);
-
-            // Rename keeps the owner and grants, so it needs no READ and reveals nothing.
-            call(handler, ALICE, put("vault", "other"));
-            assertThat(call(handler, BOB, new Message.RenameCandyRequest("vault", "other",
-                    "moved", null))).isInstanceOf(Message.HeadCandyResponse.class);
-            assertThat(((Message.CandyAclResponse) call(handler, ALICE,
-                    new Message.GetCandyAclRequest("vault", "moved"))).owner())
-                    .isEqualTo("User:alice");
-            assertThat(call(handler, BOB, new Message.GetCandyRequest("vault", "moved")))
-                    .isInstanceOf(Message.AccessDeniedResponse.class);
+            assertThat(call(handler, ALICE, new Message.GetCandyRequest("vault", secret)))
+                    .isInstanceOf(Message.CandyDataResponse.class);
 
             // The source object's own grants supply READ just as they do for a GET.
-            call(handler, ALICE, new Message.SetCandyAclRequest("vault", "secret", "User:alice",
+            call(handler, ALICE, new Message.SetCandyAclRequest("vault", secret, "User:alice",
                     List.of("User:bob:READ")));
-            assertThat(call(handler, BOB, new Message.CopyCandyRequest("vault", "secret", "mine",
+            assertThat(call(handler, BOB, new Message.CopyCandyRequest("vault", secret, mine,
                     null))).isInstanceOf(Message.HeadCandyResponse.class);
-            assertThat(call(handler, BOB, new Message.GetCandyLocatorRequest("vault", "secret")))
+            assertThat(call(handler, BOB, new Message.GetCandyLocatorRequest("vault", secret)))
                     .isInstanceOf(Message.CandyLocatorResponse.class);
-            assertThat(call(handler, BOB, new Message.UploadPartCopyRequest("vault", "mine",
-                    upload.uploadId(), 1, "secret", -1, -1)))
+            assertThat(call(handler, BOB, new Message.UploadPartCopyRequest("vault", mine,
+                    upload.uploadId(), 1, secret, -1, -1)))
                     .isInstanceOf(Message.UploadPartResponse.class);
+            assertThat(call(handler, BOB, new Message.PrepareRenameRequest("vault", secret,
+                    elsewhere, 1, "rename-2"))).isInstanceOf(Message.CandyLocatorResponse.class);
         }
     }
 

@@ -108,7 +108,7 @@ final class NodeRequestHandler implements RequestHandler {
                         principal + " is not allowed " + access.operation() + " on "
                                 + access.resource()));
             }
-            String sourceKey = copySourceKeyOf(message);
+            String sourceKey = sourceKeyOf(message);
             if (sourceKey != null && !canRead(principal, boxOf(message), sourceKey)) {
                 return codec.encode(new Message.AccessDeniedResponse(
                         principal + " is not allowed READ on " + boxOf(message) + "/" + sourceKey));
@@ -169,16 +169,20 @@ final class NodeRequestHandler implements RequestHandler {
     }
 
     /**
-     * The key whose bytes a copy-type request reads. S3 CopyObject needs READ on the source on top
-     * of WRITE on the destination; otherwise a WRITE-only caller could copy an object into one it
-     * owns and then read that. Rename is exempt: the object keeps its owner and grants.
+     * The source key a copy or move reads. S3 CopyObject needs READ on the source on top of WRITE
+     * on the destination; otherwise a WRITE-only caller could copy an object into one it owns and
+     * read that. A move is a copy plus a delete, and its response carries the source's head.
      */
-    private static String copySourceKeyOf(Message message) {
+    private static String sourceKeyOf(Message message) {
         if (message instanceof Message.CopyCandyRequest m) {
             return m.srcKey();
         } else if (message instanceof Message.GetCandyLocatorRequest m) {
             return m.key();
         } else if (message instanceof Message.UploadPartCopyRequest m) {
+            return m.srcKey();
+        } else if (message instanceof Message.RenameCandyRequest m) {
+            return m.srcKey();
+        } else if (message instanceof Message.PrepareRenameRequest m) {
             return m.srcKey();
         }
         return null;
