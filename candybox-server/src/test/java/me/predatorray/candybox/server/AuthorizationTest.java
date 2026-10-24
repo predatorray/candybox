@@ -358,13 +358,25 @@ class AuthorizationTest {
                     List.of("User:bob:READ")));
             assertThat(call(handler, BOB, new Message.CopyCandyRequest("vault", secret, mine,
                     null))).isInstanceOf(Message.HeadCandyResponse.class);
-            assertThat(call(handler, BOB, new Message.GetCandyLocatorRequest("vault", secret)))
-                    .isInstanceOf(Message.CandyLocatorResponse.class);
+            Message.CandyLocatorResponse relay = (Message.CandyLocatorResponse) call(handler, BOB,
+                    new Message.GetCandyLocatorRequest("vault", secret));
+            assertThat(call(handler, BOB, new Message.ZeroCopyPutRequest("vault", elsewhere, 0,
+                    relay.relayToken(), null, List.of(), null)))
+                    .isInstanceOf(Message.HeadCandyResponse.class);
             assertThat(call(handler, BOB, new Message.UploadPartCopyRequest("vault", mine,
                     upload.uploadId(), 1, secret, -1, -1)))
                     .isInstanceOf(Message.UploadPartResponse.class);
             assertThat(call(handler, BOB, new Message.PrepareRenameRequest("vault", secret,
-                    elsewhere, 1, "rename-2"))).isInstanceOf(Message.CandyLocatorResponse.class);
+                    keyIn(1, 2, "target"), 1, "rename-2")))
+                    .isInstanceOf(Message.CandyLocatorResponse.class);
+
+            // A rename keeps the source's owner, so bob cannot take the object over.
+            String moved = keyIn(0, 2, "moved");
+            assertThat(call(handler, BOB, new Message.RenameCandyRequest("vault", secret, moved,
+                    null))).isInstanceOf(Message.HeadCandyResponse.class);
+            assertThat(((Message.CandyAclResponse) call(handler, ALICE,
+                    new Message.GetCandyAclRequest("vault", moved))).owner())
+                    .isEqualTo("User:alice");
         }
     }
 
