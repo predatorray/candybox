@@ -109,7 +109,7 @@ class CandyboxServerSecurityIT {
                  CandyboxClient client = new CandyboxClient(t, "127.0.0.1", running.transportPort())) {
                 client.createBox("anon-box");
             }
-        }).isInstanceOfAny(AuthenticationException.class, AccessDeniedException.class);
+        }).isInstanceOf(AuthenticationException.class);
     }
 
     @Test
