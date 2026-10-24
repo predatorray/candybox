@@ -24,6 +24,7 @@ and configure each instance through the environment.
 | `server.max.inflight.per.connection` | Requests one connection may have queued for the handler before the node stops reading from it. | `8` |
 | `server.drain.timeout.millis` | How long a shutdown lets in-flight requests finish before their connections are cut. | `10000` |
 | `quorum.*` | BookKeeper replication per ledger role (`E/Qw/Qa`). | `3/3/2` (WAL, manifest), `3/2/2` (data) |
+| `compaction.interval.millis` | Background maintenance tick: compaction, ledger GC, rename-intent finalize, and the multipart and locator-relay sweeps. `0` disables it. | 15000 (15 s) |
 | `multipart.upload.ttl.millis` | How long an abandoned multipart upload is kept before a background sweep aborts it. | 7 days |
 | `zero.copy.relay.budget.bytes` | Cross-partition copy/rename: bytes of locator relays one node may have pending in ZooKeeper before it answers BUSY. | 33554432 (32 MiB) |
 | `rename.intent.abandon.millis` | Cross-partition rename: how long the source owner keeps a rename intent whose destination rendezvous marker never appears before dropping it (the source stays live); also the age after which an unconsumed zero-copy locator relay is reaped. | 60000 (60 s) |
