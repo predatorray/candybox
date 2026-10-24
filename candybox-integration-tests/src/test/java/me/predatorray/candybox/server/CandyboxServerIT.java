@@ -28,7 +28,6 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicReference;
 import me.predatorray.candybox.client.CandyboxClient;
 import me.predatorray.candybox.it.EmbeddedBookKeeper;
 import me.predatorray.candybox.protocol.transport.TcpTransport;
@@ -43,7 +42,8 @@ import org.junit.jupiter.api.io.TempDir;
  * loaded from a properties file via {@link ServerConfig#load} — against embedded BookKeeper and its
  * in-process ZooKeeper. Verifies the composition root actually stands up: the health/metrics endpoint
  * answers and the TCP server serves a real client round-trip. {@code run} blocks in the foreground, so
- * it is driven on a daemon thread; the forked IT JVM's exit runs the registered shutdown hook. Lives
+ * the test drives {@link CandyboxServer#start} instead and closes the server before the embedded
+ * backends, so the JVM exit does not block on a shutdown hook talking to dead services. Lives
  * in the {@code me.predatorray.candybox.server} package to reach the package-private {@code run}.
  */
 class CandyboxServerIT {
@@ -52,8 +52,7 @@ class CandyboxServerIT {
     private static TestingServer zookeeper;
     private static int bindPort;
     private static int healthPort;
-    private static Thread serverThread;
-    private static final AtomicReference<Throwable> serverFailure = new AtomicReference<>();
+    private static CandyboxServer.RunningServer server;
 
     @BeforeAll
     static void start(@TempDir Path tmp) throws Exception {
@@ -75,23 +74,14 @@ class CandyboxServerIT {
                 ""), StandardCharsets.UTF_8);
 
         ServerConfig config = ServerConfig.load(conf);
-        serverThread = new Thread(() -> {
-            try {
-                CandyboxServer.run(config); // blocks until JVM shutdown
-            } catch (Throwable t) {
-                serverFailure.set(t);
-            }
-        }, "candybox-server-under-test");
-        serverThread.setDaemon(true);
-        serverThread.start();
+        server = CandyboxServer.start(config);
 
         awaitHealthy();
     }
 
     @AfterAll
     static void stop() {
-        // run() owns its components and only releases them via its JVM shutdown hook, which fires when
-        // this forked IT JVM exits; we just tear down the embedded cluster here.
+        closeQuietly(server);
         closeQuietly(zookeeper);
         closeQuietly(bookKeeper);
     }
@@ -130,10 +120,6 @@ class CandyboxServerIT {
     private static void awaitHealthy() {
         long deadline = System.currentTimeMillis() + 60_000;
         while (System.currentTimeMillis() < deadline) {
-            Throwable failure = serverFailure.get();
-            if (failure != null) {
-                throw new IllegalStateException("Server failed to start", failure);
-            }
             try {
                 if (httpStatus("/healthz") == 200) {
                     return;

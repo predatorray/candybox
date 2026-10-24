@@ -73,6 +73,60 @@ public final class CandyboxServer {
 
     /** Wires the node, installs the shutdown hook, and blocks the calling thread until shutdown. */
     static void run(ServerConfig config) {
+        RunningServer server = start(config);
+        CountDownLatch shutdown = new CountDownLatch(1);
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            server.close();
+            shutdown.countDown();
+        }, "candybox-shutdown"));
+        try {
+            shutdown.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        LOG.info("Candybox node {} stopped", config.nodeId());
+    }
+
+    /** A started node; {@link #close()} drains it and is idempotent. */
+    static final class RunningServer implements AutoCloseable {
+        private final ServerConfig config;
+        private final AtomicBoolean ready;
+        private final HealthServer health;
+        private final TcpTransportServer transport;
+        private final CandyboxNode node;
+        private final CoordinationService coordination;
+        private final LedgerStore ledgerStore;
+        private final AtomicBoolean closed = new AtomicBoolean();
+
+        RunningServer(ServerConfig config, AtomicBoolean ready, HealthServer health,
+                      TcpTransportServer transport, CandyboxNode node,
+                      CoordinationService coordination, LedgerStore ledgerStore) {
+            this.config = config;
+            this.ready = ready;
+            this.health = health;
+            this.transport = transport;
+            this.node = node;
+            this.coordination = coordination;
+            this.ledgerStore = ledgerStore;
+        }
+
+        @Override
+        public void close() {
+            if (!closed.compareAndSet(false, true)) {
+                return;
+            }
+            LOG.info("Shutdown signal received; draining node {}", config.nodeId());
+            ready.set(false);
+            closeQuietly("health server", health);
+            closeQuietly("transport server", transport);
+            closeQuietly("node (releasing leases)", node);
+            closeQuietly("coordination", coordination);
+            closeQuietly("ledger store", ledgerStore);
+        }
+    }
+
+    /** Wires and starts the node without installing a shutdown hook or blocking. */
+    static RunningServer start(ServerConfig config) {
         SecurityConfig security = config.security();
         LOG.info("Starting Candybox node {} (bind={}:{}, advertised={}, zk={}, tls={}, auth={})",
                 config.nodeId(), config.bindHost(), config.bindPort(), config.advertisedAddress(),
@@ -109,24 +163,7 @@ public final class CandyboxServer {
         LOG.info("Candybox node {} is up: serving on {}, health on {}", config.nodeId(),
                 transport.port(), health.port());
 
-        CountDownLatch shutdown = new CountDownLatch(1);
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            LOG.info("Shutdown signal received; draining node {}", config.nodeId());
-            ready.set(false);
-            closeQuietly("health server", health);
-            closeQuietly("transport server", transport);
-            closeQuietly("node (releasing leases)", node);
-            closeQuietly("coordination", coordination);
-            closeQuietly("ledger store", ledgerStore);
-            shutdown.countDown();
-        }, "candybox-shutdown"));
-
-        try {
-            shutdown.await();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-        LOG.info("Candybox node {} stopped", config.nodeId());
+        return new RunningServer(config, ready, health, transport, node, coordination, ledgerStore);
     }
 
     private static void closeQuietly(String what, AutoCloseable closeable) {
