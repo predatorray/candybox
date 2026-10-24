@@ -42,7 +42,7 @@ both features on the same data model avoids a second format break later.
 | **Wire streaming** | Still buffered. Per-part body is bounded by the 16 MiB frame cap — well under S3's 5 GiB. Multipart is decoupled from the streaming `TODO(phase-2)`. |
 | **Abort TTL sweep** | Background reaper on the compaction/GC worker; **7-day** default, configurable. Explicit `Abort` always wins. |
 | **UploadPartCopy** | Same-Box only, mirroring the existing `copyCandy`/`renameCandy` rule. Cross-bucket copy stays `NOT_IMPLEMENTED`. |
-| **Concurrency** | All multipart ops go through the engine's write lock (same as PUT). Parts within an upload can be uploaded by the client in any order; the server serializes them per Box. |
+| **Concurrency** | All multipart ops go through the engine's write lock (same as PUT). Parts within an upload can be uploaded by the client in any order; the server serializes them per partition engine. |
 
 ## 3. Read path
 
