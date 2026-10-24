@@ -108,6 +108,11 @@ final class NodeRequestHandler implements RequestHandler {
                         principal + " is not allowed " + access.operation() + " on "
                                 + access.resource()));
             }
+            String sourceKey = sourceKeyOf(message);
+            if (sourceKey != null && !canRead(principal, boxOf(message), sourceKey)) {
+                return codec.encode(new Message.AccessDeniedResponse(
+                        principal + " is not allowed READ on " + boxOf(message) + "/" + sourceKey));
+            }
             return codec.encode(dispatch(message, principal));
         } catch (BusyException e) {
             return codec.encode(new Message.BusyResponse(100));
@@ -147,6 +152,11 @@ final class NodeRequestHandler implements RequestHandler {
             case SET_CANDY_ACL -> ((Message.SetCandyAclRequest) message).key();
             default -> null;
         };
+        return objectGrantPermits(box, key, principal, operation);
+    }
+
+    private boolean objectGrantPermits(String box, String key, Principal principal,
+                                       Operation operation) {
         if (box == null || key == null) {
             return false;
         }
@@ -156,6 +166,31 @@ final class NodeRequestHandler implements RequestHandler {
         } catch (CandyboxException | IllegalArgumentException resolveFailed) {
             return false;
         }
+    }
+
+    /**
+     * The source key a copy or move reads. S3 CopyObject needs READ on the source on top of WRITE
+     * on the destination; otherwise a WRITE-only caller could copy an object into one it owns and
+     * read that. A move is a copy plus a delete, and its response carries the source's head.
+     */
+    private static String sourceKeyOf(Message message) {
+        if (message instanceof Message.CopyCandyRequest m) {
+            return m.srcKey();
+        } else if (message instanceof Message.GetCandyLocatorRequest m) {
+            return m.key();
+        } else if (message instanceof Message.UploadPartCopyRequest m) {
+            return m.srcKey();
+        } else if (message instanceof Message.RenameCandyRequest m) {
+            return m.srcKey();
+        } else if (message instanceof Message.PrepareRenameRequest m) {
+            return m.srcKey();
+        }
+        return null;
+    }
+
+    private boolean canRead(Principal principal, String box, String key) {
+        return node.authorizer().authorize(principal, Operation.READ, Resource.box(box))
+                || objectGrantPermits(box, key, principal, Operation.READ);
     }
 
     private static Access requiredAccess(Message message) {
