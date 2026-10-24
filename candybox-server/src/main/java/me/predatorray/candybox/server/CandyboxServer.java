@@ -18,6 +18,7 @@ package me.predatorray.candybox.server;
 import java.nio.file.Path;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import me.predatorray.candybox.bookkeeper.LedgerStore;
 import me.predatorray.candybox.bookkeeper.bk.BookKeeperLedgerStore;
 import me.predatorray.candybox.common.SystemClock;
@@ -73,12 +74,17 @@ public final class CandyboxServer {
 
     /** Wires the node, installs the shutdown hook, and blocks the calling thread until shutdown. */
     static void run(ServerConfig config) {
+        run(config, drain -> Runtime.getRuntime().addShutdownHook(new Thread(drain, "candybox-shutdown")));
+    }
+
+    /** As {@link #run(ServerConfig)}, but hands the drain action to {@code registerShutdown}. */
+    static void run(ServerConfig config, Consumer<Runnable> registerShutdown) {
         RunningServer server = start(config);
         CountDownLatch shutdown = new CountDownLatch(1);
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+        registerShutdown.accept(() -> {
             server.close();
             shutdown.countDown();
-        }, "candybox-shutdown"));
+        });
         try {
             shutdown.await();
         } catch (InterruptedException e) {

@@ -28,6 +28,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 import me.predatorray.candybox.client.CandyboxClient;
 import me.predatorray.candybox.it.EmbeddedBookKeeper;
 import me.predatorray.candybox.protocol.transport.TcpTransport;
@@ -42,8 +43,8 @@ import org.junit.jupiter.api.io.TempDir;
  * loaded from a properties file via {@link ServerConfig#load} — against embedded BookKeeper and its
  * in-process ZooKeeper. Verifies the composition root actually stands up: the health/metrics endpoint
  * answers and the TCP server serves a real client round-trip. {@code run} blocks in the foreground, so
- * the test drives {@link CandyboxServer#start} instead and closes the server before the embedded
- * backends, so the JVM exit does not block on a shutdown hook talking to dead services. Lives
+ * the test captures the drain action instead of installing a JVM shutdown hook and runs it before
+ * stopping the embedded backends, so the JVM exit does not block on dead services. Lives
  * in the {@code me.predatorray.candybox.server} package to reach the package-private {@code run}.
  */
 class CandyboxServerIT {
@@ -52,7 +53,9 @@ class CandyboxServerIT {
     private static TestingServer zookeeper;
     private static int bindPort;
     private static int healthPort;
-    private static CandyboxServer.RunningServer server;
+    private static Thread serverThread;
+    private static final AtomicReference<Runnable> drain = new AtomicReference<>();
+    private static final AtomicReference<Throwable> serverFailure = new AtomicReference<>();
 
     @BeforeAll
     static void start(@TempDir Path tmp) throws Exception {
@@ -74,14 +77,28 @@ class CandyboxServerIT {
                 ""), StandardCharsets.UTF_8);
 
         ServerConfig config = ServerConfig.load(conf);
-        server = CandyboxServer.start(config);
+        serverThread = new Thread(() -> {
+            try {
+                CandyboxServer.run(config, drain::set); // blocks until drain runs
+            } catch (Throwable t) {
+                serverFailure.set(t);
+            }
+        }, "candybox-server-under-test");
+        serverThread.setDaemon(true);
+        serverThread.start();
 
         awaitHealthy();
     }
 
     @AfterAll
-    static void stop() {
-        closeQuietly(server);
+    static void stop() throws InterruptedException {
+        Runnable d = drain.get();
+        if (d != null) {
+            d.run();
+        }
+        if (serverThread != null) {
+            serverThread.join(10_000);
+        }
         closeQuietly(zookeeper);
         closeQuietly(bookKeeper);
     }
@@ -120,6 +137,10 @@ class CandyboxServerIT {
     private static void awaitHealthy() {
         long deadline = System.currentTimeMillis() + 60_000;
         while (System.currentTimeMillis() < deadline) {
+            Throwable failure = serverFailure.get();
+            if (failure != null) {
+                throw new IllegalStateException("Server failed to start", failure);
+            }
             try {
                 if (httpStatus("/healthz") == 200) {
                     return;
