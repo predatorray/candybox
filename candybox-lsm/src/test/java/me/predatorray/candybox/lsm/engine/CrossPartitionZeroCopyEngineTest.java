@@ -188,6 +188,27 @@ class CrossPartitionZeroCopyEngineTest {
     }
 
     @Test
+    void heldSyrupsKeepsAMemtableOnlyReferenceForAGracePeriodAfterItIsGone() {
+        CandyboxConfig config = CandyboxConfig.builder().syrupRolloverBytes(1).build();
+        ManualClock clock = new ManualClock(1000);
+        src = BoxEngine.createNew(box, config, store, 1, clock, 1L);
+        dst = BoxEngine.createNew(box, config, store, 2, clock, 1L);
+        src.putCandy(CandyKey.of("k"), bytes("payload"), null, Map.of(), null);
+        src.putCandy(CandyKey.of("other"), bytes("x"), null, Map.of(), null);
+        List<Part> parts = src.resolveLocator(CandyKey.of("k")).parts();
+        long syrup = parts.get(0).segments().get(0).syrupId();
+        dst.zeroCopyPut(CandyKey.of("d"), parts, null, Map.of(), 0L, ObjectAcl.NONE, null);
+        assertThat(dst.heldSyrups(Long.MAX_VALUE)).contains(syrup);
+
+        clock.advance(500);
+        dst.deleteCandy(CandyKey.of("d"));
+        dst.flush(); // the reference never reached an SSTable
+        assertThat(dst.referencedSyrups()).doesNotContain(syrup);
+        assertThat(dst.heldSyrups(1499)).contains(syrup);
+        assertThat(dst.heldSyrups(1500)).doesNotContain(syrup);
+    }
+
+    @Test
     void claimDropsAStalePendingEntryForAStillReferencedSyrup() {
         long syrup = sealedSyrupWithStalePendingEntry();
         assertThat(src.claimReclaimableSyrups(Long.MAX_VALUE, Set.of())).isEmpty();

@@ -832,8 +832,11 @@ public final class BoxEngine implements AutoCloseable {
             // The parts may point at a Syrup this partition already counts as a pending orphan. Clear it
             // here so its grace period restarts: the next recompute may only run once this reference is
             // gone again and would keep the old stamp, and claim-time re-validation only guards safety.
+            // Tracking it as live from the next flush on also gives a reference that never reaches an
+            // SSTable its own orphan stamp, which heldSyrups publishes to the siblings.
             for (SegmentRef seg : dstLocator.segments()) {
                 pendingOrphanSyrups.remove(seg.syrupId());
+                unflushedSyrups.add(seg.syrupId());
             }
             maybeFlushLocked();
             CandyMetadata result = CandyMetadata.from(dstLocator);
@@ -913,6 +916,27 @@ public final class BoxEngine implements AutoCloseable {
         lock.readLock().lock();
         try {
             return referencedSyrupsLocked();
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * {@link #referencedSyrups()} plus the pending orphans first seen after {@code orphanedAfterMillis}
+     * (now minus the GC grace period). This is what a sibling's GC must keep: a sibling may have
+     * orphaned the same Syrup long ago, and its own stamp says nothing about this partition's last
+     * reference.
+     */
+    public java.util.Set<Long> heldSyrups(long orphanedAfterMillis) {
+        lock.readLock().lock();
+        try {
+            java.util.Set<Long> held = referencedSyrupsLocked();
+            pendingOrphanSyrups.forEach((syrup, since) -> {
+                if (since > orphanedAfterMillis) {
+                    held.add(syrup);
+                }
+            });
+            return held;
         } finally {
             lock.readLock().unlock();
         }

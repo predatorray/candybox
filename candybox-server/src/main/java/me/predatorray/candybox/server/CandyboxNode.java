@@ -814,7 +814,8 @@ public final class CandyboxNode implements AutoCloseable {
     private boolean tryPublishPartitionRefs(PartitionOwnership ownership) {
         String key = CandyboxKeys.partitionRefsKey(ownership.box().value(), ownership.partition());
         Optional<VersionedValue> current = coordination.get(key);
-        byte[] refs = encodeLongSet(ownership.engine().referencedSyrups());
+        byte[] refs = encodeLongSet(ownership.engine().heldSyrups(
+                clock.currentTimeMillis() - config.ledgerGcGraceMillis()));
         try {
             if (current.isEmpty()) {
                 coordination.create(key, refs);

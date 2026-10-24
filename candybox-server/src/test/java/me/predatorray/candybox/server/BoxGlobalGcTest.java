@@ -167,4 +167,70 @@ class BoxGlobalGcTest {
         node.collectGarbageOnce();
         assertThat(store.listLedgers()).doesNotContain(syrup);
     }
+
+    @Test
+    void aSiblingsStalePendingOrphanStampDoesNotSkipTheGracePeriod() {
+        CandyKey a = keyIn(0, "a");
+        CandyKey b = keyIn(1, "b");
+        p0.putCandy(a, bytes("precious"), null, Map.of(), null);
+        p0.putCandy(keyIn(0, "other"), bytes("x"), null, Map.of(), null);
+        long syrup = syrupOf(p0, a);
+        p0.flush();
+        rename(p0, a, p1, b);
+        p1.flush(); // p1 tracks the Syrup too
+        rename(p1, b, p0, a);
+        p0.flush();
+        p1.flush();
+        node.compactOwnedBoxesOnce(); // p1 orphans it now
+
+        clock.advance(GRACE + 1);
+        p0.deleteCandy(a);
+        p0.flush();
+        p0.putCandy(keyIn(0, "pad"), bytes("y"), null, Map.of(), null);
+        p0.flush();
+        node.compactOwnedBoxesOnce(); // p0 orphans it now
+        assertThat(p0.referencedSyrups()).doesNotContain(syrup);
+
+        node.collectGarbageOnce();
+        assertThat(store.listLedgers()).contains(syrup);
+
+        clock.advance(GRACE - 1);
+        node.collectGarbageOnce();
+        assertThat(store.listLedgers()).contains(syrup);
+
+        clock.advance(1);
+        node.collectGarbageOnce();
+        assertThat(store.listLedgers()).doesNotContain(syrup);
+    }
+
+    @Test
+    void aSyrupReferencedOnlyInAMemtableStillGetsAGracePeriod() {
+        CandyKey b = keyIn(1, "b");
+        CandyKey a = keyIn(0, "a");
+        p1.putCandy(b, bytes("precious"), null, Map.of(), null);
+        p1.putCandy(keyIn(1, "other"), bytes("x"), null, Map.of(), null);
+        long syrup = syrupOf(p1, b);
+        p1.flush();
+        CandyLocator locator = p1.resolveLocator(b);
+        p0.zeroCopyPut(a, locator.parts(), null, Map.of(), 0L, ObjectAcl.NONE, null);
+        p1.deleteCandy(b);
+        p1.flush();
+        node.compactOwnedBoxesOnce(); // p1 orphans it
+
+        clock.advance(GRACE + 1);
+        p0.deleteCandy(a); // p0's reference never reached an SSTable
+        p0.flush();
+        assertThat(p0.referencedSyrups()).doesNotContain(syrup);
+
+        node.collectGarbageOnce();
+        assertThat(store.listLedgers()).contains(syrup);
+
+        clock.advance(GRACE - 1);
+        node.collectGarbageOnce();
+        assertThat(store.listLedgers()).contains(syrup);
+
+        clock.advance(1);
+        node.collectGarbageOnce();
+        assertThat(store.listLedgers()).doesNotContain(syrup);
+    }
 }

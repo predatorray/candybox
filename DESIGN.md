@@ -440,9 +440,13 @@ The detailed rules:
   the prior claim (under (e)) that cross-partition copy/rename cannot share segments. Because a
   zero-copy put can point a partition back at a Syrup it already counts as a pending orphan, orphan
   tracking is not monotonic: a re-referenced Syrup leaves the pending set (its grace period restarts
-  in that partition if it is orphaned again; a sibling that also tracked it keeps its older timestamp,
-  #66), and GC claims Syrups through one write-locked step that re-checks the partition's own
-  references before dropping them from the live set. Only the claimed Syrups are deleted. A pending
+  in that partition if it is orphaned again), and GC claims Syrups through one write-locked step that
+  re-checks the partition's own references before dropping them from the live set. Several
+  partitions can track one Syrup as a pending orphan, each with its own timestamp, so a partition
+  also publishes its pending orphans younger than the grace period: a sibling's older timestamp
+  cannot cut the grace short after this partition's last reference (#66). A zero-copy put counts its
+  Syrups as live in the partition from its next flush, so a reference that never reaches an SSTable
+  still gets an orphan timestamp. Only the claimed Syrups are deleted. A pending
   locator relay also pins its Syrups, so a source deleted and compacted before its relay is consumed
   cannot leave the destination dangling: GC reads the published sets, then every relay of the Box,
   then the published sets again, retries unless no set changed in between, and claims only Syrups
