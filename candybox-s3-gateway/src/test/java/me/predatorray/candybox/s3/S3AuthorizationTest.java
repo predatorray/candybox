@@ -441,5 +441,13 @@ class S3AuthorizationTest {
                 Map.of("x-amz-copy-source", "/srcbox/private"));
         assertThat(ok.status()).isEqualTo(200);
         assertThat(store.getCandyAcl("srcbox", "copy").owner()).isEqualTo("User:alice");
+
+        // UploadPartCopy reads the source the same way.
+        String uploadId = store.createMultipartUpload("srcbox", "stolen",
+                "application/octet-stream", Map.of());
+        Response partDenied = exchange(ch, HttpMethod.PUT,
+                "/srcbox/stolen?partNumber=1&uploadId=" + uploadId, null, BOB_KEY,
+                Map.of("x-amz-copy-source", "/srcbox/private"));
+        assertThat(partDenied.status()).isEqualTo(403);
     }
 }
