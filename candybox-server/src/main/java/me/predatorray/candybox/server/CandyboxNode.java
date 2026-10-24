@@ -582,7 +582,7 @@ public final class CandyboxNode implements AutoCloseable {
                 }
             } catch (RuntimeException e) {
                 unpublished.add(ownership.box().value());
-                LOG.warn("Referenced-Syrup publish error on node {}: {}", nodeId, e.getMessage());
+                LOG.warn("Held-Syrup publish error on node {}: {}", nodeId, e.getMessage());
             }
         }
         int deleted = 0;
@@ -789,7 +789,7 @@ public final class CandyboxNode implements AutoCloseable {
         }
         for (int attempt = 0; !tryPublishPartitionRefs(ownership); attempt++) {
             if (attempt >= 3) {
-                throw new BusyException("Could not publish referenced Syrups of box " + box
+                throw new BusyException("Could not publish held Syrups of box " + box
                         + " partition " + partition);
             }
         }

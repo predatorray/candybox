@@ -45,7 +45,7 @@ import org.junit.jupiter.api.Test;
 /**
  * Engine-level coverage of the cross-partition zero-copy primitives: {@link BoxEngine#resolveLocator},
  * {@link BoxEngine#zeroCopyPut}, the LWW {@link BoxEngine#deleteCandyConditional}, the rename-intent
- * journal, and the published referenced-Syrup set the Box-global GC relies on.
+ * journal, and the published held-Syrup set the Box-global GC relies on.
  *
  * <p>Two engines over one shared {@link InMemoryLedgerStore} stand in for two partitions of a Box:
  * the destination engine reuses the source engine's Syrup segments verbatim, and reads stream those

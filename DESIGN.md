@@ -435,7 +435,7 @@ The detailed rules:
   reuse a source partition's Syrup segments (§6), so within-manifest reference counting is
   generalized Box-wide. Each partition owner publishes its held-Syrup set (below) to coordination at
   `boxes/<box>/partitions/<p>/refs`; the creating partition's GC skips any Syrup a sibling partition
-  still references (consulting the published sets, gated by the same `ledgerGcGraceMillis`), so a
+  still holds (references, or released less than `ledgerGcGraceMillis` ago), so a
   Syrup is physically reclaimed only once **no** partition of the Box references it. This supersedes
   the prior claim (under (e)) that cross-partition copy/rename cannot share segments. Because a
   zero-copy put can point a partition back at a Syrup it already counts as a pending orphan, orphan
@@ -446,17 +446,19 @@ The detailed rules:
   set holds a partition's references plus its pending orphans younger than the grace period: a
   sibling's older timestamp cannot cut the grace short after this partition's last reference (#66).
   A zero-copy put's Syrups are also held from the put until the next flush stamps them, so a
-  reference that never reaches an SSTable still gets its own grace period. A dead owner's last
-  published set stays in place until the new owner publishes, which only delays reclamation. Only the claimed Syrups are deleted. A pending
-  locator relay also pins its Syrups, so a source deleted and compacted before its relay is consumed
-  cannot leave the destination dangling: GC reads the published sets, then every relay of the Box,
-  then the published sets again, retries unless no set changed in between, and claims only Syrups
-  orphaned a grace period before that read (publishes compute the set after reading its version). A
-  relay is re-checked against its source after it is written, and deleted only after the destination
-  published its refs. What still rides `ledgerGcGraceMillis` is server-side: a consumer stalling
-  between its relay freshness check (half the abandon window) and its commit past the reap (the full
-  window), clock skew beyond half the window, and the freshness of sibling partitions' published
-  sets. An undecodable relay makes its Box skip Syrup GC until it is removed (#103).
+  reference that never reaches an SSTable still gets its own grace period. Stamps live only in
+  memory: a new owner re-stamps every unreferenced live Syrup at recovery, and a dead owner's last
+  published set stays in place until the new owner publishes, which only delays reclamation. Only
+  the claimed Syrups are deleted. A pending locator relay also pins its Syrups, so a source deleted
+  and compacted before its relay is consumed cannot leave the destination dangling: GC reads the
+  published sets, then every relay of the Box, then the published sets again, retries unless no set
+  changed in between, and claims only Syrups orphaned a grace period before that read (publishes
+  compute the set after reading its version). A relay is re-checked against its source after it is
+  written, and deleted only after the destination published its refs. What still rides
+  `ledgerGcGraceMillis` is server-side: a consumer stalling between its relay freshness check (half
+  the abandon window) and its commit past the reap (the full window), clock skew beyond half the
+  window, and the freshness of sibling partitions' published sets. An undecodable relay makes its Box
+  skip Syrup GC until it is removed (#103).
 
 The full compaction-then-GC cycle is covered end-to-end by `CompactionGcCycleIT`. One gap: deleting a
 Box drops its manifest pointer but does not yet reclaim that Box's SSTable/Syrup/WAL/manifest ledgers

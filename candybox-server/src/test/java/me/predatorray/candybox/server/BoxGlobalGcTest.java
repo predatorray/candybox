@@ -288,4 +288,53 @@ class BoxGlobalGcTest {
             assertThat(store.listLedgers()).doesNotContain(syrup);
         }
     }
+
+    @Test
+    void aNewOwnerRestampsAMemtableOnlyReferenceOnRecovery() {
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        BoxName box = BoxName.of("gc-box-3");
+        try (CandyboxNode nodeA = new CandyboxNode(2, config(), store, coordination, clock);
+             CandyboxNode nodeB = new CandyboxNode(3, config(), store, coordination, clock);
+             CandyboxNode nodeC = new CandyboxNode(4, config(), store, coordination, clock)) {
+            nodeA.createBox(box, PARTITIONS);
+            nodeA.releasePartition(box, 1);
+            nodeB.openPartition(box, 1);
+            BoxEngine q0 = nodeA.enginePartition(box, 0);
+            BoxEngine q1 = nodeB.enginePartition(box, 1);
+
+            CandyKey a = keyIn(0, "a");
+            CandyKey b = keyIn(1, "b");
+            q1.putCandy(b, bytes("precious"), null, Map.of(), null);
+            q1.putCandy(keyIn(1, "other"), bytes("x"), null, Map.of(), null);
+            long syrup = syrupOf(q1, b);
+            q1.flush();
+            rename(q1, b, q0, a);
+            nodeA.publishPartitionRefs(box, 0);
+            q1.flush();
+            nodeB.compactOwnedBoxesOnce(); // q1 orphans it
+
+            clock.advance(GRACE + 1);
+            q0.deleteCandy(a); // only in the memtable when its owner goes away
+            nodeA.releasePartition(box, 0);
+            clock.advance(GRACE / 2);
+            nodeB.collectGarbageOnce(); // nodeA's last publish still holds it
+            assertThat(store.listLedgers()).contains(syrup);
+
+            nodeC.openPartition(box, 0); // re-stamps it now
+            nodeB.collectGarbageOnce();
+            nodeC.collectGarbageOnce();
+            nodeB.collectGarbageOnce();
+            assertThat(store.listLedgers()).contains(syrup);
+
+            clock.advance(GRACE - 1);
+            nodeC.collectGarbageOnce();
+            nodeB.collectGarbageOnce();
+            assertThat(store.listLedgers()).contains(syrup);
+
+            clock.advance(1);
+            nodeC.collectGarbageOnce();
+            nodeB.collectGarbageOnce();
+            assertThat(store.listLedgers()).doesNotContain(syrup);
+        }
+    }
 }
