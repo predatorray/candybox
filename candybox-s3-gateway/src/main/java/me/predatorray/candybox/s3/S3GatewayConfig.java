@@ -26,6 +26,7 @@ import java.util.Properties;
 import me.predatorray.candybox.common.config.SecurityConfig;
 import me.predatorray.candybox.protocol.FrameCodec;
 import me.predatorray.candybox.protocol.Message;
+import me.predatorray.candybox.protocol.transport.TcpTransport;
 
 /**
  * Deployment-facing configuration for the S3 gateway process, loaded from a {@code .properties} file
@@ -54,6 +55,8 @@ public final class S3GatewayConfig {
     private final int workerThreads;
     private final long routerCacheTtlMillis;
     private final long routerUnownedRetryMillis;
+    private final int nodeConnectTimeoutMillis;
+    private final int nodeReadTimeoutMillis;
     private final SecurityConfig security;
     private final boolean s3AuthEnabled;
     private final boolean s3AllowAnonymous;
@@ -69,6 +72,8 @@ public final class S3GatewayConfig {
         this.workerThreads = b.workerThreads;
         this.routerCacheTtlMillis = b.routerCacheTtlMillis;
         this.routerUnownedRetryMillis = b.routerUnownedRetryMillis;
+        this.nodeConnectTimeoutMillis = b.nodeConnectTimeoutMillis;
+        this.nodeReadTimeoutMillis = b.nodeReadTimeoutMillis;
         this.security = b.security;
         this.s3AuthEnabled = b.s3AuthEnabled;
         this.s3AllowAnonymous = b.s3AllowAnonymous;
@@ -100,6 +105,10 @@ public final class S3GatewayConfig {
                         .orElse(Math.max(4, Runtime.getRuntime().availableProcessors() * 2)))
                 .routerCacheTtlMillis(r.getLong("s3.router-cache-ttl-ms").orElse(5_000L))
                 .routerUnownedRetryMillis(r.getLong("s3.router-unowned-retry-ms").orElse(15_000L))
+                .nodeConnectTimeoutMillis(r.getInt("node.connect.timeout.ms")
+                        .orElse(TcpTransport.DEFAULT_CONNECT_TIMEOUT_MILLIS))
+                .nodeReadTimeoutMillis(r.getInt("node.read.timeout.ms")
+                        .orElse(TcpTransport.DEFAULT_READ_TIMEOUT_MILLIS))
                 .security(SecurityConfig.resolve(r::get))
                 .s3AuthEnabled(r.get("s3.auth.enabled").map(Boolean::parseBoolean).orElse(false))
                 .s3AllowAnonymous(r.get("s3.auth.allow-anonymous").map(Boolean::parseBoolean)
@@ -150,6 +159,16 @@ public final class S3GatewayConfig {
 
     public long routerCacheTtlMillis() {
         return routerCacheTtlMillis;
+    }
+
+    /** Bound on connecting to a node (TCP connect, each TLS handshake read); 0 = no limit. */
+    public int nodeConnectTimeoutMillis() {
+        return nodeConnectTimeoutMillis;
+    }
+
+    /** Bound on each blocking read while awaiting a node's response; 0 = no limit. */
+    public int nodeReadTimeoutMillis() {
+        return nodeReadTimeoutMillis;
     }
 
     public long routerUnownedRetryMillis() {
@@ -231,6 +250,8 @@ public final class S3GatewayConfig {
         private int workerThreads = 8;
         private long routerCacheTtlMillis = 5_000L;
         private long routerUnownedRetryMillis = 15_000L;
+        private int nodeConnectTimeoutMillis = TcpTransport.DEFAULT_CONNECT_TIMEOUT_MILLIS;
+        private int nodeReadTimeoutMillis = TcpTransport.DEFAULT_READ_TIMEOUT_MILLIS;
 
         Builder bindHost(String v) {
             this.bindHost = v;
@@ -274,6 +295,16 @@ public final class S3GatewayConfig {
 
         Builder routerCacheTtlMillis(long v) {
             this.routerCacheTtlMillis = v;
+            return this;
+        }
+
+        Builder nodeConnectTimeoutMillis(int v) {
+            this.nodeConnectTimeoutMillis = v;
+            return this;
+        }
+
+        Builder nodeReadTimeoutMillis(int v) {
+            this.nodeReadTimeoutMillis = v;
             return this;
         }
 

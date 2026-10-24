@@ -142,7 +142,11 @@ public final class AdminApiMain {
                 .ofNullable(env.get("CANDYBOX_" + key.toUpperCase().replace('.', '_')))
                 .filter(s -> !s.isBlank()).map(String::trim));
         Transport tcp = new TcpTransport(new me.predatorray.candybox.protocol.FrameCodec(),
-                security.clientSslContext(), security.tlsVerifyEndpoint());
+                security.clientSslContext(), security.tlsVerifyEndpoint(),
+                parseIntOr(env.get("CANDYBOX_NODE_CONNECT_TIMEOUT_MS"),
+                        TcpTransport.DEFAULT_CONNECT_TIMEOUT_MILLIS),
+                parseIntOr(env.get("CANDYBOX_NODE_READ_TIMEOUT_MS"),
+                        TcpTransport.DEFAULT_READ_TIMEOUT_MILLIS));
         Transport transport = security.clientUsername() == null ? tcp
                 : new AuthenticatingTransport(tcp, security.clientMechanism(),
                         security.clientUsername(), security.clientPassword());

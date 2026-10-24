@@ -43,6 +43,16 @@ class S3GatewayConfigTest {
         assertThat(c.routerCacheTtlMillis()).isEqualTo(5_000L);
         assertThat(c.workerThreads()).isGreaterThanOrEqualTo(4);
         assertThat(c.zookeeperConnect()).isEqualTo("zk:2181");
+        assertThat(c.nodeConnectTimeoutMillis()).isEqualTo(5_000);
+        assertThat(c.nodeReadTimeoutMillis()).isEqualTo(120_000);
+    }
+
+    @Test
+    void nodeTimeoutsAreConfigurable() {
+        S3GatewayConfig c = S3GatewayConfig.fromProperties(props("zookeeper.connect", "zk:2181",
+                "node.connect.timeout.ms", "1500"), Map.of("CANDYBOX_NODE_READ_TIMEOUT_MS", "9000"));
+        assertThat(c.nodeConnectTimeoutMillis()).isEqualTo(1_500);
+        assertThat(c.nodeReadTimeoutMillis()).isEqualTo(9_000);
     }
 
     @Test
