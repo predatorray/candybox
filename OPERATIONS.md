@@ -244,7 +244,8 @@ Every request is authorized against the caller's principal (`User:alice`, `Gatew
 A Box's ACL document (owner + additive grants, stored in ZooKeeper) governs READ / WRITE /
 READ_ACP / WRITE_ACP / ADMIN; the creator owns the Box, and `ListBoxes` only reveals READable
 Boxes. Objects additionally carry their own owner + grants inside the `CandyLocator` (the S3
-union rule: an object grant can open READ on a single object inside a private Box). Manage with:
+union rule: an object grant can open READ on a single object inside a private Box). Copy, rename and
+upload-part-copy need WRITE on the Box plus READ on the source object. Manage with:
 
 ```
 candybox acl get|set|grant|revoke <box> [--object <key>]

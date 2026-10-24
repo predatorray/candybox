@@ -31,6 +31,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
 import me.predatorray.candybox.common.ManualClock;
+import me.predatorray.candybox.common.auth.Grant;
+import me.predatorray.candybox.common.auth.ObjectAcl;
 import me.predatorray.candybox.common.auth.Principal;
 import me.predatorray.candybox.common.auth.S3Key;
 import me.predatorray.candybox.common.auth.S3KeyStore;
@@ -441,5 +443,22 @@ class S3AuthorizationTest {
                 Map.of("x-amz-copy-source", "/srcbox/private"));
         assertThat(ok.status()).isEqualTo(200);
         assertThat(store.getCandyAcl("srcbox", "copy").owner()).isEqualTo("User:alice");
+
+        // UploadPartCopy reads the source the same way.
+        String uploadId = store.createMultipartUpload("srcbox", "stolen",
+                "application/octet-stream", Map.of());
+        Response partDenied = exchange(ch, HttpMethod.PUT,
+                "/srcbox/stolen?partNumber=1&uploadId=" + uploadId, null, BOB_KEY,
+                Map.of("x-amz-copy-source", "/srcbox/private"));
+        assertThat(partDenied.status()).isEqualTo(403);
+        assertThat(store.listParts("srcbox", "stolen", uploadId, 0, 0).parts()).isEmpty();
+
+        // An object grant supplies READ on the source.
+        store.setCandyAcl("srcbox", "private",
+                new ObjectAcl("User:alice", List.of(Grant.parse("User:bob:READ"))));
+        Response partOk = exchange(ch, HttpMethod.PUT,
+                "/srcbox/stolen?partNumber=1&uploadId=" + uploadId, null, BOB_KEY,
+                Map.of("x-amz-copy-source", "/srcbox/private"));
+        assertThat(partOk.status()).isEqualTo(200);
     }
 }
