@@ -17,7 +17,10 @@ package me.predatorray.candybox.protocol.transport;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.net.InetAddress;
+import java.net.ServerSocket;
 import java.net.URISyntaxException;
 import java.nio.file.Path;
 import javax.net.ssl.SSLContext;
@@ -103,6 +106,18 @@ class TlsTransportTest {
                     }
                 });
             }
+        }
+    }
+
+    @Test
+    void handshakeWithAPeerThatNeverAnswersTimesOut() throws Exception {
+        SSLContext client = PemTls.clientContext(resource("ca.pem"), null, null);
+        try (ServerSocket silent = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
+             TcpTransport transport = new TcpTransport(CODEC, client, true, 1_000, 300)) {
+            long start = System.nanoTime();
+            assertThrows(ProtocolException.class,
+                    () -> transport.connect("localhost", silent.getLocalPort()));
+            assertTrue(System.nanoTime() - start < 5_000_000_000L);
         }
     }
 }
