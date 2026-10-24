@@ -17,7 +17,6 @@ package me.predatorray.candybox.client;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.PrintStream;
@@ -105,10 +104,6 @@ class CandyboxCliAclIT {
         return out.toString(StandardCharsets.UTF_8);
     }
 
-    private byte[] stdoutBytes() {
-        return out.toByteArray();
-    }
-
     private String stderr() {
         return err.toString(StandardCharsets.UTF_8);
     }
@@ -174,6 +169,7 @@ class CandyboxCliAclIT {
     void unknownSubcommand() {
         assertThat(cli("acl", "frobnicate", "some-box")).isEqualTo(2);
         assertThat(stderr()).contains("Unknown acl subcommand: frobnicate");
+        assertThat(stdout()).isEmpty();
         assertThat(cli("acl", "frobnicate", "some-box", "--object", "k")).isEqualTo(2);
         assertThat(stderr()).contains("Unknown acl subcommand: frobnicate");
     }
@@ -250,6 +246,7 @@ class CandyboxCliAclIT {
         putObject(tmp, "acl-obj-bytes", "k", "original bytes");
         assertThat(cli("acl", "set", "acl-obj-bytes", "--object", "k", "alice", "AllUsers:READ")).isZero();
         assertThat(cli("acl", "grant", "acl-obj-bytes", "--object", "k", "User:bob:READ")).isZero();
+        assertThat(cli("acl", "revoke", "acl-obj-bytes", "--object", "k", "User:bob")).isZero();
         assertThat(cli("get", "acl-obj-bytes", "k")).isZero();
         assertThat(stdout()).isEqualTo("original bytes");
     }
