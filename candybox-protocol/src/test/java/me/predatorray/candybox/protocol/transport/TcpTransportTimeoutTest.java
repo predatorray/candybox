@@ -55,6 +55,14 @@ class TcpTransportTimeoutTest {
     }
 
     @Test
+    void invalidPortIsRejectedWithoutLeakingTheSocket() {
+        try (TcpTransport transport = new TcpTransport()) {
+            assertThatThrownBy(() -> transport.connect("127.0.0.1", 70_000))
+                    .isInstanceOf(IllegalArgumentException.class);
+        }
+    }
+
+    @Test
     void negativeTimeoutsAreRejected() {
         assertThatThrownBy(() -> new TcpTransport(new FrameCodec(), null, true, -1, 0))
                 .isInstanceOf(IllegalArgumentException.class);
