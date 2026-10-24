@@ -16,6 +16,7 @@
 package me.predatorray.candybox.server;
 
 import java.nio.file.Path;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
@@ -54,18 +55,18 @@ public final class CandyboxServer {
     }
 
     public static void main(String[] args) {
-        Path confFile = resolveConfigFile(args);
+        Path confFile = resolveConfigFile(args, System.getenv());
         LOG.info("Loading Candybox configuration from {}", confFile.toAbsolutePath());
         ServerConfig config = ServerConfig.load(confFile);
         run(config);
     }
 
     /** Resolves the config file: first CLI argument, else {@code $CANDYBOX_CONF_DIR/candybox.properties}. */
-    private static Path resolveConfigFile(String[] args) {
+    static Path resolveConfigFile(String[] args, Map<String, String> env) {
         if (args.length > 0 && !args[0].isBlank()) {
             return Path.of(args[0]);
         }
-        String confDir = System.getenv("CANDYBOX_CONF_DIR");
+        String confDir = env.get("CANDYBOX_CONF_DIR");
         if (confDir != null && !confDir.isBlank()) {
             return Path.of(confDir, "candybox.properties");
         }
@@ -114,6 +115,14 @@ public final class CandyboxServer {
             this.node = node;
             this.coordination = coordination;
             this.ledgerStore = ledgerStore;
+        }
+
+        int transportPort() {
+            return transport.port();
+        }
+
+        int healthPort() {
+            return health.port();
         }
 
         @Override
