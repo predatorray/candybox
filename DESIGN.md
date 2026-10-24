@@ -85,8 +85,8 @@ enough: right after a flush (which every graceful handover does) the WAL is empt
 live only in SSTables. So each flush records the max HLC of the flushed memtable (point mutations and
 range tombstones) as a monotonic high-water `maxHlc` in the manifest, the recovering owner observes
 `max(manifest maxHlc, WAL max)` even when the WAL is empty, and records that max in its own rotation
-edit. Like the WAL path, `observe` fails recovery loudly if the recorded HLC leads the local clock by
-more than `maxClockSkewMillis`.
+edit (which also flushes a non-empty replay, §9). Like the WAL path, `observe` fails recovery loudly
+if the recorded HLC leads the local clock by more than `maxClockSkewMillis`.
 
 ## 4. Ledger roles & lifecycle
 
@@ -210,7 +210,8 @@ consults range tombstones across all tables rather than pruning by point range.
   append to WAL → apply to memtable (LWW). Auto-flush when the memtable exceeds its byte threshold.
 - **delete**: stamp HLC → write a DELETE tombstone the same way.
 - **flush**: seal the memtable into a new L0 SSTable, record referenced Syrups + the rotated WAL id in
-  one `ManifestEdit`, open a reader for the new table.
+  one `ManifestEdit`, open a reader for the new table. Handover flushes a non-empty WAL replay the
+  same way (§7).
 - **get/head**: resolve the key to the highest-HLC locator across the memtable and the overlapping
   SSTables at every level (range + bloom pre-filter); a point tombstone, a covering **range tombstone** newer than
   that locator, or absence ⇒ `CandyNotFound`. `getCandy` then streams bytes from Syrups and validates
@@ -291,6 +292,12 @@ The manifest is an **append-only metadata ledger**; a partition's manifest has e
 2. replay its edits to rebuild `ManifestState`;
 3. open a **fresh** manifest ledger (a sealed BK ledger can't be appended) and seed it with a
    self-contained checkpoint of the recovered state.
+
+`BoxEngine.recover` then recover-opens and replays the prior WAL, observes the HLC high-water (§3),
+and commits one edit that rotates to a fresh WAL and supersedes the prior WAL and manifest. If the
+replay is non-empty, the same edit adds it as an L0 SSTable, so the replayed writes never live only
+in the new owner's memtable, where a second handover before a flush would lose them (#63). A failed
+recovery leaves the pointer, and so the prior manifest and WAL, untouched for the next attempt.
 
 The ZK pointer to the current manifest ledger is advanced with a **compare-and-set on the expected
 ZK version** (never a blind set), and every state-mutating append carries the owner's **fencing
@@ -396,9 +403,10 @@ failed delete is retried and a new owner inherits whatever the prior owner had n
   created since the previous one to the live set, so one whose Candies were all superseded before the
   flush, or that a failed write left behind, is still seen;
 - **WAL** ledgers rotated out at flush, whose mutations are now durable in an SSTable;
-- at handover, the prior owner's **manifest** ledger, and its **WAL** — at once if its replay was
-  empty, else at the new owner's first flush. Both enter through the new manifest, so they are only
-  deleted if the manifest pointer moves to it.
+- at handover, the prior owner's **manifest** ledger and its **WAL**. A non-empty WAL replay is
+  flushed to an L0 SSTable in the same edit that rotates to the new WAL, so the replayed writes never
+  live only in the new owner's memtable (else a second handover before a flush would lose them). Both
+  enter through the new manifest, so they are only deleted if the manifest pointer moves to it.
 
 The detailed rules:
 
@@ -411,8 +419,8 @@ The detailed rules:
 - (c) orphaned-Syrup GC is driven by per-SSTable referenced-Syrup tracking plus an in-memory
   **pending-orphan list**, recomputed from the live set at flush and on handover. Ledgers that no
   manifest ever recorded (written by a flush or compaction that then failed, by an owner that crashed
-  before flushing, or by a handover whose pointer CAS lost) need an **enumeration backstop**, still
-  **TODO(phase-3+)** (#105);
+  before flushing, or by a recovery that failed or whose pointer CAS lost) need an **enumeration
+  backstop**, still **TODO(phase-3+)** (#105);
 - (d) **v1 Syrup reclamation policy**: because BookKeeper deletes whole ledgers only, a single live
   Candy pins an otherwise-dead Syrup. **v1 documents and accepts this** — a Syrup is reclaimed only
   once *every* segment in it is dead. Syrup defragmentation (copying survivors into a fresh Syrup) is
@@ -501,7 +509,7 @@ Per-role BK quorum (E/Qw/Qa) defaults: **WAL 3/3/2, Manifest 3/3/2, SSTable 3/2/
   never changes (changing it would re-home every key), and hash partitioning makes every ordered
   listing a scatter-gather fan-out (each page queries all partitions). Key-range partitions with
   splits, and re-partitioning, are future work. A partition is still unavailable during its own
-  handover fence+replay window (shrunk by the pre-handover flush).
+  handover fence+replay+flush window (shrunk by the pre-handover flush).
 - **Cross-partition copy/rename is zero-copy (resolved), but its rename is only *eventually* atomic**
   — the former byte-copy-through-the-client simplification is gone: cross-partition copy/rename now
   reuse the source's Syrup segments via the locator relay, kept safe by Box-global GC (§6, §9(f)). A

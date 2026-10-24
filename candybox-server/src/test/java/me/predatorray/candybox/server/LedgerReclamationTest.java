@@ -148,7 +148,7 @@ class LedgerReclamationTest {
     }
 
     @Test
-    void handoverReclaimsThePriorManifestAndThePriorWalOnceItsReplayIsFlushed() {
+    void handoverFlushesTheReplayedWalAndReclaimsIt() {
         nodeA.createBox(BOX, 1);
         BoxEngine ownerA = nodeA.enginePartition(BOX, 0);
         ownerA.putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null); // only in A's WAL
@@ -164,20 +164,72 @@ class LedgerReclamationTest {
         assertThat(exists(priorManifest)).isTrue();
         nodeB.collectGarbageOnce();
         assertThat(exists(priorManifest)).isFalse();
-        assertThat(exists(priorWal)).isTrue(); // still the only durable copy of "k"
+        assertThat(exists(priorWal)).isFalse(); // its replay is durable in B's L0 table
+        assertThat(ownerB.getCandy(CandyKey.of("k"))).isEqualTo(bytes("v1"));
+    }
 
-        store.failCreates = 1; // B's first flush fails before its manifest edit
-        assertThatThrownBy(ownerB::flush).isInstanceOf(StorageException.class);
-        clock.advance(GRACE + 1);
-        nodeB.collectGarbageOnce();
+    @Test
+    void aHandoverWhoseRecoveryFlushFailsKeepsThePriorWal() {
+        nodeA.createBox(BOX, 1);
+        BoxEngine ownerA = nodeA.enginePartition(BOX, 0);
+        ownerA.putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
+        long priorManifest = ownerA.manifestLedgerId();
+        long priorWal = ownerA.manifestState().walLedgerId();
+
+        clock.advance(11_000);
+        store.failCreatesOfRole = "SSTABLE";
+        assertThatThrownBy(() -> nodeB.openBox(BOX)).isInstanceOf(StorageException.class);
+        assertThat(ManifestPointer.decode(coordination.get(PartitionOwnership.manifestKey(BOX, 0))
+                .orElseThrow().value()).ledgerId()).isEqualTo(priorManifest);
+        assertThat(exists(priorManifest)).isTrue();
         assertThat(exists(priorWal)).isTrue();
-        assertThat(ownerB.manifestState().pendingDeletes()).doesNotContainKey(priorWal);
 
-        ownerB.flush();
+        nodeB.openBox(BOX);
+        BoxEngine ownerB = nodeB.enginePartition(BOX, 0);
         clock.advance(GRACE + 1);
         nodeB.collectGarbageOnce();
         assertThat(exists(priorWal)).isFalse();
         assertThat(ownerB.getCandy(CandyKey.of("k"))).isEqualTo(bytes("v1"));
+    }
+
+    @Test
+    void aFailedFlushKeepsItsWalUntilARetrySucceeds() {
+        nodeA.createBox(BOX, 1);
+        BoxEngine engine = nodeA.enginePartition(BOX, 0);
+        engine.putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
+        long wal = engine.manifestState().walLedgerId();
+
+        store.failCreatesOfRole = "SSTABLE";
+        assertThatThrownBy(engine::flush).isInstanceOf(StorageException.class);
+        clock.advance(GRACE + 1);
+        nodeA.collectGarbageOnce();
+        assertThat(exists(wal)).isTrue();
+        assertThat(engine.manifestState().walLedgerId()).isEqualTo(wal);
+        assertThat(engine.manifestState().pendingDeletes()).doesNotContainKey(wal);
+
+        engine.flush();
+        clock.advance(GRACE + 1);
+        nodeA.collectGarbageOnce();
+        assertThat(exists(wal)).isFalse();
+        assertThat(engine.getCandy(CandyKey.of("k"))).isEqualTo(bytes("v1"));
+    }
+
+    @Test
+    void aSyrupSupersededInAReplayedWalIsReclaimedAfterHandover() {
+        nodeA.createBox(BOX, 1);
+        BoxEngine ownerA = nodeA.enginePartition(BOX, 0);
+        ownerA.putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
+        long v1Syrup = ownerA.resolveLocator(CandyKey.of("k")).parts().get(0).segments().get(0)
+                .syrupId();
+        ownerA.putCandy(CandyKey.of("k"), bytes("v2"), null, Map.of(), null); // A crashes unflushed
+
+        clock.advance(11_000);
+        nodeB.openBox(BOX);
+        BoxEngine ownerB = nodeB.enginePartition(BOX, 0);
+        clock.advance(GRACE + 1);
+        nodeB.collectGarbageOnce();
+        assertThat(exists(v1Syrup)).isFalse();
+        assertThat(ownerB.getCandy(CandyKey.of("k"))).isEqualTo(bytes("v2"));
     }
 
     @Test
@@ -316,7 +368,7 @@ class LedgerReclamationTest {
     private static final class FlakyLedgerStore implements LedgerStore {
         private final LedgerStore delegate;
         volatile boolean failDeletes;
-        volatile int failCreates;
+        volatile String failCreatesOfRole; // the next create of this role fails
 
         FlakyLedgerStore(LedgerStore delegate) {
             this.delegate = delegate;
@@ -324,8 +376,9 @@ class LedgerReclamationTest {
 
         @Override
         public WritableLedger createLedger(LedgerConfig config) {
-            if (failCreates > 0) {
-                failCreates--;
+            byte[] role = config.customMetadata().get("candybox-role");
+            if (role != null && new String(role, StandardCharsets.UTF_8).equals(failCreatesOfRole)) {
+                failCreatesOfRole = null;
                 throw new StorageException("injected create failure");
             }
             return delegate.createLedger(config);
