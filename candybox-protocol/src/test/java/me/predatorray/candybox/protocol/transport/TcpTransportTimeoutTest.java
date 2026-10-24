@@ -38,6 +38,9 @@ class TcpTransportTimeoutTest {
             assertThatThrownBy(() -> conn.call(new Frame(Opcode.GET_CANDY, new byte[0])))
                     .isInstanceOf(ProtocolException.class);
             assertThat(Duration.ofNanos(System.nanoTime() - start)).isLessThan(Duration.ofSeconds(5));
+            // the connection is closed, so a retry on it fails fast instead of reading garbage
+            assertThatThrownBy(() -> conn.call(new Frame(Opcode.GET_CANDY, new byte[0])))
+                    .isInstanceOf(ProtocolException.class);
         }
     }
 
