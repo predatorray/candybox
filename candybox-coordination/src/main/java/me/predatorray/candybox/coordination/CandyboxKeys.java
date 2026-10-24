@@ -55,9 +55,10 @@ public final class CandyboxKeys {
     }
 
     /**
-     * The versioned key holding one partition's published referenced-Syrup id set, consulted by the
-     * Box-global garbage collector so a Syrup shared cross-partition (zero-copy copy/rename) is never
-     * reclaimed while any partition still points at it.
+     * The versioned key holding one partition's published held-Syrup id set (referenced, or released
+     * less than a GC grace period ago), consulted by the Box-global garbage collector so a Syrup
+     * shared cross-partition (zero-copy copy/rename) is never reclaimed while any partition still
+     * points at it, nor sooner than a grace period after the last one let go.
      */
     public static String partitionRefsKey(String boxName, int partition) {
         return BOXES_ROOT + "/" + boxName + "/partitions/" + partition + "/refs";

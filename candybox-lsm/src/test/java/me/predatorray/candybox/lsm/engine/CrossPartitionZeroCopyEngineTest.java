@@ -45,7 +45,7 @@ import org.junit.jupiter.api.Test;
 /**
  * Engine-level coverage of the cross-partition zero-copy primitives: {@link BoxEngine#resolveLocator},
  * {@link BoxEngine#zeroCopyPut}, the LWW {@link BoxEngine#deleteCandyConditional}, the rename-intent
- * journal, and the published referenced-Syrup set the Box-global GC relies on.
+ * journal, and the published held-Syrup set the Box-global GC relies on.
  *
  * <p>Two engines over one shared {@link InMemoryLedgerStore} stand in for two partitions of a Box:
  * the destination engine reuses the source engine's Syrup segments verbatim, and reads stream those
@@ -185,6 +185,28 @@ class CrossPartitionZeroCopyEngineTest {
         assertThat(src.claimReclaimableSyrups(Long.MAX_VALUE, Set.of())).containsExactly(syrup);
         assertThat(src.manifestState().liveSyrups()).doesNotContain(syrup);
         assertThat(src.claimReclaimableSyrups(Long.MAX_VALUE, Set.of())).isEmpty();
+    }
+
+    @Test
+    void heldSyrupsKeepsAMemtableOnlyReferenceForAGracePeriodAfterItIsGone() {
+        CandyboxConfig config = CandyboxConfig.builder().syrupRolloverBytes(1).build();
+        ManualClock clock = new ManualClock(1000);
+        src = BoxEngine.createNew(box, config, store, 1, clock, 1L);
+        dst = BoxEngine.createNew(box, config, store, 2, clock, 1L);
+        src.putCandy(CandyKey.of("k"), bytes("payload"), null, Map.of(), null);
+        src.putCandy(CandyKey.of("other"), bytes("x"), null, Map.of(), null);
+        List<Part> parts = src.resolveLocator(CandyKey.of("k")).parts();
+        long syrup = parts.get(0).segments().get(0).syrupId();
+        dst.zeroCopyPut(CandyKey.of("d"), parts, null, Map.of(), 0L, ObjectAcl.NONE, null);
+        assertThat(dst.heldSyrups(Long.MAX_VALUE)).contains(syrup);
+
+        clock.advance(500);
+        dst.deleteCandy(CandyKey.of("d")); // the reference never reaches an SSTable
+        assertThat(dst.referencedSyrups()).doesNotContain(syrup);
+        assertThat(dst.heldSyrups(Long.MAX_VALUE)).contains(syrup);
+        dst.flush();
+        assertThat(dst.heldSyrups(1499)).contains(syrup);
+        assertThat(dst.heldSyrups(1500)).doesNotContain(syrup);
     }
 
     @Test
