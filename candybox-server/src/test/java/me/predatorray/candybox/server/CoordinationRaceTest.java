@@ -19,6 +19,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -251,7 +252,7 @@ class CoordinationRaceTest {
 
         acls.delete("race");
 
-        assertThat(backing.get(ACL_KEY)).isPresent();
+        assertThat(backing.get(ACL_KEY).orElseThrow().value()).isEqualTo(ACL_B.toBytes());
     }
 
     // ---- PartitionBalancer -------------------------------------------------------------------
@@ -315,9 +316,13 @@ class CoordinationRaceTest {
             Optional<Lease> balancerLease = backing.tryAcquireLease(CandyboxKeys.BALANCER_RESOURCE,
                     1, 10_000_000);
             assertThat(balancerLease).isPresent();
-            backing.create(CandyboxKeys.ASSIGNMENT_KEY, new PartitionAssignment(Map.of(
-                    new BoxPartition("box-a", 0), 2, new BoxPartition("box-a", 1), 2,
-                    new BoxPartition("box-b", 0), 2, new BoxPartition("box-b", 1), 2)).encode());
+            // Ordered so the failing takeovers (box-a) are attempted before the healthy ones.
+            Map<BoxPartition, Integer> targets = new LinkedHashMap<>();
+            targets.put(new BoxPartition("box-a", 0), 2);
+            targets.put(new BoxPartition("box-a", 1), 2);
+            targets.put(new BoxPartition("box-b", 0), 2);
+            targets.put(new BoxPartition("box-b", 1), 2);
+            backing.create(CandyboxKeys.ASSIGNMENT_KEY, new PartitionAssignment(targets).encode());
             for (BoxName box : List.of(a, b)) {
                 for (int p = 0; p < 2; p++) {
                     node1.releasePartitionForHandover(box, p);
