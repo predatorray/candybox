@@ -84,6 +84,13 @@ class CandyboxCliTest {
     // ---- security options (resolved before any network call) --------------------------------
 
     @Test
+    void unknownMechanismIsRejectedBeforeAnyNetworkCall() {
+        assertThat(run("-s", "127.0.0.1:1", "-u", "alice", "--password", "x", "--mechanism", "NOPE",
+                "list-boxes")).isEqualTo(2);
+        assertThat(stderr()).contains("No AuthenticationProvider for SASL mechanism 'NOPE'");
+    }
+
+    @Test
     void userWithoutAPasswordIsRejected() {
         assertThat(run("-u", "alice", "list-boxes")).isEqualTo(2);
         assertThat(stderr()).contains("--password");

@@ -176,8 +176,8 @@ class CandyboxCliSecurityIT {
     @Test
     void unknownMechanismIsRejected() {
         assertThat(cli(sasl, "-u", "alice", "--password", "s3cret", "--mechanism", "NOPE",
-                "list-boxes")).isNotZero();
-        assertThat(stderr()).contains("NOPE");
+                "list-boxes")).isEqualTo(2);
+        assertThat(stderr()).contains("No AuthenticationProvider for SASL mechanism 'NOPE'");
     }
 
     // ---- TLS -------------------------------------------------------------------------------
@@ -192,10 +192,13 @@ class CandyboxCliSecurityIT {
     @Test
     void tlsWithoutCaFailsBecauseJvmDoesNotTrustTestCa() {
         assertThat(cli(tls, "--tls", "list-boxes")).isNotZero();
+        assertThat(stderr()).startsWith("error:");
     }
 
     @Test
     void tlsInsecureNoVerifyFlagIsAccepted() {
+        // The cert's SAN includes 127.0.0.1, so this passes with or without the flag; it guards
+        // that the flag is accepted and doesn't break the handshake.
         assertThat(cli(tls.replace("localhost", "127.0.0.1"), "--tls", "--tls-ca", ca.toString(),
                 "--tls-insecure-no-verify", "list-boxes")).isZero();
     }
