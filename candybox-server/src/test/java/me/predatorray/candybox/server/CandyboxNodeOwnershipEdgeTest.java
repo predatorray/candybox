@@ -195,6 +195,52 @@ class CandyboxNodeOwnershipEdgeTest {
         assertXIntactViaB();
     }
 
+    /**
+     * Lets A's view of X pass every ownership check except the last one of the next maintenance
+     * pass, which is {@code ownership.engine()} right after {@code isOwner()}: the lease is lost in
+     * the window between the check and the access (the {@code NotOwnerException} catch arms).
+     */
+    private void loseOwnershipOfXAfterTheCheck(Runnable maintenancePass) {
+        staleCoordination.validityChecks.set(0);
+        maintenancePass.run(); // unlimited: just counts the checks a pass makes on X
+        int checks = staleCoordination.validityChecks.get();
+        assertThat(checks).isPositive();
+        staleCoordination.validBudget = checks - 1;
+    }
+
+    @Test
+    void gcSkipsAPartitionWhoseLeaseIsLostBetweenTheCheckAndTheAccess() {
+        staleViewOfX(false);
+        loseOwnershipOfXAfterTheCheck(nodeA::collectGarbageOnce);
+
+        assertThatCode(nodeA::collectGarbageOnce).doesNotThrowAnyException();
+
+        assertXIntactViaB();
+        assertThat(nodeA.enginePartition(Y, 0).getCandy(CandyKey.of("a"))).isEqualTo(bytes("v-a"));
+    }
+
+    @Test
+    void multipartSweepSkipsAPartitionWhoseLeaseIsLostBetweenTheCheckAndTheAccess() {
+        staleViewOfX(true);
+        loseOwnershipOfXAfterTheCheck(nodeA::sweepStaleMultipartUploadsOnce);
+        // The counting pass consumed Y's old upload; make a fresh stale one, keeping both leases alive.
+        nodeA.enginePartition(Y, 0).createMultipartUpload(CandyKey.of("y-mpu"), null, Map.of());
+        nodeA.renewLeases();
+        nodeB.renewLeases();
+        clock.advance(TTL / 2 + 1);
+        nodeA.renewLeases();
+        nodeB.renewLeases();
+        clock.advance(TTL / 2 + 1);
+
+        // X is skipped through NotOwnerException; Y's stale upload is still aborted.
+        int[] aborted = new int[1];
+        assertThatCode(() -> aborted[0] = nodeA.sweepStaleMultipartUploadsOnce())
+                .doesNotThrowAnyException();
+
+        assertThat(aborted[0]).isEqualTo(1);
+        assertThat(nodeB.enginePartition(X, 0).listMultipartUploads()).hasSize(1);
+    }
+
     // ---- disabled multipart TTL ------------------------------------------------------------
 
     @Test
@@ -202,12 +248,12 @@ class CandyboxNodeOwnershipEdgeTest {
         long thirtyDays = 30L * 24 * 3600 * 1000;
         // Leases outlive the clock advance, so the node still owns the partition at sweep time and
         // only the TTL setting decides the outcome.
-        CandyboxConfig.Builder longLease = baseConfig().ownershipLeaseTtlMillis(2 * thirtyDays);
-        try (CandyboxNode disabled = new CandyboxNode(3, longLease.multipartUploadTtlMillis(0).build(),
-                        store, coordination, clock);
-                CandyboxNode enabled = new CandyboxNode(4,
-                        longLease.multipartUploadTtlMillis(thirtyDays / 2).build(),
-                        store, coordination, clock)) {
+        CandyboxConfig disabledConfig = baseConfig().ownershipLeaseTtlMillis(2 * thirtyDays)
+                .multipartUploadTtlMillis(0).build();
+        CandyboxConfig enabledConfig = baseConfig().ownershipLeaseTtlMillis(2 * thirtyDays)
+                .multipartUploadTtlMillis(thirtyDays / 2).build();
+        try (CandyboxNode disabled = new CandyboxNode(3, disabledConfig, store, coordination, clock);
+                CandyboxNode enabled = new CandyboxNode(4, enabledConfig, store, coordination, clock)) {
             disabled.createBox(X, 1);
             enabled.createBox(Y, 1);
             disabled.enginePartition(X, 0).createMultipartUpload(CandyKey.of("mpu"), null, Map.of());
@@ -252,6 +298,10 @@ class CandyboxNodeOwnershipEdgeTest {
         private final CoordinationService delegate;
         private volatile String noRenewFor; // exact lease resource
         private volatile String alwaysValidFor;
+        /** Number of {@code isValid()} calls on the always-valid lease. */
+        final AtomicInteger validityChecks = new AtomicInteger();
+        /** When >= 0, only this many more checks report valid; later ones see the real state. */
+        volatile int validBudget = -1;
 
         StaleViewCoordination(CoordinationService delegate) {
             this.delegate = delegate;
@@ -290,7 +340,16 @@ class CandyboxNodeOwnershipEdgeTest {
                 @Override
                 public boolean isValid() {
                     String stale = alwaysValidFor;
-                    return (stale != null && lease.resource().equals(stale)) || lease.isValid();
+                    if (stale != null && lease.resource().equals(stale)) {
+                        validityChecks.incrementAndGet();
+                        int budget = validBudget;
+                        if (budget < 0) {
+                            return true;
+                        }
+                        validBudget = budget - 1;
+                        return budget > 0 || lease.isValid();
+                    }
+                    return lease.isValid();
                 }
 
                 @Override
