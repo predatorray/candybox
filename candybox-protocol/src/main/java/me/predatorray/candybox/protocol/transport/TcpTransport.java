@@ -19,6 +19,7 @@ import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.net.InetSocketAddress;
 import java.net.Socket;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
@@ -40,6 +41,13 @@ public final class TcpTransport implements Transport {
     private final FrameCodec codec;
     private final SSLContext sslContext;
     private final boolean verifyEndpoint;
+    private final int connectTimeoutMillis;
+    private final int readTimeoutMillis;
+
+    /** Default time to establish a connection (including the TLS handshake). */
+    public static final int DEFAULT_CONNECT_TIMEOUT_MILLIS = 5_000;
+    /** Default time to wait for a response frame; must exceed the slowest legitimate server op. */
+    public static final int DEFAULT_READ_TIMEOUT_MILLIS = 120_000;
 
     public TcpTransport() {
         this(new FrameCodec());
@@ -55,18 +63,36 @@ public final class TcpTransport implements Transport {
      *                       only for dev certificates without proper SANs
      */
     public TcpTransport(FrameCodec codec, SSLContext sslContext, boolean verifyEndpoint) {
+        this(codec, sslContext, verifyEndpoint, DEFAULT_CONNECT_TIMEOUT_MILLIS,
+                DEFAULT_READ_TIMEOUT_MILLIS);
+    }
+
+    /**
+     * @param connectTimeoutMillis bound on TCP connect plus TLS handshake; 0 means no limit
+     * @param readTimeoutMillis    bound on waiting for a response; on expiry the call fails and the
+     *                             connection must be discarded. 0 means no limit
+     */
+    public TcpTransport(FrameCodec codec, SSLContext sslContext, boolean verifyEndpoint,
+            int connectTimeoutMillis, int readTimeoutMillis) {
+        if (connectTimeoutMillis < 0 || readTimeoutMillis < 0) {
+            throw new IllegalArgumentException("timeouts must be >= 0");
+        }
         this.codec = codec;
         this.sslContext = sslContext;
         this.verifyEndpoint = verifyEndpoint;
+        this.connectTimeoutMillis = connectTimeoutMillis;
+        this.readTimeoutMillis = readTimeoutMillis;
     }
 
     @Override
     public Connection connect(String host, int port) {
+        Socket socket = new Socket();
         try {
-            Socket socket;
+            socket.connect(new InetSocketAddress(host, port), connectTimeoutMillis);
             if (sslContext != null) {
+                socket.setSoTimeout(connectTimeoutMillis);
                 SSLSocket ssl = (SSLSocket) sslContext.getSocketFactory()
-                        .createSocket(host, port);
+                        .createSocket(socket, host, port, true);
                 if (verifyEndpoint) {
                     SSLParameters params = ssl.getSSLParameters();
                     params.setEndpointIdentificationAlgorithm("HTTPS");
@@ -74,11 +100,15 @@ public final class TcpTransport implements Transport {
                 }
                 ssl.startHandshake();
                 socket = ssl;
-            } else {
-                socket = new Socket(host, port);
             }
+            socket.setSoTimeout(readTimeoutMillis);
             return new TcpConnection(socket, codec);
         } catch (IOException e) {
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+                // best effort
+            }
             throw new ProtocolException("Failed to connect to " + host + ":" + port, e);
         }
     }
