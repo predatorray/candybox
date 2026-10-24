@@ -43,7 +43,8 @@ import org.junit.jupiter.api.io.TempDir;
  * loaded from a properties file via {@link ServerConfig#load} — against embedded BookKeeper and its
  * in-process ZooKeeper. Verifies the composition root actually stands up: the health/metrics endpoint
  * answers and the TCP server serves a real client round-trip. {@code run} blocks in the foreground, so
- * it is driven on a daemon thread; the forked IT JVM's exit runs the registered shutdown hook. Lives
+ * the test captures the drain action instead of installing a JVM shutdown hook and runs it before
+ * stopping the embedded backends, so the JVM exit does not block on dead services. Lives
  * in the {@code me.predatorray.candybox.server} package to reach the package-private {@code run}.
  */
 class CandyboxServerIT {
@@ -53,6 +54,7 @@ class CandyboxServerIT {
     private static int bindPort;
     private static int healthPort;
     private static Thread serverThread;
+    private static final AtomicReference<Runnable> drain = new AtomicReference<>();
     private static final AtomicReference<Throwable> serverFailure = new AtomicReference<>();
 
     @BeforeAll
@@ -77,7 +79,7 @@ class CandyboxServerIT {
         ServerConfig config = ServerConfig.load(conf);
         serverThread = new Thread(() -> {
             try {
-                CandyboxServer.run(config); // blocks until JVM shutdown
+                CandyboxServer.run(config, drain::set); // blocks until drain runs
             } catch (Throwable t) {
                 serverFailure.set(t);
             }
@@ -89,9 +91,14 @@ class CandyboxServerIT {
     }
 
     @AfterAll
-    static void stop() {
-        // run() owns its components and only releases them via its JVM shutdown hook, which fires when
-        // this forked IT JVM exits; we just tear down the embedded cluster here.
+    static void stop() throws InterruptedException {
+        Runnable d = drain.get();
+        if (d != null) {
+            d.run();
+        }
+        if (serverThread != null) {
+            serverThread.join(10_000);
+        }
         closeQuietly(zookeeper);
         closeQuietly(bookKeeper);
     }
