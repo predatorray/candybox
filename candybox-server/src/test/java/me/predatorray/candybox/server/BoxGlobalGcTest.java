@@ -51,7 +51,14 @@ class BoxGlobalGcTest {
 
     @BeforeEach
     void setUp() {
-        CandyboxConfig config = CandyboxConfig.builder()
+        node = new CandyboxNode(1, config(), store, new InMemoryCoordinationService(clock), clock);
+        node.createBox(BOX, PARTITIONS);
+        p0 = node.enginePartition(BOX, 0);
+        p1 = node.enginePartition(BOX, 1);
+    }
+
+    private static CandyboxConfig config() {
+        return CandyboxConfig.builder()
                 .syrupRolloverBytes(1)             // every Candy in its own (sealed) Syrup
                 .l0CompactionTrigger(2)
                 .ledgerGcGraceMillis(GRACE)
@@ -59,10 +66,6 @@ class BoxGlobalGcTest {
                 .leaseRenewIntervalMillis(0)
                 .compactionIntervalMillis(0)
                 .build();
-        node = new CandyboxNode(1, config, store, new InMemoryCoordinationService(clock), clock);
-        node.createBox(BOX, PARTITIONS);
-        p0 = node.enginePartition(BOX, 0);
-        p1 = node.enginePartition(BOX, 1);
     }
 
     @AfterEach
@@ -218,10 +221,13 @@ class BoxGlobalGcTest {
         node.compactOwnedBoxesOnce(); // p1 orphans it
 
         clock.advance(GRACE + 1);
-        p0.deleteCandy(a); // p0's reference never reached an SSTable
-        p0.flush();
+        p0.deleteCandy(a); // p0's reference never reaches an SSTable
         assertThat(p0.referencedSyrups()).doesNotContain(syrup);
+        node.collectGarbageOnce();
+        assertThat(store.listLedgers()).contains(syrup);
 
+        clock.advance(1);
+        p0.flush(); // stamps it
         node.collectGarbageOnce();
         assertThat(store.listLedgers()).contains(syrup);
 
@@ -232,5 +238,54 @@ class BoxGlobalGcTest {
         clock.advance(1);
         node.collectGarbageOnce();
         assertThat(store.listLedgers()).doesNotContain(syrup);
+    }
+
+    @Test
+    void aSiblingOnAnotherNodeWaitsForTheGracePeriodAfterTheLastReference() {
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        BoxName box = BoxName.of("gc-box-2");
+        try (CandyboxNode nodeA = new CandyboxNode(2, config(), store, coordination, clock);
+             CandyboxNode nodeB = new CandyboxNode(3, config(), store, coordination, clock)) {
+            nodeA.createBox(box, PARTITIONS);
+            nodeA.releasePartition(box, 1);
+            nodeB.openPartition(box, 1);
+            BoxEngine q0 = nodeA.enginePartition(box, 0);
+            BoxEngine q1 = nodeB.enginePartition(box, 1);
+
+            CandyKey a = keyIn(0, "a");
+            CandyKey b = keyIn(1, "b");
+            q1.putCandy(b, bytes("precious"), null, Map.of(), null);
+            q1.putCandy(keyIn(1, "other"), bytes("x"), null, Map.of(), null);
+            long syrup = syrupOf(q1, b);
+            q1.flush();
+            rename(q1, b, q0, a);
+            nodeA.publishPartitionRefs(box, 0); // as the zero-copy put request does
+            q1.flush();
+            nodeB.compactOwnedBoxesOnce(); // q1 orphans it
+
+            clock.advance(GRACE + 1);
+            q0.deleteCandy(a);
+            q0.flush();
+            q0.putCandy(keyIn(0, "pad"), bytes("y"), null, Map.of(), null);
+            q0.flush();
+            nodeA.compactOwnedBoxesOnce(); // q0 orphans it, not yet published
+            assertThat(q0.referencedSyrups()).doesNotContain(syrup);
+
+            nodeB.collectGarbageOnce();
+            nodeA.collectGarbageOnce();
+            nodeB.collectGarbageOnce();
+            assertThat(store.listLedgers()).contains(syrup);
+
+            clock.advance(GRACE - 1);
+            nodeA.collectGarbageOnce();
+            nodeB.collectGarbageOnce();
+            assertThat(store.listLedgers()).contains(syrup);
+
+            clock.advance(1);
+            nodeB.collectGarbageOnce(); // still sees nodeA's last publish
+            assertThat(store.listLedgers()).contains(syrup);
+            nodeA.collectGarbageOnce();
+            assertThat(store.listLedgers()).doesNotContain(syrup);
+        }
     }
 }

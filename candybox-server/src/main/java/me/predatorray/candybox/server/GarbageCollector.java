@@ -85,7 +85,7 @@ public final class GarbageCollector {
     /**
      * As {@link #collect(BoxEngine)}, but a Syrup is only physically reclaimed when it is referenced
      * by <em>no</em> partition of the Box: {@code foreignReferencedSyrups} is the union of every
-     * sibling partition's published referenced-Syrup set, so a Syrup shared cross-partition by a
+     * sibling partition's published held-Syrup set, so a Syrup shared cross-partition by a
      * zero-copy copy/rename is never deleted out from under the partition that points at it. This is
      * the Box-global garbage collection of DESIGN §9.
      */

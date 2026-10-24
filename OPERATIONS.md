@@ -138,16 +138,15 @@ These ledgers are tracked as *pending deletes* in the manifest until the delete 
 delete is retried on a later pass and a new owner finishes whatever its predecessor left behind.
 
 **Box-global GC.** Because cross-partition zero-copy copy/rename lets a destination partition share a
-source partition's Syrup segments, each partition owner publishes its referenced-Syrup set to
+source partition's Syrup segments, each partition owner publishes the Syrups it references to
 coordination (`boxes/<box>/partitions/<p>/refs`). The creating partition's GC skips any Syrup a
 sibling partition still references, so a shared Syrup is reclaimed only once **no** partition of the
 Box references it (still gated by `ledgerGcGraceMillis`). A partition re-checks its own references
 when it claims a Syrup for deletion, and a Syrup that is referenced again restarts its grace period
 once orphaned anew, so renaming an object away and back no longer loses its bytes through a stale
 orphan entry. A partition keeps publishing a Syrup it orphaned for one grace period, so the grace
-period always counts from the last reference anywhere in the Box (#66). A
-locator resolved before its Syrup was reclaimed and zero-copy-put afterwards is not yet guarded
-against (#65).
+period always counts from the last reference anywhere in the Box (#66). A locator resolved before
+its Syrup was reclaimed and zero-copy-put afterwards is not yet guarded against (#65).
 
 Ledgers no manifest ever recorded (written by a flush or compaction that then failed, by an owner
 that crashed before flushing, or by a handover that failed or lost the manifest-pointer race) leak

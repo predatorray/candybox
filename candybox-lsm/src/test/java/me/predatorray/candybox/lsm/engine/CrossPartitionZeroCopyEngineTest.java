@@ -201,9 +201,10 @@ class CrossPartitionZeroCopyEngineTest {
         assertThat(dst.heldSyrups(Long.MAX_VALUE)).contains(syrup);
 
         clock.advance(500);
-        dst.deleteCandy(CandyKey.of("d"));
-        dst.flush(); // the reference never reached an SSTable
+        dst.deleteCandy(CandyKey.of("d")); // the reference never reaches an SSTable
         assertThat(dst.referencedSyrups()).doesNotContain(syrup);
+        assertThat(dst.heldSyrups(Long.MAX_VALUE)).contains(syrup);
+        dst.flush();
         assertThat(dst.heldSyrups(1499)).contains(syrup);
         assertThat(dst.heldSyrups(1500)).doesNotContain(syrup);
     }

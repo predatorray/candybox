@@ -318,7 +318,7 @@ The coordination layout:
 boxes/<box>/meta                      BoxDescriptor {partitionCount} — immutable, the routing truth
 boxes/<box>/partitions/<p>/owner      partition p's ownership lease (fenced, TTL'd)
 boxes/<box>/partitions/<p>/manifest   partition p's manifest-ledger pointer (versioned CAS)
-boxes/<box>/partitions/<p>/refs       partition p's published referenced-Syrup set (Box-global GC, §9(f))
+boxes/<box>/partitions/<p>/refs       partition p's published held-Syrup set (Box-global GC, §9(f))
 boxes/<box>/renames/<token>           cross-partition rename rendezvous marker (§6); cleared on finalize
 cluster/balancer                      the balancer's coordinator-election lease
 cluster/assignment                    the desired partition→node assignment table (versioned CAS)
@@ -433,7 +433,7 @@ The detailed rules:
   point delete);
 - (f) **Box-global GC** (what makes cross-partition zero-copy safe): a destination partition can now
   reuse a source partition's Syrup segments (§6), so within-manifest reference counting is
-  generalized Box-wide. Each partition owner publishes its referenced-Syrup set to coordination at
+  generalized Box-wide. Each partition owner publishes its held-Syrup set (below) to coordination at
   `boxes/<box>/partitions/<p>/refs`; the creating partition's GC skips any Syrup a sibling partition
   still references (consulting the published sets, gated by the same `ledgerGcGraceMillis`), so a
   Syrup is physically reclaimed only once **no** partition of the Box references it. This supersedes
@@ -442,11 +442,12 @@ The detailed rules:
   tracking is not monotonic: a re-referenced Syrup leaves the pending set (its grace period restarts
   in that partition if it is orphaned again), and GC claims Syrups through one write-locked step that
   re-checks the partition's own references before dropping them from the live set. Several
-  partitions can track one Syrup as a pending orphan, each with its own timestamp, so a partition
-  also publishes its pending orphans younger than the grace period: a sibling's older timestamp
-  cannot cut the grace short after this partition's last reference (#66). A zero-copy put counts its
-  Syrups as live in the partition from its next flush, so a reference that never reaches an SSTable
-  still gets an orphan timestamp. Only the claimed Syrups are deleted. A pending
+  partitions can track one Syrup as a pending orphan, each with its own timestamp, so the published
+  set holds a partition's references plus its pending orphans younger than the grace period: a
+  sibling's older timestamp cannot cut the grace short after this partition's last reference (#66).
+  A zero-copy put's Syrups are also held from the put until the next flush stamps them, so a
+  reference that never reaches an SSTable still gets its own grace period. A dead owner's last
+  published set stays in place until the new owner publishes, which only delays reclamation. Only the claimed Syrups are deleted. A pending
   locator relay also pins its Syrups, so a source deleted and compacted before its relay is consumed
   cannot leave the destination dangling: GC reads the published sets, then every relay of the Box,
   then the published sets again, retries unless no set changed in between, and claims only Syrups

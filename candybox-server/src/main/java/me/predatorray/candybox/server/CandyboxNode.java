@@ -570,7 +570,7 @@ public final class CandyboxNode implements AutoCloseable {
      * @return the number of ledgers deleted
      */
     public int collectGarbageOnce() {
-        // Publish every owned partition's referenced-Syrup set first, so this pass's Box-global gate
+        // Publish every owned partition's held-Syrup set first, so this pass's Box-global gate
         // sees up-to-date references from this node's partitions (cross-node freshness rides the other
         // owners' own publishes plus the GC grace period). A Box with a failed publish sits this pass
         // out rather than gate on its stale references.
@@ -777,7 +777,7 @@ public final class CandyboxNode implements AutoCloseable {
     }
 
     /**
-     * Publishes a partition's referenced-Syrup set, or throws: a zero-copy put deletes its relay
+     * Publishes a partition's held-Syrup set, or throws: a zero-copy put deletes its relay
      * only after this, so the Box-global GC never loses sight of the Syrups it now references.
      *
      * @throws NotOwnerException if this node no longer owns the partition
@@ -795,7 +795,7 @@ public final class CandyboxNode implements AutoCloseable {
         }
     }
 
-    /** Publishes one owned partition's referenced-Syrup set (Box-global GC input), best effort. */
+    /** Publishes one owned partition's held-Syrup set (Box-global GC input), best effort. */
     private void publishPartitionRefs(PartitionOwnership ownership) {
         try {
             tryPublishPartitionRefs(ownership);

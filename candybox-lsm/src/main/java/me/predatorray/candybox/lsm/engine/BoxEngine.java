@@ -109,9 +109,10 @@ public final class BoxEngine implements AutoCloseable {
     // Syrup ledgers no longer referenced by any SSTable/memtable, awaiting GC: id -> first-seen-orphan.
     private final ConcurrentMap<Long, Long> pendingOrphanSyrups = new ConcurrentHashMap<>();
 
-    // Syrups this owner created since the last flush, joined to the live set by the next flush even if
-    // nothing then references them (the Candy was overwritten, or its write failed), so GC sees them.
-    // Guarded by the write lock, which every Syrup write holds.
+    // Syrups this owner created or zero-copy-put since the last flush, joined to the live set by the next
+    // flush even if nothing then references them (the Candy was overwritten, or its write failed), so
+    // GC sees them; held for siblings' GC until then (heldSyrups). Guarded by the write lock, which
+    // every Syrup write holds.
     private final Set<Long> unflushedSyrups = new LinkedHashSet<>();
 
     // Lightweight operational counters (snapshotted via stats()).
@@ -803,7 +804,7 @@ public final class BoxEngine implements AutoCloseable {
      * across partitions: the {@code parts} were resolved from a source Candy in <em>another</em>
      * partition (via {@link #resolveLocator} relayed by the client). No Candy bytes are read or
      * rewritten; the destination locator points at the very same Syrup segments, which stay alive
-     * Box-globally because every partition publishes its referenced-Syrup set (see the server's
+     * Box-globally because every partition publishes its held-Syrup set (see the server's
      * Box-global GC). Same-Box only.
      */
     public CandyMetadata zeroCopyPut(CandyKey dst, List<Part> parts, String contentType,
@@ -832,8 +833,8 @@ public final class BoxEngine implements AutoCloseable {
             // The parts may point at a Syrup this partition already counts as a pending orphan. Clear it
             // here so its grace period restarts: the next recompute may only run once this reference is
             // gone again and would keep the old stamp, and claim-time re-validation only guards safety.
-            // Tracking it as live from the next flush on also gives a reference that never reaches an
-            // SSTable its own orphan stamp, which heldSyrups publishes to the siblings.
+            // Tracking it as unflushed holds it for siblings until the next flush stamps it, so a
+            // reference that never reaches an SSTable still gets its own grace period.
             for (SegmentRef seg : dstLocator.segments()) {
                 pendingOrphanSyrups.remove(seg.syrupId());
                 unflushedSyrups.add(seg.syrupId());
@@ -908,9 +909,7 @@ public final class BoxEngine implements AutoCloseable {
 
     /**
      * The set of Syrup ids this partition currently references — manifest SSTable refs, in-flight
-     * multipart parts, the memtable, and the open write Syrup. Published to coordination so the
-     * Box-global GC never reclaims a Syrup a sibling partition still points at (cross-partition
-     * zero-copy copy/rename).
+     * multipart parts, the memtable, and the open write Syrup.
      */
     public java.util.Set<Long> referencedSyrups() {
         lock.readLock().lock();
@@ -922,15 +921,16 @@ public final class BoxEngine implements AutoCloseable {
     }
 
     /**
-     * {@link #referencedSyrups()} plus the pending orphans first seen after {@code orphanedAfterMillis}
-     * (now minus the GC grace period). This is what a sibling's GC must keep: a sibling may have
-     * orphaned the same Syrup long ago, and its own stamp says nothing about this partition's last
-     * reference.
+     * {@link #referencedSyrups()} plus the not yet stamped Syrups since the last flush and the pending
+     * orphans first seen after {@code orphanedAfterMillis} (now minus the GC grace period). Published
+     * to coordination as what a sibling's GC must keep: a sibling may have orphaned the same Syrup
+     * long ago, and its own stamp says nothing about this partition's last reference.
      */
     public java.util.Set<Long> heldSyrups(long orphanedAfterMillis) {
         lock.readLock().lock();
         try {
             java.util.Set<Long> held = referencedSyrupsLocked();
+            held.addAll(unflushedSyrups);
             pendingOrphanSyrups.forEach((syrup, since) -> {
                 if (since > orphanedAfterMillis) {
                     held.add(syrup);
