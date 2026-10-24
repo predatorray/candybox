@@ -570,7 +570,7 @@ public final class CandyboxNode implements AutoCloseable {
      * @return the number of ledgers deleted
      */
     public int collectGarbageOnce() {
-        // Publish every owned partition's referenced-Syrup set first, so this pass's Box-global gate
+        // Publish every owned partition's held-Syrup set first, so this pass's Box-global gate
         // sees up-to-date references from this node's partitions (cross-node freshness rides the other
         // owners' own publishes plus the GC grace period). A Box with a failed publish sits this pass
         // out rather than gate on its stale references.
@@ -582,7 +582,7 @@ public final class CandyboxNode implements AutoCloseable {
                 }
             } catch (RuntimeException e) {
                 unpublished.add(ownership.box().value());
-                LOG.warn("Referenced-Syrup publish error on node {}: {}", nodeId, e.getMessage());
+                LOG.warn("Held-Syrup publish error on node {}: {}", nodeId, e.getMessage());
             }
         }
         int deleted = 0;
@@ -777,7 +777,7 @@ public final class CandyboxNode implements AutoCloseable {
     }
 
     /**
-     * Publishes a partition's referenced-Syrup set, or throws: a zero-copy put deletes its relay
+     * Publishes a partition's held-Syrup set, or throws: a zero-copy put deletes its relay
      * only after this, so the Box-global GC never loses sight of the Syrups it now references.
      *
      * @throws NotOwnerException if this node no longer owns the partition
@@ -789,13 +789,13 @@ public final class CandyboxNode implements AutoCloseable {
         }
         for (int attempt = 0; !tryPublishPartitionRefs(ownership); attempt++) {
             if (attempt >= 3) {
-                throw new BusyException("Could not publish referenced Syrups of box " + box
+                throw new BusyException("Could not publish held Syrups of box " + box
                         + " partition " + partition);
             }
         }
     }
 
-    /** Publishes one owned partition's referenced-Syrup set (Box-global GC input), best effort. */
+    /** Publishes one owned partition's held-Syrup set (Box-global GC input), best effort. */
     private void publishPartitionRefs(PartitionOwnership ownership) {
         try {
             tryPublishPartitionRefs(ownership);
@@ -814,7 +814,8 @@ public final class CandyboxNode implements AutoCloseable {
     private boolean tryPublishPartitionRefs(PartitionOwnership ownership) {
         String key = CandyboxKeys.partitionRefsKey(ownership.box().value(), ownership.partition());
         Optional<VersionedValue> current = coordination.get(key);
-        byte[] refs = encodeLongSet(ownership.engine().referencedSyrups());
+        byte[] refs = encodeLongSet(ownership.engine().heldSyrups(
+                clock.currentTimeMillis() - config.ledgerGcGraceMillis()));
         try {
             if (current.isEmpty()) {
                 coordination.create(key, refs);
