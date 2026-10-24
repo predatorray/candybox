@@ -89,7 +89,8 @@ data.dir=./data
 # lease.renew.interval.millis=3000
 # router.cache.ttl.millis=5000
 # router.unowned.retry.millis=15000
-# compaction.interval.millis=0
+# Background compaction, GC and sweeps; 0 disables them.
+# compaction.interval.millis=15000
 # max.clock.skew.millis=300000
 # tombstone.gc.grace.millis=86400000
 # ledger.gc.grace.millis=300000

@@ -56,6 +56,10 @@ public final class ServerConfig {
     public static final int DEFAULT_HEALTH_PORT = 9710;
 
     private static final String ENV_PREFIX = "CANDYBOX_";
+
+    /** Default background maintenance period; {@code compaction.interval.millis=0} disables it. */
+    static final long DEFAULT_MAINTENANCE_INTERVAL_MILLIS = 15_000L;
+
     private static final Pattern TRAILING_ORDINAL = Pattern.compile("(\\d+)$");
 
     private final int nodeId;
@@ -296,7 +300,8 @@ public final class ServerConfig {
 
         /** Maps the optional tuning keys onto {@link CandyboxConfig.Builder}; absent keys keep defaults. */
         CandyboxConfig buildTuning() {
-            CandyboxConfig.Builder b = CandyboxConfig.builder();
+            CandyboxConfig.Builder b = CandyboxConfig.builder()
+                    .compactionIntervalMillis(DEFAULT_MAINTENANCE_INTERVAL_MILLIS);
             applyLong("memtable.flush.threshold.bytes", b::memtableFlushThresholdBytes);
             applyLong("syrup.rollover.bytes", b::syrupRolloverBytes);
             applyLong("ownership.lease.ttl.millis", b::ownershipLeaseTtlMillis);
