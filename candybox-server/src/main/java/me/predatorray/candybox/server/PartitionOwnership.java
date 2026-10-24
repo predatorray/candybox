@@ -125,6 +125,9 @@ final class PartitionOwnership implements AutoCloseable {
             } catch (CasConflictException raced) {
                 engine.close();
                 throw new NotOwnerException(box.value()); // someone advanced the pointer; we lost
+            } catch (RuntimeException e) {
+                engine.close(); // the CAS outcome is unknown; the next owner recovers either way
+                throw e;
             }
             LOG.info("Node {} recovered ownership of box {} partition {} (token {})", nodeId, box,
                     partition, lease.fencingToken());
