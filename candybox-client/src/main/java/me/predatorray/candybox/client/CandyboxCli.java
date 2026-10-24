@@ -175,7 +175,13 @@ public final class CandyboxCli {
         }
         Transport transport = new TcpTransport(new FrameCodec(), sslContext, tlsVerifyEndpoint);
         if (username != null) {
-            transport = new AuthenticatingTransport(transport, mechanism, username, password);
+            try {
+                transport = new AuthenticatingTransport(transport, mechanism, username, password);
+            } catch (IllegalArgumentException e) {
+                transport.close();
+                err.println(e.getMessage());
+                return 2;
+            }
         }
         try (Transport t = transport;
              CandyboxClient client = new CandyboxClient(t, host, port)) {
