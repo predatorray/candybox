@@ -85,6 +85,38 @@ class BoxHandoverTest {
     }
 
     @Test
+    void unflushedWriteSurvivesTwoFailoversWithoutWritesInBetween() {
+        ManualClock clock = new ManualClock(1_000);
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        CandyboxConfig config = CandyboxConfig.builder()
+                .leaseRenewIntervalMillis(0)
+                .ownershipLeaseTtlMillis(10_000)
+                .build();
+        BoxName box = BoxName.of("shared-box");
+
+        CandyboxNode nodeA = new CandyboxNode(1, config, store, coordination, clock);
+        CandyboxNode nodeB = new CandyboxNode(2, config, store, coordination, clock);
+        CandyboxNode nodeC = new CandyboxNode(3, config, store, coordination, clock);
+        try {
+            nodeA.createBox(box, 1);
+            nodeA.enginePartition(box, 0).putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
+
+            clock.advance(11_000);
+            nodeB.openBox(box); // B's lease then lapses without any write or flush
+            clock.advance(11_000);
+            nodeC.openBox(box);
+
+            assertThat(nodeC.enginePartition(box, 0).getCandy(CandyKey.of("k"))).isEqualTo(bytes("v1"));
+        } finally {
+            nodeA.close();
+            nodeB.close();
+            nodeC.close();
+            store.close();
+        }
+    }
+
+    @Test
     void newWriterAfterHandoverWinsLwwDespiteAOlderWrite() {
         ManualClock clock = new ManualClock(1_000);
         InMemoryLedgerStore store = new InMemoryLedgerStore();

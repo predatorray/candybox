@@ -109,12 +109,6 @@ public final class BoxEngine implements AutoCloseable {
     // Syrup ledgers no longer referenced by any SSTable/memtable, awaiting GC: id -> first-seen-orphan.
     private final ConcurrentMap<Long, Long> pendingOrphanSyrups = new ConcurrentHashMap<>();
 
-    // The prior owner's WAL, replayed into the memtable at recovery and obsolete once that is flushed.
-    // In memory only: if this owner never flushes, the prior WAL leaks (#105) — and holds the only copy
-    // of the replayed writes (#63). A #63 fix that makes the replay durable at recovery should mark the
-    // prior WAL superseded there instead.
-    private long unflushedPriorWal = -1L;
-
     // Syrups this owner created since the last flush, joined to the live set by the next flush even if
     // nothing then references them (the Candy was overwritten, or its write failed), so GC sees them.
     // Guarded by the write lock, which every Syrup write holds.
@@ -168,8 +162,9 @@ public final class BoxEngine implements AutoCloseable {
 
     /**
      * Recovers ownership of a Box on handover: replays the prior owner's manifest and WAL (fencing
-     * both), rebuilds the memtable, and — critically — advances the HLC past the maximum HLC durably
-     * recorded so a regressed wall clock cannot stamp a newer write with a lower timestamp.
+     * both), flushes the replayed WAL to an L0 SSTable, and — critically — advances the HLC past
+     * the maximum HLC durably recorded so a regressed wall clock cannot stamp a newer write with a
+     * lower timestamp.
      *
      * @param priorManifestLedgerId the prior owner's manifest ledger id
      * @param fencingToken          this owner's lease fencing token; a stale (lower) token is rejected
@@ -181,74 +176,109 @@ public final class BoxEngine implements AutoCloseable {
         Manifest manifest = Manifest.recover(ledgerStore,
                 roleConfig(config, ledgerStore, box, LedgerRole.MANIFEST), priorManifestLedgerId,
                 fencingToken);
-        ManifestState state = manifest.current();
-
-        Memtable memtable = new Memtable();
-        Hlc highWater = state.maxHlc();
-        long priorWalId = state.walLedgerId();
-        boolean priorWalReplayed = false;
-        if (priorWalId >= 0) {
-            // recover-open fences the prior WAL so a resurrected old owner cannot keep appending.
-            ReadableLedger priorWal = ledgerStore.recoverOpen(priorWalId);
-            WriteAheadLog.ReplayResult replay;
-            try {
-                replay = WriteAheadLog.replay(priorWal);
-            } finally {
-                priorWal.close();
-            }
-            priorWalReplayed = !replay.entries().isEmpty();
-            for (WalEntry e : replay.entries()) {
-                if (e instanceof WalEntry.PointMutation pm) {
-                    memtable.put(pm.mutation());
-                } else if (e instanceof WalEntry.RangeDelete rd) {
-                    memtable.delete(rd.tombstone());
+        WriteAheadLog newWal = null;
+        BoxEngine engine = null;
+        try {
+            ManifestState state = manifest.current();
+            Memtable memtable = new Memtable();
+            // Every replayed write's Syrups, overwritten ones included: the prior owner tracked
+            // those only in memory, so the recovery flush adds them to the live set for GC.
+            Set<Long> replayedSyrups = new LinkedHashSet<>();
+            Hlc highWater = state.maxHlc();
+            long priorWalId = state.walLedgerId();
+            int replayedEntries = 0;
+            if (priorWalId >= 0) {
+                // recover-open fences the prior WAL so a resurrected old owner cannot keep appending.
+                ReadableLedger priorWal = ledgerStore.recoverOpen(priorWalId);
+                WriteAheadLog.ReplayResult replay;
+                try {
+                    replay = WriteAheadLog.replay(priorWal);
+                } finally {
+                    priorWal.close();
+                }
+                replayedEntries = replay.entries().size();
+                for (WalEntry e : replay.entries()) {
+                    if (e instanceof WalEntry.PointMutation pm) {
+                        memtable.put(pm.mutation());
+                        for (SegmentRef seg : pm.mutation().locator().segments()) {
+                            replayedSyrups.add(seg.syrupId());
+                        }
+                    } else if (e instanceof WalEntry.RangeDelete rd) {
+                        memtable.delete(rd.tombstone());
+                    }
+                }
+                if (replay.maxHlc().isAfter(highWater)) {
+                    highWater = replay.maxHlc();
                 }
             }
-            if (replay.maxHlc().isAfter(highWater)) {
-                highWater = replay.maxHlc();
+            // The WAL alone is not enough: right after a flush it is empty and the newest HLCs live
+            // only in SSTables, which the manifest's high-water mark covers.
+            if (highWater.isAfter(Hlc.MIN)) {
+                try {
+                    hlc.observe(highWater);
+                } catch (IllegalStateException e) {
+                    throw new IllegalStateException("Cannot recover box " + box + ": recorded HLC "
+                            + highWater + " (manifest high-water " + state.maxHlc() + ") leads the"
+                            + " local clock by more than maxClockSkewMillis; fix the clock or raise"
+                            + " the limit", e);
+                }
             }
-        }
-        // The WAL alone is not enough: right after a flush it is empty and the newest HLCs live only
-        // in SSTables, which the manifest's high-water mark covers.
-        if (highWater.isAfter(Hlc.MIN)) {
+
+            newWal = WriteAheadLog.create(ledgerStore,
+                    roleConfig(config, ledgerStore, box, LedgerRole.WAL));
+            engine = new BoxEngine(box, config, ledgerStore, hlc, clock, manifest, newWal);
+            engine.openReadersFor(state);
+            // The prior manifest and WAL are superseded by this one: the rotation below leaves the
+            // prior WAL unreachable, so a non-empty replay is flushed to L0 in the same edit, or the
+            // next owner would lose it (#63). This edit only takes effect if the manifest pointer
+            // moves here, and nothing reads a superseded manifest or WAL again.
+            long now = clock.currentTimeMillis();
+            Map<Long, Long> superseded = new LinkedHashMap<>();
+            superseded.put(priorManifestLedgerId, now);
+            if (priorWalId >= 0) {
+                superseded.put(priorWalId, now);
+            }
+            if (memtable.isEmpty()) {
+                manifest.apply(ManifestEdit.builder().newWalLedgerId(newWal.ledgerId())
+                        .maxHlc(highWater).addedPendingDeletes(superseded).build());
+            } else {
+                L0Table table = engine.writeL0(memtable);
+                Set<Long> syrups = new LinkedHashSet<>(table.syrups());
+                syrups.addAll(replayedSyrups);
+                manifest.apply(ManifestEdit.flush(table.meta(), syrups, newWal.ledgerId(), highWater)
+                        .withAddedPendingDeletes(superseded));
+                engine.readers.put(table.meta().ledgerId(),
+                        new SSTableReader(ledgerStore, table.meta().ledgerId()));
+                engine.flushCount.incrementAndGet();
+                LOG.info("Recovery flushed {} replayed entries of box {} to SSTable ledger {}",
+                        replayedEntries, box, table.meta().ledgerId());
+            }
+            // Catch Syrups already orphaned before this handover (e.g. by a prior owner that crashed
+            // pre-GC) so they are not leaked.
+            engine.lock.writeLock().lock();
             try {
-                hlc.observe(highWater);
-            } catch (IllegalStateException e) {
-                throw new IllegalStateException("Cannot recover box " + box + ": recorded HLC "
-                        + highWater + " (manifest high-water " + state.maxHlc() + ") leads the local"
-                        + " clock by more than maxClockSkewMillis; fix the clock or raise the limit",
-                        e);
+                engine.recomputeOrphanSyrupsLocked(clock.currentTimeMillis());
+            } finally {
+                engine.lock.writeLock().unlock();
             }
+            return engine;
+        } catch (RuntimeException e) {
+            // The pointer never moves here, so nothing references this owner's ledgers; they leak
+            // (#105), but their handles must not.
+            try {
+                if (engine != null) {
+                    engine.close();
+                } else {
+                    if (newWal != null) {
+                        newWal.close();
+                    }
+                    manifest.close();
+                }
+            } catch (RuntimeException closeFailure) {
+                e.addSuppressed(closeFailure);
+            }
+            throw e;
         }
-
-        WriteAheadLog newWal = WriteAheadLog.create(ledgerStore,
-                roleConfig(config, ledgerStore, box, LedgerRole.WAL));
-        // The prior manifest is superseded by this one, and the prior WAL too unless its entries still
-        // await a flush. This edit only takes effect if the manifest pointer moves here, and nothing
-        // reads a superseded manifest or WAL again.
-        long now = clock.currentTimeMillis();
-        Map<Long, Long> superseded = new LinkedHashMap<>();
-        superseded.put(priorManifestLedgerId, now);
-        if (priorWalId >= 0 && !priorWalReplayed) {
-            superseded.put(priorWalId, now);
-        }
-        // Persist the replayed WAL's max too: its entries now live only in this owner's memtable.
-        manifest.apply(ManifestEdit.builder().newWalLedgerId(newWal.ledgerId()).maxHlc(highWater)
-                .addedPendingDeletes(superseded).build());
-
-        BoxEngine engine = new BoxEngine(box, config, ledgerStore, hlc, clock, manifest, newWal);
-        engine.active = memtable;
-        engine.unflushedPriorWal = priorWalReplayed ? priorWalId : -1L;
-        engine.openReadersFor(state);
-        // Catch Syrups already orphaned before this handover (e.g. by a prior owner that crashed
-        // pre-GC) so they are not leaked.
-        engine.lock.writeLock().lock();
-        try {
-            engine.recomputeOrphanSyrupsLocked(clock.currentTimeMillis());
-        } finally {
-            engine.lock.writeLock().unlock();
-        }
-        return engine;
     }
 
     private void openReadersFor(ManifestState state) {
@@ -1360,7 +1390,6 @@ public final class BoxEngine implements AutoCloseable {
             state.tables().forEach(t -> inUse.add(t.ledgerId()));
             inUse.add(state.walLedgerId());
             inUse.add(wal.ledgerId());
-            inUse.add(unflushedPriorWal);
             inUse.add(manifest.ledgerId());
             for (Iterator<Long> it = ids.iterator(); it.hasNext(); ) {
                 long id = it.next();
@@ -1611,7 +1640,35 @@ public final class BoxEngine implements AutoCloseable {
         if (flushing.isEmpty()) {
             return;
         }
-        // Collect the Syrups referenced by this memtable (for live-Syrup tracking / GC) and its max HLC.
+        L0Table table = writeL0(flushing);
+
+        WriteAheadLog newWal = WriteAheadLog.create(ledgerStore, ledgerConfig(LedgerRole.WAL));
+        // The rotated WAL's mutations are durable in the SSTable once this edit commits, and the
+        // manifest then points at the new WAL, so it is no longer a recovery source.
+        long now = clock.currentTimeMillis();
+        manifest.apply(ManifestEdit.flush(table.meta(), table.syrups(), newWal.ledgerId(),
+                table.maxHlc()).withAddedPendingDeletes(Map.of(wal.ledgerId(), now)));
+        unflushedSyrups.clear();
+        wal.close();
+        wal = newWal;
+        active = new Memtable();
+        // A Syrup whose Candies were all superseded before this flush is an orphan already.
+        recomputeOrphanSyrupsLocked(now);
+
+        readers.put(table.meta().ledgerId(), new SSTableReader(ledgerStore, table.meta().ledgerId()));
+        flushCount.incrementAndGet();
+        LOG.debug("Flushed memtable of box {} to SSTable ledger {} ({} entries)", box,
+                table.meta().ledgerId(), table.meta().entryCount());
+    }
+
+    private record L0Table(SSTableMeta meta, Set<Long> syrups, Hlc maxHlc) {
+    }
+
+    /**
+     * Writes {@code flushing} to an L0 SSTable, collecting the Syrups it references (plus those created
+     * since the last flush, for live-Syrup tracking / GC) and its max HLC.
+     */
+    private L0Table writeL0(Memtable flushing) {
         Set<Long> syrups = new LinkedHashSet<>(unflushedSyrups);
         Hlc maxHlc = Hlc.MIN;
         Iterator<Mutation> scan = flushing.iterator();
@@ -1632,30 +1689,7 @@ public final class BoxEngine implements AutoCloseable {
 
         SSTableMeta table = sstableWriter.write(ledgerConfig(LedgerRole.SSTABLE), 0,
                 flushing.iterator(), flushing.rangeTombstones());
-
-        WriteAheadLog newWal = WriteAheadLog.create(ledgerStore, ledgerConfig(LedgerRole.WAL));
-        // The rotated WAL's mutations (and a replayed prior WAL's) are durable in the SSTable once this
-        // edit commits, and the manifest then points at the new WAL, so neither is a recovery source.
-        long now = clock.currentTimeMillis();
-        Map<Long, Long> obsoleteWals = new LinkedHashMap<>();
-        obsoleteWals.put(wal.ledgerId(), now);
-        if (unflushedPriorWal >= 0) {
-            obsoleteWals.put(unflushedPriorWal, now);
-        }
-        manifest.apply(ManifestEdit.flush(table, syrups, newWal.ledgerId(), maxHlc)
-                .withAddedPendingDeletes(obsoleteWals));
-        unflushedPriorWal = -1L;
-        unflushedSyrups.clear();
-        wal.close();
-        wal = newWal;
-        active = new Memtable();
-        // A Syrup whose Candies were all superseded before this flush is an orphan already.
-        recomputeOrphanSyrupsLocked(now);
-
-        readers.put(table.ledgerId(), new SSTableReader(ledgerStore, table.ledgerId()));
-        flushCount.incrementAndGet();
-        LOG.debug("Flushed memtable of box {} to SSTable ledger {} ({} entries)", box,
-                table.ledgerId(), table.entryCount());
+        return new L0Table(table, syrups, maxHlc);
     }
 
     /** The quorum and metadata this Box's SSTable ledgers are created with, for compaction outputs. */

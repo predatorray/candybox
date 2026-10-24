@@ -137,6 +137,22 @@ class Phase1EngineIT {
     }
 
     @Test
+    void unflushedWritesSurviveTwoHandoversWithoutAFlush() {
+        BoxName box = BoxName.of("double-recover-box");
+        BoxEngine ownerA = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1,
+                SystemClock.INSTANCE, 1L);
+        ownerA.putCandy(CandyKey.of("k"), bytes("v1"), null, Map.of(), null);
+
+        // B takes over and "crashes" without writing or flushing.
+        BoxEngine ownerB = BoxEngine.recover(box, CandyboxConfig.defaults(), store, 2,
+                SystemClock.INSTANCE, ownerA.manifestLedgerId(), 2L);
+        try (BoxEngine ownerC = BoxEngine.recover(box, CandyboxConfig.defaults(), store, 3,
+                SystemClock.INSTANCE, ownerB.manifestLedgerId(), 3L)) {
+            assertThat(ownerC.getCandy(CandyKey.of("k"))).isEqualTo(bytes("v1"));
+        }
+    }
+
+    @Test
     void flushedWritesBoundTheHlcOfABehindRecoveringOwner() {
         BoxName box = BoxName.of("flushed-hlc-box");
         BoxEngine ownerA = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1,

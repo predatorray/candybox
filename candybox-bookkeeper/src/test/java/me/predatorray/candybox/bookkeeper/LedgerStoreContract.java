@@ -117,6 +117,22 @@ public abstract class LedgerStoreContract {
     }
 
     @Test
+    void recoverOpenIsRepeatable() {
+        WritableLedger w = store.createLedger(config());
+        w.append(bytes("one"));
+        w.append(bytes("two"));
+        store.recoverOpen(w.ledgerId()).close();
+
+        // A recovery redone after a lost pointer race recover-opens the same, already sealed ledger.
+        ReadableLedger again = store.recoverOpen(w.ledgerId());
+        assertThat(again.isSealed()).isTrue();
+        assertThat(again.lastAddConfirmed()).isEqualTo(1);
+        assertThat(again.readRange(0, 1))
+                .extracting(e -> new String(e.data(), StandardCharsets.UTF_8))
+                .containsExactly("one", "two");
+    }
+
+    @Test
     void closedLedgerRejectsFurtherAppends() {
         WritableLedger w = store.createLedger(config());
         w.append(bytes("x"));
