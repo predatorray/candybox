@@ -66,7 +66,7 @@ level N's budget is `levelBaseBytes × multiplier^(N-1)`.
 
 > **Important:** the server runs background maintenance every 15 s by default. Setting
 > `compaction.interval.millis=0` disables it, so L0 grows until writes hit `BUSY` and nothing reclaims
-> obsolete ledgers. A failure in one step is logged and does not stop the others. The bare
+> obsolete ledgers. A failing step is logged at ERROR as `Background <step> failed on node <id>` and does not stop the others. The bare
 > `CandyboxConfig` builder still defaults to `0` so tests are deterministic; the steps can also be run
 > manually via `CandyboxNode.compactOwnedBoxesOnce()` / `collectGarbageOnce()`.
 
