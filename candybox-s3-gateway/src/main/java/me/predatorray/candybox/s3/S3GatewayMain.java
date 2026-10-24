@@ -73,7 +73,8 @@ public final class S3GatewayMain {
 
         Transport tcp = new TcpTransport(new FrameCodec(config.maxFrameSizeBytes()),
                 security.clientSslContext(),
-                security.tlsVerifyEndpoint());
+                security.tlsVerifyEndpoint(),
+                config.nodeConnectTimeoutMillis(), config.nodeReadTimeoutMillis());
         Transport transport = security.clientUsername() == null ? tcp
                 : new AuthenticatingTransport(tcp, security.clientMechanism(),
                         security.clientUsername(), security.clientPassword());

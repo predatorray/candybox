@@ -19,6 +19,7 @@ import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.net.InetSocketAddress;
 import java.net.Socket;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
@@ -37,9 +38,20 @@ import me.predatorray.candybox.protocol.ProtocolException;
  */
 public final class TcpTransport implements Transport {
 
+    /** Default bound on each blocking read while connecting (TCP connect and TLS handshake). */
+    public static final int DEFAULT_CONNECT_TIMEOUT_MILLIS = 5_000;
+    /**
+     * Default bound on waiting for a response frame. Generous because a single request can span a
+     * scatter-gather listing, a large Syrup transfer, or a partition handover; a pooled connection
+     * to a lost host therefore still takes up to this long to fail.
+     */
+    public static final int DEFAULT_READ_TIMEOUT_MILLIS = 120_000;
+
     private final FrameCodec codec;
     private final SSLContext sslContext;
     private final boolean verifyEndpoint;
+    private final int connectTimeoutMillis;
+    private final int readTimeoutMillis;
 
     public TcpTransport() {
         this(new FrameCodec());
@@ -55,18 +67,38 @@ public final class TcpTransport implements Transport {
      *                       only for dev certificates without proper SANs
      */
     public TcpTransport(FrameCodec codec, SSLContext sslContext, boolean verifyEndpoint) {
+        this(codec, sslContext, verifyEndpoint, DEFAULT_CONNECT_TIMEOUT_MILLIS,
+                DEFAULT_READ_TIMEOUT_MILLIS);
+    }
+
+    /**
+     * @param connectTimeoutMillis bound on the TCP connect and on each read of the TLS handshake (DNS
+     *                             resolution is not covered); 0 means no limit
+     * @param readTimeoutMillis    bound on each blocking read while awaiting a response (not the
+     *                             whole frame: a peer trickling bytes never trips it); on expiry
+     *                             the call fails and the connection is closed. 0 means no limit
+     */
+    public TcpTransport(FrameCodec codec, SSLContext sslContext, boolean verifyEndpoint,
+            int connectTimeoutMillis, int readTimeoutMillis) {
+        if (connectTimeoutMillis < 0 || readTimeoutMillis < 0) {
+            throw new IllegalArgumentException("timeouts must be >= 0");
+        }
         this.codec = codec;
         this.sslContext = sslContext;
         this.verifyEndpoint = verifyEndpoint;
+        this.connectTimeoutMillis = connectTimeoutMillis;
+        this.readTimeoutMillis = readTimeoutMillis;
     }
 
     @Override
     public Connection connect(String host, int port) {
+        Socket socket = new Socket();
         try {
-            Socket socket;
+            socket.connect(new InetSocketAddress(host, port), connectTimeoutMillis);
             if (sslContext != null) {
+                socket.setSoTimeout(connectTimeoutMillis);
                 SSLSocket ssl = (SSLSocket) sslContext.getSocketFactory()
-                        .createSocket(host, port);
+                        .createSocket(socket, host, port, true);
                 if (verifyEndpoint) {
                     SSLParameters params = ssl.getSSLParameters();
                     params.setEndpointIdentificationAlgorithm("HTTPS");
@@ -74,12 +106,24 @@ public final class TcpTransport implements Transport {
                 }
                 ssl.startHandshake();
                 socket = ssl;
-            } else {
-                socket = new Socket(host, port);
             }
+            socket.setSoTimeout(readTimeoutMillis);
             return new TcpConnection(socket, codec);
         } catch (IOException e) {
+            closeQuietly(socket);
             throw new ProtocolException("Failed to connect to " + host + ":" + port, e);
+        } catch (RuntimeException e) {
+            closeQuietly(socket);
+            throw e;
+        }
+    }
+
+    // the layered SSL socket is autoClose, so closing either socket closes both
+    private static void closeQuietly(Socket socket) {
+        try {
+            socket.close();
+        } catch (IOException ignored) {
+            // best effort
         }
     }
 
@@ -107,6 +151,8 @@ public final class TcpTransport implements Transport {
                 codec.write(out, request);
                 return codec.read(in);
             } catch (IOException e) {
+                // a failure (notably a timeout) can leave the stream mid-frame: never reuse it
+                closeQuietly(socket);
                 throw new ProtocolException("RPC failed", e);
             }
         }
