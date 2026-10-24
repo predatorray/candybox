@@ -363,8 +363,8 @@ block within one BookKeeper entry; an oversized range-tombstone block fails the 
 clear error. It then returns the `ManifestEdit` to commit. Outputs use the
 Box's configured `SSTABLE` quorum and ledger metadata, the same as flushes. `CompactionService`
 (server) runs one step end-to-end; `CandyboxNode` drives it on a background worker (`compactionIntervalMillis`), running
-a **bounded** number of passes per owned Box per tick so one Box can't starve the others, then a GC
-pass (§9). The commit is **fencing-gated** by the manifest, so a Box whose ownership was lost
+a **bounded** number of passes per owned partition per tick so one partition can't starve the others, then a GC
+pass (§9). The commit is **fencing-gated** by the manifest, so a partition whose ownership was lost
 mid-round fails its commit (`FencedException`) and is skipped — a zombie owner cannot corrupt state.
 Distributed *cross-node* scheduling (claiming work via ZK task leases so compaction can run off the
 owner) is still **TODO(phase-3)**; today each owner compacts its own Boxes in-process. Covered by
@@ -565,7 +565,7 @@ Kubernetes manifests). Fault-injection / failure-path hardening and operational 
   the client buffers a stream in memory; chunked PUT/GET/UploadPart bodies are future work
   (`TODO(phase-2)` in `Message`/`CandyboxClient`). Multipart upload partially fills the
   "resumable / parallel upload" gap, but each part is still bounded by the frame cap.
-- **Distributed cross-node compaction scheduling.** Compaction runs in-process on each Box's owner;
+- **Distributed cross-node compaction scheduling.** Compaction runs in-process on each partition's owner;
   claiming work via ZK task leases so it can run off the owner is `TODO(phase-3)` (the *commit* is
   already fencing-gated).
 - **Watch-based coordination.** The `CoordinationService` callers poll today; ZK watches to avoid
