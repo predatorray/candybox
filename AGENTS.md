@@ -2,6 +2,13 @@
 
 Guidance for coding agents working in this repository.
 
+## Skills
+
+Shared skills live in `.agents/skills/<skill-name>/SKILL.md` and follow the open
+[Agent Skills specification](https://agentskills.io/specification). Edit skills there;
+`.claude/skills` is a relative symlink to `../.agents/skills` for Claude compatibility.
+Skill inputs come from the user's request, so they do not require agent-specific argument substitution.
+
 ## Project
 
 Candybox is a distributed, S3-like object store in Java 17 (Maven multi-module). Its storage engine is
