@@ -45,6 +45,8 @@ import me.predatorray.candybox.lsm.engine.BoxEngine;
 import me.predatorray.candybox.lsm.manifest.RenameIntent;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 /** Background maintenance must keep going across transient coordination (ZooKeeper) errors. */
 class MaintenanceResilienceTest {
@@ -118,23 +120,25 @@ class MaintenanceResilienceTest {
         }
     }
 
-    @Test
-    void compactionSkipsOnlyThePartitionWhoseOwnershipCheckFails() {
+    @ParameterizedTest
+    @EnumSource(value = Fault.class, names = {"THROW", "ERROR"})
+    void compactionSkipsOnlyThePartitionWhoseOwnershipCheckFails(Fault fault) {
         AtomicReference<Fault> p0 = new AtomicReference<>(Fault.NONE);
         try (CandyboxNode node = twoPartitionNode(p0, CandyboxConfig.builder()
                 .l0CompactionTrigger(2).build(), new ManualClock(1000))) {
             for (int i = 0; i < 2; i++) {
                 putAndFlush(node, keyIn(1, i));
             }
-            p0.set(Fault.THROW);
+            p0.set(fault);
 
             assertThat(node.compactOwnedBoxesOnce()).isPositive();
             assertThat(level0(node, 1)).isZero();
         }
     }
 
-    @Test
-    void gcSkipsABoxWhosePartitionFailedToPublishItsRefs() {
+    @ParameterizedTest
+    @EnumSource(value = Fault.class, names = {"THROW", "ERROR"})
+    void gcSkipsABoxWhosePartitionFailedToPublishItsRefs(Fault fault) {
         AtomicBoolean failP0Publish = new AtomicBoolean();
         ManualClock clock = new ManualClock(1000);
         InMemoryCoordinationService real = new InMemoryCoordinationService();
@@ -143,7 +147,7 @@ class MaintenanceResilienceTest {
                 .l0CompactionTrigger(2).ledgerGcGraceMillis(WINDOW).build();
         try (CandyboxNode node = new CandyboxNode(1, config, store, flaky(real, (method, key) ->
                 failP0Publish.get() && !method.equals("get") && key.equals(p0Refs)
-                        ? connectionLoss() : null), clock)) {
+                        ? fail(fault) : null), clock)) {
             node.createBox(BOX, 2);
             node.collectGarbageOnce();
             for (int i = 0; i < 2; i++) {
@@ -163,8 +167,9 @@ class MaintenanceResilienceTest {
         }
     }
 
-    @Test
-    void multipartSweepSkipsOnlyThePartitionWhoseOwnershipCheckFails() {
+    @ParameterizedTest
+    @EnumSource(value = Fault.class, names = {"THROW", "ERROR"})
+    void multipartSweepSkipsOnlyThePartitionWhoseOwnershipCheckFails(Fault fault) {
         AtomicReference<Fault> p0 = new AtomicReference<>(Fault.NONE);
         ManualClock clock = new ManualClock(1000);
         CandyboxConfig config = CandyboxConfig.builder().multipartUploadTtlMillis(WINDOW).build();
@@ -172,25 +177,29 @@ class MaintenanceResilienceTest {
             node.enginePartition(BOX, 0).createMultipartUpload(CandyKey.of(keyIn(0, 0)), null, Map.of());
             node.enginePartition(BOX, 1).createMultipartUpload(CandyKey.of(keyIn(1, 0)), null, Map.of());
             clock.advance(WINDOW + 1);
-            p0.set(Fault.THROW);
+            p0.set(fault);
 
             assertThat(node.sweepStaleMultipartUploadsOnce()).isEqualTo(1);
             assertThat(node.enginePartition(BOX, 1).listMultipartUploads()).isEmpty();
         }
     }
 
-    @Test
-    void renameFinalizeAndRelaySweepSkipOnlyThePartitionWhoseOwnershipCheckFails() {
+    @ParameterizedTest
+    @EnumSource(value = Fault.class, names = {"THROW", "ERROR"})
+    void renameFinalizeAndRelaySweepSkipOnlyThePartitionWhoseOwnershipCheckFails(Fault fault) {
         AtomicReference<Fault> p0 = new AtomicReference<>(Fault.NONE);
         ManualClock clock = new ManualClock(1000);
         CandyboxConfig config = CandyboxConfig.builder().renameIntentAbandonMillis(WINDOW).build();
         try (CandyboxNode node = twoPartitionNode(p0, config, clock)) {
             seedStaleRenameIntentAndRelayInP1(node, clock);
-            p0.set(Fault.THROW);
+            p0.set(fault);
 
-            node.finalizeRenameIntentsOnce();
-            assertThat(node.enginePartition(BOX, 1).listRenameIntents()).isEmpty();
-            assertThat(node.sweepStaleLocatorRelaysOnce()).isEqualTo(1);
+            org.junit.jupiter.api.Assertions.assertAll(
+                    () -> {
+                        node.finalizeRenameIntentsOnce();
+                        assertThat(node.enginePartition(BOX, 1).listRenameIntents()).isEmpty();
+                    },
+                    () -> assertThat(node.sweepStaleLocatorRelaysOnce()).isEqualTo(1));
         }
     }
 
@@ -233,7 +242,7 @@ class MaintenanceResilienceTest {
         clock.advance(WINDOW + 1);
     }
 
-    private enum Fault { NONE, THROW, LOST }
+    private enum Fault { NONE, THROW, ERROR, LOST }
 
     /** A node owning both partitions of {@link #BOX}, whose partition-0 lease check fails on demand. */
     private CandyboxNode twoPartitionNode(AtomicReference<Fault> p0, CandyboxConfig config,
@@ -246,6 +255,7 @@ class MaintenanceResilienceTest {
                     }
                     return switch (p0.get()) {
                         case THROW -> connectionLoss();
+                        case ERROR -> throw new AssertionError("persistent partition error");
                         case LOST -> false;
                         case NONE -> null;
                     };
@@ -280,6 +290,13 @@ class MaintenanceResilienceTest {
             Thread.sleep(10);
         }
         assertThat(condition.getAsBoolean()).isTrue();
+    }
+
+    private static Object fail(Fault fault) {
+        if (fault == Fault.ERROR) {
+            throw new AssertionError("persistent publish error");
+        }
+        return connectionLoss();
     }
 
     private static Object connectionLoss() {
