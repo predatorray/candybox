@@ -72,12 +72,18 @@ final class MetricsScraper implements AutoCloseable {
     /** @param scrapeToken sent as {@code Authorization: Bearer} to token-guarded /metrics targets */
     MetricsScraper(List<URI> targets, long pollIntervalMillis, int windowSamples,
                    String scrapeToken) {
+        this(targets, pollIntervalMillis, windowSamples, scrapeToken,
+                HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build());
+    }
+
+    MetricsScraper(List<URI> targets, long pollIntervalMillis, int windowSamples,
+                   String scrapeToken, HttpClient http) {
         this.scrapeToken = scrapeToken;
         this.targets = List.copyOf(targets);
         this.pollIntervalMillis = pollIntervalMillis;
         this.windowSamples = windowSamples;
         this.series = new KeyedSlidingWindow<>(windowSamples);
-        this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build();
+        this.http = http;
         this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "admin-metrics-scraper");
             t.setDaemon(true);
@@ -93,8 +99,8 @@ final class MetricsScraper implements AutoCloseable {
         LOG.info("Metrics scraper polling {} target(s) every {}ms", targets.size(), pollIntervalMillis);
         // Tick once on the calling thread so the first /api/metrics request after boot has data,
         // then schedule the periodic refresh.
-        scrapeOnce();
-        scheduler.scheduleAtFixedRate(this::scrapeOnce, pollIntervalMillis, pollIntervalMillis,
+        scrapeSafely();
+        scheduler.scheduleAtFixedRate(this::scrapeSafely, pollIntervalMillis, pollIntervalMillis,
                 TimeUnit.MILLISECONDS);
     }
 
@@ -135,6 +141,14 @@ final class MetricsScraper implements AutoCloseable {
 
     // ---- scraping ------------------------------------------------------------------------------
 
+    private void scrapeSafely() {
+        try {
+            scrapeOnce();
+        } catch (Throwable t) {
+            LOG.warn("Metrics scrape tick failed", t);
+        }
+    }
+
     private void scrapeOnce() {
         StringBuilder concat = new StringBuilder();
         long ingestMillis = System.currentTimeMillis();
@@ -157,7 +171,7 @@ final class MetricsScraper implements AutoCloseable {
                     concat.append('\n');
                 }
                 ingest(resp.body(), ingestMillis);
-            } catch (Exception e) {
+            } catch (Throwable e) {
                 // Loud-but-not-fatal: log once per failure but keep ticking. A flapping target
                 // shouldn't drown the log either, so debug-log the trace and warn just the message.
                 LOG.warn("Failed to scrape {}: {}", target, e.toString());
