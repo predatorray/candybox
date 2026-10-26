@@ -3,8 +3,18 @@ name: Docker Publish
 on:
   push:
     branches: [ main ]
+    tags: [ 'v*' ]
   # Allow manual runs from the Actions tab
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to publish, e.g. v0.1.0. Empty builds the selected ref.'
+        required: false
+        default: ''
+
+concurrency:
+  group: docker-${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+  cancel-in-progress: false
 
 jobs:
   docker:
@@ -15,6 +25,20 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+
+      - name: Resolve image tags from the checked-out source
+        id: source
+        env:
+          RELEASE_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
+        run: |
+          if [ -n "${RELEASE_TAG}" ] && ! [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9][a-zA-Z0-9.-]*)?$ ]]; then
+            echo "::error::Expected a release tag such as v0.1.0 or v0.1.0-rc.1"
+            exit 1
+          fi
+          echo "tag=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "sha=sha-$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -29,10 +53,13 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
+          context: git
           images: ${{ secrets.DOCKERHUB_USERNAME }}/candybox
+          flavor: latest=false
           tags: |
-            type=raw,value=latest
-            type=sha,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' && !inputs.tag }}
+            type=raw,value=${{ steps.source.outputs.tag }},enable=${{ steps.source.outputs.tag != '' }}
+            type=raw,value=${{ steps.source.outputs.sha }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
