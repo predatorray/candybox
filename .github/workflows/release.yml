@@ -31,6 +31,7 @@ jobs:
     environment: maven-central
     permissions:
       contents: write
+      actions: write
       pull-requests: write
     steps:
       - uses: actions/checkout@v4
@@ -121,6 +122,14 @@ jobs:
         run: |
           git push origin "HEAD:refs/heads/${BUMP}"
           git push origin "refs/tags/v${RELEASE}"
+
+      # GITHUB_TOKEN pushes do not trigger push workflows. Dispatch explicitly using main's
+      # publisher, which checks out the release tag (also supports backfilling older releases).
+      - name: Dispatch the release Docker image
+        env:
+          RELEASE: ${{ steps.versions.outputs.release }}
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run docker-publish.yml --ref main -f "tag=v${RELEASE}"
 
       - name: Create the GitHub Release with the distribution archives
         uses: softprops/action-gh-release@v2
