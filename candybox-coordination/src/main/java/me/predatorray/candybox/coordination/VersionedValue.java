@@ -22,6 +22,10 @@ package me.predatorray.candybox.coordination;
  *
  * @param version the current version (starts at 0 on create)
  * @param value   the stored bytes (treat as read-only)
+ * @param modifiedAtMillis backend last-write time in epoch milliseconds, or -1 when unavailable
  */
-public record VersionedValue(long version, byte[] value) {
+public record VersionedValue(long version, byte[] value, long modifiedAtMillis) {
+    public VersionedValue(long version, byte[] value) {
+        this(version, value, -1);
+    }
 }

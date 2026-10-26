@@ -219,6 +219,37 @@ class CrossPartitionGcAndRenameTest {
     }
 
     @Test
+    void undecodableRelayIsReapedOnlyAfterItsLastWriteAbandonWindow() {
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        ManualClock clock = new ManualClock(1000);
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        CandyboxConfig config = aggressiveGcConfig();
+        try (CandyboxNode node = new CandyboxNode(1, config, store, coordination, clock)) {
+            node.createBox(BOX, PARTITIONS);
+            String src = keyIn(0, "src");
+            long syrup = putAndFlush(node, src);
+            orphanSource(node, src);
+            String key = CandyboxKeys.locatorRelayKey(BOX.value(), 2, "unknown-version");
+            coordination.create(key, new byte[] {(byte) 0xff});
+            assertThat(node.sweepStaleLocatorRelaysOnce()).isZero();
+            node.collectGarbageOnce();
+            assertThat(store.listLedgers()).contains(syrup);
+
+            clock.advance(config.renameIntentAbandonMillis() - 1);
+            assertThat(node.sweepStaleLocatorRelaysOnce()).isZero();
+            coordination.compareAndSet(key, new byte[] {(byte) 0xfe}, 0);
+            clock.advance(1);
+            assertThat(node.sweepStaleLocatorRelaysOnce()).isZero();
+            clock.advance(config.renameIntentAbandonMillis());
+            assertThat(node.sweepStaleLocatorRelaysOnce()).isEqualTo(1);
+            assertThat(coordination.get(key)).isEmpty();
+            node.collectGarbageOnce();
+            assertThat(store.listLedgers()).doesNotContain(syrup);
+        }
+        store.close();
+    }
+
+    @Test
     void undecodableRelaySkipsSyrupGcButNotSSTableGc() {
         InMemoryLedgerStore store = new InMemoryLedgerStore();
         InMemoryCoordinationService coordination = new InMemoryCoordinationService();
