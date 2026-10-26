@@ -223,7 +223,10 @@ class CrossPartitionGcAndRenameTest {
         InMemoryLedgerStore store = new InMemoryLedgerStore();
         ManualClock clock = new ManualClock(1000);
         InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
-        CandyboxConfig config = aggressiveGcConfig();
+        CandyboxConfig config = CandyboxConfig.builder()
+                .memtableFlushThresholdBytes(1).syrupRolloverBytes(1).l0CompactionTrigger(2)
+                .ledgerGcGraceMillis(0).leaseRenewIntervalMillis(0).compactionIntervalMillis(0)
+                .renameIntentAbandonMillis(1_000).build();
         try (CandyboxNode node = new CandyboxNode(1, config, store, coordination, clock)) {
             node.createBox(BOX, PARTITIONS);
             String src = keyIn(0, "src");
