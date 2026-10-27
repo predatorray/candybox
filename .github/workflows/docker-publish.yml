@@ -70,3 +70,49 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # The release workflow dispatches this publisher explicitly. Publish the chart only
+      # after its matching image is available. Older release tags may not contain a chart.
+      - name: Set up JDK for release chart
+        if: ${{ steps.source.outputs.tag != '' && hashFiles('candybox-charts/pom.xml') != '' }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Set up Helm for release chart
+        if: ${{ steps.source.outputs.tag != '' && hashFiles('candybox-charts/pom.xml') != '' }}
+        uses: azure/setup-helm@v4.3.0
+        with:
+          version: v3.17.3
+
+      - name: Build and publish release chart
+        if: ${{ steps.source.outputs.tag != '' && hashFiles('candybox-charts/pom.xml') != '' }}
+        env:
+          RELEASE_VERSION: ${{ steps.source.outputs.tag }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          version=$(mvn -q -B -ntp -N help:evaluate -Dexpression=project.version -DforceStdout)
+          if [ "$version" != "$RELEASE_VERSION" ] || [[ "$version" == *SNAPSHOT* ]]; then
+            echo "::error::Chart parent version must match the non-SNAPSHOT release tag"
+            exit 1
+          fi
+          mvn -B -ntp -pl candybox-charts verify
+          printf '%s' "$DOCKERHUB_TOKEN" | helm registry login registry-1.docker.io \
+            --username "$DOCKERHUB_USERNAME" --password-stdin
+          # A rerun must not overwrite a published version. An existing artifact is retained.
+          chart_ref="oci://registry-1.docker.io/$DOCKERHUB_USERNAME/candybox-chart"
+          error_file=$(mktemp)
+          trap 'rm -f "$error_file"' EXIT
+          if helm show chart "$chart_ref" --version "$version" >/dev/null 2>"$error_file"; then
+            echo "Chart $version already exists; retaining the published artifact."
+          elif grep -Eq 'not found|MANIFEST_UNKNOWN' "$error_file"; then
+            helm push "candybox-charts/target/candybox-chart-$version.tgz" \
+              "oci://registry-1.docker.io/$DOCKERHUB_USERNAME"
+          else
+            # Authentication/network failures do not establish that the tag is absent.
+            cat "$error_file" >&2
+            exit 1
+          fi
