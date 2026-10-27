@@ -1,0 +1,13 @@
+Candybox {{ .Chart.AppVersion }} has been installed as {{ .Release.Name }}.
+{{- if .Values.gateway.enabled }}
+S3 endpoint (path-style):
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "candybox.fullname" . }}-gateway 9711:{{ .Values.gateway.service.port }}
+{{- end }}
+{{- if .Values.admin.enabled }}
+Dashboard:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "candybox.fullname" . }}-admin 9713:{{ .Values.admin.service.port }}
+  http://localhost:9713/ui/
+{{- end }}
+Run an object roundtrip: helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
+For authenticated clusters, configure the test client's credentials as described in README.md.
+Production requires site-specific storage, authentication, TLS, backup and recovery configuration.

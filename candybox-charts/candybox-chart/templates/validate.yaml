@@ -1,0 +1,27 @@
+{{- range $role, $q := .Values.node.quorums -}}
+{{- $parts := splitList "/" $q -}}
+{{- $ensemble := int (index $parts 0) -}}
+{{- $write := int (index $parts 1) -}}
+{{- $ack := int (index $parts 2) -}}
+{{- if or (lt $ack 1) (gt $ack $write) (gt $write $ensemble) -}}
+{{- fail (printf "node.quorums.%s must satisfy 1 <= ack <= write <= ensemble" $role) -}}
+{{- end -}}
+{{- if and $.Values.bookkeeper.enabled (gt $ensemble (int $.Values.bookkeeper.replicas)) -}}
+{{- fail (printf "node.quorums.%s ensemble exceeds bookkeeper.replicas" $role) -}}
+{{- end -}}
+{{- end -}}
+{{- range $key, $_ := .Values.node.config -}}
+{{- if or (has $key (list "server.bind" "server.advertised" "node.id" "health.port" "zookeeper.connect" "coordination.connect" "bookkeeper.metadataServiceUri")) (hasPrefix "quorum." $key) -}}
+{{- fail (printf "node.config.%s is managed by the chart; use its dedicated values" $key) -}}
+{{- end -}}
+{{- end -}}
+{{- range $key, $_ := .Values.gateway.config -}}
+{{- if has $key (list "s3.bind" "health.port" "zookeeper.connect") -}}
+{{- fail (printf "gateway.config.%s is managed by the chart" $key) -}}
+{{- end -}}
+{{- end -}}
+{{- range $key, $_ := .Values.bookkeeper.config -}}
+{{- if has $key (list "zkServers" "metadataServiceUri" "zkLedgersRootPath" "journalDirectory" "ledgerDirectories" "httpServerEnabled" "useHostNameAsBookieID" "advertisedAddress" "bookiePort" "httpServerPort") -}}
+{{- fail (printf "bookkeeper.config.%s is managed by the chart" $key) -}}
+{{- end -}}
+{{- end -}}

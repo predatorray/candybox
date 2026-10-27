@@ -32,6 +32,7 @@ COPY candybox-admin-api/pom.xml         candybox-admin-api/
 COPY candybox-web/pom.xml               candybox-web/
 COPY candybox-integration-tests/pom.xml candybox-integration-tests/
 COPY candybox-dist/pom.xml              candybox-dist/
+COPY candybox-charts/pom.xml            candybox-charts/
 RUN --mount=type=cache,target=/root/.m2 \
     mvn -q -B -DskipTests dependency:go-offline
 
@@ -44,7 +45,7 @@ RUN --mount=type=cache,target=/root/.m2 \
 # serves the "UI bundle not built" placeholder.
 COPY . .
 RUN --mount=type=cache,target=/root/.m2 \
-    mvn -q -B -DskipTests -Pfrontend package
+    mvn -q -B -DskipTests -Dcandybox.charts.skip=true -Pfrontend package
 
 # Unpack the assembled distribution to a stable, version-independent path so the runtime
 # stage does not need to know the project version.

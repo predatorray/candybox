@@ -1,0 +1,54 @@
+{{- if and .Values.bookkeeper.enabled .Values.bookkeeper.autoRecovery.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "candybox.fullname" . }}-autorecovery
+  labels: {{ include "candybox.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {{ include "candybox.selector" (dict "root" . "component" "autorecovery") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{ include "candybox.selector" (dict "root" . "component" "autorecovery") | nindent 8 }}
+      annotations:
+        checksum/scripts: {{ include (print $.Template.BasePath "/bookkeeper-configmap.yaml") . | sha256sum }}
+        checksum/settings: {{ toJson .Values.bookkeeper | sha256sum }}
+        checksum/metadata: {{ include "candybox.metadata" . | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {{ toYaml .Values.bookkeeper.podSecurityContext | nindent 8 }}
+      {{- with .Values.bookkeeper.imagePullSecrets }}
+      imagePullSecrets: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "candybox.scheduling" (dict "nodeSelector" .Values.bookkeeper.nodeSelector "tolerations" .Values.bookkeeper.tolerations) | nindent 6 }}
+      containers:
+        - name: autorecovery
+          image: "{{ .Values.bookkeeper.image.repository }}:{{ .Values.bookkeeper.image.tag }}"
+          imagePullPolicy: {{ .Values.bookkeeper.image.pullPolicy }}
+          securityContext: {{ toYaml .Values.bookkeeper.securityContext | nindent 12 }}
+          command: [bash, -ec]
+          args:
+            - |
+              source /etc/bookkeeper-scripts/configure.sh
+              until bin/bookkeeper shell whatisinstanceid; do sleep 5; done
+              exec bin/bookkeeper autorecovery
+          env:
+            {{- include "candybox.bkEnv" . | nindent 12 }}
+            - {name: BOOKIE_MEM, value: "-Xms128m -Xmx256m -XX:MaxDirectMemorySize=256m"}
+          {{- with .Values.bookkeeper.envFrom }}
+          envFrom: {{ toYaml . | nindent 12 }}
+          {{- end }}
+          resources: {{ toYaml .Values.bookkeeper.autoRecovery.resources | nindent 12 }}
+          volumeMounts:
+            - {name: scripts, mountPath: /etc/bookkeeper-scripts, readOnly: true}
+            {{- with .Values.bookkeeper.volumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: scripts
+          configMap: {name: {{ include "candybox.fullname" . }}-bookkeeper}
+        {{- with .Values.bookkeeper.volumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+{{- end }}
