@@ -46,6 +46,12 @@ class ChartTest(unittest.TestCase):
         for role in ('wal', 'manifest', 'sstable', 'syrup'):
             self.assertIn(f'quorum.{role}=1/1/1', config)
         self.assertFalse(any(d['kind'] == 'PodDisruptionBudget' for d in docs))
+        node = find(docs, 'StatefulSet', '-node')['spec']['template']['spec']
+        waiter = node['initContainers'][0]
+        self.assertEqual('wait-for-bookkeeper', waiter['name'])
+        self.assertEqual(node['containers'][0]['image'], waiter['image'])
+        bookie_service = find(docs, 'Service', '-bookkeeper')['metadata']['name']
+        self.assertEqual(bookie_service + '.testing.svc', waiter['env'][0]['value'])
 
     def test_production_persistence_secrets_and_recovery(self):
         docs = render('-f', str(CHART / 'values-production.yaml'))
@@ -67,6 +73,7 @@ class ChartTest(unittest.TestCase):
                       '--set-string', 'externalBookkeeper.metadataServiceUri=zk://bk.example:2181/custom')
         sts = [d for d in docs if d['kind'] == 'StatefulSet']
         self.assertEqual(1, len(sts))
+        self.assertNotIn('initContainers', sts[0]['spec']['template']['spec'])
         config = find(docs, 'ConfigMap', '-chart-config')['data']['node.properties']
         self.assertIn('zookeeper.connect=coord.example:2181', config)
         self.assertIn('bookkeeper.metadataServiceUri=zk://bk.example:2181/custom', config)

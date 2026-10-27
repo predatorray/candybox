@@ -38,6 +38,28 @@ spec:
       imagePullSecrets: {{ toYaml . | nindent 8 }}
       {{- end }}
       {{- include "candybox.scheduling" .Values.node | nindent 6 }}
+      {{- if .Values.bookkeeper.enabled }}
+      initContainers:
+        - name: wait-for-bookkeeper
+          image: {{ include "candybox.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext: {{ toYaml .Values.securityContext | nindent 12 }}
+          command: [bash, -ec]
+          args:
+            - |
+              # Bookies open their client port only after metadata initialization.
+              # Avoid starting the node while ZooKeeper and the ledger layout are absent.
+              until timeout 5 bash -c 'exec 3<>/dev/tcp/$BOOKKEEPER_HOST/3181'; do
+                echo 'Waiting for BookKeeper metadata and a listening bookie'
+                sleep 5
+              done
+          env:
+            - name: BOOKKEEPER_HOST
+              value: {{ printf "%s-bookkeeper.%s.svc" (include "candybox.fullname" .) .Release.Namespace | quote }}
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {memory: 32Mi}
+      {{- end }}
       containers:
         - name: node
           image: {{ include "candybox.image" . | quote }}
