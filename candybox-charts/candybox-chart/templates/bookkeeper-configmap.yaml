@@ -10,9 +10,10 @@ data:
     cp /opt/bookkeeper/conf/bk_server.conf "$BOOKIE_CONF"
     python3 /opt/bookkeeper/scripts/apply-config-from-env.py "$BOOKIE_CONF"
     mkdir -p "$BOOKIE_LOG_DIR"
+    # BookKeeper shell uses a separate log property and changes back to BK_HOME.
+    export BOOKIE_EXTRA_OPTS="${BOOKIE_EXTRA_OPTS:-} -Dbookkeeper.shell.log.dir=$BOOKIE_LOG_DIR"
   initialize.sh: |
     source /etc/bookkeeper-scripts/configure.sh
-    cd "$BOOKIE_LOG_DIR"
     # Check first; initialize only an absent metadata layout. Never run metaformat.
     # Concurrent first starts are safe: after another pod wins, recheck identity.
     for attempt in $(seq 1 60); do

@@ -31,7 +31,6 @@ spec:
           args:
             - |
               source /etc/bookkeeper-scripts/configure.sh
-              cd "$BOOKIE_LOG_DIR"
               until /opt/bookkeeper/bin/bookkeeper shell whatisinstanceid; do sleep 5; done
               exec /opt/bookkeeper/bin/bookkeeper autorecovery
           env:
