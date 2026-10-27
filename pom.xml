@@ -57,6 +57,7 @@
         <module>candybox-web</module>
         <module>candybox-integration-tests</module>
         <module>candybox-dist</module>
+        <module>candybox-charts</module>
     </modules>
 
     <properties>
@@ -473,6 +474,7 @@
                             <excludeArtifacts>
                                 <excludeArtifact>candybox-integration-tests</excludeArtifact>
                                 <excludeArtifact>candybox-dist</excludeArtifact>
+                                <excludeArtifact>candybox-charts</excludeArtifact>
                             </excludeArtifacts>
                             <waitMaxTime>3600</waitMaxTime>
                         </configuration>
