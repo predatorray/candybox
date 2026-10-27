@@ -219,6 +219,62 @@ class CrossPartitionGcAndRenameTest {
     }
 
     @Test
+    void undecodableRelayIsReapedOnlyAfterItsLastWriteAbandonWindow() {
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        ManualClock clock = new ManualClock(1000);
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        CandyboxConfig config = CandyboxConfig.builder()
+                .memtableFlushThresholdBytes(1).syrupRolloverBytes(1).l0CompactionTrigger(2)
+                .ledgerGcGraceMillis(0).leaseRenewIntervalMillis(0).compactionIntervalMillis(0)
+                .renameIntentAbandonMillis(1_000).build();
+        try (CandyboxNode node = new CandyboxNode(1, config, store, coordination, clock)) {
+            node.createBox(BOX, PARTITIONS);
+            String src = keyIn(0, "src");
+            long syrup = putAndFlush(node, src);
+            orphanSource(node, src);
+            String key = CandyboxKeys.locatorRelayKey(BOX.value(), 2, "unknown-version");
+            coordination.create(key, new byte[] {(byte) 0xff});
+            assertThat(node.sweepStaleLocatorRelaysOnce()).isZero();
+            node.collectGarbageOnce();
+            assertThat(store.listLedgers()).contains(syrup);
+
+            clock.advance(config.renameIntentAbandonMillis() - 1);
+            assertThat(node.sweepStaleLocatorRelaysOnce()).isZero();
+            coordination.compareAndSet(key, new byte[] {(byte) 0xfe}, 0);
+            clock.advance(1);
+            assertThat(node.sweepStaleLocatorRelaysOnce()).isZero();
+            clock.advance(config.renameIntentAbandonMillis());
+            assertThat(node.sweepStaleLocatorRelaysOnce()).isEqualTo(1);
+            assertThat(coordination.get(key)).isEmpty();
+            node.collectGarbageOnce();
+            assertThat(store.listLedgers()).doesNotContain(syrup);
+        }
+        store.close();
+    }
+
+    @Test
+    void undecodableRelayWithoutWriteMetadataIsNeverReaped() {
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        ManualClock clock = new ManualClock(1000);
+        FaultyCoordination coordination = new FaultyCoordination(new InMemoryCoordinationService());
+        coordination.omitWriteMetadata = true;
+        try (CandyboxNode node = new CandyboxNode(1, aggressiveGcConfig(), store, coordination, clock)) {
+            node.createBox(BOX, PARTITIONS);
+            String src = keyIn(0, "src");
+            long syrup = putAndFlush(node, src);
+            orphanSource(node, src);
+            String key = CandyboxKeys.locatorRelayKey(BOX.value(), 2, "unknown-age");
+            coordination.create(key, new byte[] {(byte) 0xff});
+            clock.advance(aggressiveGcConfig().renameIntentAbandonMillis() + 1);
+            assertThat(node.sweepStaleLocatorRelaysOnce()).isZero();
+            assertThat(coordination.get(key)).isPresent();
+            node.collectGarbageOnce();
+            assertThat(store.listLedgers()).contains(syrup);
+        }
+        store.close();
+    }
+
+    @Test
     void undecodableRelaySkipsSyrupGcButNotSSTableGc() {
         InMemoryLedgerStore store = new InMemoryLedgerStore();
         InMemoryCoordinationService coordination = new InMemoryCoordinationService();
@@ -673,6 +729,7 @@ class CrossPartitionGcAndRenameTest {
     private static final class FaultyCoordination implements CoordinationService {
         private final CoordinationService delegate;
         volatile boolean failChildren;
+        volatile boolean omitWriteMetadata;
         volatile String failWritesTo;
         volatile Consumer<String> beforeCreate = key -> { };
         volatile Consumer<String> beforeGet = key -> { };
@@ -694,7 +751,8 @@ class CrossPartitionGcAndRenameTest {
         @Override
         public Optional<VersionedValue> get(String key) {
             beforeGet.accept(key);
-            return delegate.get(key);
+            return delegate.get(key).map(value -> omitWriteMetadata
+                    ? new VersionedValue(value.version(), value.value()) : value);
         }
 
         @Override

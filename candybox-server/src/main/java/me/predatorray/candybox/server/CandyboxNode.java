@@ -718,7 +718,17 @@ public final class CandyboxNode implements AutoCloseable {
                 if (value.isEmpty()) {
                     continue;
                 }
-                if (LocatorRelay.deserialize(value.get().value()).createdAtMillis() <= cutoff) {
+                long writtenAt;
+                try {
+                    writtenAt = LocatorRelay.deserialize(value.get().value()).createdAtMillis();
+                } catch (RuntimeException undecodable) {
+                    // Unknown formats may still be consumed by newer nodes during the full window.
+                    writtenAt = value.get().modifiedAtMillis();
+                    if (writtenAt < 0) {
+                        throw undecodable;
+                    }
+                }
+                if (writtenAt <= cutoff) {
                     coordination.delete(key, value.get().version());
                     deleted++;
                 } else {
