@@ -31,8 +31,9 @@ spec:
           args:
             - |
               source /etc/bookkeeper-scripts/configure.sh
-              until bin/bookkeeper shell whatisinstanceid; do sleep 5; done
-              exec bin/bookkeeper autorecovery
+              cd "$BOOKIE_LOG_DIR"
+              until /opt/bookkeeper/bin/bookkeeper shell whatisinstanceid; do sleep 5; done
+              exec /opt/bookkeeper/bin/bookkeeper autorecovery
           env:
             {{- include "candybox.bkEnv" . | nindent 12 }}
             - {name: BOOKIE_MEM, value: "-Xms128m -Xmx256m -XX:MaxDirectMemorySize=256m"}

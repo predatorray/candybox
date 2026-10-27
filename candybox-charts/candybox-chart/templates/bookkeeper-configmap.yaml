@@ -12,11 +12,12 @@ data:
     mkdir -p "$BOOKIE_LOG_DIR"
   initialize.sh: |
     source /etc/bookkeeper-scripts/configure.sh
+    cd "$BOOKIE_LOG_DIR"
     # Check first; initialize only an absent metadata layout. Never run metaformat.
     # Concurrent first starts are safe: after another pod wins, recheck identity.
     for attempt in $(seq 1 60); do
-      if bin/bookkeeper shell whatisinstanceid; then exit 0; fi
-      if bin/bookkeeper shell initnewcluster; then exit 0; fi
+      if /opt/bookkeeper/bin/bookkeeper shell whatisinstanceid; then exit 0; fi
+      if /opt/bookkeeper/bin/bookkeeper shell initnewcluster; then exit 0; fi
       sleep 5
     done
     echo 'BookKeeper metadata initialization timed out' >&2

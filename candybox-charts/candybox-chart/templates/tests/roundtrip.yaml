@@ -14,6 +14,9 @@ spec:
   imagePullSecrets: {{ toYaml . | nindent 4 }}
   {{- end }}
   nodeSelector: {{ toYaml .Values.node.nodeSelector | nindent 4 }}
+  {{- with .Values.node.tolerations }}
+  tolerations: {{ toYaml . | nindent 4 }}
+  {{- end }}
   containers:
     - name: roundtrip
       image: {{ include "candybox.image" . | quote }}
