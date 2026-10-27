@@ -47,6 +47,9 @@ jobs:
           cache-to: type=gha,mode=max
       - uses: helm/kind-action@v1.12.0
         with:
+          # Kubernetes 1.32.2 uses containerd 2; Kind 0.26 cannot load images into it.
+          version: v0.27.0
+          kubectl_version: v1.32.2
           cluster_name: candybox-helm
           node_image: kindest/node:v1.32.2
       - name: Install, upgrade and test demo
