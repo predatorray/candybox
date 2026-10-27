@@ -58,6 +58,13 @@ docker compose run --rm cli get photos hello.txt   # -> hello candybox
 Tear it down with `docker compose down` (add `-v` to also wipe the data volumes). The
 [quick start guide](https://www.predatorray.me/candybox/docs/getting-started/quickstart/) walks through this in more detail.
 
+### Kubernetes / Helm
+
+The [Candybox Helm chart](candybox-charts/README.md) provides demo and production
+configuration examples, optional BookKeeper/ZooKeeper, and external-cluster support.
+Build it with `mvn -pl candybox-charts package`; release charts are published to
+`oci://registry-1.docker.io/zetaplusae/candybox-chart` with the Maven release version.
+
 ### Download and Maven Central
 
 Release **0.1.0** is out. The distribution archive is attached to the

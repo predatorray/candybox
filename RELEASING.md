@@ -258,3 +258,14 @@ gh workflow run docker-publish.yml --ref main -f tag=v0.1.0
 This builds the tagged source without rerunning Maven Central publishing or changing
 Git tags. Use the same command to retry a failed Docker publication. The updated
 publisher must be on `main` before using its `tag` input.
+
+## Helm chart
+
+Install Helm 3.17+ before running the full Maven release lifecycle. The
+`candybox-charts` module inherits the parent POM version, packages the chart during
+`package`, and attaches it as a `helm` artifact. The chart is excluded from Maven
+Central; its archive is attached to the GitHub Release. After the Docker publisher
+pushes the matching release image, it publishes the chart to the separate Docker
+Hub `candybox-chart` repository using the existing Docker Hub credentials. Ensure
+that repository is public and writable by the token. Snapshot charts are built
+but not pushed. See [chart documentation](candybox-charts/README.md) for details.

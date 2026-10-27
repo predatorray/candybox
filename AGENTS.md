@@ -19,7 +19,9 @@ bytes), and **Syrup** = a data ledger that holds the object bytes.
 
 ## Commands
 
-Requires Java 17+ and Maven 3.9+. No external services are needed: the ITs start an in-JVM BookKeeper
+Requires Java 17+ and Maven 3.9+. The chart module also requires Helm 3.17+ for
+`package` and later phases (`-Dcandybox.charts.skip=true` skips it for image-only builds).
+No external services are needed for the Java tests: the ITs start an in-JVM BookKeeper
 and ZooKeeper.
 
 ```bash

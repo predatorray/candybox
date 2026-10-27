@@ -1,0 +1,15 @@
+{{- range $component := list "node" "gateway" "admin" "bookkeeper" }}
+{{- $settings := index $.Values $component }}
+{{- if and (or (eq $component "node") $settings.enabled) $settings.pdb.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "candybox.fullname" $ }}-{{ $component }}
+  labels: {{ include "candybox.labels" $ | nindent 4 }}
+spec:
+  maxUnavailable: {{ $settings.pdb.maxUnavailable }}
+  selector:
+    matchLabels: {{ include "candybox.selector" (dict "root" $ "component" $component) | nindent 6 }}
+{{- end }}
+{{- end }}
