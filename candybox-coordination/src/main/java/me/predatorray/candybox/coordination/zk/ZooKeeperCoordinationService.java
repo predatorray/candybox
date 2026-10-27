@@ -152,7 +152,7 @@ public final class ZooKeeperCoordinationService implements CoordinationService {
         Stat stat = new Stat();
         try {
             byte[] data = client.getData().storingStatIn(stat).forPath(path(key));
-            return Optional.of(new VersionedValue(stat.getVersion(), data));
+            return Optional.of(new VersionedValue(stat.getVersion(), data, stat.getMtime()));
         } catch (KeeperException.NoNodeException e) {
             return Optional.empty();
         } catch (Exception e) {
