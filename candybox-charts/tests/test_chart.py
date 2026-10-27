@@ -102,7 +102,10 @@ class ChartTest(unittest.TestCase):
     def test_test_client_secret_and_ingress(self):
         docs = render('--set', 'test.envFrom[0].secretRef.name=cli-auth',
                       '--set', 'gateway.ingress.enabled=true')
-        test = find(docs, 'Pod', '-test')['spec']['containers'][0]
+        test_pod = find(docs, 'Pod', '-test')
+        self.assertEqual('before-hook-creation',
+                         test_pod['metadata']['annotations']['helm.sh/hook-delete-policy'])
+        test = test_pod['spec']['containers'][0]
         self.assertIn({'secretRef': {'name': 'cli-auth'}}, test['envFrom'])
         ingress = find(docs, 'Ingress', '-gateway')
         self.assertEqual(9711, ingress['spec']['rules'][0]['http']['paths'][0]['backend']['service']['port']['number'])
