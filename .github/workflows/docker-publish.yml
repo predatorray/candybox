@@ -78,9 +78,13 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          context: git
+          # SHA-pinned checkouts have detached HEADs with no branch/tag ref.
+          context: workflow
           images: ${{ secrets.DOCKERHUB_USERNAME }}/candybox
           flavor: latest=false
+          # Manual release publication may build a different commit than the workflow.
+          labels: |
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.commit }}
           tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' && !inputs.tag }}
             type=raw,value=${{ needs.prepare.outputs.tag }},enable=${{ needs.prepare.outputs.tag != '' }}
@@ -137,9 +141,13 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          context: git
+          # SHA-pinned checkouts have detached HEADs with no branch/tag ref.
+          context: workflow
           images: ${{ secrets.DOCKERHUB_USERNAME }}/candybox
           flavor: latest=false
+          # Manual release publication may build a different commit than the workflow.
+          labels: |
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.commit }}
           tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' && !inputs.tag }}
             type=raw,value=${{ needs.prepare.outputs.tag }},enable=${{ needs.prepare.outputs.tag != '' }}
