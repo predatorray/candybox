@@ -237,6 +237,10 @@ through its agent; in a non-interactive shell, export `MAVEN_GPG_PASSPHRASE` ins
 
 ## Docker release images
 
+Published image tags include both `linux/amd64` and `linux/arm64` in a single
+multi-platform manifest. Docker automatically selects the image for the host
+architecture. The publisher uses Buildx with QEMU to build the ARM64 image.
+
 `Docker Publish` publishes `zetaplusae/candybox:X.Y.Z` alongside `sha-<commit>` for
 release tags, stripping the leading `v` (for example, `v0.1.0` becomes `0.1.0` and
 `v0.1.0-rc.1` becomes `0.1.0-rc.1`). The hash is taken from the
