@@ -17,11 +17,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  docker:
-    name: Build & Push Image
-    runs-on: ubuntu-latest
+  prepare:
+    name: Resolve source
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+      tag: ${{ steps.source.outputs.tag }}
+      sha: ${{ steps.source.outputs.sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,8 +41,29 @@ jobs:
             echo "::error::Expected a release tag such as v0.1.0 or v0.1.0-rc.1"
             exit 1
           fi
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "tag=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
           echo "sha=sha-$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.arch }} image
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -58,23 +83,100 @@ jobs:
           flavor: latest=false
           tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' && !inputs.tag }}
-            type=raw,value=${{ steps.source.outputs.tag }},enable=${{ steps.source.outputs.tag != '' }}
-            type=raw,value=${{ steps.source.outputs.sha }}
+            type=raw,value=${{ needs.prepare.outputs.tag }},enable=${{ needs.prepare.outputs.tag != '' }}
+            type=raw,value=${{ needs.prepare.outputs.sha }}
 
-      - name: Build and push
+      - name: Build and push by digest
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ secrets.DOCKERHUB_USERNAME }}/candybox,push-by-digest=true,name-canonical=true,push=true
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=candybox-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=candybox-${{ matrix.arch }}
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish multi-platform image and chart
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          context: git
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/candybox
+          flavor: latest=false
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' && !inputs.tag }}
+            type=raw,value=${{ needs.prepare.outputs.tag }},enable=${{ needs.prepare.outputs.tag != '' }}
+            type=raw,value=${{ needs.prepare.outputs.sha }}
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: image-digest-*
+          merge-multiple: true
+
+      - name: Publish multi-platform manifest
+        env:
+          IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/candybox
+          METADATA: ${{ steps.meta.outputs.json }}
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          mapfile -t tags < <(jq -r '.tags[]' <<< "$METADATA")
+          tag_args=()
+          for tag in "${tags[@]}"; do
+            tag_args+=(--tag "$tag")
+          done
+          sources=()
+          for digest in *; do
+            sources+=("$IMAGE@sha256:$digest")
+          done
+          if [ "${#sources[@]}" -ne 2 ]; then
+            echo "::error::Expected image digests for both amd64 and arm64"
+            exit 1
+          fi
+          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
 
       # The release workflow dispatches this publisher explicitly. Publish the chart only
       # after its matching image is available. Older release tags may not contain a chart.
       - name: Set up JDK for release chart
-        if: ${{ steps.source.outputs.tag != '' && hashFiles('candybox-charts/pom.xml') != '' }}
+        if: ${{ needs.prepare.outputs.tag != '' && hashFiles('candybox-charts/pom.xml') != '' }}
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -82,15 +184,15 @@ jobs:
           cache: maven
 
       - name: Set up Helm for release chart
-        if: ${{ steps.source.outputs.tag != '' && hashFiles('candybox-charts/pom.xml') != '' }}
+        if: ${{ needs.prepare.outputs.tag != '' && hashFiles('candybox-charts/pom.xml') != '' }}
         uses: azure/setup-helm@v4.3.0
         with:
           version: v3.17.3
 
       - name: Build and publish release chart
-        if: ${{ steps.source.outputs.tag != '' && hashFiles('candybox-charts/pom.xml') != '' }}
+        if: ${{ needs.prepare.outputs.tag != '' && hashFiles('candybox-charts/pom.xml') != '' }}
         env:
-          RELEASE_VERSION: ${{ steps.source.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.tag }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
