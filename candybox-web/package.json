@@ -1,7 +1,7 @@
 {
   "name": "candybox-web",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.2-SNAPSHOT",
   "description": "Candybox web dashboard (React + TypeScript + MUI). Built by Vite; packaged into candybox-web.jar's classpath under ui/ so the admin API can serve it from /ui/*.",
   "type": "module",
   "scripts": {
