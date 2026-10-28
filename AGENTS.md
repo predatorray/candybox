@@ -2,6 +2,13 @@
 
 Guidance for coding agents working in this repository.
 
+## Skills
+
+Shared skills live in `.agents/skills/<skill-name>/SKILL.md` and follow the open
+[Agent Skills specification](https://agentskills.io/specification). Edit skills there;
+`.claude/skills` is a relative symlink to `../.agents/skills` for Claude compatibility.
+Skill inputs come from the user's request, so they do not require agent-specific argument substitution.
+
 ## Project
 
 Candybox is a distributed, S3-like object store in Java 17 (Maven multi-module). Its storage engine is
@@ -12,7 +19,9 @@ bytes), and **Syrup** = a data ledger that holds the object bytes.
 
 ## Commands
 
-Requires Java 17+ and Maven 3.9+. No external services are needed: the ITs start an in-JVM BookKeeper
+Requires Java 17+ and Maven 3.9+. The chart module also requires Helm 3.17+ for
+`package` and later phases (`-Dcandybox.charts.skip=true` skips it for image-only builds).
+No external services are needed for the Java tests: the ITs start an in-JVM BookKeeper
 and ZooKeeper.
 
 ```bash

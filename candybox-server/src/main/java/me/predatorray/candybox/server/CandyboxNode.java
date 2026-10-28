@@ -165,7 +165,8 @@ public final class CandyboxNode implements AutoCloseable {
 
     /**
      * One background maintenance tick: compact owned partitions, GC their obsoleted ledgers, and sweep
-     * any abandoned in-flight multipart uploads (older than {@code multipartUploadTtlMillis}).
+     * abandoned multipart uploads, finalize rename intents, and sweep stale locator relays.
+     * Every phase is guarded so a failed phase cannot escape the tick or suppress later phases.
      */
     private void runMaintenance() {
         guarded("allocation epoch rotation", this::rotateAllocationEpochs).run();
@@ -574,7 +575,7 @@ public final class CandyboxNode implements AutoCloseable {
             } catch (FencedException | NotOwnerException lostOwnership) {
                 LOG.info("Stopping compaction of a partition on node {}: {}", nodeId,
                         lostOwnership.getMessage());
-            } catch (RuntimeException e) {
+            } catch (Throwable e) {
                 LOG.warn("Compaction error on node {}", nodeId, e);
             }
         }
@@ -598,7 +599,7 @@ public final class CandyboxNode implements AutoCloseable {
                 if (ownership.isOwner()) {
                     publishPartitionRefs(ownership);
                 }
-            } catch (RuntimeException e) {
+            } catch (Throwable e) {
                 unpublished.add(ownership.box().value());
                 LOG.warn("Held-Syrup publish error on node {}: {}", nodeId, e.getMessage());
             }
@@ -621,7 +622,7 @@ public final class CandyboxNode implements AutoCloseable {
             } catch (NotOwnerException lostOwnership) {
                 LOG.info("Skipping GC of a partition on node {}: {}", nodeId,
                         lostOwnership.getMessage());
-            } catch (RuntimeException e) {
+            } catch (Throwable e) {
                 LOG.warn("GC error on node {}", nodeId, e);
             }
         }
@@ -687,7 +688,7 @@ public final class CandyboxNode implements AutoCloseable {
                 intents = engine.listRenameIntents();
             } catch (NotOwnerException lost) {
                 continue;
-            } catch (RuntimeException e) {
+            } catch (Throwable e) {
                 LOG.warn("Rename-intent finalize error on node {}: {}", nodeId, e.getMessage());
                 continue;
             }
@@ -703,7 +704,7 @@ public final class CandyboxNode implements AutoCloseable {
                     }
                 } catch (NotOwnerException lost) {
                     break;
-                } catch (RuntimeException e) {
+                } catch (Throwable e) {
                     LOG.warn("Rename-intent finalize error on node {} for token {}: {}", nodeId,
                             intent.token(), e.getMessage());
                 }
@@ -728,7 +729,7 @@ public final class CandyboxNode implements AutoCloseable {
             boolean owner;
             try {
                 owner = ownership.isOwner();
-            } catch (RuntimeException e) {
+            } catch (Throwable e) {
                 LOG.warn("Locator relay sweep error on node {}: {}", nodeId, e.getMessage());
                 complete = false;
                 continue;
@@ -758,7 +759,7 @@ public final class CandyboxNode implements AutoCloseable {
         List<String> tokens;
         try {
             tokens = coordination.children(CandyboxKeys.locatorRelaysPath(box, partition));
-        } catch (RuntimeException e) {
+        } catch (Throwable e) {
             LOG.warn("Locator relay sweep error on node {} for box {} partition {}: {}", nodeId, box,
                     partition, e.getMessage());
             return new RelaySweep(0, 0, false);
@@ -770,17 +771,26 @@ public final class CandyboxNode implements AutoCloseable {
                 if (value.isEmpty()) {
                     continue;
                 }
-                if (LocatorRelay.deserialize(value.get().value()).createdAtMillis() <= cutoff) {
-                    LocatorRelay relay = LocatorRelay.deserialize(value.get().value());
+                long writtenAt;
+                LocatorRelay relay = null;
+                try {
+                    relay = LocatorRelay.deserialize(value.get().value());
+                    writtenAt = relay.createdAtMillis();
+                } catch (RuntimeException undecodable) {
+                    // Unknown formats retain their full window before reaping.
+                    writtenAt = value.get().modifiedAtMillis();
+                    if (writtenAt < 0) { throw undecodable; }
+                }
+                if (writtenAt <= cutoff) {
                     coordination.delete(key, value.get().version());
-                    if (config.ledgerEnumerationGraceMillis() > 0) { releaseRelayPins(token, relay); }
+                    if (config.ledgerEnumerationGraceMillis() > 0 && relay != null) { releaseRelayPins(token, relay); }
                     deleted++;
                 } else {
                     liveBytes += value.get().value().length;
                 }
             } catch (CasConflictException raced) {
                 // Consumed or deleted concurrently.
-            } catch (RuntimeException e) {
+            } catch (Throwable e) {
                 complete = false;
                 LOG.warn("Locator relay sweep error on node {} for {}: {}", nodeId, key,
                         e.getMessage());
@@ -818,7 +828,7 @@ public final class CandyboxNode implements AutoCloseable {
             } catch (NotOwnerException lostOwnership) {
                 LOG.info("Skipping multipart TTL sweep on a partition on node {}: {}", nodeId,
                         lostOwnership.getMessage());
-            } catch (RuntimeException e) {
+            } catch (Throwable e) {
                 LOG.warn("Multipart TTL sweep error on node {}", nodeId, e);
             }
         }
@@ -1144,3 +1154,4 @@ public final class CandyboxNode implements AutoCloseable {
         coordination.unregisterMember(nodeId);
     }
 }
+

@@ -234,3 +234,38 @@ mvn -Prelease,frontend deploy
 `-Pfrontend` is required. Without it, the `release` profile refuses to package `candybox-web`,
 because the published jar would not contain the dashboard. gpg asks for the key's passphrase
 through its agent; in a non-interactive shell, export `MAVEN_GPG_PASSPHRASE` instead.
+
+## Docker release images
+
+`Docker Publish` publishes `zetaplusae/candybox:X.Y.Z` alongside `sha-<commit>` for
+release tags, stripping the leading `v` (for example, `v0.1.0` becomes `0.1.0` and
+`v0.1.0-rc.1` becomes `0.1.0-rc.1`). The hash is taken from the
+checked-out release commit. `latest` continues to track `main`; publishing an older
+release does not move it. Configure repository secrets `DOCKERHUB_USERNAME` and
+`DOCKERHUB_TOKEN` for the publisher.
+
+Pushing a `v*` tag starts the publisher. The Release workflow explicitly dispatches
+it after pushing its tag, since pushes made with `GITHUB_TOKEN` do not trigger other
+workflows. Check the separate Docker Publish run for completion. Cherry-pick the
+Release workflow change onto active release branches before the next release.
+
+To backfill a missing image, run the publisher from `main` with an existing tag:
+
+```bash
+gh workflow run docker-publish.yml --ref main -f tag=v0.1.0
+```
+
+This builds the tagged source without rerunning Maven Central publishing or changing
+Git tags. Use the same command to retry a failed Docker publication. The updated
+publisher must be on `main` before using its `tag` input.
+
+## Helm chart
+
+Install Helm 3.17+ before running the full Maven release lifecycle. The
+`candybox-charts` module inherits the parent POM version, packages the chart during
+`package`, and attaches it as a `helm` artifact. The chart is excluded from Maven
+Central; its archive is attached to the GitHub Release. After the Docker publisher
+pushes the matching release image, it publishes the chart to the separate Docker
+Hub `candybox-chart` repository using the existing Docker Hub credentials. Ensure
+that repository is public and writable by the token. Snapshot charts are built
+but not pushed. See [chart documentation](candybox-charts/README.md) for details.

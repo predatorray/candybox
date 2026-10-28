@@ -31,9 +31,15 @@ jobs:
     environment: maven-central
     permissions:
       contents: write
+      actions: write
       pull-requests: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4.3.0
+        with:
+          version: v3.17.3
 
       - name: Set up JDK 17 with Central credentials and the signing key
         uses: actions/setup-java@v4
@@ -122,6 +128,14 @@ jobs:
           git push origin "HEAD:refs/heads/${BUMP}"
           git push origin "refs/tags/v${RELEASE}"
 
+      # GITHUB_TOKEN pushes do not trigger push workflows. Dispatch explicitly using main's
+      # publisher, which checks out the release tag (also supports backfilling older releases).
+      - name: Dispatch the release Docker image
+        env:
+          RELEASE: ${{ steps.versions.outputs.release }}
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run docker-publish.yml --ref main -f "tag=v${RELEASE}"
+
       - name: Create the GitHub Release with the distribution archives
         uses: softprops/action-gh-release@v2
         with:
@@ -130,6 +144,7 @@ jobs:
           files: |
             candybox-dist/target/candybox-*.tar.gz
             candybox-dist/target/candybox-*.zip
+            candybox-charts/target/candybox-chart-*.tgz
 
       # The next-version bump goes through a PR to the release branch. The PR branch carries the
       # tagged release commit too, but the tag is what keeps it, so the PR can be squash-merged.

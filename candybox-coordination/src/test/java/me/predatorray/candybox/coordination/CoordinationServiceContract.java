@@ -74,10 +74,15 @@ public abstract class CoordinationServiceContract {
         VersionedValue read = service.get("manifest").orElseThrow();
         assertThat(new String(read.value(), StandardCharsets.UTF_8)).isEqualTo("ledger-1");
         assertThat(read.version()).isEqualTo(0);
+        assertThat(read.modifiedAtMillis()).isGreaterThanOrEqualTo(0);
+        assertThat(service.get("manifest").orElseThrow().modifiedAtMillis())
+                .isEqualTo(read.modifiedAtMillis());
 
         long v1 = service.compareAndSet("manifest", b("ledger-2"), 0);
         assertThat(v1).isEqualTo(1);
         assertThat(service.get("manifest").orElseThrow().version()).isEqualTo(1);
+        assertThat(service.get("manifest").orElseThrow().modifiedAtMillis())
+                .isGreaterThanOrEqualTo(read.modifiedAtMillis());
     }
 
     @Test

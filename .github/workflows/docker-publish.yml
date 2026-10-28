@@ -3,8 +3,18 @@ name: Docker Publish
 on:
   push:
     branches: [ main ]
+    tags: [ 'v*' ]
   # Allow manual runs from the Actions tab
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to publish, e.g. v0.1.0. Empty builds the selected ref.'
+        required: false
+        default: ''
+
+concurrency:
+  group: docker-${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+  cancel-in-progress: false
 
 jobs:
   docker:
@@ -15,6 +25,20 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+
+      - name: Resolve image tags from the checked-out source
+        id: source
+        env:
+          RELEASE_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
+        run: |
+          if [ -n "${RELEASE_TAG}" ] && ! [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9][a-zA-Z0-9.-]*)?$ ]]; then
+            echo "::error::Expected a release tag such as v0.1.0 or v0.1.0-rc.1"
+            exit 1
+          fi
+          echo "tag=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "sha=sha-$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -29,10 +53,13 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
+          context: git
           images: ${{ secrets.DOCKERHUB_USERNAME }}/candybox
+          flavor: latest=false
           tags: |
-            type=raw,value=latest
-            type=sha,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' && !inputs.tag }}
+            type=raw,value=${{ steps.source.outputs.tag }},enable=${{ steps.source.outputs.tag != '' }}
+            type=raw,value=${{ steps.source.outputs.sha }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -43,3 +70,49 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # The release workflow dispatches this publisher explicitly. Publish the chart only
+      # after its matching image is available. Older release tags may not contain a chart.
+      - name: Set up JDK for release chart
+        if: ${{ steps.source.outputs.tag != '' && hashFiles('candybox-charts/pom.xml') != '' }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Set up Helm for release chart
+        if: ${{ steps.source.outputs.tag != '' && hashFiles('candybox-charts/pom.xml') != '' }}
+        uses: azure/setup-helm@v4.3.0
+        with:
+          version: v3.17.3
+
+      - name: Build and publish release chart
+        if: ${{ steps.source.outputs.tag != '' && hashFiles('candybox-charts/pom.xml') != '' }}
+        env:
+          RELEASE_VERSION: ${{ steps.source.outputs.tag }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          version=$(mvn -q -B -ntp -N help:evaluate -Dexpression=project.version -DforceStdout)
+          if [ "$version" != "$RELEASE_VERSION" ] || [[ "$version" == *SNAPSHOT* ]]; then
+            echo "::error::Chart parent version must match the non-SNAPSHOT release tag"
+            exit 1
+          fi
+          mvn -B -ntp -pl candybox-charts verify
+          printf '%s' "$DOCKERHUB_TOKEN" | helm registry login registry-1.docker.io \
+            --username "$DOCKERHUB_USERNAME" --password-stdin
+          # A rerun must not overwrite a published version. An existing artifact is retained.
+          chart_ref="oci://registry-1.docker.io/$DOCKERHUB_USERNAME/candybox-chart"
+          error_file=$(mktemp)
+          trap 'rm -f "$error_file"' EXIT
+          if helm show chart "$chart_ref" --version "$version" >/dev/null 2>"$error_file"; then
+            echo "Chart $version already exists; retaining the published artifact."
+          elif grep -Eq 'not found|MANIFEST_UNKNOWN' "$error_file"; then
+            helm push "candybox-charts/target/candybox-chart-$version.tgz" \
+              "oci://registry-1.docker.io/$DOCKERHUB_USERNAME"
+          else
+            # Authentication/network failures do not establish that the tag is absent.
+            cat "$error_file" >&2
+            exit 1
+          fi

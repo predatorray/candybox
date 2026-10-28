@@ -1,0 +1,51 @@
+# Starting point: requires >=3 amd64 workers, a default StorageClass and the Secrets below.
+# Review capacity, failure domains, ZooKeeper/BookKeeper security and TLS before exposing traffic.
+volumes:
+  - name: credentials
+    secret: {secretName: candybox-credentials}
+volumeMounts:
+  - {name: credentials, mountPath: /etc/candybox-security, readOnly: true}
+node:
+  config:
+    auth.enabled: true
+    auth.required: true
+    auth.credentials.file: /etc/candybox-security/credentials.properties
+    auth.super.users: Gateway:s3-gw,Admin:admin-api
+  # Spread storage node processes over distinct workers.
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: DoNotSchedule
+      labelSelector:
+        matchLabels: {app.kubernetes.io/component: node, app.kubernetes.io/name: candybox-chart}
+  envFrom:
+    - secretRef: {name: candybox-node-env}
+gateway:
+  config:
+    s3.auth.enabled: true
+    s3.auth.allow-anonymous: false
+    auth.credentials.file: /etc/candybox-security/credentials.properties
+  envFrom:
+    - secretRef: {name: candybox-gateway-env}
+admin:
+  envFrom:
+    - secretRef: {name: candybox-admin-env}
+bookkeeper:
+  # A spare bookie permits ensemble replacement after a failure with E=3.
+  replicas: 4
+  persistence:
+    journalSize: 20Gi
+    ledgerSize: 200Gi
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: DoNotSchedule
+      labelSelector:
+        matchLabels: {app.kubernetes.io/component: bookkeeper, app.kubernetes.io/name: candybox-chart}
+zookeeper:
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels: {app.kubernetes.io/name: zookeeper}

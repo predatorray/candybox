@@ -249,7 +249,9 @@ consults range tombstones across all tables rather than pruning by point range.
   object bytes are ever moved or re-stored. A relay is bound to the requesting principal, deleted
   once its put succeeds, consumable only within half of `rename.intent.abandon.millis` (so it can
   never outlive its rename intent, with the rest as clock-skew margin), and reaped by the source
-  owner past the full window. Pending relays are bounded per node in bytes
+  owner past the full window. Undecodable relays use the coordination backend last-write time
+  for reaping, preserving the full window for consumers that understand newer formats. If that
+  metadata is unavailable, reaping fails safe. Pending relays are bounded per node in bytes
   (`zero.copy.relay.budget.bytes`) and per partition in count (1024). This is safe because the blob layer is physically global (a `SegmentRef` resolves bytes
   by `syrupId` alone, no partition scoping) and because **Box-global GC** (§9) keeps a Syrup alive
   while *any* partition references it. A cross-partition `rename` is still copy-then-delete across

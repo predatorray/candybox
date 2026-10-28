@@ -1,0 +1,173 @@
+# Replicated, persistent baseline. Use values-demo.yaml for a small disposable cluster.
+nameOverride: ""
+fullnameOverride: ""
+image:
+  repository: zetaplusae/candybox
+  # Defaults to Chart.appVersion. Snapshot builds require an existing tag or digest.
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# Shared by Candybox processes; use Secret refs in env/envFrom for credentials.
+commonEnv: []
+commonEnvFrom: []
+volumes: []
+volumeMounts: []
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+  seccompProfile:
+    type: RuntimeDefault
+
+node:
+  replicas: 3
+  heapOpts: "-Xms512m -Xmx1g"
+  resources:
+    requests: {cpu: 250m, memory: 768Mi}
+    limits: {memory: 2Gi}
+  # Arbitrary Candybox properties. Do not put secrets in this ConfigMap.
+  config: {}
+  quorums:
+    wal: "3/3/2"
+    manifest: "3/3/2"
+    sstable: "3/2/2"
+    syrup: "3/2/2"
+  env: []
+  envFrom: []
+  nodeSelector: {kubernetes.io/arch: amd64}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+  podAnnotations: {}
+  pdb: {enabled: true, maxUnavailable: 1}
+
+gateway:
+  enabled: true
+  replicas: 2
+  heapOpts: "-Xms256m -Xmx512m"
+  resources:
+    requests: {cpu: 100m, memory: 384Mi}
+    limits: {memory: 1Gi}
+  config: {}
+  env: []
+  envFrom: []
+  nodeSelector: {kubernetes.io/arch: amd64}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+  podAnnotations: {}
+  pdb: {enabled: true, maxUnavailable: 1}
+  service:
+    type: ClusterIP
+    port: 9711
+    annotations: {}
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    host: candybox.example.com
+    tls: []
+
+admin:
+  probeScheme: HTTP
+  enabled: true
+  replicas: 1
+  heapOpts: "-Xms128m -Xmx256m"
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {memory: 512Mi}
+  env: []
+  envFrom: []
+  nodeSelector: {kubernetes.io/arch: amd64}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+  podAnnotations: {}
+  pdb: {enabled: false, maxUnavailable: 1}
+  service:
+    type: ClusterIP
+    port: 9713
+    annotations: {}
+
+# CloudPirates upstream chart. All its values may be overridden here.
+zookeeper:
+  enabled: true
+  replicaCount: 3
+  image:
+    imagePullPolicy: IfNotPresent
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {memory: 512Mi}
+  extraEnvVars:
+    - {name: JVMFLAGS, value: "-Xms128m -Xmx256m"}
+  persistence:
+    enabled: true
+    size: 8Gi
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: "2"
+externalZookeeper:
+  # Required when zookeeper.enabled=false. Used for Candybox coordination.
+  servers: ""
+
+bookkeeper:
+  enabled: true
+  replicas: 3
+  image:
+    repository: apache/bookkeeper
+    tag: "4.17.1"
+    pullPolicy: IfNotPresent
+  imagePullSecrets: []
+  heapOpts: "-Xms512m -Xmx1g -XX:MaxDirectMemorySize=512m"
+  resources:
+    requests: {cpu: 250m, memory: 1Gi}
+    limits: {memory: 2Gi}
+  # Metadata shares the configured ZooKeeper ensemble; never format existing data.
+  ledgerRootPath: /ledgers
+  # Optional separate ZooKeeper ensemble for managed BookKeeper metadata.
+  zookeeperServers: ""
+  config: {}
+  env: []
+  envFrom: []
+  volumes: []
+  volumeMounts: []
+  podSecurityContext: {fsGroup: 1000}
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    runAsNonRoot: true
+    allowPrivilegeEscalation: false
+    capabilities: {drop: [ALL]}
+    seccompProfile: {type: RuntimeDefault}
+  persistence:
+    enabled: true
+    storageClass: ""
+    journalSize: 10Gi
+    ledgerSize: 50Gi
+  nodeSelector: {kubernetes.io/arch: amd64}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+  podAnnotations: {}
+  pdb: {enabled: true, maxUnavailable: 1}
+  autoRecovery:
+    enabled: true
+    resources:
+      requests: {cpu: 100m, memory: 512Mi}
+      limits: {memory: 1Gi}
+externalBookkeeper:
+  # Required when bookkeeper.enabled=false; external cluster must be initialized.
+  metadataServiceUri: ""
+
+# CLI credentials for helm test; CLI uses CANDYBOX_AUTH_USERNAME/PASSWORD, not AUTH_CLIENT_*.
+test:
+  env: []
+  envFrom: []
