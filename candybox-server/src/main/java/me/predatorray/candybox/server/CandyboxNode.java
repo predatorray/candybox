@@ -650,7 +650,8 @@ public final class CandyboxNode implements AutoCloseable {
     synchronized void reconcileAllocations() {
         long grace = config.ledgerEnumerationGraceMillis();
         long now = clock.currentTimeMillis();
-        if (grace == 0 || now - lastEnumeration < grace) { return; }
+        long interval = Math.min(grace, 60_000);
+        if (grace == 0 || (lastEnumeration != 0 && now - lastEnumeration < interval)) { return; }
         lastEnumeration = now;
         enumerationReport = retention.reconcile(grace, 1024, false);
     }

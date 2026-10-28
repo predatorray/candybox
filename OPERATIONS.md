@@ -349,7 +349,9 @@ it rejects a pointer without an exact incarnation match. Manifest pointer v2 kee
 backup capture depends on retention pins. Box descriptors now use format v2 (v1 remains readable).
 
 Owners rotate through normal fenced recovery at this interval. The elected balancer enumerates
-at most 1024 ledgers per interval, with a durable cursor. Recovery pins the complete retained set
+at most 1024 ledgers per minute (or per grace interval when shorter), with a durable cursor.
+Each scan cycle captures an upper ledger-ID boundary, so continued allocations cannot starve
+previously held ledgers or physical-delete retries. Cursor format v2 reads v1 cursors safely. Recovery pins the complete retained set
 before retiring predecessor allocation epochs. Failed/ambiguous pointer publication leaves epochs
 active until a successor recovers the actual pointer. Active or missing epochs, legacy untagged
 allocations, unknown roles, and unavailable coordination block deletion. This does not rely on

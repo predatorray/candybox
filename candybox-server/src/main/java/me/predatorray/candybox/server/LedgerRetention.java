@@ -249,10 +249,15 @@ public final class LedgerRetention {
         int examined = 0;
         String cursorKey = ROOT + "/enumeration-cursor";
         var cursor = coordination.get(cursorKey);
-        long after = cursor.map(v -> decodeCursor(v.value())).orElse(-1L);
+        Cursor previous = cursor.map(v -> decodeCursor(v.value())).orElse(new Cursor(-1, -1));
         List<Long> ids = store.listLedgers().stream().sorted().toList();
-        List<Long> remaining = ids.stream().filter(id -> id > after).toList();
-        if (remaining.isEmpty()) { remaining = ids; }
+        List<Long> remaining = ids.stream()
+                .filter(id -> id > previous.after() && id <= previous.upperBound()).toList();
+        long upperBound = previous.upperBound();
+        if (remaining.isEmpty()) {
+            remaining = ids;
+            upperBound = ids.isEmpty() ? -1 : ids.get(ids.size() - 1);
+        }
         long last = -1;
         for (long id : remaining) {
             if (examined++ >= limit) { break; }
@@ -283,7 +288,7 @@ public final class LedgerRetention {
             } catch (RuntimeException failure) { errors++; }
         }
         if (!reportOnly && last >= 0) {
-            byte[] next = new BinaryWriter().writeByte(1).writeLong(last).toByteArray();
+            byte[] next = new BinaryWriter().writeByte(2).writeLong(last).writeLong(upperBound).toByteArray();
             try {
                 if (cursor.isEmpty()) { coordination.create(cursorKey, next); }
                 else { coordination.compareAndSet(cursorKey, next, cursor.get().version()); }
@@ -292,10 +297,17 @@ public final class LedgerRetention {
         return new Report(candidates, held, deleted, errors, oldest);
     }
 
-    private static long decodeCursor(byte[] bytes) {
+    private record Cursor(long after, long upperBound) { }
+
+    private static Cursor decodeCursor(byte[] bytes) {
         BinaryReader r = new BinaryReader(bytes);
-        if (r.readByte() != 1) { throw new StorageException("Unknown enumeration cursor version"); }
-        return r.readLong();
+        int version = r.readByte();
+        if (version != 1 && version != 2) { throw new StorageException("Unknown enumeration cursor version"); }
+        long after = r.readLong();
+        // A v1 cursor had no cycle bound; start a fresh bounded cycle on its next pass.
+        long upper = version == 1 ? after : r.readLong();
+        if (after < -1 || upper < after) { throw new StorageException("Invalid enumeration cursor"); }
+        return new Cursor(after, upper);
     }
 
     private static String tag(Map<String, byte[]> tags, String key) {

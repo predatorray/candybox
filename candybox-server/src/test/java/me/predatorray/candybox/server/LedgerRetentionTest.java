@@ -444,4 +444,39 @@ class LedgerRetentionTest {
         assertThat(encoded.length).isLessThan(512);
     }
 
+    @Test void newAllocationsCannotStarveEarlierHeldLedgers() {
+        var old = retention.allocate("box", "generation", 0);
+        var orphan = syrup(old); orphan.close();
+        retention.allocate("box", "generation", 0).inheritAndRetire(Set.of());
+        assertThat(retention.reconcile(100, 1, false).deleted()).isZero();
+        clock.advance(1_000);
+        var active = retention.allocate("box", "generation", 1);
+        for (int i = 0; i < 3; i++) {
+            syrup(active).close();
+            retention.reconcile(100, 1, false);
+        }
+        assertThat(store.listLedgers()).doesNotContain(orphan.ledgerId());
+    }
+
+    @Test void failedDeleteIsRetriedDespiteContinuousNewAllocationsAndLegacyCursor() {
+        var old = retention.allocate("box", "generation", 0);
+        var orphan = syrup(old); orphan.close();
+        retention.allocate("box", "generation", 0).inheritAndRetire(Set.of());
+        clock.advance(1_000);
+        var failing = new AdversarialStore(store);
+        failing.failDeletes = true;
+        assertThat(new LedgerRetention(failing, coordination, clock).reconcile(100, 1, false).errors())
+                .isEqualTo(1);
+        var key = "retention/enumeration-cursor";
+        coordination.compareAndSet(key, new me.predatorray.candybox.common.serial.BinaryWriter()
+                .writeByte(1).writeLong(orphan.ledgerId()).toByteArray(),
+                coordination.get(key).orElseThrow().version());
+        var active = retention.allocate("box", "generation", 1);
+        for (int i = 0; i < 3; i++) {
+            syrup(active).close();
+            retention.reconcile(100, 1, false);
+        }
+        assertThat(store.listLedgers()).doesNotContain(orphan.ledgerId());
+    }
+
 }
