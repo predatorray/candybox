@@ -1154,4 +1154,3 @@ public final class CandyboxNode implements AutoCloseable {
         coordination.unregisterMember(nodeId);
     }
 }
-
