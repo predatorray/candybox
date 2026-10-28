@@ -6,7 +6,7 @@
     <parent>
         <groupId>me.predatorray.candybox</groupId>
         <artifactId>candybox-parent</artifactId>
-        <version>0.1.1</version>
+        <version>0.1.2-SNAPSHOT</version>
     </parent>
     <artifactId>candybox-charts</artifactId>
     <packaging>pom</packaging>
