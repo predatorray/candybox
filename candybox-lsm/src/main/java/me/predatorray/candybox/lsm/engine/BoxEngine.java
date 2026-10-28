@@ -828,6 +828,8 @@ public final class BoxEngine implements AutoCloseable {
                     createdAtMillis > 0 ? createdAtMillis : clock.currentTimeMillis(),
                     List.copyOf(parts), acl == null ? ObjectAcl.NONE : acl);
             Mutation mutation = new Mutation(dst, dstLocator);
+            ledgerStore.retainLedgers(dstLocator.segments().stream()
+                    .map(SegmentRef::syrupId).toList());
             wal.append(mutation);
             active.put(mutation);
             // The parts may point at a Syrup this partition already counts as a pending orphan. Clear it
@@ -1443,6 +1445,26 @@ public final class BoxEngine implements AutoCloseable {
         }
     }
 
+    /** All recovery roots, including allocations not yet flushed and durable pending deletes. */
+    public Set<Long> retainedLedgers() {
+        lock.readLock().lock();
+        try {
+            ManifestState state = manifest.current();
+            Set<Long> retained = referencedSyrupsLocked();
+            retained.addAll(unflushedSyrups);
+            retained.addAll(state.liveSyrups());
+            retained.addAll(state.pendingDeletes().keySet());
+            state.tables().forEach(table -> retained.add(table.ledgerId()));
+            retained.add(state.walLedgerId());
+            retained.add(wal.ledgerId());
+            retained.add(manifest.ledgerId());
+            retained.remove(-1L);
+            return retained;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
     /** A consistent snapshot of the current LSM state (for compaction picking / inspection). */
     public ManifestState manifestState() {
         return manifest.current();
@@ -1730,6 +1752,7 @@ public final class BoxEngine implements AutoCloseable {
         Map<String, byte[]> metadata = new LinkedHashMap<>();
         metadata.put("candybox-role", role.name().getBytes(java.nio.charset.StandardCharsets.UTF_8));
         metadata.put("candybox-box", box.value().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        metadata.putAll(store.allocationMetadata());
         return new LedgerConfig(config.quorum(role), metadata);
     }
 }

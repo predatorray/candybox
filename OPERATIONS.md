@@ -337,3 +337,51 @@ authentication.
 - **GC enumeration backstop** and **Syrup defragmentation** (see above).
 - **Real multi-bookie chaos testing:** fault injection is covered deterministically on the in-memory
   fakes; a Jepsen-style harness against a real cluster is future work.
+
+### Ledger enumeration backstop
+
+`ledger.enumeration.grace.millis` (`CANDYBOX_LEDGER_ENUMERATION_GRACE_MILLIS`) opts in to
+allocation-epoch tracking and reconciliation; `0` (the default) disables it. Use a long interval,
+for example `86400000` (24 hours). Enable it consistently on every node after upgrading the
+whole cluster; mixed-version or mixed-setting operation is unsupported. Existing format-v1
+manifest pointers must first be upgraded by a normal recovery with enumeration disabled; enabling
+it rejects a pointer without an exact incarnation match. Manifest pointer v2 keeps v1 readable. Do not turn it off while
+backup capture depends on retention pins. Box descriptors now use format v2 (v1 remains readable).
+
+Owners rotate through normal fenced recovery at this interval. The elected balancer enumerates
+at most 1024 ledgers per interval, with a durable cursor. Recovery pins the complete retained set
+before retiring predecessor allocation epochs. Failed/ambiguous pointer publication leaves epochs
+active until a successor recovers the actual pointer. Active or missing epochs, legacy untagged
+allocations, unknown roles, and unavailable coordination block deletion. This does not rely on
+read-open manifest tails or on expiring owner reports. The price is periodic owner recovery and
+coordination writes for roots and cross-partition imports.
+
+`CandyboxNode.enumerationReport()` and the `candybox_ledger_enumeration_*` gauges expose the last
+pass's candidate, held, deleted and error counts and oldest candidate age in milliseconds.
+`LedgerRetention.inspect(id, grace)` explains an individual ledger's incarnation, allocation epoch,
+known pins and hold reason; `reconcile(grace, limit, true)` performs a report-only pass.
+Deletion claims are permanent: physical delete errors retry on later cursor passes and no new
+reference or backup pin can resurrect a claimed id. Backlog latency depends on cluster ledger count
+and the configured interval; inspect held roots before increasing enumeration frequency.
+
+Backup integrations must call `node.retention().pinBackup(backupId, ids)` **before** capturing any
+root or copying bytes, abort capture if pinning fails, and release pins only when the backup no
+longer needs the live ledgers. Partial/ambiguous pin operations retain data conservatively; retry
+release with the same inventory. This supplies the retention interface for #166, not a backup or
+restore implementation. Relay pins and destination-epoch transfer pins use the same deletion CAS
+as backups. An expired delayed consumer either pins before a claim and keeps bytes alive until
+its destination epoch is recovered, or fails before appending its locator.
+
+This backstop does not migrate legacy allocations into collectible epochs, nor replace #60's
+Box-deletion journal. For a deleted incarnation the reconciler closes allocation admission with a CAS, recover-fences
+all registered WAL/manifest writers (including unpublished candidates), then durably retires the
+epoch. A failed fence leaves it closing and held for retry. A creator must register a WAL/manifest
+before handing its handle to the engine; admission loss seals the new handle and rejects it.
+Operator diagnosis must not manually retire an epoch while a writer might publish.
+
+Sealed WAL/manifest handles remove their writer registrations only after sealing succeeds. Epoch
+writer records are bounded to 4096 outstanding IDs (under 64 KiB for valid ledger IDs); maintenance
+rotates early at 1024 outstanding registrations. Failed seal/coordination cleanup retains roots.
+Run the balancer or compaction maintenance worker for automatic rotation; with both intervals zero,
+maintenance is manual and operators must drive `runBalancerOnce()`. Hitting the outstanding-writer
+bound applies backpressure until rotation rather than exceeding ZooKeeper's znode limit.
