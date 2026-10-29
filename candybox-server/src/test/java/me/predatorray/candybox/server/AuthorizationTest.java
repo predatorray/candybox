@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import me.predatorray.candybox.bookkeeper.fake.InMemoryLedgerStore;
+import me.predatorray.candybox.common.BoxName;
 import me.predatorray.candybox.common.ManualClock;
 import me.predatorray.candybox.common.Partitioning;
 import me.predatorray.candybox.common.auth.Grant;
@@ -249,6 +250,77 @@ class AuthorizationTest {
             // And a missing object resolves to AccessDenied, not NotFound (no existence leak).
             assertThat(call(handler, BOB, new Message.GetCandyRequest("mostly-private", "nope")))
                     .isInstanceOf(Message.AccessDeniedResponse.class);
+        }
+    }
+
+    @Test
+    void objectGrantChecksFollowPartitionHandover() {
+        ManualClock clock = new ManualClock(1000);
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        CandyboxConfig config = CandyboxConfig.builder().leaseRenewIntervalMillis(0).build();
+        try (InMemoryLedgerStore store = new InMemoryLedgerStore();
+                CandyboxNode oldOwner = new CandyboxNode(1, config, store, coordination, clock);
+                CandyboxNode newOwner = new CandyboxNode(2, config, store, coordination, clock)) {
+            for (CandyboxNode node : List.of(oldOwner, newOwner)) {
+                node.authorizer(new StandardAuthorizer(List.of(), box -> node.aclStore().get(box)));
+            }
+            String box = "grant-handover";
+            RequestHandler stale = oldOwner.requestHandler();
+            call(stale, ALICE, new Message.CreateBoxRequest(box, 1));
+            // WRITE lets copy/move requests reach their source-READ check; no Box READ or ACP.
+            call(stale, ALICE, new Message.SetBoxAclRequest(box, "User:alice",
+                    List.of("User:bob:WRITE")));
+            call(stale, ALICE, new Message.PutCandyRequest(box, "src", null, Map.of(), null,
+                    "v".getBytes(StandardCharsets.UTF_8), null,
+                    List.of("User:bob:READ+READ_ACP+WRITE_ACP")));
+            call(stale, ALICE, put(box, "secret"));
+            assertThat(call(stale, BOB, new Message.GetCandyRequest(box, "src")))
+                    .isInstanceOf(Message.CandyDataResponse.class);
+            assertThat(call(stale, BOB, new Message.GetCandyAclRequest(box, "src")))
+                    .isInstanceOf(Message.CandyAclResponse.class);
+
+            List<Message> requests = List.of(
+                    new Message.GetCandyRequest(box, "src"),
+                    new Message.RangeGetCandyRequest(box, "src", 0, 0),
+                    new Message.HeadCandyRequest(box, "src"),
+                    new Message.GetCandyAclRequest(box, "src"),
+                    new Message.SetCandyAclRequest(box, "src", "User:alice", List.of()),
+                    new Message.CopyCandyRequest(box, "src", "dst", null),
+                    new Message.GetCandyLocatorRequest(box, "src"),
+                    new Message.UploadPartCopyRequest(box, "dst", "upload", 1, "src", -1, -1),
+                    new Message.RenameCandyRequest(box, "src", "dst", null),
+                    new Message.PrepareRenameRequest(box, "src", "dst", 0, "rename"));
+            oldOwner.releasePartitionForHandover(BoxName.of(box), 0);
+            for (Message request : requests) {
+                assertThat(call(stale, BOB, request)).as(request.opcode().toString())
+                        .isInstanceOf(Message.UnavailableResponse.class);
+            }
+            newOwner.openPartition(BoxName.of(box), 0);
+            for (Message request : requests) {
+                assertThat(call(stale, BOB, request)).as(request.opcode().toString())
+                        .isEqualTo(new Message.MovedResponse(2));
+            }
+            RequestHandler current = newOwner.requestHandler();
+            assertThat(call(current, BOB, new Message.GetCandyRequest(box, "src")))
+                    .isInstanceOf(Message.CandyDataResponse.class);
+            // Ownership is routing metadata; only the owner can decide the object's grants.
+            for (String key : List.of("secret", "missing")) {
+                assertThat(call(stale, BOB, new Message.GetCandyRequest(box, key)))
+                        .isEqualTo(new Message.MovedResponse(2));
+                assertThat(call(current, BOB, new Message.GetCandyRequest(box, key)))
+                        .isInstanceOf(Message.AccessDeniedResponse.class);
+            }
+            assertThat(call(current, BOB, new Message.GetCandyRequest(box, "")))
+                    .isInstanceOf(Message.AccessDeniedResponse.class);
+        }
+    }
+
+    @Test
+    void missingBoxDuringObjectGrantLookupMapsToNotFound() {
+        try (CandyboxNode node = newAuthorizedNode()) {
+            assertThat(call(node.requestHandler(), null,
+                    new Message.GetCandyRequest("absent-box", "k")))
+                    .isInstanceOf(Message.NotFoundResponse.class);
         }
     }
 
