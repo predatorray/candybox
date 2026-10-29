@@ -133,9 +133,13 @@ public final class LiveDashboardData implements DashboardData {
                 // partition. Per-partition runtime fields (ledger counts, compactions, GC) require
                 // a new per-node JSON endpoint on HealthServer to fan out against; deferred to keep
                 // this commit contained to the admin API + UI.
-                long manifestVersion = coordination.get(CandyboxKeys.manifestKey(box, p))
-                        .map(v -> v.version())
-                        .orElse(-1L);
+                int partition = p;
+                var descriptor = coordination.get(CandyboxKeys.boxMetaKey(box));
+                var pointer = descriptor.flatMap(value -> coordination.get(
+                        CandyboxKeys.incarnationManifestKey(box, partition,
+                                BoxDescriptor.decode(value.value()).incarnation())));
+                long manifestVersion = pointer.or(() -> coordination.get(CandyboxKeys.manifestKey(box, partition)))
+                        .map(v -> v.version()).orElse(-1L);
                 rows.add(LsmRow.coordinationOnly(box + "/" + p, owner, manifestVersion, fencing));
             }
         }

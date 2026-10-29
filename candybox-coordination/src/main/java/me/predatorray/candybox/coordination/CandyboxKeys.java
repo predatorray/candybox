@@ -49,6 +49,14 @@ public final class CandyboxKeys {
         return BOXES_ROOT + "/" + boxName + "/partitions/" + partition + "/manifest";
     }
 
+    /** Pointer namespace isolated from every other incarnation of the same Box name. */
+    public static String incarnationManifestKey(String boxName, int partition, String incarnation) {
+        if (incarnation == null || incarnation.isBlank() || incarnation.contains("/")) {
+            throw new IllegalArgumentException("Invalid Box incarnation");
+        }
+        return manifestKey(boxName, partition) + "/incarnations/" + incarnation;
+    }
+
     /** The versioned key holding a Box's ACL document (owner + grants). */
     public static String boxAclKey(String boxName) {
         return "acls/" + boxName;

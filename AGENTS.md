@@ -9,6 +9,13 @@ Shared skills live in `.agents/skills/<skill-name>/SKILL.md` and follow the open
 `.claude/skills` is a relative symlink to `../.agents/skills` for Claude compatibility.
 Skill inputs come from the user's request, so they do not require agent-specific argument substitution.
 
+Queue skills: `$issue-loop` continuously selects requester-authored GitHub issues,
+dispatches isolated `$resolve-issue NUMBER` workers, independently judges PRs, and
+squash-merges only after checks pass, using `PR title (#number)` with an empty
+commit body. See
+[issue-loop](.agents/skills/issue-loop/SKILL.md) for persistent claims and restart
+handoffs; use `$resolve-issue NUMBER` directly for a single issue.
+
 ## Project
 
 Candybox is a distributed, S3-like object store in Java 17 (Maven multi-module). Its storage engine is

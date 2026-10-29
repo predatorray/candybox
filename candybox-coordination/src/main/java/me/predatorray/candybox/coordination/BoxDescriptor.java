@@ -24,11 +24,18 @@ import me.predatorray.candybox.common.serial.BinaryWriter;
  * created. The partition count is fixed for the Box's lifetime — it is the routing source of truth
  * for servers and clients, so changing it would silently re-home every key.
  */
-public record BoxDescriptor(int partitionCount) {
+public record BoxDescriptor(int partitionCount, String incarnation) {
 
-    private static final int FORMAT_VERSION = 1;
+    private static final int FORMAT_VERSION = 2;
+
+    public BoxDescriptor(int partitionCount) {
+        this(partitionCount, java.util.UUID.randomUUID().toString());
+    }
 
     public BoxDescriptor {
+        if (incarnation == null || incarnation.isBlank() || incarnation.contains("/")) {
+            throw new IllegalArgumentException("Invalid Box incarnation");
+        }
         if (partitionCount < 1) {
             throw new IllegalArgumentException("partitionCount must be positive: " + partitionCount);
         }
@@ -43,15 +50,17 @@ public record BoxDescriptor(int partitionCount) {
         return new BinaryWriter(8)
                 .writeByte(FORMAT_VERSION)
                 .writeVarInt(partitionCount)
+                .writeString(incarnation)
                 .toByteArray();
     }
 
     public static BoxDescriptor decode(byte[] data) {
         BinaryReader r = new BinaryReader(data);
         int version = r.readByte();
-        if (version != FORMAT_VERSION) {
+        if (version != 1 && version != FORMAT_VERSION) {
             throw new CoordinationException("Unsupported BoxDescriptor version: " + version);
         }
-        return new BoxDescriptor(r.readVarInt());
+        int count = r.readVarInt();
+        return new BoxDescriptor(count, version == 1 ? "legacy" : r.readString());
     }
 }

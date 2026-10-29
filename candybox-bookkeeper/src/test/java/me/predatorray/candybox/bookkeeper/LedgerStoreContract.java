@@ -64,6 +64,25 @@ public abstract class LedgerStoreContract {
     }
 
     @Test
+    void metadataReadDoesNotFenceAndReturnsCreationMetadata() {
+        long before = System.currentTimeMillis();
+        WritableLedger writer = store.createLedger(new LedgerConfig(config().quorum(),
+                java.util.Map.of("candybox-role", bytes("SYRUP"))));
+        LedgerMetadata metadata = store.readMetadata(writer.ledgerId());
+        assertThat(metadata.createdAtMillis()).isBetween(before, System.currentTimeMillis());
+        assertThat(metadata.customMetadata().get("candybox-role")).isEqualTo(bytes("SYRUP"));
+        metadata.customMetadata().get("candybox-role")[0] = 0;
+        assertThat(store.readMetadata(writer.ledgerId()).customMetadata().get("candybox-role"))
+                .isEqualTo(bytes("SYRUP"));
+        assertThat(writer.append(bytes("still writable"))).isZero();
+        writer.close();
+        assertThat(store.listLedgers()).contains(writer.ledgerId());
+        store.deleteLedger(writer.ledgerId());
+        assertThatThrownBy(() -> store.readMetadata(writer.ledgerId()))
+                .isInstanceOf(LedgerNotFoundException.class);
+    }
+
+    @Test
     void createAppendAndReadRoundTrip() {
         WritableLedger w = store.createLedger(config());
         long e0 = w.append(bytes("alpha"));
