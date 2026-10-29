@@ -56,6 +56,21 @@ not reset it. Default limit is three, including coordinator judge feedback.
    links and repository guidance. Ask it to inspect the diff, run relevant checks
    and return blocking findings with the reviewed head SHA. If delegation is
    unavailable, checkpoint needs-input; self-review is not independent review.
+   Include the following local skill paths and review instructions in the handoff;
+   do not pass this session's implementation rationale or conclusions:
+   - Read [software-architecture-review](../software-architecture-review/SKILL.md),
+     [data-system-design-review](../data-system-design-review/SKILL.md), and
+     [microservices-design-review](../microservices-design-review/SKILL.md) under
+     `.agents/skills/<skill-name>/SKILL.md` in the PR checkout.
+   - Apply software architecture guidance to module boundaries, coupling and
+     trade-offs; data system guidance to storage, replication, partitioning,
+     consistency and failures; and microservices guidance to service boundaries,
+     contracts, resilience and deployment. Follow the skills' workflows and load
+     bundled references relevant to the diff. Keep the review proportional to
+     the PR and state when an area is not applicable.
+   - Check the implementation and tests against the issue, `AGENTS.md` and
+     `DESIGN.md`. Post concrete findings with severity, code locations, failure
+     scenarios and suggested fixes on the PR; distinguish blockers from suggestions.
 5. Address valid findings, explain declined ones, checkpoint used rounds and
    rerun affected checks after pushes. A new revision consumes the next round and
    invalidates prior review evidence. Exit when no blockers remain, or at the cap.
