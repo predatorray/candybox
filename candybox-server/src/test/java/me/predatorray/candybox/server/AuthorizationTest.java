@@ -16,27 +16,36 @@
 package me.predatorray.candybox.server;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 import me.predatorray.candybox.bookkeeper.fake.InMemoryLedgerStore;
 import me.predatorray.candybox.common.BoxName;
+import me.predatorray.candybox.common.CandyKey;
 import me.predatorray.candybox.common.ManualClock;
 import me.predatorray.candybox.common.Partitioning;
 import me.predatorray.candybox.common.auth.Grant;
+import me.predatorray.candybox.common.auth.ObjectAcl;
 import me.predatorray.candybox.common.auth.Operation;
 import me.predatorray.candybox.common.auth.Principal;
 import me.predatorray.candybox.common.auth.StandardAuthorizer;
 import me.predatorray.candybox.common.config.CandyboxConfig;
+import me.predatorray.candybox.common.exception.CandyNotFoundException;
 import me.predatorray.candybox.coordination.fake.InMemoryCoordinationService;
+import me.predatorray.candybox.lsm.engine.BoxEngine;
 import me.predatorray.candybox.protocol.Frame;
 import me.predatorray.candybox.protocol.Message;
 import me.predatorray.candybox.protocol.MessageCodec;
+import me.predatorray.candybox.protocol.Opcode;
 import me.predatorray.candybox.protocol.transport.ConnectionContext;
 import me.predatorray.candybox.protocol.transport.RequestHandler;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 /**
  * Authorization end-to-end through {@link NodeRequestHandler}: per-Box ACLs (owner, grants, the
@@ -449,6 +458,123 @@ class AuthorizationTest {
             assertThat(((Message.CandyAclResponse) call(handler, ALICE,
                     new Message.GetCandyAclRequest("vault", moved))).owner())
                     .isEqualTo("User:alice");
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = Opcode.class, names = {"GET_CANDY", "RANGE_GET_CANDY", "HEAD_CANDY",
+            "COPY_CANDY", "RENAME_CANDY", "UPLOAD_PART_COPY", "GET_CANDY_LOCATOR", "PREPARE_RENAME"})
+    void sourceReadChecksTheVersionActuallyUsed(Opcode opcode) {
+        raceSourceRead(opcode, false);
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = Opcode.class, names = {"GET_CANDY", "RANGE_GET_CANDY", "HEAD_CANDY",
+            "COPY_CANDY", "RENAME_CANDY", "UPLOAD_PART_COPY", "GET_CANDY_LOCATOR", "PREPARE_RENAME"})
+    void sourceReadChecksRevokedGrantsBeforeUsingTheSource(Opcode opcode) {
+        raceSourceRead(opcode, true);
+    }
+
+    private void raceSourceRead(Opcode opcode, boolean revokeOnly) {
+        ManualClock clock = new ManualClock(1000);
+        AtomicInteger leaseChecks = new AtomicInteger();
+        Runnable[] overwrite = {null};
+        // The second engine access is dispatch, after the first access checked the old ACL.
+        // Run an overwrite there, deterministically opening the former TOCTOU window.
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(() -> {
+            if (overwrite[0] != null && leaseChecks.incrementAndGet() == 2) {
+                Runnable action = overwrite[0];
+                overwrite[0] = null;
+                action.run();
+            }
+            return clock.currentTimeMillis();
+        });
+        try (CandyboxNode node = new CandyboxNode(1, config(), new InMemoryLedgerStore(),
+                coordination, clock)) {
+            node.authorizer(new StandardAuthorizer(List.of(), box -> node.aclStore().get(box)));
+            RequestHandler handler = node.requestHandler();
+            call(handler, ALICE, new Message.CreateBoxRequest("race", 1));
+            call(handler, ALICE, new Message.SetBoxAclRequest("race", "User:alice",
+                    List.of("User:bob:WRITE")));
+            call(handler, ALICE, new Message.PutCandyRequest("race", "src", null, null, null,
+                    "public".getBytes(StandardCharsets.UTF_8), null, List.of("User:bob:READ")));
+            Message.CreateMultipartUploadResponse upload = (Message.CreateMultipartUploadResponse)
+                    call(handler, BOB, new Message.CreateMultipartUploadRequest("race", "dst",
+                            null, Map.of()));
+            BoxEngine engine = node.engine(BoxName.of("race"), "src");
+            Message request = switch (opcode) {
+                case GET_CANDY -> new Message.GetCandyRequest("race", "src");
+                case RANGE_GET_CANDY -> new Message.RangeGetCandyRequest("race", "src", 0, 5);
+                case HEAD_CANDY -> new Message.HeadCandyRequest("race", "src");
+                case COPY_CANDY -> new Message.CopyCandyRequest("race", "src", "dst", null);
+                case RENAME_CANDY -> new Message.RenameCandyRequest("race", "src", "dst", null);
+                case UPLOAD_PART_COPY -> new Message.UploadPartCopyRequest("race", "dst",
+                        upload.uploadId(), 1, "src", -1, -1);
+                case GET_CANDY_LOCATOR -> new Message.GetCandyLocatorRequest("race", "src");
+                case PREPARE_RENAME -> new Message.PrepareRenameRequest("race", "src", "dst",
+                        0, "rename-race");
+                default -> throw new AssertionError(opcode);
+            };
+            overwrite[0] = () -> {
+                if (revokeOnly) {
+                    engine.setCandyAcl(CandyKey.of("src"), new ObjectAcl("User:alice", List.of()));
+                } else {
+                    engine.putCandy(CandyKey.of("src"), "private".getBytes(StandardCharsets.UTF_8),
+                            null, Map.of(), null);
+                }
+            };
+
+            assertThat(call(handler, BOB, request)).isInstanceOf(Message.AccessDeniedResponse.class);
+            assertThat(overwrite[0]).as("overwrite occurred after the old ACL check").isNull();
+            assertThat(engine.headCandy(CandyKey.of("src")).contentLength())
+                    .isEqualTo(revokeOnly ? 6 : 7);
+            assertThatThrownBy(() -> engine.headCandy(CandyKey.of("dst")))
+                    .isInstanceOf(CandyNotFoundException.class);
+            assertThat(engine.multipartUpload(upload.uploadId()).parts()).isEmpty();
+            assertThat(engine.listRenameIntents()).isEmpty();
+            assertThat(coordination.children("boxes/race/partitions/0/relays")).isEmpty();
+        }
+    }
+
+    @Test
+    void relayAuthorizationIsPinnedToTheGrantedVersionAndExpires() {
+        ManualClock clock = new ManualClock(1000);
+        CandyboxConfig config = CandyboxConfig.builder().leaseRenewIntervalMillis(0)
+                .ownershipLeaseTtlMillis(1_000_000).renameIntentAbandonMillis(1000).build();
+        try (CandyboxNode node = new CandyboxNode(1, config, new InMemoryLedgerStore(),
+                new InMemoryCoordinationService(clock), clock)) {
+            node.authorizer(new StandardAuthorizer(List.of(), box -> node.aclStore().get(box)));
+            RequestHandler handler = node.requestHandler();
+            call(handler, ALICE, new Message.CreateBoxRequest("relay-grant", 1));
+            call(handler, ALICE, new Message.SetBoxAclRequest("relay-grant", "User:alice",
+                    List.of("User:bob:WRITE")));
+            call(handler, ALICE, new Message.PutCandyRequest("relay-grant", "src", null, null,
+                    null, "public".getBytes(StandardCharsets.UTF_8), null, List.of("User:bob:READ")));
+            Message.CandyLocatorResponse granted = (Message.CandyLocatorResponse) call(handler, BOB,
+                    new Message.GetCandyLocatorRequest("relay-grant", "src"));
+            Message.CandyLocatorResponse expiring = (Message.CandyLocatorResponse) call(handler, BOB,
+                    new Message.GetCandyLocatorRequest("relay-grant", "src"));
+
+            call(handler, ALICE, new Message.SetCandyAclRequest("relay-grant", "src", "User:alice",
+                    List.of()));
+            call(handler, ALICE, new Message.PutCandyRequest("relay-grant", "src", null, null,
+                    null, "private".getBytes(StandardCharsets.UTF_8)));
+            assertThat(call(handler, BOB, new Message.GetCandyLocatorRequest("relay-grant", "src")))
+                    .isInstanceOf(Message.AccessDeniedResponse.class);
+            // An already minted relay is a bounded capability for precisely the granted version.
+            assertThat(call(handler, BOB, new Message.ZeroCopyPutRequest("relay-grant", "copy", 0,
+                    granted.relayToken(), null, List.of(), null)))
+                    .isInstanceOf(Message.HeadCandyResponse.class);
+            Message.CandyDataResponse copy = (Message.CandyDataResponse) call(handler, BOB,
+                    new Message.GetCandyRequest("relay-grant", "copy"));
+            assertThat(copy.data()).isEqualTo("public".getBytes(StandardCharsets.UTF_8));
+
+            clock.advance(501); // only half the abandonment window is consumable
+            assertThat(call(handler, BOB, new Message.ZeroCopyPutRequest("relay-grant", "expired", 0,
+                    expiring.relayToken(), null, List.of(), null)))
+                    .isInstanceOf(Message.ErrorResponse.class);
+            assertThatThrownBy(() -> node.engine(BoxName.of("relay-grant"), "expired")
+                    .headCandy(CandyKey.of("expired"))).isInstanceOf(CandyNotFoundException.class);
         }
     }
 
