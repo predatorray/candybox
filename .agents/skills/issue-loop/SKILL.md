@@ -1,6 +1,6 @@
 ---
 name: issue-loop
-description: Continuously dispatch requester-authored GitHub issues to isolated resolve-issue workers, judge their PRs independently, and approve after checks pass. Use when asked to run or resume the issue resolution queue.
+description: Continuously dispatch requester-authored GitHub issues to isolated resolve-issue workers, judge their PRs independently, and squash-merge after checks pass. Use when asked to run or resume the issue resolution queue.
 ---
 
 # Continuous issue queue
@@ -8,7 +8,7 @@ description: Continuously dispatch requester-authored GitHub issues to isolated 
 Invoke as `$issue-loop` (or `$issue-loop REQUESTER_LOGIN`). This is an agent
 workflow, not a background daemon. It runs while the session has budget; invoke
 it again after interruption. Do not start a code audit or file speculative issues.
-The coordinator selects, delegates, judges and approves; it does not implement fixes.
+The coordinator selects, delegates, judges and squash-merges; it does not implement fixes.
 
 ## Scope and defaults
 
@@ -26,8 +26,12 @@ The coordinator selects, delegates, judges and approves; it does not implement f
   judge-requested revisions), and one final judge per revision. Reduce concurrency
   to fit available agent slots. If delegation is unavailable, stop with a checkpoint;
   never substitute coordinator implementation or self-review.
-- Approval is authorized by invoking this skill. **Merging is not.** Do not merge,
-  enable auto-merge, close issues, or change branch protection.
+- Invoking this skill authorizes the coordinator to **squash and merge** eligible
+  workflow-owned PRs after the gate below. Do not submit an approval review or
+  invent an approval requirement. Use the requester's available merge permissions,
+  including admin permissions; respect enforced repository rules. Do not change
+  branch protection, enable auto-merge, or close issues manually. GitHub may close
+  linked issues automatically when their fixing PR merges.
 
 ## 1. Reconcile before selecting
 
@@ -51,7 +55,7 @@ For each candidate, classify:
 | No ongoing work or fix | Eligible for a new claim |
 
 Review already-open queue PRs before dispatching new work, so a restart also
-finishes pending judging/approval. A claim does not prevent reconciliation of its
+finishes pending judging/merging. A claim does not prevent reconciliation of its
 existing PR. Only mutate PRs clearly owned by this workflow; report human-owned
 PRs unless the requester explicitly asks to take them over.
 
@@ -96,7 +100,7 @@ each transition. Use marker `<!-- issue-loop:v1 -->` and include:
 
 - repository, requester, issue, claim SHA, coordinator/worker session IDs;
 - state: `claimed`, `working`, `reviewing`, `ready`, `needs-input`,
-  `approval-blocked`, `approved` or `done`;
+  `merging`, `merge-blocked`, `merged` or `done`;
 - canonical work branch, pushed head SHA, worktree (advisory), PR URL;
 - rounds used/limit, last test commands/results, unresolved findings;
 - reviewer/judge verdict and exact reviewed SHA, next action or precise question.
@@ -128,7 +132,7 @@ When a worker returns ready (or needs-input after its bounded loop), spawn a
 reviewers. Give it only issue/PR links, repository guidance and request to judge
 current code, requirements, tests and unresolved review threads independently.
 It must inspect the actual diff and return `pass`, `revise` or `needs-input`, with
-head SHA, evidence and blocking findings. It must not implement changes or approve.
+head SHA, evidence and blocking findings. It must not implement changes, approve or merge.
 For needs-input without a PR, give it the issue and durable checkpoint/branch;
 it should validate the blocker rather than invent a PR verdict.
 
@@ -137,32 +141,66 @@ a new head requires another fresh judge. At the cap, record needs-input with a
 specific decision needed, keep incomplete PRs draft, and continue other issues.
 Do not automatically retry the same blocker each polling cycle.
 
-## 5. Approval gate and continuation
+## 5. Squash-merge gate and continuation
 
-For a workflow-owned PR, coordinator approves only when:
+For a workflow-owned PR, coordinator squash-merges only when:
 
 1. Worker completed and an independent final judge passed the **current head SHA**.
 2. PR is open, ready, nonconflicting, and all blocking findings/threads addressed.
 3. Query both check runs (all pages/latest attempts) and commit status contexts for
-   that SHA, repository required checks/rules, and pending external PR reviewers.
+   that SHA, repository required checks/rules, and external review feedback.
    Every applicable checker must finish successfully; required checks must exist.
    Failure, pending, cancelled, timed out, action-required, unknown/missing required
-   checks or unreadable policy blocks approval. Neutral/skipped counts only when
+   checks or unreadable policy blocks merging. Neutral/skipped counts only when
    explicitly acceptable under repository policy; no checks is not proof of success.
-4. Reread head and check state immediately before submitting the GitHub APPROVE
-   review, targeting that commit SHA when supported. If head changed, invalidate
-   judge/check evidence. After submission verify the review's commit matches the
-   current head; record a mismatch as blocked and rerun the gate.
+   Do not require an approval review unless enforced repository rules require one.
+4. Reread head, PR title, base and check state immediately before merging. If the
+   head or base changed since validation, invalidate affected judge/check evidence
+   and rerun the gate. Record `merging` with the expected head and intended message.
+   Submit a squash merge with an **expected head SHA** so GitHub rejects a moved
+   head. Do not use a merge tool that cannot enforce this precondition.
 
-GitHub prohibits self-approval. If the authenticated approver is the PR author,
-record `approval-blocked` and request an authorized independent human/account.
-Do not switch identities, forge an approval comment, or claim success. The judge
-agent's independence does not create a second GitHub identity. Likewise record
-insufficient permissions rather than repeatedly retrying. Continue the queue.
+### Exact squash commit message
 
-Leave approved PRs open for the requester to merge. Existing unmerged PRs continue
-to exclude their issues. Poll pending checks with bounded waits, continuing other
-eligible work. End when the queue is empty, all remaining work is blocked, user
-stops, or budget is low; do not busy-loop forever. Before ending, persist all
-active states and report PR links, approved/blocked status, claims needing handoff,
-and the command `$issue-loop REQUESTER_LOGIN` to resume.
+Use the current PR title followed by ` (#NUMBER)` as the commit title, matching
+GitHub's usual prefilled title. Set the optional commit description/body to the
+**explicit empty string**. For example, PR #123 titled `Fix WAL recovery` becomes:
+
+```text
+Fix WAL recovery (#123)
+```
+
+For the GitHub merge API, pass `merge_method: "squash"`, `sha: REVIEWED_HEAD_SHA`,
+`commit_title: "Fix WAL recovery (#123)"`, and `commit_message: ""`.
+Connected tools may name `sha` as `expected_head_sha`; use their actual schema.
+Never omit the empty body or pass null, since that can select a default containing
+commit messages. Do not copy the PR description, list individual commits, append
+agent attribution, or add `Co-authored-by` trailers to the squash message. If a
+tool drops empty strings or cannot set the title/body explicitly, use an API/CLI
+that preserves them; otherwise checkpoint `merge-blocked` rather than accepting
+an unwanted default message.
+
+### Verify and continue
+
+Verify GitHub reports the PR merged, capture the resulting commit SHA, and read
+that commit to confirm its subject and empty body. Record `merged` with PR URL,
+reviewed head, merge SHA and message verification, then continue to the next issue.
+If GitHub unexpectedly changes the message, report the discrepancy as needs-input;
+do not rewrite published default-branch history automatically.
+
+After a timeout or ambiguous merge response, reread PR state before retrying:
+if already merged, verify the merge commit and checkpoint it without another
+merge request. If still open, rerun the gate; an unreadable result is blocked.
+On insufficient permissions, disabled squash merging, enforced unmet review rules,
+conflicts or merge rejection, record `merge-blocked` with the actual reason and
+continue other issues. Do not switch accounts or change repository settings.
+Same-author PRs do not need self-approval: the coordinator merges directly when
+GitHub permits it and this gate passes.
+
+On restart, treat legacy `approved`/`approval-blocked` checkpoints as open PRs
+needing this merge gate, not as proof that the PR is merged or blocked forever.
+Existing unmerged PRs continue to exclude their issues. Poll pending checks with
+bounded waits, continuing other eligible work. End when the queue is empty, all
+remaining work is blocked, user stops, or budget is low; do not busy-loop forever.
+Before ending, persist all active states and report PR links, merged/blocked
+status, claims needing handoff, and `$issue-loop REQUESTER_LOGIN` to resume.

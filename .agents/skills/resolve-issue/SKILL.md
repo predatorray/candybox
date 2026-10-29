@@ -70,9 +70,11 @@ repository requires it; document that exception and restore draft on blockage.
 
 On success, mark the PR ready and record `ready` on the issue with PR URL, head
 SHA, claim, tests, review verdict and rounds used. Return these same fields to the
-coordinator. It spawns a separate final judge and handles checks/approval.
+coordinator. It spawns a separate final judge and handles checks and squash-merging
+with a title-only commit message.
 For a standalone invocation, request independent final judgement from a fresh
-agent and leave approval to the requester; never approve your own work.
+agent and leave merging to the requester unless they invoke `$issue-loop` to
+authorize coordinator merging. The worker never approves or merges its own PR.
 
 On blockage, keep incomplete PRs draft, checkpoint `needs-input`, exact unresolved
 findings and the decision needed; return the branch/PR link and remaining rounds.
