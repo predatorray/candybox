@@ -1,48 +1,89 @@
 ---
 name: resolve-issue
-description: Resolve a GitHub issue end to end — verify it, fix it with tests, open a draft PR, drive CI and independent reviews to green, then link the PR on the issue. Use when given an issue number or link.
+description: Resolve one GitHub issue with a restart-safe claim, isolated worktree, bounded fix/review loop and a single review-ready PR. Use with an issue number or URL, directly or as an issue-loop worker.
 ---
 
-# Resolve a GitHub issue
+# Resolve one issue
 
-Run this workflow only when the user explicitly asks to resolve an issue. Use the issue number or URL supplied by the user; an issue number refers to this repository. If no target issue is supplied, ask for it before proceeding.
+Invoke as `$resolve-issue ISSUE_NUMBER` (or an issue URL in this repository).
+An explicit coordinator dispatch authorizes this skill as well as a direct user
+request. If no issue is supplied, ask for one. Use connected GitHub tools or
+an authenticated CLI; read `AGENTS.md` and
+[the queue protocol](../issue-loop/SKILL.md), especially reconciliation, atomic
+claims, checkpoints and recovery. Never approve, merge or close the issue here.
 
-Use the GitHub integration available in the current agent environment, or the authenticated `gh` CLI. Map the operations below to the available tools; do not assume a particular tool name.
+## 1. Establish ownership and verify
 
-## 1. Verify
-Read the issue and its comments. Check whether it is real.
-- Bug: write a failing test that reproduces it before touching the code.
-- Architectural improvement: re-evaluate whether it still makes sense against the current code and `DESIGN.md`.
-- Not real or already fixed: comment on the issue with the evidence and stop; tell the user.
+Read the issue, all comments and linked PRs. In queue mode verify that its author
+matches the requester's login supplied by the coordinator. Direct invocation may
+resolve the specifically requested issue regardless of author, but must still
+claim and de-duplicate. Do not expand scope to other users' issues.
 
-## 2. Implement
-- Compare the approaches proposed in the issue, pick the one that makes the most sense, and implement it on a properly named side branch (e.g. `fix/<short-topic>`). If the session mandates a specific branch, use that instead.
-- Follow `AGENTS.md` (module boundaries, record format versioning, test conventions: no mocking frameworks, update the `*ContractTest`/`*ContractIT` suites when SPI behavior changes).
-- Keep existing tests passing; update them only if the change fundamentally alters their expectations. Add new tests that guard against regression.
-- Run `mvn test`, plus `mvn verify` (or the relevant `-Dit.test=...`) when engine, server or integration behavior is touched.
+Verify the supplied remote claim SHA. Without a supplied claim, reconcile existing
+work and acquire one using the queue helper before editing. An existing open fix
+PR means reuse only after an authorized handoff; otherwise report it and stop.
+Do not assume an old claim is abandoned. Use one isolated worktree and canonical
+`resolve-issue/NUMBER` branch; preserve existing uncommitted work and other agents'
+checkouts. Record the claim, branch, session, round budget and state on the issue.
 
-## 3. Open a draft PR
-- One-line commit messages, no body paragraph.
-- Open the PR as a **draft**, first line of the description `Fixes #<issue>`, then a few high-level paragraphs. No file-by-file or line-by-line walkthrough.
-- Wait for the checks. Fix failures properly (never skip or disable tests). If checks don't trigger because the PR is a draft, mark it ready.
+Verify the report against the current default branch. For bugs, reproduce with a
+failing regression test before the fix where practical. For improvements, reassess
+against `DESIGN.md`; for docs, compare the claim with code. If already fixed,
+invalid or unclear, checkpoint evidence as needs-input and stop; do not close it.
 
-## 4. Independent review loop
-Once all checks pass, use the following independent review loop. If agent delegation is unavailable, request an independent human review and report that the review loop is pending; do not claim a self-review is independent.
+## 2. Fix and review (at most three rounds total)
 
-Once an independent reviewer is available:
-1. Spawn a **fresh** reviewer using the current environment's agent delegation capability (independent context, not a fork) and give it only the PR link and the issue link. Ask it to review the PR independently and post its review and comments on the PR.
-2. In this session, read the comments left (by the reviewer and anyone else). Fix the ones that make sense; reply with a reason to the ones you won't fix. Keep checks green after each push.
-3. After each new revision, spawn another fresh reviewer and repeat.
-4. Stop when only non-blocking or nitpick comments remain and all checks pass.
-5. If review goes back and forth for more than 3 rounds, stop and ask the user for a judgement.
+A round is one implementation/revision plus its independent review. Persist the
+round counter before starting each round; restarts and final-judge revisions do
+not reset it. Default limit is three, including coordinator judge feedback.
 
-## 5. Wrap up
-- Comment on the original issue with the PR link and a high-level summary of the fix. Publish the PR if it is still a draft.
-- Do **not** close or resolve the issue and do **not** approve or merge the PR; the user does that.
-- Tell the user it's done, with the PR link.
+1. Implement the smallest complete fix. Follow module boundaries, versioned
+   formats and testing conventions in `AGENTS.md`. Add meaningful regression
+   coverage, update shared contracts when SPI behavior changes, and keep tests
+   enabled. Use concise one-line commit messages.
+2. Run checks appropriate to the touched code. Java changes normally require
+   `mvn test`; engine/server/integration changes also require relevant `mvn verify`
+   integration coverage, installing sibling test-jars first as needed. Frontend,
+   scripts, charts and docs use their own relevant checks. Report exact commands,
+   outcomes and unavailable dependencies. Do not claim an unrun check passed.
+3. Push to the canonical branch and recheck **all authors'** open fix PRs and issue
+   references immediately before opening a PR. Create exactly one draft PR with
+   `Fixes #NUMBER`, problem/result and validation. If one appeared meanwhile, stop
+   and reconcile; do not open a duplicate. An uncertain create response requires
+   rereading PRs before retrying. Reuse the same PR on every revision and restart.
+4. Fetch CI and external review feedback. Fix failures without skipping tests.
+   Spawn a fresh reviewer with no inherited conversation, giving only issue/PR
+   links and repository guidance. Ask it to inspect the diff, run relevant checks
+   and return blocking findings with the reviewed head SHA. If delegation is
+   unavailable, checkpoint needs-input; self-review is not independent review.
+5. Address valid findings, explain declined ones, checkpoint used rounds and
+   rerun affected checks after pushes. A new revision consumes the next round and
+   invalidates prior review evidence. Exit when no blockers remain, or at the cap.
 
-## Style
-Code comments, docs, commit messages and PR text are concise. Don't explain what the code already says; comment only when necessary.
+Do not wait indefinitely for infrastructure. A persistent CI/dependency failure,
+unclear requirement, unavailable independent reviewer or exhausted budget yields
+needs-input with a precise blocker and durable progress. Push useful checkpoints
+before stopping. Do not mark a broken PR ready just to trigger CI unless the
+repository requires it; document that exception and restore draft on blockage.
+
+## 3. Return a durable result
+
+On success, mark the PR ready and record `ready` on the issue with PR URL, head
+SHA, claim, tests, review verdict and rounds used. Return these same fields to the
+coordinator. It spawns a separate final judge and handles checks/approval.
+For a standalone invocation, request independent final judgement from a fresh
+agent and leave approval to the requester; never approve your own work.
+
+On blockage, keep incomplete PRs draft, checkpoint `needs-input`, exact unresolved
+findings and the decision needed; return the branch/PR link and remaining rounds.
+A coordinator may ask its independent judge to assess the blocker. Never report
+completion merely because a PR exists. Never release/delete the persistent claim.
 
 ## Unrelated findings
-If you hit a separate problem unrelated to this issue, don't go deep. Search existing issues first, then file a follow-up issue summarizing everything you found (symptoms, location, repro hints, suspected cause) so another agent can understand, verify and fix it independently without this conversation.
+
+Do not fix unrelated problems. Search open/closed issues and PRs first; file a
+narrow follow-up only when not already covered, with evidence/reproduction and
+existing type labels (bug, testing, improvement or documentation as applicable).
+Use the authenticated requester identity; if it differs from the queue requester,
+report the finding to the coordinator rather than filing as another author.
+Do not claim or resolve the follow-up here: the coordinator will discover it.
