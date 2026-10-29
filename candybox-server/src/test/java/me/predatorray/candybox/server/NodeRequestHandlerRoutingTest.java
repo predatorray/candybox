@@ -162,8 +162,8 @@ class NodeRequestHandlerRoutingTest {
         Message reply = send(node1, new Message.GetBoxAclRequest(BOX));
         assertThat(reply).isInstanceOf(Message.BoxAclResponse.class);
         Message.BoxAclResponse acl = (Message.BoxAclResponse) reply;
-        assertThat(acl.owner()).isEqualTo("user:alice");
-        assertThat(acl.grants()).containsExactly(grant);
+        assertThat(acl.owner()).isEqualTo("User:alice");
+        assertThat(acl.grants()).containsExactly("User:bob:READ");
     }
 
     @Test

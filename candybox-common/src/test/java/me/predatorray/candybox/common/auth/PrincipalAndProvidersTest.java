@@ -35,6 +35,35 @@ class PrincipalAndProvidersTest {
     }
 
     @Test
+    void builtinPrincipalTypesAreCanonicalButNamesAndCustomTypesKeepTheirCase() {
+        for (String type : List.of("User", "Node", "Gateway", "Admin")) {
+            assertEquals(new Principal(type, "Alice"), Principal.parse(type.toLowerCase() + ":Alice"));
+            assertEquals(type, new Principal(type.toUpperCase(), "Alice").type());
+        }
+        assertFalse(Principal.parse("user:Alice").equals(Principal.user("alice")));
+        assertEquals("Custom:Alice", Principal.parse("Custom:Alice").toString());
+        assertEquals("custom:Alice", Principal.parse("custom:Alice").toString());
+        assertTrue(Principal.parse("user:ANONYMOUS").isAnonymous());
+    }
+
+    @Test
+    void legacyLowercaseAclTypesMatchWithoutChangingNamesOrVirtualGroups() {
+        BoxAcl box = BoxAcl.fromBytes(("owner=user:alice\ngrant=uSeR:Bob:READ\n")
+                .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        assertTrue(box.permits(Principal.user("alice"), Operation.WRITE_ACP));
+        assertTrue(box.permits(Principal.user("Bob"), Operation.READ));
+        assertFalse(box.permits(Principal.user("bob"), Operation.READ));
+        assertEquals("User:Bob:READ", box.grants().get(0).toText());
+        ObjectAcl object = new ObjectAcl("user:alice", List.of(Grant.of("user:Bob", Operation.READ)));
+        assertTrue(object.permits(Principal.user("alice"), Operation.WRITE_ACP));
+        assertTrue(object.permits(Principal.user("Bob"), Operation.READ));
+        assertFalse(object.permits(Principal.user("bob"), Operation.READ));
+        assertTrue(Grant.of(Grant.ALL_USERS, Operation.READ).matches(Principal.ANONYMOUS));
+        assertFalse(Grant.of(Grant.AUTHENTICATED_USERS, Operation.READ).matches(Principal.ANONYMOUS));
+        assertFalse(Grant.of("allusers", Operation.READ).matches(Principal.ANONYMOUS));
+    }
+
+    @Test
     void principalRejectsBlankAndColonedTypes() {
         assertThrows(IllegalArgumentException.class, () -> new Principal("", "x"));
         assertThrows(IllegalArgumentException.class, () -> new Principal("User", " "));
