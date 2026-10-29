@@ -149,8 +149,11 @@ class NodeRequestHandlerTest {
                     throw failure;
                 });
                 Message response = roundTrip(node.requestHandler(), new Message.ListBoxesRequest());
-                assertThat(response).isEqualTo(new Message.ErrorResponse(
-                        failure.getClass().getSimpleName(), failure.getMessage()));
+                Message expected = failure instanceof AccessDeniedException
+                        ? new Message.AccessDeniedResponse(failure.getMessage())
+                        : new Message.ErrorResponse(failure.getClass().getSimpleName(),
+                                failure.getMessage());
+                assertThat(response).isEqualTo(expected);
             }
         }
     }

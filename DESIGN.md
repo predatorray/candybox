@@ -249,7 +249,12 @@ consults range tombstones across all tables rather than pruning by point range.
   object bytes are ever moved or re-stored. A relay is bound to the requesting principal, deleted
   once its put succeeds, consumable only within half of `rename.intent.abandon.millis` (so it can
   never outlive its rename intent, with the rest as clock-skew margin), and reaped by the source
-  owner past the full window. Undecodable relays use the coordination backend last-write time
+  owner past the full window. Source READ authorization checks the ACL of the exact locator being
+  read, copied, or relayed, in union with Box READ permission. For local copy, part-copy, and rename,
+  the engine checks the resolved source ACL before changing state under its write lock. A relay is
+  a bounded capability for that authorized version: later ACL revocation or source overwrite cannot
+  expose a newer version, while the already authorized version stays consumable until relay expiry.
+  Undecodable relays use the coordination backend last-write time
   for reaping, preserving the full window for consumers that understand newer formats. If that
   metadata is unavailable, reaping fails safe. Pending relays are bounded per node in bytes
   (`zero.copy.relay.budget.bytes`) and per partition in count (1024). This is safe because the blob layer is physically global (a `SegmentRef` resolves bytes

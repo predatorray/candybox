@@ -30,6 +30,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Consumer;
 import me.predatorray.candybox.bookkeeper.LedgerConfig;
 import me.predatorray.candybox.bookkeeper.LedgerStore;
 import me.predatorray.candybox.bookkeeper.ReadableLedger;
@@ -462,6 +463,13 @@ public final class BoxEngine implements AutoCloseable {
      */
     public PartUploadResult uploadPartCopy(String uploadId, int partNumber, CandyKey src,
                                            long firstByte, long lastByte) {
+        return uploadPartCopy(uploadId, partNumber, src, firstByte, lastByte, acl -> { });
+    }
+
+    /** Checks the resolved source ACL before reading bytes or updating the upload. */
+    public PartUploadResult uploadPartCopy(String uploadId, int partNumber, CandyKey src,
+                                           long firstByte, long lastByte,
+                                           Consumer<ObjectAcl> authorizeSource) {
         Validation.checkCandyKey(src, config.sizeLimits());
         if (uploadId == null || uploadId.isEmpty()) {
             throw new ValidationException("uploadId is required");
@@ -479,6 +487,7 @@ public final class BoxEngine implements AutoCloseable {
             }
             CandyLocator source = resolveLiveLocked(src)
                     .orElseThrow(() -> new CandyNotFoundException(box.value(), src.value()));
+            authorizeSource.accept(source.acl());
             long total = source.contentLength();
             long resolvedFirst = firstByte < 0 ? 0 : firstByte;
             long resolvedLast = lastByte < 0 ? total - 1 : Math.min(lastByte, total - 1);
@@ -712,7 +721,13 @@ public final class BoxEngine implements AutoCloseable {
      */
     public CandyMetadata copyCandy(CandyKey src, CandyKey dst, String idempotencyToken,
                                    ObjectAcl dstAcl) {
-        return copyOrRename(src, dst, idempotencyToken, false, dstAcl);
+        return copyCandy(src, dst, idempotencyToken, dstAcl, acl -> { });
+    }
+
+    /** Checks the resolved source ACL under the write lock, before copying that version. */
+    public CandyMetadata copyCandy(CandyKey src, CandyKey dst, String idempotencyToken,
+                                   ObjectAcl dstAcl, Consumer<ObjectAcl> authorizeSource) {
+        return copyOrRename(src, dst, idempotencyToken, false, dstAcl, authorizeSource);
     }
 
     /**
@@ -723,13 +738,20 @@ public final class BoxEngine implements AutoCloseable {
      * @throws CandyNotFoundException if there is no live Candy at {@code src}
      */
     public CandyMetadata renameCandy(CandyKey src, CandyKey dst, String idempotencyToken) {
+        return renameCandy(src, dst, idempotencyToken, acl -> { });
+    }
+
+    /** Checks the resolved source ACL under the write lock, before moving that version. */
+    public CandyMetadata renameCandy(CandyKey src, CandyKey dst, String idempotencyToken,
+                                     Consumer<ObjectAcl> authorizeSource) {
         // A rename is a move: the object keeps its identity, so owner + grants travel with it.
-        return copyOrRename(src, dst, idempotencyToken, true, null);
+        return copyOrRename(src, dst, idempotencyToken, true, null, authorizeSource);
     }
 
     /** {@code dstAcl == null} ⇒ keep the source's owner/grants (rename); else stamp it (copy). */
     private CandyMetadata copyOrRename(CandyKey src, CandyKey dst, String idempotencyToken,
-                                       boolean tombstoneSource, ObjectAcl dstAcl) {
+                                       boolean tombstoneSource, ObjectAcl dstAcl,
+                                       Consumer<ObjectAcl> authorizeSource) {
         Validation.checkCandyKey(src, config.sizeLimits());
         Validation.checkCandyKey(dst, config.sizeLimits());
         if (src.equals(dst)) {
@@ -748,6 +770,7 @@ public final class BoxEngine implements AutoCloseable {
             rejectIfStalled();
             CandyLocator source = resolveLiveLocked(src)
                     .orElseThrow(() -> new CandyNotFoundException(box.value(), src.value()));
+            authorizeSource.accept(source.acl());
 
             // The destination locator reuses the source's parts verbatim — zero copy of the bytes
             // *and* zero rebuild of the part list, so a multipart source becomes a multipart-shaped
@@ -1045,8 +1068,14 @@ public final class BoxEngine implements AutoCloseable {
 
     /** Returns metadata for a live Candy, or throws {@link CandyNotFoundException}. */
     public CandyMetadata headCandy(CandyKey key) {
+        return headCandy(key, acl -> { });
+    }
+
+    /** Checks the ACL of the same resolved version whose metadata is returned. */
+    public CandyMetadata headCandy(CandyKey key, Consumer<ObjectAcl> authorizeSource) {
         CandyLocator locator = resolveLive(key)
                 .orElseThrow(() -> new CandyNotFoundException(box.value(), key.value()));
+        authorizeSource.accept(locator.acl());
         headCount.incrementAndGet();
         return CandyMetadata.from(locator);
     }
@@ -1069,8 +1098,15 @@ public final class BoxEngine implements AutoCloseable {
      * @throws LimitExceededException if the Candy is longer than {@code maxBytes}
      */
     public CandyMetadata getCandy(CandyKey key, OutputStream out, long maxBytes) {
+        return getCandy(key, out, maxBytes, acl -> { });
+    }
+
+    /** Checks the resolved version's ACL before reading any of its bytes. */
+    public CandyMetadata getCandy(CandyKey key, OutputStream out, long maxBytes,
+                                   Consumer<ObjectAcl> authorizeSource) {
         CandyLocator locator = resolveLive(key)
                 .orElseThrow(() -> new CandyNotFoundException(box.value(), key.value()));
+        authorizeSource.accept(locator.acl());
         checkReadSize(locator.contentLength(), maxBytes);
         syrupReader.readParts(locator.parts(), out);
         getCount.incrementAndGet();
@@ -1113,8 +1149,16 @@ public final class BoxEngine implements AutoCloseable {
      */
     public RangeReadResult getCandyRange(CandyKey key, long firstByte, long lastByte,
                                          OutputStream out, long maxBytes) {
+        return getCandyRange(key, firstByte, lastByte, out, maxBytes, acl -> { });
+    }
+
+    /** Checks the resolved version's ACL before returning range information or reading bytes. */
+    public RangeReadResult getCandyRange(CandyKey key, long firstByte, long lastByte,
+                                         OutputStream out, long maxBytes,
+                                         Consumer<ObjectAcl> authorizeSource) {
         CandyLocator locator = resolveLive(key)
                 .orElseThrow(() -> new CandyNotFoundException(box.value(), key.value()));
+        authorizeSource.accept(locator.acl());
         long total = locator.contentLength();
         long resolvedFirst;
         long resolvedLast;

@@ -20,6 +20,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.function.Consumer;
 import java.util.regex.Pattern;
 import me.predatorray.candybox.common.BoxName;
 import me.predatorray.candybox.common.CandyKey;
@@ -119,6 +120,8 @@ final class NodeRequestHandler implements RequestHandler {
                         principal + " is not allowed READ on " + boxOf(message) + "/" + sourceKey));
             }
             return codec.encode(dispatch(message, principal));
+        } catch (AccessDeniedException e) {
+            return codec.encode(new Message.AccessDeniedResponse(safe(e.getMessage())));
         } catch (BusyException e) {
             return codec.encode(new Message.BusyResponse(100));
         } catch (CandyNotFoundException e) {
@@ -129,8 +132,7 @@ final class NodeRequestHandler implements RequestHandler {
         } catch (CandyboxException e) {
             String errorType = e.getClass().getSimpleName();
             if (e instanceof ValidationException || e instanceof BoxAlreadyExistsException
-                    || e instanceof BoxNotEmptyException || e instanceof AccessDeniedException
-                    || e instanceof AuthenticationException) {
+                    || e instanceof BoxNotEmptyException || e instanceof AuthenticationException) {
                 return codec.encode(new Message.ErrorResponse(errorType, safe(e.getMessage())));
             }
             return codec.encode(internalError(errorType, e));
@@ -211,6 +213,21 @@ final class NodeRequestHandler implements RequestHandler {
     private boolean canRead(Principal principal, String box, String key) {
         return node.authorizer().authorize(principal, Operation.READ, Resource.box(box))
                 || objectGrantPermits(box, key, principal, Operation.READ);
+    }
+
+    /**
+     * The preflight grant lookup only rejects clearly denied requests. This check must also run on
+     * the ACL resolved by the actual operation, so an intervening overwrite cannot grant access to
+     * a different version. Resolve Box permission before entering an engine write lock; the returned
+     * callback only examines the immutable ACL passed by the engine.
+     */
+    private Consumer<ObjectAcl> sourceReadCheck(Principal principal, String box, String key) {
+        boolean boxRead = node.authorizer().authorize(principal, Operation.READ, Resource.box(box));
+        return acl -> {
+            if (!boxRead && !acl.permits(principal, Operation.READ)) {
+                throw new AccessDeniedException(principal + " is not allowed READ on " + box + "/" + key);
+            }
+        };
     }
 
     private static Access requiredAccess(Message message) {
@@ -450,7 +467,8 @@ final class NodeRequestHandler implements RequestHandler {
         } else if (message instanceof Message.GetCandyRequest m) {
             BoxEngine engine = node.engine(BoxName.of(m.box()), m.key());
             ByteArrayOutputStream out = new ByteArrayOutputStream();
-            CandyMetadata meta = engine.getCandy(CandyKey.of(m.key()), out, maxInlineDataBytes());
+            CandyMetadata meta = engine.getCandy(CandyKey.of(m.key()), out, maxInlineDataBytes(),
+                    sourceReadCheck(principal, m.box(), m.key()));
             return new Message.CandyDataResponse(meta.contentLength(), meta.contentType(),
                     meta.userMetadata(), meta.crc32c(), out.toByteArray());
         } else if (message instanceof Message.RangeGetCandyRequest m) {
@@ -459,7 +477,7 @@ final class NodeRequestHandler implements RequestHandler {
             BoxEngine.RangeReadResult result;
             try {
                 result = engine.getCandyRange(CandyKey.of(m.key()), m.firstByte(), m.lastByte(), out,
-                        maxInlineDataBytes());
+                        maxInlineDataBytes(), sourceReadCheck(principal, m.box(), m.key()));
             } catch (IllegalArgumentException e) {
                 // S3's InvalidRange — surface as a typed error the gateway can map to 416.
                 throw new ValidationException("InvalidRange: " + e.getMessage());
@@ -469,7 +487,8 @@ final class NodeRequestHandler implements RequestHandler {
                     meta.contentType(), meta.userMetadata(), meta.crc32c(), out.toByteArray());
         } else if (message instanceof Message.HeadCandyRequest m) {
             BoxEngine engine = node.engine(BoxName.of(m.box()), m.key());
-            CandyMetadata meta = engine.headCandy(CandyKey.of(m.key()));
+            CandyMetadata meta = engine.headCandy(CandyKey.of(m.key()),
+                    sourceReadCheck(principal, m.box(), m.key()));
             return new Message.HeadCandyResponse(meta.contentLength(), meta.contentType(),
                     meta.userMetadata(), meta.crc32c(), meta.createdAtMillis());
         } else if (message instanceof Message.DeleteCandyRequest m) {
@@ -478,24 +497,27 @@ final class NodeRequestHandler implements RequestHandler {
         } else if (message instanceof Message.CopyCandyRequest m) {
             CandyMetadata meta = samePartitionEngine(m.box(), m.srcKey(), m.dstKey())
                     .copyCandy(CandyKey.of(m.srcKey()), CandyKey.of(m.dstKey()),
-                            m.idempotencyToken(), effectiveAcl(principal, m.owner(), m.grants()));
+                            m.idempotencyToken(), effectiveAcl(principal, m.owner(), m.grants()),
+                            sourceReadCheck(principal, m.box(), m.srcKey()));
             return new Message.HeadCandyResponse(meta.contentLength(), meta.contentType(),
                     meta.userMetadata(), meta.crc32c(), meta.createdAtMillis());
         } else if (message instanceof Message.RenameCandyRequest m) {
             CandyMetadata meta = samePartitionEngine(m.box(), m.srcKey(), m.dstKey())
                     .renameCandy(CandyKey.of(m.srcKey()), CandyKey.of(m.dstKey()),
-                            m.idempotencyToken());
+                            m.idempotencyToken(), sourceReadCheck(principal, m.box(), m.srcKey()));
             return new Message.HeadCandyResponse(meta.contentLength(), meta.contentType(),
                     meta.userMetadata(), meta.crc32c(), meta.createdAtMillis());
         } else if (message instanceof Message.GetCandyLocatorRequest m) {
             BoxEngine engine = node.engine(BoxName.of(m.box()), m.key());
             CandyLocator locator = engine.resolveLocator(CandyKey.of(m.key()));
+            sourceReadCheck(principal, m.box(), m.key()).accept(locator.acl());
             return relayLocator(engine, m.box(), m.key(), principal, null, null, locator);
         } else if (message instanceof Message.PrepareRenameRequest m) {
             // The source partition's owner: resolve the locator (relayed to the destination) and
             // durably record the rename intent so the owed source delete survives a crash/handover.
             BoxEngine engine = node.engine(BoxName.of(m.box()), m.srcKey());
             CandyLocator locator = engine.resolveLocator(CandyKey.of(m.srcKey()));
+            sourceReadCheck(principal, m.box(), m.srcKey()).accept(locator.acl());
             engine.recordRenameIntent(new RenameIntent(m.renameToken(), m.srcKey(), locator.hlc(),
                     m.dstKey(), m.dstPartition(), node.currentTimeMillis()));
             try {
@@ -664,7 +686,8 @@ final class NodeRequestHandler implements RequestHandler {
             BoxEngine engine = samePartitionEngine(m.box(), m.srcKey(), m.key());
             try {
                 BoxEngine.PartUploadResult r = engine.uploadPartCopy(m.uploadId(), m.partNumber(),
-                        CandyKey.of(m.srcKey()), m.firstByte(), m.lastByte());
+                        CandyKey.of(m.srcKey()), m.firstByte(), m.lastByte(),
+                        sourceReadCheck(principal, m.box(), m.srcKey()));
                 return new Message.UploadPartResponse(r.crc32c(), r.partLength());
             } catch (IllegalArgumentException e) {
                 throw new ValidationException("InvalidRange: " + e.getMessage());
