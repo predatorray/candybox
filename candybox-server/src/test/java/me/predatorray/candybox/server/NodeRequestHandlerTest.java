@@ -20,9 +20,23 @@ import static org.assertj.core.api.Assertions.assertThat;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import me.predatorray.candybox.common.Partitioning;
 import me.predatorray.candybox.bookkeeper.fake.InMemoryLedgerStore;
 import me.predatorray.candybox.common.BoxName;
+import me.predatorray.candybox.common.CandyKey;
+import me.predatorray.candybox.common.auth.Principal;
+import me.predatorray.candybox.common.auth.StandardAuthorizer;
+import me.predatorray.candybox.common.exception.CandyboxException;
+import me.predatorray.candybox.common.exception.AccessDeniedException;
+import me.predatorray.candybox.common.exception.AuthenticationException;
+import me.predatorray.candybox.common.exception.BoxAlreadyExistsException;
+import me.predatorray.candybox.common.exception.BoxNotEmptyException;
+import me.predatorray.candybox.common.exception.LimitExceededException;
+import me.predatorray.candybox.common.exception.ValidationException;
+import me.predatorray.candybox.common.exception.FencedException;
+import me.predatorray.candybox.common.exception.SerializationException;
+import me.predatorray.candybox.common.exception.StorageException;
 import me.predatorray.candybox.common.ManualClock;
 import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.coordination.fake.InMemoryCoordinationService;
@@ -31,6 +45,7 @@ import me.predatorray.candybox.protocol.Message;
 import me.predatorray.candybox.protocol.MessageCodec;
 import me.predatorray.candybox.protocol.Opcode;
 import me.predatorray.candybox.protocol.transport.RequestHandler;
+import me.predatorray.candybox.protocol.transport.ConnectionContext;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -57,6 +72,93 @@ class NodeRequestHandlerTest {
     /** Multipart minimum dropped to 0 so small in-memory parts complete. */
     private static CandyboxConfig config() {
         return CandyboxConfig.builder().multipartMinPartBytes(0).build();
+    }
+
+    @Test
+    void missingSyrupDetailsAreHiddenFromAnAuthenticatedBoxOwner() {
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        try (CandyboxNode node = new CandyboxNode(1, config(), store,
+                new InMemoryCoordinationService(), new ManualClock(1000))) {
+            node.authorizer(new StandardAuthorizer(List.of("Admin:ops"),
+                    box -> node.aclStore().get(box)));
+            ConnectionContext context = new ConnectionContext();
+            context.authenticated(Principal.user("alice"));
+            RequestHandler handler = node.requestHandler();
+            assertThat(node.authorizer().isSuperUser(context.principalOrAnonymous())).isFalse();
+            assertThat(CODEC.decode(handler.handle(context,
+                    CODEC.encode(new Message.CreateBoxRequest("private-box", 1)))))
+                    .isInstanceOf(Message.OkResponse.class);
+            assertThat(CODEC.decode(handler.handle(context, CODEC.encode(new Message.PutCandyRequest(
+                    "private-box", "k", null, Map.of(), null, bytes("value"))))))
+                    .isInstanceOf(Message.OkResponse.class);
+            long syrupId = node.engine(BoxName.of("private-box"), "k")
+                    .resolveLocator(CandyKey.of("k")).segments().get(0).syrupId();
+            store.deleteLedger(syrupId);
+
+            Message response = CODEC.decode(handler.handle(context,
+                    CODEC.encode(new Message.GetCandyRequest("private-box", "k"))));
+
+            assertThat(response).isInstanceOf(Message.ErrorResponse.class);
+            Message.ErrorResponse error = (Message.ErrorResponse) response;
+            assertThat(error.errorType()).isEqualTo("LedgerNotFoundException");
+            assertThat(error.message()).doesNotContain("No such ledger: " + syrupId);
+            assertInternalErrorWithReference(error);
+        }
+    }
+
+    @Test
+    void internalFailuresKeepTheirTypeButHideTheirDetails() {
+        try (CandyboxNode node = new CandyboxNode(1, config(), new InMemoryLedgerStore(),
+                new InMemoryCoordinationService(), new ManualClock(1000))) {
+            List<RuntimeException> failures = List.of(
+                    new StorageException("private-ledger-918273"),
+                    new SerializationException("private-record-offset-918273"),
+                    new FencedException("private-ledger-918273"),
+                    new CandyboxException("private-backend-918273"),
+                    new IllegalStateException("private-runtime-918273"));
+            java.util.Set<String> references = new java.util.HashSet<>();
+            for (RuntimeException failure : failures) {
+                node.authorizer((principal, operation, resource) -> {
+                    throw failure;
+                });
+                Message response = roundTrip(node.requestHandler(), new Message.ListBoxesRequest());
+                assertThat(response).isInstanceOf(Message.ErrorResponse.class);
+                Message.ErrorResponse error = (Message.ErrorResponse) response;
+                assertThat(error.errorType()).isEqualTo(failure instanceof CandyboxException
+                        ? failure.getClass().getSimpleName() : "InternalError");
+                assertThat(error.message()).doesNotContain(failure.getMessage());
+                assertInternalErrorWithReference(error);
+                assertThat(references.add(error.message())).isTrue();
+            }
+        }
+    }
+
+    @Test
+    void userFacingFailuresKeepTheirTypeAndMessage() {
+        try (CandyboxNode node = new CandyboxNode(1, config(), new InMemoryLedgerStore(),
+                new InMemoryCoordinationService(), new ManualClock(1000))) {
+            List<CandyboxException> failures = List.of(
+                    new ValidationException("InvalidRange: outside object bounds"),
+                    new LimitExceededException("Candy exceeds configured size limit"),
+                    new BoxAlreadyExistsException("existing-box"),
+                    new BoxNotEmptyException("existing-box"),
+                    new AuthenticationException("Authentication required"),
+                    new AccessDeniedException("Read access required"));
+            for (CandyboxException failure : failures) {
+                node.authorizer((principal, operation, resource) -> {
+                    throw failure;
+                });
+                Message response = roundTrip(node.requestHandler(), new Message.ListBoxesRequest());
+                assertThat(response).isEqualTo(new Message.ErrorResponse(
+                        failure.getClass().getSimpleName(), failure.getMessage()));
+            }
+        }
+    }
+
+    private static void assertInternalErrorWithReference(Message.ErrorResponse error) {
+        assertThat(error.message()).startsWith("Internal server error. Reference: ");
+        String reference = error.message().substring("Internal server error. Reference: ".length());
+        assertThat(UUID.fromString(reference).toString()).isEqualTo(reference);
     }
 
     @Test
@@ -278,6 +380,9 @@ class NodeRequestHandlerTest {
             Message response = roundTrip(handler,
                     new Message.RangeGetCandyRequest("range-box", "k", 100, 200));
             assertThat(response).isInstanceOf(Message.ErrorResponse.class);
+            Message.ErrorResponse error = (Message.ErrorResponse) response;
+            assertThat(error.errorType()).isEqualTo("ValidationException");
+            assertThat(error.message()).startsWith("InvalidRange:");
         }
     }
 

@@ -19,6 +19,7 @@ import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.regex.Pattern;
 import me.predatorray.candybox.common.BoxName;
 import me.predatorray.candybox.common.CandyKey;
@@ -28,6 +29,10 @@ import me.predatorray.candybox.common.auth.ObjectAcl;
 import me.predatorray.candybox.common.auth.Operation;
 import me.predatorray.candybox.common.auth.Principal;
 import me.predatorray.candybox.common.auth.Resource;
+import me.predatorray.candybox.common.exception.AccessDeniedException;
+import me.predatorray.candybox.common.exception.AuthenticationException;
+import me.predatorray.candybox.common.exception.BoxAlreadyExistsException;
+import me.predatorray.candybox.common.exception.BoxNotEmptyException;
 import me.predatorray.candybox.common.exception.BoxNotFoundException;
 import me.predatorray.candybox.common.exception.BusyException;
 import me.predatorray.candybox.common.exception.CandyNotFoundException;
@@ -122,11 +127,23 @@ final class NodeRequestHandler implements RequestHandler {
             // We don't own this partition: re-route, retry later, or the Box is gone.
             return codec.encode(movedOrNotFound(message, e));
         } catch (CandyboxException e) {
-            return codec.encode(new Message.ErrorResponse(e.getClass().getSimpleName(), safe(e.getMessage())));
+            String errorType = e.getClass().getSimpleName();
+            if (e instanceof ValidationException || e instanceof BoxAlreadyExistsException
+                    || e instanceof BoxNotEmptyException || e instanceof AccessDeniedException
+                    || e instanceof AuthenticationException) {
+                return codec.encode(new Message.ErrorResponse(errorType, safe(e.getMessage())));
+            }
+            return codec.encode(internalError(errorType, e));
         } catch (RuntimeException e) {
-            LOG.warn("Unexpected error handling request", e);
-            return codec.encode(new Message.ErrorResponse("InternalError", safe(e.getMessage())));
+            return codec.encode(internalError("InternalError", e));
         }
+    }
+
+    /** Internal details stay in the server log; the reference lets operators find the failure. */
+    private static Message.ErrorResponse internalError(String errorType, RuntimeException cause) {
+        String reference = UUID.randomUUID().toString();
+        LOG.warn("Error handling request; reference={}", reference, cause);
+        return new Message.ErrorResponse(errorType, "Internal server error. Reference: " + reference);
     }
 
     /** Reads larger than this would not fit in one response frame, so they are refused unread. */
