@@ -127,6 +127,19 @@ class LiveDashboardDataTest {
     }
 
     @Test
+    void lsmReadsIncarnationSpecificManifestPointer() {
+        InMemoryCoordinationService coord = new InMemoryCoordinationService();
+        BoxDescriptor descriptor = new BoxDescriptor(1);
+        coord.create(CandyboxKeys.boxMetaKey("photos"), descriptor.encode());
+        String pointer = CandyboxKeys.incarnationManifestKey("photos", 0, descriptor.incarnation());
+        coord.create(pointer, new byte[]{1});
+        coord.compareAndSet(pointer, new byte[]{2}, 0);
+        FakeBoxClient client = new FakeBoxClient();
+        client.boxes.add("photos");
+        assertThat(new LiveDashboardData(coord, client).lsm().get(0).manifestVersion()).isEqualTo(1);
+    }
+
+    @Test
     void boxesAndLsmReadOwnerAndManifestVersion() throws Exception {
         InMemoryCoordinationService coord = new InMemoryCoordinationService();
         coord.create(CandyboxKeys.boxMetaKey("photos"), new BoxDescriptor(1).encode());

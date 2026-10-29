@@ -79,6 +79,20 @@ public interface LedgerStore extends AutoCloseable {
      */
     List<Long> listLedgers();
 
+    /** Reads creation metadata without fencing; missing ids throw LedgerNotFoundException. */
+    default LedgerMetadata readMetadata(long ledgerId) {
+        throw new UnsupportedOperationException("Ledger metadata reads are not supported");
+    }
+
+    default java.util.Map<String, byte[]> allocationMetadata() {
+        return java.util.Map.of();
+    }
+
+    /** Pins imported bytes before a durable reference may be appended. */
+    default void retainLedgers(java.util.Collection<Long> ledgerIds) {
+        // Stores without a lifecycle registry leave retention to their caller.
+    }
+
     @Override
     void close();
 }

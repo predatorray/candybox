@@ -464,9 +464,9 @@ The detailed rules:
   window, and the freshness of sibling partitions' published sets. An undecodable relay makes its Box
   skip Syrup GC until it is removed (#103).
 
-The full compaction-then-GC cycle is covered end-to-end by `CompactionGcCycleIT`. One gap: deleting a
-Box drops its manifest pointer but does not yet reclaim that Box's SSTable/Syrup/WAL/manifest ledgers
-(**TODO(phase-3)**).
+The full compaction-then-GC cycle and opt-in allocation enumeration are covered by
+`CompactionGcCycleIT`. Deleted-Box allocations carrying epoch tags are reclaimed after writer
+admission closes and every admitted WAL/manifest is fenced; legacy ledgers remain held.
 
 ## 10. Size limits (configurable; enforced at client and node)
 
@@ -572,9 +572,32 @@ Kubernetes manifests). Fault-injection / failure-path hardening and operational 
   already fencing-gated).
 - **Watch-based coordination.** The `CoordinationService` callers poll today; ZK watches to avoid
   polling are `TODO(phase-2)`.
-- **GC enumeration backstop + Box-delete reclamation.** Ledgers that no manifest ever recorded, and
-  the ledgers of a deleted Box, are not yet reclaimed (§9, `TODO(phase-3)`, #105).
+- **Legacy ledger reclamation.** Untagged allocations remain outside the opt-in epoch backstop;
+  legacy Box-deletion journaling remains tracked by #60.
 - **Read scaling.** Sealed SSTables/Syrups are immutable and replicated, so any node *could* serve
   reads of flushed data; only unflushed-memtable read-your-writes needs the owner. Serving reads off
   the owner is not built in v1.
 - **Syrup defragmentation and small-object inlining** — see §9(d) and §12.
+
+
+### Allocation-epoch enumeration
+
+The opt-in enumeration backstop tags allocations with Box incarnation, partition, and a durable
+allocation epoch. Every live epoch protects all of its allocations, including a writer paused
+immediately after creation. Normal owner rotation seals the old engine and recovers the authoritative
+manifest and WAL before publishing a fresh pointer. The successor pins every recovery root before
+retiring captured epochs with strictly lower lease fencing tokens. Same-token acquisitions
+remain pinned until a genuine subsequent lease epoch; an older operation cannot retire a newer
+owner merely because its allocation was delayed. Epoch retirement is independent of wall-clock
+age. Failed pointer CAS outcomes never authorize retirement. Incarnation-specific pointer keys keep
+old-generation pointer operations separate from a recreated Box's pointers.
+
+A per-ledger coordination CAS serializes retention pins with permanent deletion claims. Backup and
+relay pins are explicit durable roots. Imported zero-copy segments acquire destination-epoch pins
+before their WAL append; the pin does not expire while that epoch could still append. Retiring a
+destination requires recovery of its fenced WAL, so an interrupted transfer is either inherited as
+a root or cannot subsequently commit. The original refs/relays/refs snapshot remains in place for
+normal Syrup orphan claiming. Normal pending-delete GC also passes the retention CAS when enabled.
+Enumeration requires a retired allocating epoch, a recognized matching identity, sufficient age,
+and no active retention pins. Legacy or incomplete evidence is held. Claims and the enumeration
+cursor survive coordinator handover, and failed physical deletes are retried.

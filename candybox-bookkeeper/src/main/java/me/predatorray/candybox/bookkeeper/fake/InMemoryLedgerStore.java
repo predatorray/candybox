@@ -53,6 +53,15 @@ public final class InMemoryLedgerStore implements LedgerStore {
     private final AtomicLong idGenerator = new AtomicLong(0);
     private volatile int availableBookies = Integer.MAX_VALUE;
     private volatile boolean storeClosed = false;
+    private final me.predatorray.candybox.common.Clock clock;
+
+    public InMemoryLedgerStore() {
+        this(me.predatorray.candybox.common.SystemClock.INSTANCE);
+    }
+
+    public InMemoryLedgerStore(me.predatorray.candybox.common.Clock clock) {
+        this.clock = java.util.Objects.requireNonNull(clock);
+    }
 
     /** Sets how many bookies are currently reachable, to inject quorum-loss failures. */
     public void setAvailableBookies(int count) {
@@ -84,7 +93,7 @@ public final class InMemoryLedgerStore implements LedgerStore {
                     + " bookie(s) available, ensemble requires " + config.quorum().ensembleSize());
         }
         long id = idGenerator.getAndIncrement();
-        FakeLedger ledger = new FakeLedger(id, config);
+        FakeLedger ledger = new FakeLedger(id, config, clock.currentTimeMillis());
         ledgers.put(id, ledger);
         return new WritableHandle(ledger, ledger.epoch);
     }
@@ -118,6 +127,14 @@ public final class InMemoryLedgerStore implements LedgerStore {
     }
 
     @Override
+    public me.predatorray.candybox.bookkeeper.LedgerMetadata readMetadata(long ledgerId) {
+        ensureOpen();
+        FakeLedger ledger = require(ledgerId);
+        return new me.predatorray.candybox.bookkeeper.LedgerMetadata(
+                ledger.createdAtMillis, ledger.config.customMetadata());
+    }
+
+    @Override
     public void close() {
         storeClosed = true;
     }
@@ -128,13 +145,15 @@ public final class InMemoryLedgerStore implements LedgerStore {
 
     /** Mutable per-ledger state; all access synchronized on the instance. */
     private static final class FakeLedger {
+        private final long createdAtMillis;
         private final long id;
         private final LedgerConfig config;
         private final List<byte[]> entries = new ArrayList<>();
         private boolean sealed = false;
         private int epoch = 0;
 
-        FakeLedger(long id, LedgerConfig config) {
+        FakeLedger(long id, LedgerConfig config, long createdAtMillis) {
+            this.createdAtMillis = createdAtMillis;
             this.id = id;
             this.config = config;
         }

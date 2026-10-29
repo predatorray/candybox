@@ -98,6 +98,9 @@ public final class CandyboxNode implements AutoCloseable {
     private final CompactionService compactionService;
     private final GarbageCollector garbageCollector;
     private final PartitionBalancer balancer;
+    private final LedgerRetention retention;
+    private long lastEnumeration;
+    private volatile LedgerRetention.Report enumerationReport = new LedgerRetention.Report(0, 0, 0, 0, 0);
 
     /** Bounded compaction passes per partition per worker tick, so one cannot starve the others. */
     private static final int MAX_COMPACTIONS_PER_TICK = 8;
@@ -126,7 +129,10 @@ public final class CandyboxNode implements AutoCloseable {
         this.aclStore = new BoxAclStore(coordination, clock);
         coordination.registerMember(nodeId, advertisedAddress.getBytes(StandardCharsets.UTF_8));
         this.compactionService = new CompactionService(ledgerStore, config, clock);
-        this.garbageCollector = new GarbageCollector(ledgerStore, config.ledgerGcGraceMillis(), clock);
+        this.retention = new LedgerRetention(ledgerStore, coordination, clock);
+        this.garbageCollector = new GarbageCollector(ledgerStore, config.ledgerGcGraceMillis(), clock,
+                (engine, ledger) -> config.ledgerEnumerationGraceMillis() == 0
+                        || retention.deletePending(engine, ledger));
         this.balancer = new PartitionBalancer(this, coordination, config);
 
         long renewInterval = config.leaseRenewIntervalMillis();
@@ -163,6 +169,7 @@ public final class CandyboxNode implements AutoCloseable {
      * Every phase is guarded so a failed phase cannot escape the tick or suppress later phases.
      */
     private void runMaintenance() {
+        guarded("allocation epoch rotation", this::rotateAllocationEpochs).run();
         guarded("compaction", this::compactOwnedBoxesOnce).run();
         guarded("GC", this::collectGarbageOnce).run();
         guarded("multipart TTL sweep", this::sweepStaleMultipartUploadsOnce).run();
@@ -347,6 +354,9 @@ public final class CandyboxNode implements AutoCloseable {
         }
         descriptorCache.remove(box.value());
         deleteMetaQuietly(box);
+        if (!boxExists(box)) {
+            for (PartitionOwnership ownership : owned) { ownership.retireDeletedAllocations(); }
+        }
         aclStore.delete(box.value());
         deleteLocatorRelays(box, descriptor.partitionCount());
         // TODO(phase-3): reference-counted GC of the Box's SSTable/Syrup/WAL/manifest ledgers.
@@ -357,7 +367,7 @@ public final class CandyboxNode implements AutoCloseable {
         ownership.currentPointer().ifPresent(p -> {
             try {
                 coordination.delete(
-                        PartitionOwnership.manifestKey(ownership.box(), ownership.partition()),
+                        ownership.pointerKey(),
                         p.version());
             } catch (RuntimeException e) {
                 LOG.warn("Failed to delete manifest pointer for box {} partition {}: {}",
@@ -431,7 +441,7 @@ public final class CandyboxNode implements AutoCloseable {
 
     private Optional<BoxDescriptor> findDescriptor(BoxName box) {
         BoxDescriptor cached = descriptorCache.get(box.value());
-        if (cached != null) {
+        if (cached != null && config.ledgerEnumerationGraceMillis() == 0) {
             return Optional.of(cached);
         }
         Optional<BoxDescriptor> loaded = coordination.get(CandyboxKeys.boxMetaKey(box.value()))
@@ -464,6 +474,10 @@ public final class CandyboxNode implements AutoCloseable {
     /** Returns the engine of one partition this node owns (see {@link #engine}). */
     public BoxEngine enginePartition(BoxName box, int partition) {
         PartitionOwnership ownership = partitions.get(new BoxPartition(box.value(), partition));
+        if (ownership != null && config.ledgerEnumerationGraceMillis() > 0
+                && !descriptor(box).incarnation().equals(ownership.incarnation())) {
+            throw new NotOwnerException("Box incarnation changed");
+        }
         if (ownership == null) {
             if (!boxExists(box)) {
                 throw new BoxNotFoundException(box.value());
@@ -480,12 +494,16 @@ public final class CandyboxNode implements AutoCloseable {
      */
     void sweepDeletedBoxes() {
         for (BoxPartition bp : partitions.keySet()) {
-            if (coordination.get(CandyboxKeys.boxMetaKey(bp.box())).isEmpty()) {
+            var descriptor = coordination.get(CandyboxKeys.boxMetaKey(bp.box()));
+            PartitionOwnership existing = partitions.get(bp);
+            if (descriptor.isEmpty() || (config.ledgerEnumerationGraceMillis() > 0 && existing != null
+                    && !BoxDescriptor.decode(descriptor.get().value()).incarnation().equals(existing.incarnation()))) {
                 PartitionOwnership ownership = partitions.remove(bp);
                 if (ownership != null) {
                     LOG.info("Dropping box {} partition {} on node {}: the Box was deleted",
                             bp.box(), bp.partition(), nodeId);
                     dropPartition(ownership);
+                    ownership.retireDeletedAllocations();
                 }
                 descriptorCache.remove(bp.box());
             }
@@ -611,6 +629,42 @@ public final class CandyboxNode implements AutoCloseable {
         return deleted;
     }
 
+    synchronized void rotateAllocationEpochs() {
+        long grace = config.ledgerEnumerationGraceMillis();
+        if (grace == 0) { return; }
+        for (BoxPartition bp : new ArrayList<>(partitions.keySet())) {
+            if (!ownsPartition(bp.box(), bp.partition())) { continue; }
+            try {
+                PartitionOwnership ownership = partitions.get(bp);
+                if (ownership == null || !ownership.allocationRotationDue(grace)) { continue; }
+                BoxName box = BoxName.of(bp.box());
+                releasePartitionForHandover(box, bp.partition());
+                openPartition(box, bp.partition());
+            } catch (RuntimeException failure) {
+                LOG.warn("Allocation epoch rotation failed for {}", bp, failure);
+            }
+        }
+    }
+
+    /** Low-frequency enumeration; only the elected balancer invokes this pass. */
+    synchronized void reconcileAllocations() {
+        long grace = config.ledgerEnumerationGraceMillis();
+        long now = clock.currentTimeMillis();
+        long interval = Math.min(grace, 60_000);
+        if (grace == 0 || (lastEnumeration != 0 && now - lastEnumeration < interval)) { return; }
+        lastEnumeration = now;
+        enumerationReport = retention.reconcile(grace, 1024, false);
+    }
+
+    public LedgerRetention.Report enumerationReport() { return enumerationReport; }
+
+    public LedgerRetention retention() {
+        if (config.ledgerEnumerationGraceMillis() == 0) {
+            throw new IllegalStateException("Retention pins require ledger enumeration to be enabled");
+        }
+        return retention;
+    }
+
     /**
      * Finalizes (or abandons) the cross-partition rename intents owed by every partition this node
      * owns: a present coordination rendezvous marker ⇒ LWW-conditioned delete of the source key, then
@@ -719,17 +773,18 @@ public final class CandyboxNode implements AutoCloseable {
                     continue;
                 }
                 long writtenAt;
+                LocatorRelay relay = null;
                 try {
-                    writtenAt = LocatorRelay.deserialize(value.get().value()).createdAtMillis();
+                    relay = LocatorRelay.deserialize(value.get().value());
+                    writtenAt = relay.createdAtMillis();
                 } catch (RuntimeException undecodable) {
-                    // Unknown formats may still be consumed by newer nodes during the full window.
+                    // Unknown formats retain their full window before reaping.
                     writtenAt = value.get().modifiedAtMillis();
-                    if (writtenAt < 0) {
-                        throw undecodable;
-                    }
+                    if (writtenAt < 0) { throw undecodable; }
                 }
                 if (writtenAt <= cutoff) {
                     coordination.delete(key, value.get().version());
+                    if (config.ledgerEnumerationGraceMillis() > 0 && relay != null) { releaseRelayPins(token, relay); }
                     deleted++;
                 } else {
                     liveBytes += value.get().value().length;
@@ -982,6 +1037,12 @@ public final class CandyboxNode implements AutoCloseable {
                     + " partition " + srcPartition);
         }
         String token = UUID.randomUUID().toString();
+        if (config.ledgerEnumerationGraceMillis() > 0) {
+            byte[] epoch = enginePartition(BoxName.of(box), srcPartition)
+                    .sstableLedgerConfig().customMetadata().get(LedgerRetention.EPOCH_TAG);
+            retention.pinRelay(new String(epoch, StandardCharsets.UTF_8), token,
+                    relay.locator().segments().stream().map(SegmentRef::syrupId).toList());
+        }
         coordination.create(CandyboxKeys.locatorRelayKey(box, srcPartition, token), value);
         pendingRelayBytes.addAndGet(value.length);
         return token;
@@ -1013,11 +1074,20 @@ public final class CandyboxNode implements AutoCloseable {
 
     void deleteLocatorRelay(String box, int srcPartition, String token) {
         try {
-            CoordinationCas.deleteIfPresent(coordination,
-                    CandyboxKeys.locatorRelayKey(box, srcPartition, token), 0);
+            String key = CandyboxKeys.locatorRelayKey(box, srcPartition, token);
+            var value = coordination.get(key);
+            CoordinationCas.deleteIfPresent(coordination, key, 0);
+            if (config.ledgerEnumerationGraceMillis() > 0 && value.isPresent()) {
+                releaseRelayPins(token, LocatorRelay.deserialize(value.get().value()));
+            }
         } catch (CasConflictException raced) {
             // Already consumed by a concurrent retry, or reaped.
         }
+    }
+
+    private void releaseRelayPins(String token, LocatorRelay relay) {
+        retention.releaseRelay(token,
+                relay.locator().segments().stream().map(SegmentRef::syrupId).toList());
     }
 
     /** Best-effort: a relay left behind expires at consume time anyway. */
@@ -1026,8 +1096,7 @@ public final class CandyboxNode implements AutoCloseable {
             try {
                 for (String token : coordination.children(
                         CandyboxKeys.locatorRelaysPath(box.value(), p))) {
-                    CoordinationCas.deleteIfPresent(coordination,
-                            CandyboxKeys.locatorRelayKey(box.value(), p, token), 0);
+                    deleteLocatorRelay(box.value(), p, token);
                 }
             } catch (RuntimeException e) {
                 LOG.warn("Failed to delete locator relays of box {} partition {}: {}", box, p,

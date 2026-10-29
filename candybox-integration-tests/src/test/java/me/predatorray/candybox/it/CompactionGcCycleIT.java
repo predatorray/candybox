@@ -106,4 +106,53 @@ class CompactionGcCycleIT {
             store.close();
         }
     }
+    @Test
+    void allocationEpochBackstopReclaimsFailedOutputOnRealBackends() {
+        var clock = new me.predatorray.candybox.common.ManualClock(System.currentTimeMillis());
+        CandyboxConfig config = CandyboxConfig.builder()
+                .ledgerEnumerationGraceMillis(1_000).ownershipLeaseTtlMillis(100_000)
+                .leaseRenewIntervalMillis(0).compactionIntervalMillis(0).balancerIntervalMillis(0).build();
+        BoxName box = BoxName.of("enumeration-box");
+        try (var store = new BookKeeperLedgerStore(bookKeeper.clientConfiguration(), bytes("candybox"));
+             var coordination = new ZooKeeperCoordinationService(zookeeper.getConnectString(), clock);
+             var node = new CandyboxNode(1, config, store, coordination, clock)) {
+            node.createBox(box, 1);
+            var engine = node.enginePartition(box, 0);
+            engine.putCandy(CandyKey.of("key"), bytes("value"), null, Map.of(), null);
+            var abandoned = store.createLedger(engine.sstableLedgerConfig());
+            abandoned.append(bytes("uncommitted output"));
+            abandoned.close();
+            long created = store.readMetadata(abandoned.ledgerId()).createdAtMillis();
+            assertThat(created).isPositive();
+            clock.advance(Math.max(0, created - clock.currentTimeMillis()) + 2_000);
+            node.runBalancerOnce();
+            assertThat(store.listLedgers()).doesNotContain(abandoned.ledgerId());
+            assertThat(node.enginePartition(box, 0).getCandy(CandyKey.of("key"))).isEqualTo(bytes("value"));
+        }
+    }
+
+    @Test
+    void deletedIncarnationParentDoesNotBlockDisabledRecreationOnZooKeeper() {
+        CandyboxConfig enabled = CandyboxConfig.builder().ledgerEnumerationGraceMillis(1_000)
+                .leaseRenewIntervalMillis(0).compactionIntervalMillis(0).balancerIntervalMillis(0).build();
+        CandyboxConfig disabled = CandyboxConfig.builder()
+                .leaseRenewIntervalMillis(0).compactionIntervalMillis(0).balancerIntervalMillis(0).build();
+        BoxName box = BoxName.of("recreated-enumeration-box");
+        try (var store = new BookKeeperLedgerStore(bookKeeper.clientConfiguration(), bytes("candybox"));
+             var coordination = new ZooKeeperCoordinationService(zookeeper.getConnectString(), SystemClock.INSTANCE)) {
+            try (var initial = new CandyboxNode(1, enabled, store, coordination, SystemClock.INSTANCE)) {
+                initial.createBox(box, 1);
+                initial.deleteBox(box, true);
+            }
+            try (var recreated = new CandyboxNode(2, disabled, store, coordination, SystemClock.INSTANCE)) {
+                recreated.createBox(box, 1);
+                recreated.enginePartition(box, 0).putCandy(CandyKey.of("key"), bytes("new"), null, Map.of(), null);
+            }
+            try (var recovered = new CandyboxNode(3, disabled, store, coordination, SystemClock.INSTANCE)) {
+                recovered.openBox(box);
+                assertThat(recovered.enginePartition(box, 0).getCandy(CandyKey.of("key"))).isEqualTo(bytes("new"));
+            }
+        }
+    }
+
 }

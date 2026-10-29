@@ -40,6 +40,7 @@ public final class CandyboxConfig {
     private final long maxClockSkewMillis;
     private final long tombstoneGcGraceMillis;
     private final long ledgerGcGraceMillis;
+    private final long ledgerEnumerationGraceMillis;
     private final int l0CompactionTrigger;
     private final int l0StallThreshold;
     private final long compactionTargetFileSizeBytes;
@@ -68,6 +69,7 @@ public final class CandyboxConfig {
         this.maxClockSkewMillis = b.maxClockSkewMillis;
         this.tombstoneGcGraceMillis = b.tombstoneGcGraceMillis;
         this.ledgerGcGraceMillis = b.ledgerGcGraceMillis;
+        this.ledgerEnumerationGraceMillis = b.ledgerEnumerationGraceMillis;
         this.l0CompactionTrigger = b.l0CompactionTrigger;
         this.l0StallThreshold = b.l0StallThreshold;
         this.compactionTargetFileSizeBytes = b.compactionTargetFileSizeBytes;
@@ -150,6 +152,10 @@ public final class CandyboxConfig {
     }
 
     /** Grace period before an obsoleted ledger (compaction input, dead Syrup) is physically deleted. */
+    public long ledgerEnumerationGraceMillis() {
+        return ledgerEnumerationGraceMillis;
+    }
+
     public long ledgerGcGraceMillis() {
         return ledgerGcGraceMillis;
     }
@@ -235,6 +241,7 @@ public final class CandyboxConfig {
         private long compactionIntervalMillis = 0L;            // background compaction; 0 disables
         private long maxClockSkewMillis = 300_000L;            // 5 min HLC skew bound
         private long tombstoneGcGraceMillis = 24L * 3600 * 1000; // 24h late-write window
+        private long ledgerEnumerationGraceMillis; // opt-in; 0 disables enumeration
         private long ledgerGcGraceMillis = 300_000L;           // 5 min before deleting obsolete ledgers
         private int l0CompactionTrigger = 4;
         private int l0StallThreshold = 12;
@@ -311,6 +318,14 @@ public final class CandyboxConfig {
 
         public Builder tombstoneGcGraceMillis(long v) {
             this.tombstoneGcGraceMillis = v;
+            return this;
+        }
+
+        public Builder ledgerEnumerationGraceMillis(long v) {
+            if (v < 0) {
+                throw new IllegalArgumentException("ledgerEnumerationGraceMillis must be >= 0");
+            }
+            this.ledgerEnumerationGraceMillis = v;
             return this;
         }
 

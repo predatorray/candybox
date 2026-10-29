@@ -50,4 +50,14 @@ class BoxDescriptorTest {
         assertThatThrownBy(() -> BoxDescriptor.decode(encoded))
                 .isInstanceOf(CoordinationException.class);
     }
+    @org.junit.jupiter.api.Test
+    void incarnationIsStableOnDecodeAndDistinctAcrossCreations() {
+        BoxDescriptor first = new BoxDescriptor(4);
+        assertThat(BoxDescriptor.decode(first.encode()).incarnation()).isEqualTo(first.incarnation());
+        assertThat(new BoxDescriptor(4).incarnation()).isNotEqualTo(first.incarnation());
+        byte[] legacy = new me.predatorray.candybox.common.serial.BinaryWriter()
+                .writeByte(1).writeVarInt(4).toByteArray();
+        assertThat(BoxDescriptor.decode(legacy)).isEqualTo(new BoxDescriptor(4, "legacy"));
+    }
+
 }

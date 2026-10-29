@@ -173,6 +173,21 @@ public final class BookKeeperLedgerStore implements LedgerStore {
     }
 
     @Override
+    public me.predatorray.candybox.bookkeeper.LedgerMetadata readMetadata(long ledgerId) {
+        try {
+            var metadata = bookKeeper.getLedgerMetadata(ledgerId).get();
+            return new me.predatorray.candybox.bookkeeper.LedgerMetadata(
+                    metadata.getCtime(), metadata.getCustomMetadata());
+        } catch (InterruptedException e) {
+            throw mapException("read metadata", ledgerId, e);
+        } catch (java.util.concurrent.ExecutionException e) {
+            Throwable cause = e.getCause();
+            throw mapException("read metadata", ledgerId,
+                    cause instanceof Exception exception ? exception : e);
+        }
+    }
+
+    @Override
     public List<Long> listLedgers() {
         List<Long> result = new ArrayList<>();
         try (BookKeeperAdmin admin = new BookKeeperAdmin(clientConfiguration)) {
