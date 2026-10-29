@@ -141,8 +141,9 @@ final class NodeRequestHandler implements RequestHandler {
     /**
      * The S3 union rule: a READ / READ_ACP / WRITE_ACP the Box ACL denies is still allowed when the
      * <em>object's own</em> grants (locator v3) permit it. Only single-object read-side requests
-     * qualify; resolution failures (no such object, partition moved) deny rather than leak
-     * existence — the box-level outcome stands.
+     * qualify. Missing objects and malformed keys deny without revealing object existence.
+     * Ownership failures follow the normal routing response so the owner can evaluate the grants;
+     * redirects reveal partition ownership, never whether the object exists.
      */
     private boolean objectGrantPermits(Message message, Principal principal, Operation operation) {
         String box = boxOf(message);
@@ -163,6 +164,8 @@ final class NodeRequestHandler implements RequestHandler {
         try {
             ObjectAcl acl = node.engine(BoxName.of(box), key).getCandyAcl(CandyKey.of(key));
             return acl.permits(principal, operation);
+        } catch (NotOwnerException | BoxNotFoundException routingFailed) {
+            throw routingFailed;
         } catch (CandyboxException | IllegalArgumentException resolveFailed) {
             return false;
         }
