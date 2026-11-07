@@ -122,6 +122,17 @@ build either; finish the node rollout promptly (or disable the balancer during i
 given such a partition fences the manifest, fails to decode it and releases the lease, so the
 partition stays unowned (`RESPONSE_UNAVAILABLE`) until an upgraded node takes it. No data is lost.
 
+Same-partition rename now immediately writes WAL kind 3 (atomic batch v1). Older builds only
+understand kinds 1 and 2 and cannot recover a WAL containing kind 3. **Use a coordinated maintenance
+upgrade for this change:** stop traffic and all nodes, back up the stopped cluster, install the
+batch-capable binary on every node, then restart all nodes and resume traffic. Do not run mixed
+old/new owners or downgrade binaries after new nodes start writing; restore the pre-upgrade backup
+if rollback is necessary. Runtime reader capability checks and a separate writer activation gate
+remain tracked by [#157](https://github.com/predatorray/candybox/issues/157); this release does not
+provide a zero-downtime mixed-version rollout. WAL batches are capped at 1 MiB including framing;
+BookKeeper frame limits must accommodate that payload plus its protocol overhead (the standard
+5 MiB frame setting does).
+
 ## Garbage collection
 
 Run by each partition's owner, against the committed manifest, after `ledgerGcGraceMillis`:

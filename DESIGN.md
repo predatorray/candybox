@@ -147,9 +147,16 @@ logicalCounter | int nodeId`. Carries no Syrup segments; shadows every key in `[
 locator HLC is older.
 
 **WAL entry** (`WalEntrySerializer`) — the WAL is a kind-tagged log so point mutations and range
-deletes replay in one ordered pass: `byte kind (1=point mutation, 2=range delete) | <Mutation or
-RangeTombstone payload>`. Replay reports the max HLC across **both** kinds, so handover's HLC
-`observe` cannot lose a range delete.
+deletes and atomic batches replay in one ordered pass: `byte kind (1=point mutation, 2=range delete,
+3=atomic batch) | payload`. Kinds 1 and 2 retain their original payloads. Kind 3 has
+`byte batchVersion (=1) | varint count | bytes(serialized Mutation)[count]`, bounded to 128 mutations
+and 1 MiB including framing (below BookKeeper's default 5 MiB frame limit; deployments must allow
+at least this payload plus BookKeeper overhead). Same-partition rename writes the destination PUT
+and source DELETE as one batch in one ledger entry; neither memtable mutation is applied until it
+is durable. Recovery decodes the entire batch before applying any member and reports the maximum
+HLC across all members, point records and range deletes. Unknown versions, truncated members,
+invalid counts and trailing batch bytes fail recovery. Legacy point/range WAL entries stay readable.
+See OPERATIONS.md for the required coordinated upgrade before writing kind 3.
 
 **Syrup chunk entry**: `int crc32c | payload[<= chunkSize]`. The crc covers the payload only.
 
