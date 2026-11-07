@@ -60,7 +60,7 @@ public final class WriteAheadLog implements AutoCloseable {
         return append(WalEntry.of(tombstone));
     }
 
-    /** Appends a WAL entry of either kind, blocking until ack-quorum durable. */
+    /** Appends a WAL entry of any kind, blocking until ack-quorum durable. */
     public long append(WalEntry entry) {
         return ledger.append(WalEntrySerializer.serialize(entry));
     }
@@ -76,7 +76,7 @@ public final class WriteAheadLog implements AutoCloseable {
 
     /**
      * Reads every entry of a WAL ledger back into {@link WalEntry}s, also reporting the maximum HLC
-     * seen across both point mutations and range tombstones — the value the recovering owner must
+     * seen across point mutations, range tombstones and every batch member — the value the recovering owner must
      * advance its clock beyond before stamping anything new.
      *
      * @param ledger a readable WAL ledger (typically the result of {@code recoverOpen})
@@ -100,7 +100,7 @@ public final class WriteAheadLog implements AutoCloseable {
     /**
      * The outcome of a WAL replay.
      *
-     * @param entries the WAL entries in append order (point mutations and range tombstones)
+     * @param entries the WAL entries in append order (including atomic batches)
      * @param maxHlc  the highest HLC recorded ({@link Hlc#MIN} if the WAL was empty)
      */
     public record ReplayResult(List<WalEntry> entries, Hlc maxHlc) {

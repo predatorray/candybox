@@ -200,13 +200,17 @@ public final class BoxEngine implements AutoCloseable {
                 }
                 replayedEntries = replay.entries().size();
                 for (WalEntry e : replay.entries()) {
-                    if (e instanceof WalEntry.PointMutation pm) {
-                        memtable.put(pm.mutation());
-                        for (SegmentRef seg : pm.mutation().locator().segments()) {
-                            replayedSyrups.add(seg.syrupId());
-                        }
-                    } else if (e instanceof WalEntry.RangeDelete rd) {
+                    if (e instanceof WalEntry.RangeDelete rd) {
                         memtable.delete(rd.tombstone());
+                    } else {
+                        List<Mutation> mutations = e instanceof WalEntry.PointMutation pm
+                                ? List.of(pm.mutation()) : ((WalEntry.Batch) e).mutations();
+                        for (Mutation mutation : mutations) {
+                            memtable.put(mutation);
+                            for (SegmentRef seg : mutation.locator().segments()) {
+                                replayedSyrups.add(seg.syrupId());
+                            }
+                        }
                     }
                 }
                 if (replay.maxHlc().isAfter(highWater)) {
@@ -732,8 +736,9 @@ public final class BoxEngine implements AutoCloseable {
 
     /**
      * Server-side, zero-copy rename/move: like {@link #copyCandy} but also writes a DELETE tombstone at
-     * {@code src}, atomically (the single owner serializes both into the WAL and memtable under one
-     * write lock). The Candy's bytes never move; only locator pointers are rewritten. Same-Box only.
+     * {@code src}, atomically (one WAL batch is durable before either memtable mutation is applied
+     * under the write lock). The Candy's bytes never move; only locator pointers are rewritten.
+     * Same-Box only.
      *
      * @throws CandyNotFoundException if there is no live Candy at {@code src}
      */
@@ -780,15 +785,20 @@ public final class BoxEngine implements AutoCloseable {
                     source.userMetadata(), clock.currentTimeMillis(), source.parts(),
                     dstAcl == null ? source.acl() : dstAcl);
             Mutation dstMutation = new Mutation(dst, dstLocator);
-            wal.append(dstMutation);
+            // Reject oversized locators and serialize the complete batch before any append.
+            me.predatorray.candybox.common.serial.CandyLocatorSerializer.serialize(dstLocator,
+                    config.sizeLimits().maxLocatorBytes());
 
             Mutation tombstone = null;
             if (tombstoneSource) {
                 tombstone = new Mutation(src,
                         CandyLocator.tombstone(hlc.tick(), clock.currentTimeMillis()));
-                wal.append(tombstone);
+                wal.append(WalEntry.batch(List.of(dstMutation, tombstone)));
+            } else {
+                wal.append(dstMutation);
             }
-            // Apply to the memtable only after both are durable in the WAL (atomic to readers).
+            // Apply only after the whole record is durable. Ambiguous failures are recovered;
+            // never compensate by deleting dst, since the batch may already be committed.
             active.put(dstMutation);
             if (tombstone != null) {
                 active.put(tombstone);

@@ -15,19 +15,20 @@
  */
 package me.predatorray.candybox.lsm.wal;
 
+import java.util.List;
 import me.predatorray.candybox.common.Hlc;
 import me.predatorray.candybox.common.Mutation;
 import me.predatorray.candybox.common.RangeTombstone;
 
 /**
- * One record in the write-ahead log: either a point {@link Mutation} (PUT or DELETE of a single key)
- * or a {@link RangeTombstone} ({@code deleteRange}). Modeling the WAL as this tagged union keeps the
- * recovery path a single ordered replay and lets the recovering owner observe the maximum HLC across
- * <em>both</em> kinds — essential so a range delete cannot be silently lost on handover (DESIGN §3,§7).
+ * One WAL record: a point {@link Mutation}, an atomic batch of point mutations, or a
+ * {@link RangeTombstone}. This tagged union keeps recovery a single ordered replay and lets the
+ * recovering owner observe the maximum HLC across every mutation and range delete (DESIGN §3,§7).
  */
-public sealed interface WalEntry permits WalEntry.PointMutation, WalEntry.RangeDelete {
+public sealed interface WalEntry permits WalEntry.PointMutation, WalEntry.RangeDelete,
+        WalEntry.Batch {
 
-    /** The HLC stamped on this record (the value the recovering owner must advance past). */
+    /** The maximum HLC in this record (the value the recovering owner must advance past). */
     Hlc hlc();
 
     static WalEntry of(Mutation mutation) {
@@ -36,6 +37,28 @@ public sealed interface WalEntry permits WalEntry.PointMutation, WalEntry.RangeD
 
     static WalEntry of(RangeTombstone tombstone) {
         return new RangeDelete(tombstone);
+    }
+
+    /** One BookKeeper entry: all members become durable together. */
+    static WalEntry batch(List<Mutation> mutations) {
+        return new Batch(mutations);
+    }
+
+    record Batch(List<Mutation> mutations) implements WalEntry {
+        public static final int MAX_MUTATIONS = 128;
+
+        public Batch {
+            mutations = List.copyOf(mutations);
+            if (mutations.isEmpty() || mutations.size() > MAX_MUTATIONS) {
+                throw new IllegalArgumentException("WAL batch must contain 1.." + MAX_MUTATIONS
+                        + " mutations");
+            }
+        }
+
+        @Override
+        public Hlc hlc() {
+            return mutations.stream().map(Mutation::hlc).max(Hlc::compareTo).orElseThrow();
+        }
     }
 
     record PointMutation(Mutation mutation) implements WalEntry {
