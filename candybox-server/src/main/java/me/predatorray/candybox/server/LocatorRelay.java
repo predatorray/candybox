@@ -15,11 +15,15 @@
  */
 package me.predatorray.candybox.server;
 
+import java.util.HashMap;
+import java.util.Map;
 import me.predatorray.candybox.common.CandyLocator;
+import me.predatorray.candybox.common.Hlc;
 import me.predatorray.candybox.common.exception.SerializationException;
 import me.predatorray.candybox.common.serial.BinaryReader;
 import me.predatorray.candybox.common.serial.BinaryWriter;
 import me.predatorray.candybox.common.serial.CandyLocatorSerializer;
+import me.predatorray.candybox.lsm.engine.CandyMetadata;
 
 /**
  * A source locator snapshot the source partition's owner stashes in coordination for the destination
@@ -32,11 +36,29 @@ import me.predatorray.candybox.common.serial.CandyLocatorSerializer;
  * @param dstKey          the rename's destination key, else null
  * @param createdAtMillis when the relay was written, used to reap abandoned relays
  * @param locator         the resolved source locator
+ * @param consumer        durable single-consumer claim; null while pending
  */
 record LocatorRelay(String requester, String srcKey, String renameToken, String dstKey,
-                    long createdAtMillis, CandyLocator locator) {
+                    long createdAtMillis, CandyLocator locator, Consumer consumer) {
 
-    private static final byte FORMAT_VERSION = 1;
+    private static final byte FORMAT_VERSION = 2;
+
+    LocatorRelay(String requester, String srcKey, String renameToken, String dstKey,
+                 long createdAtMillis, CandyLocator locator) {
+        this(requester, srcKey, renameToken, dstKey, createdAtMillis, locator, null);
+    }
+
+    record Consumer(int partition, long fencingToken, String key, CandyMetadata committed) { }
+
+    LocatorRelay claim(int partition, long fencingToken, String key) {
+        return new LocatorRelay(requester, srcKey, renameToken, dstKey, createdAtMillis, locator,
+                new Consumer(partition, fencingToken, key, null));
+    }
+
+    LocatorRelay committed(CandyMetadata metadata) {
+        return new LocatorRelay(requester, srcKey, renameToken, dstKey, createdAtMillis, locator,
+                new Consumer(consumer.partition(), consumer.fencingToken(), consumer.key(), metadata));
+    }
 
     boolean isRename() {
         return renameToken != null;
@@ -52,17 +74,55 @@ record LocatorRelay(String requester, String srcKey, String renameToken, String 
         writeNullable(w, dstKey);
         w.writeVarLong(createdAtMillis);
         w.writeBytes(locatorBytes);
+        w.writeBoolean(consumer != null);
+        if (consumer != null) {
+            w.writeVarInt(consumer.partition());
+            w.writeVarLong(consumer.fencingToken());
+            w.writeString(consumer.key());
+            w.writeBoolean(consumer.committed() != null);
+            if (consumer.committed() != null) { writeMetadata(w, consumer.committed()); }
+        }
         return w.toByteArray();
     }
 
     static LocatorRelay deserialize(byte[] data) {
         BinaryReader r = new BinaryReader(data);
         int version = r.readByte();
-        if (version != FORMAT_VERSION) {
+        if (version != 1 && version != FORMAT_VERSION) {
             throw new SerializationException("Unsupported locator relay version " + version);
         }
-        return new LocatorRelay(r.readString(), r.readString(), readNullable(r), readNullable(r),
-                r.readVarLong(), CandyLocatorSerializer.deserialize(r.readBytes()));
+        LocatorRelay relay = new LocatorRelay(r.readString(), r.readString(), readNullable(r),
+                readNullable(r), r.readVarLong(), CandyLocatorSerializer.deserialize(r.readBytes()));
+        if (version != 1 && r.readBoolean()) {
+            relay = relay.claim(r.readVarInt(), r.readVarLong(), r.readString());
+            if (r.readBoolean()) { relay = relay.committed(readMetadata(r)); }
+        }
+        return relay;
+    }
+
+    private static void writeMetadata(BinaryWriter w, CandyMetadata metadata) {
+        w.writeLong(metadata.contentLength());
+        writeNullable(w, metadata.contentType());
+        w.writeVarInt(metadata.userMetadata().size());
+        metadata.userMetadata().forEach((key, value) -> { w.writeString(key); w.writeString(value); });
+        w.writeInt(metadata.crc32c());
+        w.writeLong(metadata.hlc().physicalMillis());
+        w.writeVarInt(metadata.hlc().logicalCounter());
+        w.writeInt(metadata.hlc().nodeId());
+        w.writeLong(metadata.createdAtMillis());
+    }
+
+    private static CandyMetadata readMetadata(BinaryReader r) {
+        long length = r.readLong();
+        String type = readNullable(r);
+        int count = r.readVarInt();
+        if (count < 0 || count > r.remaining() / 2) {
+            throw new SerializationException("Invalid committed relay metadata count");
+        }
+        Map<String, String> metadata = new HashMap<>();
+        for (int i = 0; i < count; i++) { metadata.put(r.readString(), r.readString()); }
+        return new CandyMetadata(length, type, Map.copyOf(metadata), r.readInt(),
+                new Hlc(r.readLong(), r.readVarInt(), r.readInt()), r.readLong());
     }
 
     private static void writeNullable(BinaryWriter w, String s) {

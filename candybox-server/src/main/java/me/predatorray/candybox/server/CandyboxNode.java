@@ -55,6 +55,7 @@ import me.predatorray.candybox.coordination.VersionedValue;
 import me.predatorray.candybox.common.serial.BinaryReader;
 import me.predatorray.candybox.common.serial.BinaryWriter;
 import me.predatorray.candybox.lsm.engine.BoxEngine;
+import me.predatorray.candybox.lsm.engine.CandyMetadata;
 import me.predatorray.candybox.lsm.manifest.RenameIntent;
 import me.predatorray.candybox.protocol.transport.RequestHandler;
 import me.predatorray.candybox.server.PartitionAssignment.BoxPartition;
@@ -362,7 +363,7 @@ public final class CandyboxNode implements AutoCloseable {
             for (PartitionOwnership ownership : owned) { ownership.retireDeletedAllocations(); }
         }
         aclStore.delete(box.value());
-        deleteLocatorRelays(box, descriptor.partitionCount());
+        deleteLocatorRelays(box, descriptor.partitionCount(), owned.size() == descriptor.partitionCount());
         // TODO(phase-3): reference-counted GC of the Box's SSTable/Syrup/WAL/manifest ledgers.
     }
 
@@ -593,6 +594,7 @@ public final class CandyboxNode implements AutoCloseable {
      * @return the number of ledgers deleted
      */
     public int collectGarbageOnce() {
+        reconcileClaimedLocatorRelaysOnce();
         // Publish every owned partition's held-Syrup set first, so this pass's Box-global gate
         // sees up-to-date references from this node's partitions (cross-node freshness rides the other
         // owners' own publishes plus the GC grace period). A Box with a failed publish sits this pass
@@ -719,7 +721,7 @@ public final class CandyboxNode implements AutoCloseable {
     }
 
     /**
-     * Deletes the locator relays of every owned partition that no destination consumed within
+     * Deletes the unclaimed locator relays of every owned partition that no destination claimed within
      * {@code renameIntentAbandonMillis} (the client gave up between resolving the source and the
      * zero-copy put), and recounts the bytes of the ones still pending against the node's relay
      * budget. Exposed for manual/operational triggering and tests.
@@ -786,7 +788,7 @@ public final class CandyboxNode implements AutoCloseable {
                     writtenAt = value.get().modifiedAtMillis();
                     if (writtenAt < 0) { throw undecodable; }
                 }
-                if (writtenAt <= cutoff) {
+                if ((relay == null || relay.consumer() == null) && writtenAt <= cutoff) {
                     coordination.delete(key, value.get().version());
                     if (config.ledgerEnumerationGraceMillis() > 0 && relay != null) { releaseRelayPins(token, relay); }
                     deleted++;
@@ -1064,29 +1066,119 @@ public final class CandyboxNode implements AutoCloseable {
     }
 
     /**
-     * The relay under {@code token}, if {@code acceptable} and still fresh. Freshness is half the
-     * abandon window, leaving the other half for clock skew against the source owner's intent sweep.
+     * Claims a fresh, acceptable pending relay for exactly one request. The CAS serializes against
+     * expiry: once claimed, its pin cannot expire even if this process pauses before the WAL append.
+     * The captured engine and ownership token must agree; recovery fences that engine before it can
+     * clean a claim from an older ownership generation.
      */
-    Optional<LocatorRelay> readLocatorRelay(String box, int srcPartition, String token,
-                                            Predicate<LocatorRelay> acceptable) {
-        return coordination.get(CandyboxKeys.locatorRelayKey(box, srcPartition, token))
-                .map(v -> LocatorRelay.deserialize(v.value()))
-                .filter(r -> clock.currentTimeMillis() - r.createdAtMillis()
-                        <= config.renameIntentAbandonMillis() / 2)
-                .filter(acceptable);
+    Optional<LocatorRelay> claimLocatorRelay(String box, int srcPartition, String token,
+                                             String dstKey, BoxEngine engine,
+                                             Predicate<LocatorRelay> acceptable) {
+        int dstPartition = descriptor(BoxName.of(box)).partitionOf(dstKey);
+        PartitionOwnership ownership = partitions.get(new BoxPartition(box, dstPartition));
+        if (ownership == null || ownership.engine() != engine) {
+            throw new NotOwnerException(box);
+        }
+        String key = CandyboxKeys.locatorRelayKey(box, srcPartition, token);
+        var value = coordination.get(key);
+        if (value.isEmpty()) { return Optional.empty(); }
+        LocatorRelay relay = LocatorRelay.deserialize(value.get().value());
+        if (!acceptable.test(relay)) { return Optional.empty(); }
+        if (relay.consumer() != null) {
+            // A committed retry only publishes refs/markers; it must never append another locator.
+            return relay.consumer().committed() != null && relay.consumer().key().equals(dstKey)
+                    ? Optional.of(relay) : Optional.empty();
+        }
+        if (clock.currentTimeMillis() - relay.createdAtMillis()
+                > config.renameIntentAbandonMillis() / 2) {
+            return Optional.empty();
+        }
+        LocatorRelay claimed = relay.claim(dstPartition, ownership.fencingToken(), dstKey);
+        try {
+            coordination.compareAndSet(key, claimed.serialize(config.sizeLimits().maxLocatorBytes()),
+                    value.get().version());
+            return Optional.of(claimed);
+        } catch (CasConflictException expiredOrClaimed) {
+            return Optional.empty();
+        }
+    }
+
+    LocatorRelay recordCommittedLocatorRelay(String box, int srcPartition, String token,
+                                             LocatorRelay claim, CandyMetadata metadata) {
+        String key = CandyboxKeys.locatorRelayKey(box, srcPartition, token);
+        var value = coordination.get(key);
+        if (value.isEmpty() || !LocatorRelay.deserialize(value.get().value()).equals(claim)) {
+            throw new NotOwnerException("Locator relay was reconciled by a newer owner");
+        }
+        LocatorRelay committed = claim.committed(metadata);
+        coordination.compareAndSet(key, committed.serialize(config.sizeLimits().maxLocatorBytes()),
+                value.get().version());
+        return committed;
     }
 
     void deleteLocatorRelay(String box, int srcPartition, String token) {
+        deleteLocatorRelay(box, srcPartition, token, null, false);
+    }
+
+    void completeLocatorRelay(String box, int srcPartition, String token, LocatorRelay claim) {
+        deleteLocatorRelay(box, srcPartition, token, claim, false);
+    }
+
+    private void deleteLocatorRelay(String box, int srcPartition, String token,
+                                    LocatorRelay expectedClaim, boolean includeClaimed) {
         try {
             String key = CandyboxKeys.locatorRelayKey(box, srcPartition, token);
             var value = coordination.get(key);
-            CoordinationCas.deleteIfPresent(coordination, key, 0);
-            if (config.ledgerEnumerationGraceMillis() > 0 && value.isPresent()) {
-                releaseRelayPins(token, LocatorRelay.deserialize(value.get().value()));
+            if (value.isEmpty()) { return; }
+            LocatorRelay relay = LocatorRelay.deserialize(value.get().value());
+            if (!includeClaimed && (expectedClaim == null ? relay.consumer() != null
+                    : !expectedClaim.equals(relay))) { return; }
+            coordination.delete(key, value.get().version());
+            if (config.ledgerEnumerationGraceMillis() > 0) {
+                releaseRelayPins(token, relay);
             }
         } catch (CasConflictException raced) {
             // Already consumed by a concurrent retry, or reaped.
         }
+    }
+
+    /**
+     * A newer destination owner has recover-opened the prior WAL. It publishes the recovered refs
+     * before dropping any older consumer claim. An old consumer can no longer append, and an append
+     * that made it to the WAL is now protected by those refs. Failed/uncertain coordination keeps the
+     * pin for a later pass. Same-generation failures deliberately keep their claims until handover.
+     */
+    public int reconcileClaimedLocatorRelaysOnce() {
+        int reconciled = 0;
+        Set<String> boxes = new HashSet<>();
+        for (BoxPartition bp : partitions.keySet()) { boxes.add(bp.box()); }
+        for (String box : boxes) {
+            try {
+                int count = descriptor(BoxName.of(box)).partitionCount();
+                for (int src = 0; src < count; src++) {
+                    for (String token : coordination.children(CandyboxKeys.locatorRelaysPath(box, src))) {
+                        var value = coordination.get(CandyboxKeys.locatorRelayKey(box, src, token));
+                        if (value.isEmpty()) { continue; }
+                        LocatorRelay relay = LocatorRelay.deserialize(value.get().value());
+                        if (relay.consumer() == null) { continue; }
+                        PartitionOwnership destination = partitions.get(
+                                new BoxPartition(box, relay.consumer().partition()));
+                        if (destination == null || !destination.isOwner()
+                                || destination.fencingToken() <= relay.consumer().fencingToken()) {
+                            continue;
+                        }
+                        if (tryPublishPartitionRefs(destination)) {
+                            completeLocatorRelay(box, src, token, relay);
+                            reconciled++;
+                        }
+                    }
+                }
+            } catch (RuntimeException failure) {
+                LOG.warn("Claimed relay reconciliation failed for box {}: {}", box,
+                        failure.getMessage());
+            }
+        }
+        return reconciled;
     }
 
     private void releaseRelayPins(String token, LocatorRelay relay) {
@@ -1094,13 +1186,13 @@ public final class CandyboxNode implements AutoCloseable {
                 relay.locator().segments().stream().map(SegmentRef::syrupId).toList());
     }
 
-    /** Best-effort: a relay left behind expires at consume time anyway. */
-    private void deleteLocatorRelays(BoxName box, int partitionCount) {
+    /** Claims survive force deletion when a remote consumer has not yet been fenced. */
+    private void deleteLocatorRelays(BoxName box, int partitionCount, boolean includeClaimed) {
         for (int p = 0; p < partitionCount; p++) {
             try {
                 for (String token : coordination.children(
                         CandyboxKeys.locatorRelaysPath(box.value(), p))) {
-                    deleteLocatorRelay(box.value(), p, token);
+                    deleteLocatorRelay(box.value(), p, token, null, includeClaimed);
                 }
             } catch (RuntimeException e) {
                 LOG.warn("Failed to delete locator relays of box {} partition {}: {}", box, p,

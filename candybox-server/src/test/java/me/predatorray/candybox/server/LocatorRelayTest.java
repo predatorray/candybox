@@ -53,10 +53,24 @@ class LocatorRelayTest {
     }
 
     @Test
+    void claimedRelayRoundTripsAndVersionOneRemainsPending() {
+        LocatorRelay pending = new LocatorRelay("User:alice", "src", null, null, 99L, LOCATOR);
+        LocatorRelay claimed = pending.claim(3, 17, "dst");
+        assertThat(LocatorRelay.deserialize(claimed.serialize(1 << 20))).isEqualTo(claimed);
+        LocatorRelay committed = claimed.committed(me.predatorray.candybox.lsm.engine.CandyMetadata.from(LOCATOR));
+        assertThat(LocatorRelay.deserialize(committed.serialize(1 << 20))).isEqualTo(committed);
+        byte[] v2 = pending.serialize(1 << 20);
+        byte[] v1 = Arrays.copyOf(v2, v2.length - 1); // v1 has no consumer flag
+        v1[0] = 1;
+        assertThat(LocatorRelay.deserialize(v1)).isEqualTo(pending);
+        assertThat(LocatorRelay.deserialize(v1).consumer()).isNull();
+    }
+
+    @Test
     void unknownVersionAndTruncatedBytesAreRejected() {
         byte[] bytes = new LocatorRelay("User:alice", "src", null, null, 99L, LOCATOR).serialize(1 << 20);
         byte[] future = bytes.clone();
-        future[0] = 2;
+        future[0] = 3;
         assertThatThrownBy(() -> LocatorRelay.deserialize(future))
                 .isInstanceOf(SerializationException.class);
         assertThatThrownBy(() -> LocatorRelay.deserialize(Arrays.copyOf(bytes, bytes.length / 2)))
