@@ -64,6 +64,23 @@ class LedgerRetentionTest {
         assertThat(store.listLedgers()).containsExactly(live.ledgerId());
     }
 
+    @Test void corruptDeletedBoxRelayDoesNotBlockUnrelatedAllocationCleanup() {
+        retention.allocate("deleted", "deleted-generation", 0).retireDeleted();
+        String relayKey = me.predatorray.candybox.coordination.CandyboxKeys
+                .locatorRelayKey("deleted", 0, "corrupt");
+        coordination.create(relayKey, new byte[]{(byte) 0xff});
+        var old = retention.allocate("box", "generation", 0);
+        var orphan = syrup(old);
+        orphan.close();
+        retention.allocate("box", "generation", 0).inheritAndRetire(Set.of());
+        clock.advance(1_000);
+        var report = retention.reconcile(100, 100, false);
+        assertThat(report.errors()).isZero();
+        assertThat(report.deleted()).isEqualTo(1);
+        assertThat(coordination.get(relayKey)).isPresent();
+        assertThat(store.listLedgers()).doesNotContain(orphan.ledgerId());
+    }
+
     @Test void youngAndBackupPinnedAllocationsAreRetainedAndReleasedPinsAreReclaimed() {
         var old = retention.allocate("box", "generation", 0);
         var ledger = syrup(old);

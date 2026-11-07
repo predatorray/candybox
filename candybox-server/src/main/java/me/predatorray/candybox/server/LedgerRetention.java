@@ -254,7 +254,12 @@ public final class LedgerRetention {
                 String key = CandyboxKeys.locatorRelayKey(source.box(), source.partition(), token);
                 var value = coordination.get(key);
                 if (value.isEmpty()) { continue; }
-                LocatorRelay relay = LocatorRelay.deserialize(value.get().value());
+                LocatorRelay relay;
+                try { relay = LocatorRelay.deserialize(value.get().value()); }
+                catch (RuntimeException undecodable) {
+                    // Retain this relay and its pins; one Box must not block unrelated enumeration.
+                    continue;
+                }
                 var consumer = relay.consumer();
                 if (consumer == null || !consumer.incarnation().equals(source.incarnation())) { continue; }
                 List<Epoch> writers = epochs.stream().filter(e -> e.box().equals(source.box())
