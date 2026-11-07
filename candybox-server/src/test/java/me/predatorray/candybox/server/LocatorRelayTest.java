@@ -55,7 +55,7 @@ class LocatorRelayTest {
     @Test
     void claimedRelayRoundTripsAndVersionOneRemainsPending() {
         LocatorRelay pending = new LocatorRelay("User:alice", "src", null, null, 99L, LOCATOR);
-        LocatorRelay claimed = pending.claim(3, 17, "dst");
+        LocatorRelay claimed = pending.claim(3, 17, "dst", "generation");
         assertThat(LocatorRelay.deserialize(claimed.serialize(1 << 20))).isEqualTo(claimed);
         LocatorRelay committed = claimed.committed(me.predatorray.candybox.lsm.engine.CandyMetadata.from(LOCATOR));
         assertThat(LocatorRelay.deserialize(committed.serialize(1 << 20))).isEqualTo(committed);

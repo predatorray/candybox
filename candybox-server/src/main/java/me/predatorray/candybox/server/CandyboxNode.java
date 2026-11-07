@@ -301,6 +301,7 @@ public final class CandyboxNode implements AutoCloseable {
         PartitionOwnership ownership = partitions.remove(new BoxPartition(box.value(), partition));
         if (ownership != null) {
             ownership.close();
+            cleanupDeletedConsumerClaims(ownership);
         }
     }
 
@@ -509,6 +510,7 @@ public final class CandyboxNode implements AutoCloseable {
                             bp.box(), bp.partition(), nodeId);
                     dropPartition(ownership);
                     ownership.retireDeletedAllocations();
+                    cleanupDeletedConsumerClaims(ownership);
                 }
                 descriptorCache.remove(bp.box());
             }
@@ -1087,13 +1089,15 @@ public final class CandyboxNode implements AutoCloseable {
         if (relay.consumer() != null) {
             // A committed retry only publishes refs/markers; it must never append another locator.
             return relay.consumer().committed() != null && relay.consumer().key().equals(dstKey)
+                    && relay.consumer().incarnation().equals(ownership.incarnation())
                     ? Optional.of(relay) : Optional.empty();
         }
         if (clock.currentTimeMillis() - relay.createdAtMillis()
                 > config.renameIntentAbandonMillis() / 2) {
             return Optional.empty();
         }
-        LocatorRelay claimed = relay.claim(dstPartition, ownership.fencingToken(), dstKey);
+        LocatorRelay claimed = relay.claim(dstPartition, ownership.fencingToken(), dstKey,
+                ownership.incarnation());
         try {
             coordination.compareAndSet(key, claimed.serialize(config.sizeLimits().maxLocatorBytes()),
                     value.get().version());
@@ -1164,6 +1168,7 @@ public final class CandyboxNode implements AutoCloseable {
                         PartitionOwnership destination = partitions.get(
                                 new BoxPartition(box, relay.consumer().partition()));
                         if (destination == null || !destination.isOwner()
+                                || !destination.incarnation().equals(relay.consumer().incarnation())
                                 || destination.fencingToken() <= relay.consumer().fencingToken()) {
                             continue;
                         }
@@ -1179,6 +1184,32 @@ public final class CandyboxNode implements AutoCloseable {
             }
         }
         return reconciled;
+    }
+
+    /** A closed destination can release its deleted incarnation's claims without a live descriptor. */
+    private void cleanupDeletedConsumerClaims(PartitionOwnership closedOwnership) {
+        String box = closedOwnership.box().value();
+        try {
+            var descriptor = coordination.get(CandyboxKeys.boxMetaKey(box));
+            if (descriptor.isPresent() && BoxDescriptor.decode(descriptor.get().value()).incarnation()
+                    .equals(closedOwnership.incarnation())) { return; }
+            for (String source : coordination.children(CandyboxKeys.BOXES_ROOT + "/" + box + "/partitions")) {
+                int partition = Integer.parseInt(source);
+                for (String token : coordination.children(CandyboxKeys.locatorRelaysPath(box, partition))) {
+                    var value = coordination.get(CandyboxKeys.locatorRelayKey(box, partition, token));
+                    if (value.isEmpty()) { continue; }
+                    LocatorRelay relay = LocatorRelay.deserialize(value.get().value());
+                    var consumer = relay.consumer();
+                    if (consumer != null && consumer.partition() == closedOwnership.partition()
+                            && consumer.incarnation().equals(closedOwnership.incarnation())
+                            && consumer.fencingToken() <= closedOwnership.fencingToken()) {
+                        completeLocatorRelay(box, partition, token, relay);
+                    }
+                }
+            }
+        } catch (RuntimeException failure) {
+            LOG.warn("Deleted consumer claim cleanup failed for box {}: {}", box, failure.getMessage());
+        }
     }
 
     private void releaseRelayPins(String token, LocatorRelay relay) {
@@ -1246,6 +1277,7 @@ public final class CandyboxNode implements AutoCloseable {
         }
         for (PartitionOwnership ownership : partitions.values()) {
             ownership.close();
+            cleanupDeletedConsumerClaims(ownership);
         }
         partitions.clear();
         coordination.unregisterMember(nodeId);

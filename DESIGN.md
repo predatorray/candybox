@@ -471,8 +471,9 @@ The detailed rules:
   changed in between, and claims only Syrups orphaned a grace period before that read (publishes
   compute the set after reading its version). A relay is re-checked against its source after it is
   written. Before appending a destination locator, the consumer **CAS-claims the relay** with its
-  destination key, partition and ownership fencing token. Expiry and claim contend on the same relay
-  version: expiry winning rejects the consumer; a claim winning makes the relay's pin non-expiring.
+  destination key, partition, Box incarnation and ownership fencing token. Expiry and claim contend
+  on the same relay version: expiry winning rejects the consumer; a claim winning makes the relay's
+  pin non-expiring.
   There is exactly one WAL-writing consumer. The order across coordination and BookKeeper is:
   **pending relay → CAS claim → destination WAL append → record committed result → publish destination
   refs → delete claimed relay**. This is not a transaction between ZooKeeper and the WAL: the durable
@@ -488,6 +489,10 @@ The detailed rules:
   retained claims count against the existing relay byte/count limits. Failed publication can be
   retried using the same committed relay, including after its original freshness window. A crash
   after publication but before relay deletion only retains an extra pin until retry or recovery.
+  A recreated Box cannot reconcile another incarnation's claim. Deleted-incarnation claims are
+  removed after the destination engine closes, or after the allocation registry fences/retires the
+  matching destination writer epoch; this cleanup does not require a live Box descriptor. Missing
+  fencing evidence retains the claim. Cleanup of an old incarnation never releases a new one's pin.
   Sibling partitions' published-set freshness still rides their maintenance and the GC grace period.
   An undecodable relay makes its Box skip Syrup GC until it is removed (#103).
 

@@ -48,16 +48,18 @@ record LocatorRelay(String requester, String srcKey, String renameToken, String 
         this(requester, srcKey, renameToken, dstKey, createdAtMillis, locator, null);
     }
 
-    record Consumer(int partition, long fencingToken, String key, CandyMetadata committed) { }
+    record Consumer(int partition, long fencingToken, String key, String incarnation,
+                    CandyMetadata committed) { }
 
-    LocatorRelay claim(int partition, long fencingToken, String key) {
+    LocatorRelay claim(int partition, long fencingToken, String key, String incarnation) {
         return new LocatorRelay(requester, srcKey, renameToken, dstKey, createdAtMillis, locator,
-                new Consumer(partition, fencingToken, key, null));
+                new Consumer(partition, fencingToken, key, incarnation, null));
     }
 
     LocatorRelay committed(CandyMetadata metadata) {
         return new LocatorRelay(requester, srcKey, renameToken, dstKey, createdAtMillis, locator,
-                new Consumer(consumer.partition(), consumer.fencingToken(), consumer.key(), metadata));
+                new Consumer(consumer.partition(), consumer.fencingToken(), consumer.key(),
+                        consumer.incarnation(), metadata));
     }
 
     boolean isRename() {
@@ -79,6 +81,7 @@ record LocatorRelay(String requester, String srcKey, String renameToken, String 
             w.writeVarInt(consumer.partition());
             w.writeVarLong(consumer.fencingToken());
             w.writeString(consumer.key());
+            w.writeString(consumer.incarnation());
             w.writeBoolean(consumer.committed() != null);
             if (consumer.committed() != null) { writeMetadata(w, consumer.committed()); }
         }
@@ -94,7 +97,7 @@ record LocatorRelay(String requester, String srcKey, String renameToken, String 
         LocatorRelay relay = new LocatorRelay(r.readString(), r.readString(), readNullable(r),
                 readNullable(r), r.readVarLong(), CandyLocatorSerializer.deserialize(r.readBytes()));
         if (version != 1 && r.readBoolean()) {
-            relay = relay.claim(r.readVarInt(), r.readVarLong(), r.readString());
+            relay = relay.claim(r.readVarInt(), r.readVarLong(), r.readString(), r.readString());
             if (r.readBoolean()) { relay = relay.committed(readMetadata(r)); }
         }
         return relay;

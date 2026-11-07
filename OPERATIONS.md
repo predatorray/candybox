@@ -77,7 +77,9 @@ destination handover. Releasing/reopening that partition fences and recovers its
 GC maintenance pass publishes recovered refs before reclaiming old claims. A committed relay whose
 refs/rename marker publication failed can instead finish via the same relay without another write.
 Do not delete claimed relay keys manually: a paused consumer may still append. A force-deleted Box
-with live remote owners conservatively retains claimed relays when those owners could still write.
+with live remote owners retains claimed relays until their destination engines close or the
+allocation registry fences/retires the matching destination writer epochs. Recreated Box names do
+not release an old incarnation's claims. Missing fencing evidence leaves a claim held.
 
 Relay format v2 requires a stopped-cluster upgrade from earlier releases. Stop every older server
 before starting upgraded servers; mixed-version rolling operation cannot enforce claim retention.

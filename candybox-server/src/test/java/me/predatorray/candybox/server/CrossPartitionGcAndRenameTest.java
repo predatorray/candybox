@@ -42,6 +42,7 @@ import me.predatorray.candybox.common.Partitioning;
 import me.predatorray.candybox.common.auth.ObjectAcl;
 import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.exception.CandyNotFoundException;
+import me.predatorray.candybox.common.exception.FencedException;
 import me.predatorray.candybox.common.exception.NotOwnerException;
 import me.predatorray.candybox.common.serial.BinaryWriter;
 import me.predatorray.candybox.coordination.CandyboxKeys;
@@ -305,6 +306,95 @@ class CrossPartitionGcAndRenameTest {
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             throw new AssertionError(interrupted);
+        }
+    }
+
+    @Test
+    void deletedBoxClaimsAreCleanedAfterTheirRemoteWriterEpochIsFenced() {
+        assertDeletedClaimCleanup(false);
+    }
+
+    @Test
+    void recreatedBoxCannotReleaseOldClaimsBeforeTheOldWriterIsFenced() {
+        assertDeletedClaimCleanup(true);
+    }
+
+    private static void assertDeletedClaimCleanup(boolean recreate) {
+        ManualClock clock = new ManualClock(1_000_000);
+        InMemoryLedgerStore store = new InMemoryLedgerStore(clock);
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        CandyboxConfig config = CandyboxConfig.builder().leaseRenewIntervalMillis(0)
+                .ledgerEnumerationGraceMillis(100).build();
+        try (CandyboxNode source = new CandyboxNode(1, config, store, coordination, clock);
+             CandyboxNode destination = new CandyboxNode(2, config, store, coordination, clock)) {
+            source.createBox(BOX, PARTITIONS);
+            source.releasePartition(BOX, 1);
+            destination.openPartition(BOX, 1);
+            String src = keyIn(0, "src");
+            String dst = keyIn(1, "dst");
+            long syrup = putAndFlush(source, src);
+            CandyLocator locator = source.enginePartition(BOX, 0).resolveLocator(CandyKey.of(src));
+            BoxEngine staleDestination = destination.enginePartition(BOX, 1);
+            String token = relayToken(source.requestHandler(), src);
+            String relayKey = CandyboxKeys.locatorRelayKey(BOX.value(), 0, token);
+            // A client error after claiming leaves the same durable state as a crash before append.
+            assertThat(send(destination.requestHandler(), new Message.ZeroCopyPutRequest(
+                    BOX.value(), dst, 0, token, null, List.of("invalid-grant"), null)))
+                    .isInstanceOf(Message.ErrorResponse.class);
+            source.deleteBox(BOX, true);
+            assertThat(coordination.get(relayKey)).isPresent(); // remote writer is not fenced yet
+            clock.advance(11_000);
+            String newRelayKey = null;
+            if (recreate) {
+                source.createBox(BOX, PARTITIONS);
+                putAndFlush(source, src);
+                String newToken = relayToken(source.requestHandler(), src);
+                newRelayKey = CandyboxKeys.locatorRelayKey(BOX.value(), 0, newToken);
+                assertThat(source.claimLocatorRelay(BOX.value(), 0, newToken, dst,
+                        source.enginePartition(BOX, 1), relay -> true)).isPresent();
+                source.reconcileClaimedLocatorRelaysOnce();
+                assertThat(coordination.get(relayKey)).isPresent();
+            }
+            LedgerRetention retention = new LedgerRetention(store, coordination, clock);
+            for (int i = 0; i < 3; i++) { retention.reconcile(100, 1024, false); }
+            assertThat(coordination.get(relayKey)).isEmpty();
+            assertThat(store.listLedgers()).doesNotContain(syrup);
+            assertThatThrownBy(() -> staleDestination.zeroCopyPut(CandyKey.of(dst), locator.parts(),
+                    null, Map.of(), 0L, ObjectAcl.NONE, null)).isInstanceOf(FencedException.class);
+            if (newRelayKey != null) {
+                assertThat(coordination.get(newRelayKey)).isPresent();
+                assertThat(source.enginePartition(BOX, 0).getCandy(CandyKey.of(src)))
+                        .isEqualTo(bytes("payload"));
+            }
+        } finally {
+            store.close();
+        }
+    }
+
+    @Test
+    void remoteDestinationCloseCleansItsDeletedBoxClaimWithoutEnumeration() {
+        ManualClock clock = new ManualClock(1_000_000);
+        InMemoryLedgerStore store = new InMemoryLedgerStore(clock);
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        CandyboxConfig config = CandyboxConfig.builder().leaseRenewIntervalMillis(0).build();
+        try (CandyboxNode source = new CandyboxNode(1, config, store, coordination, clock);
+             CandyboxNode destination = new CandyboxNode(2, config, store, coordination, clock)) {
+            source.createBox(BOX, PARTITIONS);
+            source.releasePartition(BOX, 1);
+            destination.openPartition(BOX, 1);
+            String src = keyIn(0, "src");
+            putAndFlush(source, src);
+            String token = relayToken(source.requestHandler(), src);
+            String relayKey = CandyboxKeys.locatorRelayKey(BOX.value(), 0, token);
+            assertThat(send(destination.requestHandler(), new Message.ZeroCopyPutRequest(
+                    BOX.value(), keyIn(1, "dst"), 0, token, null, List.of("invalid-grant"), null)))
+                    .isInstanceOf(Message.ErrorResponse.class);
+            source.deleteBox(BOX, true);
+            assertThat(coordination.get(relayKey)).isPresent();
+            destination.releaseBox(BOX);
+            assertThat(coordination.get(relayKey)).isEmpty();
+        } finally {
+            store.close();
         }
     }
 
