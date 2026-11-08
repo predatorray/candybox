@@ -240,8 +240,12 @@ public final class CandyboxNode implements AutoCloseable {
      * balancer spreads them across the cluster afterwards.
      */
     public void createBox(BoxName box, int partitionCount) {
+        createBox(box, partitionCount, false);
+    }
+
+    public void createBox(BoxName box, int partitionCount, boolean namespaceManaged) {
         int count = partitionCount > 0 ? partitionCount : config.partitionsPerBoxDefault();
-        BoxDescriptor descriptor = new BoxDescriptor(count);
+        BoxDescriptor descriptor = new BoxDescriptor(count, java.util.UUID.randomUUID().toString(), namespaceManaged);
         try {
             coordination.create(CandyboxKeys.boxMetaKey(box.value()), descriptor.encode());
         } catch (CasConflictException exists) {

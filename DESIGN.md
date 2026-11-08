@@ -613,3 +613,9 @@ normal Syrup orphan claiming. Normal pending-delete GC also passes the retention
 Enumeration requires a retired allocating epoch, a recognized matching identity, sufficient age,
 and no active retention pins. Legacy or incomplete evidence is held. Claims and the enumeration
 cursor survive coordinator handover, and failed physical deletes are retried.
+
+## Managed namespace lifecycle
+
+See [the namespace lifecycle contract](docs/design/namespace-lifecycle.md) for
+owner-admission timestamps, atomic renewal/retirement, native examples, resource
+overhead, bounded cleanup, error/retry semantics and upgrade/rollback limits.

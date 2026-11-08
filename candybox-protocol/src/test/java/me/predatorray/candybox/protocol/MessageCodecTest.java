@@ -29,6 +29,21 @@ class MessageCodecTest {
         return codec.decode(codec.encode(message));
     }
 
+    @Test void namespaceActionsAndLifecycleRoundTrip() {
+        for (var operation : me.predatorray.candybox.common.namespace.NamespaceOperation.values()) {
+            var request = new Message.NamespaceRequest("shared", "地址", operation,
+                    "", new byte[]{42}, 100, 2, 128, "i/abc/", 7);
+            var decoded = (Message.NamespaceRequest) roundTrip(request);
+            assertThat(decoded).usingRecursiveComparison().isEqualTo(request);
+        }
+        var response = new Message.NamespaceResponse("OK",
+                new me.predatorray.candybox.common.namespace.NamespaceState(2, 100, 100, 200, false),
+                new byte[]{42}, List.of("", "你好"), null);
+        assertThat(roundTrip(response)).usingRecursiveComparison().isEqualTo(response);
+        assertThat(roundTrip(new Message.CreateNamespaceBoxRequest("shared", 8)))
+                .isEqualTo(new Message.CreateNamespaceBoxRequest("shared", 8));
+    }
+
     @Test
     void putCandyRequestRoundTrips() {
         Message.PutCandyRequest req = new Message.PutCandyRequest("my-box", "k/1", "text/plain",

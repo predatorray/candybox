@@ -398,3 +398,9 @@ rotates early at 1024 outstanding registrations. Failed seal/coordination cleanu
 Run the balancer or compaction maintenance worker for automatic rotation; with both intervals zero,
 maintenance is manual and operators must drive `runBalancerOnce()`. Hitting the outstanding-writer
 bound applies backpressure until rotation rather than exceeding ZooKeeper's znode limit.
+
+## Managed namespace lifecycle
+
+See [the namespace lifecycle contract](docs/design/namespace-lifecycle.md) for
+owner-admission timestamps, atomic renewal/retirement, native examples, resource
+overhead, bounded cleanup, error/retry semantics and upgrade/rollback limits.

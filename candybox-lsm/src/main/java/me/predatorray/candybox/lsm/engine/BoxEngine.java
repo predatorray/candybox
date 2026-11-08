@@ -15,6 +15,10 @@
  */
 package me.predatorray.candybox.lsm.engine;
 
+import me.predatorray.candybox.common.namespace.NamespaceKeys;
+import me.predatorray.candybox.common.namespace.NamespaceState;
+import me.predatorray.candybox.common.namespace.NamespaceOperation;
+
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -300,6 +304,206 @@ public final class BoxEngine implements AutoCloseable {
     /** The id of the manifest ledger this owner writes to (used to hand off to the next owner). */
     public long manifestLedgerId() {
         return manifest.ledgerId();
+    }
+
+    // ---- managed namespaces (trusted callers must enforce managed Box isolation) -------------
+
+    private boolean namespaceUncertain;
+    private final AtomicLong namespaceRenewals = new AtomicLong();
+    private final AtomicLong namespaceRejectedClaims = new AtomicLong();
+    private final AtomicLong namespaceRetirements = new AtomicLong();
+    private final AtomicLong namespaceCleanupBatches = new AtomicLong();
+    private final AtomicLong namespaceCleanupItems = new AtomicLong();
+    private final AtomicLong namespaceFailures = new AtomicLong();
+
+    public record NamespaceResult(String outcome,
+            NamespaceState state,
+            byte[] data, List<String> keys, String cursor) {
+        public NamespaceResult(String outcome,
+                NamespaceState state) {
+            this(outcome, state, new byte[0], List.of(), null);
+        }
+    }
+
+    /** One owner-fenced operation; all data and lifecycle publication share this engine's lock. */
+    public NamespaceResult namespace(
+            NamespaceOperation operation,
+            String address, String key, byte[] data, long ttl, long expectedVersion,
+            int pageSize, String cursor, int maxReadBytes) {
+        var op = java.util.Objects.requireNonNull(operation);
+        if (pageSize < 1 || pageSize > 128) {
+            throw new ValidationException("Namespace page size must be 1..128");
+        }
+        String life = op == NamespaceOperation.ENUMERATE
+                ? null : NamespaceKeys.lifecycle(address);
+        String prefix = life == null ? "l/"
+                : NamespaceKeys.prefix(address);
+        CandyKey item = null;
+        if (op == NamespaceOperation.PUT
+                || op == NamespaceOperation.GET
+                || op == NamespaceOperation.DELETE) {
+            item = CandyKey.of(NamespaceKeys.item(address, key));
+            Validation.checkCandyKey(item, config.sizeLimits());
+        }
+        if (life != null) {
+            Validation.checkCandyKey(CandyKey.of(life), config.sizeLimits());
+        }
+        if (cursor != null && !cursor.startsWith(prefix)) {
+            throw new ValidationException("Cursor is outside namespace");
+        }
+        if (op == NamespaceOperation.CREATE
+                && (ttl < 1 || ttl > 365L * 24 * 60 * 60 * 1000)) {
+            throw new ValidationException("Namespace TTL must be 1ms..365 days");
+        }
+        if (op == NamespaceOperation.PUT) {
+            java.util.Objects.requireNonNull(data, "data");
+            Validation.checkCandySize(data.length, config.sizeLimits());
+        }
+        lock.writeLock().lock();
+        try {
+            if (namespaceUncertain) {
+                throw new IllegalStateException("Namespace outcome unknown; owner recovery required");
+            }
+            if (life == null) {
+                var page = listCandies(prefix, cursor, pageSize);
+                return new NamespaceResult("OK", null, new byte[0],
+                        page.entries().stream().map(e -> e.key().value()).toList(), page.nextStartAfter());
+            }
+            var existing = resolveLiveLocked(CandyKey.of(life));
+            var state = existing.map(l ->
+                    NamespaceState.from(l.userMetadata()))
+                    .orElse(null);
+            if (op == NamespaceOperation.CREATE) {
+                if (state != null) { return new NamespaceResult("EXISTS", state); }
+                long now = namespaceNow();
+                state = new NamespaceState(
+                        1, now, ttl, Math.addExact(now, ttl), false);
+                namespaceCommit(List.of(namespaceLifecycle(life, state)));
+                return new NamespaceResult("OK", state);
+            }
+            if (state == null) { return new NamespaceResult("MISSING", null); }
+            if (op == NamespaceOperation.CLAIM_EXPIRY) {
+                if (state.retired()) { return new NamespaceResult("RETIRED", state); }
+                if (state.version() != expectedVersion) {
+                    namespaceRejectedClaims.incrementAndGet();
+                    return new NamespaceResult("STALE", state);
+                }
+                if (namespaceNow() < state.expiresAtMillis()) { return new NamespaceResult("NOT_DUE", state); }
+                state = namespaceRetire(life, state);
+                return new NamespaceResult("RETIRED", state);
+            }
+            if (op == NamespaceOperation.CLEANUP) {
+                if (!state.retired()) { return new NamespaceResult("NOT_RETIRED", state); }
+                var result = namespaceDeletePage(prefix, null, pageSize, state);
+                namespaceCleanupBatches.incrementAndGet();
+                return result;
+            }
+            if (state.retired()) { return new NamespaceResult("EXPIRED", state); }
+            if (namespaceNow() >= state.expiresAtMillis()) {
+                state = namespaceRetire(life, state);
+                return new NamespaceResult("EXPIRED", state);
+            }
+            switch (op) {
+                case PUT -> {
+                    rejectIfStalled();
+                    SyrupWriteResult written = syrupManager.writeCandy(new ByteArrayInputStream(data));
+                    // Payload append may block past the deadline. Recheck before the commit decision.
+                    long now = namespaceNow();
+                    if (now >= state.expiresAtMillis()) {
+                        state = namespaceRetire(life, state);
+                        return new NamespaceResult("EXPIRED", state);
+                    }
+                    var renewed = new NamespaceState(
+                            Math.addExact(state.version(), 1), state.createdAtMillis(),
+                            state.idleTtlMillis(), Math.addExact(now, state.idleTtlMillis()), false);
+                    CandyLocator locator = CandyLocator.singlePart(hlc.tick(), written.contentLength(),
+                            config.sizeLimits().chunkSizeBytes(), null, Map.of(), written.crc32c(),
+                            now, written.segments(), ObjectAcl.NONE);
+                    namespaceCommit(List.of(new Mutation(item, locator), namespaceLifecycle(life, renewed)));
+                    namespaceRenewals.incrementAndGet();
+                    return new NamespaceResult("OK", renewed);
+                }
+                case GET -> {
+                    var locator = resolveLiveLocked(item);
+                    if (locator.isEmpty()) { return new NamespaceResult("ITEM_MISSING", state); }
+                    checkReadSize(locator.get().contentLength(), maxReadBytes);
+                    return new NamespaceResult("OK", state, getCandy(item), List.of(), null);
+                }
+                case DELETE -> {
+                    namespaceCommit(List.of(new Mutation(item,
+                            CandyLocator.tombstone(hlc.tick(), namespaceNow()))));
+                    return new NamespaceResult("OK", state);
+                }
+                case LIST -> {
+                    var page = listCandies(prefix, cursor, pageSize);
+                    return new NamespaceResult("OK", state, new byte[0],
+                            page.entries().stream().map(e ->
+                                    NamespaceKeys.decode(
+                                            e.key().value().substring(prefix.length()))).toList(),
+                            page.nextStartAfter());
+                }
+                case CLEAR -> { return namespaceDeletePage(prefix, cursor, pageSize, state); }
+                case HEAD -> { return new NamespaceResult("OK", state); }
+                default -> throw new ValidationException("Unsupported namespace action");
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    private long namespaceNow() {
+        return Math.max(0, Math.max(clock.currentTimeMillis(), hlc.peek().physicalMillis()));
+    }
+
+    private Mutation namespaceLifecycle(String key,
+            NamespaceState state) {
+        return new Mutation(CandyKey.of(key), new CandyLocator(hlc.tick(), LocatorType.PUT,
+                null, state.metadata(), namespaceNow(), List.of(), ObjectAcl.NONE));
+    }
+
+    private NamespaceState namespaceRetire(String life,
+            NamespaceState state) {
+        var retired = new NamespaceState(state.version(),
+                state.createdAtMillis(), state.idleTtlMillis(), state.expiresAtMillis(), true);
+        namespaceCommit(List.of(namespaceLifecycle(life, retired)));
+        namespaceRetirements.incrementAndGet();
+        return retired;
+    }
+
+    private NamespaceResult namespaceDeletePage(String prefix, String cursor, int pageSize,
+            NamespaceState state) {
+        int batchLimit = Math.max(1, (int) ((me.predatorray.candybox.lsm.wal.WalEntrySerializer.MAX_BATCH_BYTES - 1024L)
+                / ((long) config.sizeLimits().maxCandyKeyBytes() + 128)));
+        var page = listCandies(prefix, cursor, Math.min(pageSize, batchLimit));
+        List<Mutation> deletes = new ArrayList<>();
+        for (var entry : page.entries()) {
+            deletes.add(new Mutation(entry.key(), CandyLocator.tombstone(hlc.tick(), namespaceNow())));
+        }
+        if (!deletes.isEmpty()) {
+            namespaceCommit(deletes);
+            if (state.retired()) { namespaceCleanupItems.addAndGet(deletes.size()); }
+        }
+        return new NamespaceResult("OK", state, new byte[0], List.of(), page.nextStartAfter());
+    }
+
+    private void namespaceCommit(List<Mutation> mutations) {
+        rejectIfStalled();
+        // Serialize before append: deterministic bounds errors must not poison service.
+        for (Mutation mutation : mutations) {
+            me.predatorray.candybox.common.serial.CandyLocatorSerializer.serialize(
+                    mutation.locator(), config.sizeLimits().maxLocatorBytes());
+        }
+        var batch = WalEntry.batch(mutations);
+        me.predatorray.candybox.lsm.wal.WalEntrySerializer.serialize(batch);
+        try {
+            wal.append(batch);
+            for (Mutation mutation : mutations) { active.put(mutation); }
+            maybeFlushLocked();
+        } catch (RuntimeException | Error failure) {
+            namespaceUncertain = true;
+            namespaceFailures.incrementAndGet();
+            throw failure;
+        }
     }
 
     // ---- writes ----------------------------------------------------------------------------
@@ -1527,7 +1731,9 @@ public final class BoxEngine implements AutoCloseable {
     /** A snapshot of this engine's cumulative operational counters. */
     public BoxEngineStats stats() {
         return new BoxEngineStats(putCount.get(), deleteCount.get(), getCount.get(), headCount.get(),
-                listCount.get(), flushCount.get(), compactionCount.get(), stallRejectionCount.get());
+                listCount.get(), flushCount.get(), compactionCount.get(), stallRejectionCount.get(),
+                namespaceRenewals.get(), namespaceRejectedClaims.get(), namespaceRetirements.get(),
+                namespaceCleanupBatches.get(), namespaceCleanupItems.get(), namespaceFailures.get());
     }
 
     @Override

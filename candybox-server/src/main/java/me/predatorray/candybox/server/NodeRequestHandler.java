@@ -15,6 +15,9 @@
  */
 package me.predatorray.candybox.server;
 
+import me.predatorray.candybox.common.namespace.NamespaceKeys;
+import me.predatorray.candybox.common.namespace.NamespaceOperation;
+
 import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.List;
@@ -232,7 +235,7 @@ final class NodeRequestHandler implements RequestHandler {
 
     private static Access requiredAccess(Message message) {
         // Cluster-level requests first; everything Box-scoped derives from boxOf().
-        if (message instanceof Message.CreateBoxRequest) {
+        if (message instanceof Message.CreateBoxRequest || message instanceof Message.CreateNamespaceBoxRequest) {
             return new Access(Operation.WRITE, Resource.CLUSTER);
         }
         if (message instanceof Message.ListBoxesRequest) {
@@ -260,6 +263,14 @@ final class NodeRequestHandler implements RequestHandler {
             return new Access(Operation.READ, Resource.box(m.box()));
         }
         String box = boxOf(message);
+        if (message instanceof Message.NamespaceRequest m) {
+            Operation permission = switch (m.operation()) {
+                case GET, HEAD, LIST -> Operation.READ;
+                case CLAIM_EXPIRY, CLEANUP, ENUMERATE -> Operation.ADMIN;
+                default -> Operation.WRITE;
+            };
+            return new Access(permission, Resource.box(m.box()));
+        }
         if (box == null) {
             return null; // SASL frames are consumed by the authentication gate before this handler
         }
@@ -293,7 +304,9 @@ final class NodeRequestHandler implements RequestHandler {
 
     /** The target Box of a Box- or partition-routed request, or {@code null} for cluster-wide ones. */
     private static String boxOf(Message message) {
-        if (message instanceof Message.PutCandyRequest m) {
+        if (message instanceof Message.NamespaceRequest m) {
+            return m.box();
+        } else if (message instanceof Message.PutCandyRequest m) {
             return m.box();
         } else if (message instanceof Message.GetCandyRequest m) {
             return m.box();
@@ -364,7 +377,10 @@ final class NodeRequestHandler implements RequestHandler {
     }
 
     private static Integer explicitPartitionOf(Message message) {
-        if (message instanceof Message.ListCandiesRequest m) {
+        if (message instanceof Message.NamespaceRequest m
+                && m.operation() == NamespaceOperation.ENUMERATE) {
+            return m.partition();
+        } else if (message instanceof Message.ListCandiesRequest m) {
             return m.partition();
         } else if (message instanceof Message.DeleteRangeRequest m) {
             return m.partition();
@@ -376,7 +392,10 @@ final class NodeRequestHandler implements RequestHandler {
 
     /** The key whose hash partition a keyed request routes by, or {@code null}. */
     private static String routingKeyOf(Message message) {
-        if (message instanceof Message.PutCandyRequest m) {
+        if (message instanceof Message.NamespaceRequest m) {
+            return m.address() == null ? null
+                    : NamespaceKeys.lifecycle(m.address());
+        } else if (message instanceof Message.PutCandyRequest m) {
             return m.key();
         } else if (message instanceof Message.GetCandyRequest m) {
             return m.key();
@@ -419,6 +438,45 @@ final class NodeRequestHandler implements RequestHandler {
     }
 
     private Message dispatch(Message message, Principal principal) {
+        if (message instanceof Message.CreateNamespaceBoxRequest m) {
+            node.createBox(BoxName.of(m.box()), m.partitionCount(), true);
+            if (!principal.isAnonymous()) {
+                node.aclStore().seed(m.box(), BoxAcl.privateTo(principal));
+            }
+            return new Message.OkResponse();
+        }
+        String target = boxOf(message);
+        if (target != null && node.descriptor(BoxName.of(target)).namespaceManaged()) {
+            if (message instanceof Message.NamespaceRequest m) {
+                BoxEngine engine = m.operation() == NamespaceOperation.ENUMERATE
+                        ? node.enginePartition(BoxName.of(target), m.partition())
+                        : node.engine(BoxName.of(target), routingKeyOf(message));
+                if (m.data().length > maxInlineDataBytes()) {
+                    throw new ValidationException("Namespace payload exceeds inline frame budget");
+                }
+                if (m.pageSize() < 1 || m.pageSize() > 128) {
+                    throw new ValidationException("Namespace page size must be 1..128");
+                }
+                int pageSize = m.pageSize();
+                if (m.operation() == NamespaceOperation.LIST || m.operation() == NamespaceOperation.ENUMERATE) {
+                    long rowBudget = (long) node.config().sizeLimits().maxCandyKeyBytes() + 16;
+                    long rows = maxInlineDataBytes() / rowBudget;
+                    if (rows < 1) { throw new ValidationException("Namespace page cannot fit frame budget"); }
+                    pageSize = (int) Math.min(pageSize, rows);
+                }
+                var result = engine.namespace(m.operation(), m.address(), m.key(), m.data(),
+                        m.idleTtlMillis(), m.expectedVersion(), pageSize, m.cursor(), maxInlineDataBytes());
+                return new Message.NamespaceResponse(result.outcome(), result.state(), result.data(),
+                        result.keys(), result.cursor());
+            }
+            if (!(message instanceof Message.GetBoxAclRequest)
+                    && !(message instanceof Message.SetBoxAclRequest)) {
+                throw new ValidationException("Managed Box requires namespace operations");
+            }
+        } else if (message instanceof Message.NamespaceRequest) {
+            throw new ValidationException("Namespace operation requires a managed Box");
+        }
+
         if (message instanceof Message.CreateBoxRequest m) {
             node.createBox(BoxName.of(m.box()), m.partitionCount());
             // The creator owns the Box (private by default). An anonymous create (auth disabled)

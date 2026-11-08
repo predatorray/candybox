@@ -15,6 +15,9 @@
  */
 package me.predatorray.candybox.client;
 
+import me.predatorray.candybox.common.namespace.NamespaceKeys;
+import me.predatorray.candybox.common.namespace.NamespaceOperation;
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -96,6 +99,70 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
     // ---- Box admin -------------------------------------------------------------------------
 
     /** Creates a Box with the server's default partition count. */
+    /** Creates a shared Box whose data is accessible only through namespace operations. */
+    public void createNamespaceBox(String box, int partitionCount) {
+        expectOk(router.callAny(new Message.CreateNamespaceBoxRequest(BoxName.of(box).value(), partitionCount)));
+    }
+
+    /** Backend/transport errors propagate; an interrupted PUT may have committed and renewed. */
+    public Message.NamespaceResponse namespace(String box, String address,
+            NamespaceOperation operation,
+            String key, byte[] data, long ttl, long expectedVersion, int pageSize,
+            String cursor, int partition) {
+        var request = new Message.NamespaceRequest(BoxName.of(box).value(), address, operation,
+                key, data == null ? new byte[0] : data, ttl, expectedVersion, pageSize, cursor, partition);
+        Message response = operation == NamespaceOperation.ENUMERATE
+                ? callPartition(box, partition, request)
+                : callKey(box, NamespaceKeys.lifecycle(address), request);
+        if (response instanceof Message.NamespaceResponse result) { return result; }
+        throw mapResponse(response);
+    }
+
+    public Message.NamespaceResponse createNamespace(String box, String address, long idleTtlMillis) {
+        return namespace(box, address, NamespaceOperation.CREATE,
+                null, null, idleTtlMillis, 0, 128, null, 0);
+    }
+
+    public Message.NamespaceResponse putNamespaceItem(String box, String address, String key, byte[] data) {
+        return namespace(box, address, NamespaceOperation.PUT,
+                key, data, 0, 0, 128, null, 0);
+    }
+
+    public Message.NamespaceResponse getNamespaceItem(String box, String address, String key) {
+        return namespace(box, address, NamespaceOperation.GET,
+                key, null, 0, 0, 128, null, 0);
+    }
+
+    public Message.NamespaceResponse claimNamespaceExpiry(String box, String address, long version) {
+        return namespace(box, address, NamespaceOperation.CLAIM_EXPIRY,
+                null, null, 0, version, 128, null, 0);
+    }
+
+    public Message.NamespaceResponse cleanupNamespace(String box, String address, int pageSize) {
+        return namespace(box, address, NamespaceOperation.CLEANUP,
+                null, null, 0, 0, pageSize, null, 0);
+    }
+
+    public Message.NamespaceResponse headNamespace(String box, String address) {
+        return namespace(box, address, NamespaceOperation.HEAD, null, null, 0, 0, 128, null, 0);
+    }
+
+    public Message.NamespaceResponse listNamespaceItems(String box, String address, int pageSize, String cursor) {
+        return namespace(box, address, NamespaceOperation.LIST, null, null, 0, 0, pageSize, cursor, 0);
+    }
+
+    public Message.NamespaceResponse deleteNamespaceItem(String box, String address, String key) {
+        return namespace(box, address, NamespaceOperation.DELETE, key, null, 0, 0, 128, null, 0);
+    }
+
+    public Message.NamespaceResponse clearNamespace(String box, String address, int pageSize, String cursor) {
+        return namespace(box, address, NamespaceOperation.CLEAR, null, null, 0, 0, pageSize, cursor, 0);
+    }
+
+    public Message.NamespaceResponse enumerateNamespaces(String box, int partition, int pageSize, String cursor) {
+        return namespace(box, null, NamespaceOperation.ENUMERATE, null, null, 0, 0, pageSize, cursor, partition);
+    }
+
     public void createBox(String box) {
         createBox(box, 0);
     }

@@ -29,5 +29,12 @@ package me.predatorray.candybox.lsm.engine;
  * @param stallRejections writes rejected with {@code BUSY} under write-stall backpressure
  */
 public record BoxEngineStats(long puts, long deletes, long gets, long heads, long lists, long flushes,
-                             long compactions, long stallRejections) {
+                             long compactions, long stallRejections, long namespaceRenewals,
+                             long namespaceRejectedClaims, long namespaceRetirements,
+                             long namespaceCleanupBatches, long namespaceCleanupItems,
+                             long namespaceFailures) {
+    public BoxEngineStats(long puts, long deletes, long gets, long heads, long lists, long flushes,
+                          long compactions, long stallRejections) {
+        this(puts, deletes, gets, heads, lists, flushes, compactions, stallRejections, 0, 0, 0, 0, 0, 0);
+    }
 }
