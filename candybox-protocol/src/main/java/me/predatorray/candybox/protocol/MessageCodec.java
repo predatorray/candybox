@@ -15,6 +15,9 @@
  */
 package me.predatorray.candybox.protocol;
 
+import me.predatorray.candybox.common.namespace.NamespaceState;
+import me.predatorray.candybox.common.namespace.NamespaceOperation;
+
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -31,10 +34,45 @@ public final class MessageCodec {
 
     private static final byte BODY_VERSION = 1;
 
+    private static NamespaceOperation namespaceOperation(int code) {
+        var values = NamespaceOperation.values();
+        if (code < 0 || code >= values.length) { throw new ProtocolException("Unknown namespace action"); }
+        return values[code];
+    }
+
+    private static Message.NamespaceResponse decodeNamespaceResponse(BinaryReader r) {
+        String outcome = r.readString();
+        var state = r.readBoolean() ? new NamespaceState(
+                r.readLong(), r.readLong(), r.readLong(), r.readLong(), r.readBoolean()) : null;
+        return new Message.NamespaceResponse(outcome, state, r.readBytes(), readStrings(r), readNullable(r));
+    }
+
     public Frame encode(Message message) {
         BinaryWriter w = new BinaryWriter(64);
         w.writeByte(BODY_VERSION);
-        if (message instanceof Message.CreateBoxRequest m) {
+        if (message instanceof Message.CreateNamespaceBoxRequest m) {
+            w.writeString(m.box()).writeVarInt(m.partitionCount());
+        } else if (message instanceof Message.NamespaceRequest m) {
+            w.writeString(m.box());
+            writeNullable(w, m.address());
+            w.writeByte(m.operation().ordinal());
+            writeNullable(w, m.key());
+            w.writeBytes(m.data() == null ? new byte[0] : m.data());
+            w.writeLong(m.idleTtlMillis()).writeLong(m.expectedVersion()).writeVarInt(m.pageSize());
+            writeNullable(w, m.cursor());
+            w.writeVarInt(m.partition());
+        } else if (message instanceof Message.NamespaceResponse m) {
+            w.writeString(m.outcome()).writeBoolean(m.state() != null);
+            if (m.state() != null) {
+                var state = m.state();
+                w.writeLong(state.version()).writeLong(state.createdAtMillis())
+                        .writeLong(state.idleTtlMillis()).writeLong(state.expiresAtMillis())
+                        .writeBoolean(state.retired());
+            }
+            w.writeBytes(m.data());
+            writeStrings(w, m.keys());
+            writeNullable(w, m.cursor());
+        } else if (message instanceof Message.CreateBoxRequest m) {
             w.writeString(m.box());
             w.writeVarInt(m.partitionCount());
         } else if (message instanceof Message.BoxInfoRequest m) {
@@ -286,6 +324,11 @@ public final class MessageCodec {
             throw new ProtocolException("Unsupported message body version: " + version);
         }
         return switch (frame.opcode()) {
+            case CREATE_NAMESPACE_BOX -> new Message.CreateNamespaceBoxRequest(r.readString(), r.readVarInt());
+            case NAMESPACE -> new Message.NamespaceRequest(r.readString(), readNullable(r),
+                    namespaceOperation(r.readByte()), readNullable(r), r.readBytes(),
+                    r.readLong(), r.readLong(), r.readVarInt(), readNullable(r), r.readVarInt());
+            case RESPONSE_NAMESPACE -> decodeNamespaceResponse(r);
             case CREATE_BOX -> new Message.CreateBoxRequest(r.readString(), r.readVarInt());
             case BOX_INFO -> new Message.BoxInfoRequest(r.readString());
             case DELETE_BOX -> new Message.DeleteBoxRequest(r.readString(), r.readBoolean());

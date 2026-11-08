@@ -15,6 +15,9 @@
  */
 package me.predatorray.candybox.protocol;
 
+import me.predatorray.candybox.common.namespace.NamespaceState;
+import me.predatorray.candybox.common.namespace.NamespaceOperation;
+
 import java.util.List;
 import java.util.Map;
 import me.predatorray.candybox.common.Hlc;
@@ -42,6 +45,24 @@ public sealed interface Message {
 
     /** The opcode that identifies this message on the wire. */
     Opcode opcode();
+
+    record CreateNamespaceBoxRequest(String box, int partitionCount) implements Message {
+        public Opcode opcode() { return Opcode.CREATE_NAMESPACE_BOX; }
+    }
+
+    /** Address-routed operation. ENUMERATE uses explicit partition, others ignore it. */
+    record NamespaceRequest(String box, String address,
+            NamespaceOperation operation,
+            String key, byte[] data, long idleTtlMillis, long expectedVersion,
+            int pageSize, String cursor, int partition) implements Message {
+        public Opcode opcode() { return Opcode.NAMESPACE; }
+    }
+
+    record NamespaceResponse(String outcome,
+            NamespaceState state,
+            byte[] data, List<String> keys, String cursor) implements Message {
+        public Opcode opcode() { return Opcode.RESPONSE_NAMESPACE; }
+    }
 
     // ---- Box admin requests ----------------------------------------------------------------
 

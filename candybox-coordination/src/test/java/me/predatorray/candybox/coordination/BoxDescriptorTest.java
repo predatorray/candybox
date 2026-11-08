@@ -23,6 +23,13 @@ import org.junit.jupiter.api.Test;
 
 class BoxDescriptorTest {
 
+    @Test void managedDescriptorHasDistinctVersionAndOrdinaryEncodingIsPreserved() {
+        var managed = new BoxDescriptor(8, "managed", true);
+        assertThat(managed.encode()[0]).isEqualTo((byte)3);
+        assertThat(BoxDescriptor.decode(managed.encode())).isEqualTo(managed);
+        assertThat(new BoxDescriptor(8).encode()[0]).isEqualTo((byte)2);
+    }
+
     @Test
     void encodeDecodeRoundTrips() {
         for (int count : new int[] {1, 8, 1024}) {

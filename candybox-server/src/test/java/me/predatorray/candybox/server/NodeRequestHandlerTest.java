@@ -75,6 +75,35 @@ class NodeRequestHandlerTest {
     }
 
     @Test
+    void managedBoxesRejectAllLegacyDataPathsAndNamespaceActionsUseBoxPermissions() {
+        try (var store = new InMemoryLedgerStore();
+             var node = new CandyboxNode(1, config(), store,
+                     new InMemoryCoordinationService(), new ManualClock(1000))) {
+            var handler = node.requestHandler();
+            assertThat(roundTrip(handler, new Message.CreateNamespaceBoxRequest("managed", 8)))
+                    .isInstanceOf(Message.OkResponse.class);
+            for (Message request : List.of(
+                    new Message.PutCandyRequest("managed", "l/61", null, Map.of(), null, new byte[0]),
+                    new Message.GetCandyRequest("managed", "l/61"),
+                    new Message.DeleteCandyRequest("managed", "l/61"),
+                    new Message.CreateMultipartUploadRequest("managed", "l/61", null, Map.of()),
+                    new Message.CopyCandyRequest("managed", "l/61", "x", null),
+                    new Message.RenameCandyRequest("managed", "l/61", "x", null))) {
+                assertThat(roundTrip(handler, request)).isInstanceOf(Message.ErrorResponse.class);
+            }
+            var create = new Message.NamespaceRequest("managed", "a",
+                    me.predatorray.candybox.common.namespace.NamespaceOperation.CREATE,
+                    null, new byte[0], 100, 0, 2, null, 0);
+            assertThat(roundTrip(handler, create)).isInstanceOf(Message.NamespaceResponse.class);
+            node.authorizer(new StandardAuthorizer(List.of("Admin:ops"), b -> node.aclStore().get(b)));
+            var context = new ConnectionContext(); context.authenticated(Principal.user("outsider"));
+            node.aclStore().seed("managed", me.predatorray.candybox.common.auth.BoxAcl.privateTo(Principal.user("owner")));
+            assertThat(CODEC.decode(handler.handle(context, CODEC.encode(create))))
+                    .isInstanceOf(Message.AccessDeniedResponse.class);
+        }
+    }
+
+    @Test
     void missingSyrupDetailsAreHiddenFromAnAuthenticatedBoxOwner() {
         InMemoryLedgerStore store = new InMemoryLedgerStore();
         try (CandyboxNode node = new CandyboxNode(1, config(), store,
