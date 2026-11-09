@@ -122,6 +122,10 @@ public final class BoxEngine implements AutoCloseable {
     private final Set<Long> unflushedSyrups = new LinkedHashSet<>();
 
     // Destination commit decisions survive independently of mutable user keys. Guarded by lock.
+    // Reserve most of BookKeeper's default 5 MiB entry for the remaining checkpoint metadata.
+    // Admission happens before the destination WAL append, so ACK cleanup can always rotate it.
+    private static final int MAX_RENAME_RECEIPT_BYTES = 1 << 20;
+    private static final int MAX_RENAME_RECEIPTS = 1024;
     private final Map<String, RenameReceipt> renameReceipts = new LinkedHashMap<>();
 
     // Lightweight operational counters (snapshotted via stats()).
@@ -1069,9 +1073,15 @@ public final class BoxEngine implements AutoCloseable {
     /** Commit the destination PUT and its recovery receipt in one ledger entry. */
     public CandyMetadata zeroCopyRename(CandyKey dst, CandyLocator source, String token,
             String incarnation, String relayToken, int srcPartition, String srcKey) {
+        return zeroCopyRename(dst, source, token, incarnation, relayToken, srcPartition, srcKey, () -> { });
+    }
+
+    /** Revalidate the transfer under the engine lock before a new commit; retries of a receipt reuse it. */
+    public CandyMetadata zeroCopyRename(CandyKey dst, CandyLocator source, String token,
+            String incarnation, String relayToken, int srcPartition, String srcKey, Runnable beforeCommit) {
         return zeroCopyPut(dst, source.parts(), source.contentType(), source.userMetadata(), 0,
                 source.acl(), null, result -> new RenameReceipt(token, incarnation, relayToken,
-                        srcPartition, srcKey, source.hlc(), dst.value(), result), token);
+                        srcPartition, srcKey, source.hlc(), dst.value(), result), token, beforeCommit);
     }
 
     /**
@@ -1086,13 +1096,13 @@ public final class BoxEngine implements AutoCloseable {
                                      Map<String, String> userMetadata, long createdAtMillis,
                                      ObjectAcl acl, String idempotencyToken) {
         return zeroCopyPut(dst, parts, contentType, userMetadata, createdAtMillis, acl,
-                idempotencyToken, null, null);
+                idempotencyToken, null, null, () -> { });
     }
 
     private CandyMetadata zeroCopyPut(CandyKey dst, List<Part> parts, String contentType,
             Map<String, String> userMetadata, long createdAtMillis, ObjectAcl acl,
             String idempotencyToken, java.util.function.Function<CandyLocator, RenameReceipt> receiptFactory,
-            String renameToken) {
+            String renameToken, Runnable beforeCommit) {
         Validation.checkCandyKey(dst, config.sizeLimits());
         Map<String, String> metadata = userMetadata == null ? Map.of() : Map.copyOf(userMetadata);
         CandyMetadata cached = idempotentResult(idempotencyToken);
@@ -1103,7 +1113,7 @@ public final class BoxEngine implements AutoCloseable {
         try {
             RenameReceipt prior = renameReceipts.get(renameToken);
             if (prior != null) {
-                if (!prior.equals(receiptFactory.apply(prior.result()))) {
+                if (!prior.sameTransfer(receiptFactory.apply(prior.result()))) {
                     throw new ValidationException("Rename token belongs to a different transfer");
                 }
                 return CandyMetadata.from(prior.result());
@@ -1113,14 +1123,22 @@ public final class BoxEngine implements AutoCloseable {
                 return replay;
             }
             rejectIfStalled();
+            beforeCommit.run();
             Hlc stamp = hlc.tick();
             CandyLocator dstLocator = new CandyLocator(stamp, LocatorType.PUT, contentType, metadata,
                     createdAtMillis > 0 ? createdAtMillis : clock.currentTimeMillis(),
                     List.copyOf(parts), acl == null ? ObjectAcl.NONE : acl);
             Mutation mutation = new Mutation(dst, dstLocator);
+            RenameReceipt receipt = receiptFactory == null ? null : receiptFactory.apply(dstLocator);
+            if (receipt != null) {
+                long bytes = receipt.serialize().length + 5L;
+                for (RenameReceipt retained : renameReceipts.values()) { bytes += retained.serialize().length + 5L; }
+                if (renameReceipts.size() >= MAX_RENAME_RECEIPTS || bytes > MAX_RENAME_RECEIPT_BYTES) {
+                    throw new BusyException("Unacknowledged rename receipt budget exhausted");
+                }
+            }
             ledgerStore.retainLedgers(dstLocator.segments().stream()
                     .map(SegmentRef::syrupId).toList());
-            RenameReceipt receipt = receiptFactory == null ? null : receiptFactory.apply(dstLocator);
             wal.append(receipt == null ? WalEntry.of(mutation) : new WalEntry.RenamePut(mutation, receipt));
             if (receipt != null) { renameReceipts.put(receipt.token(), receipt); }
             active.put(mutation);

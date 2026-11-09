@@ -25,6 +25,13 @@ import me.predatorray.candybox.common.exception.SerializationException;
 /** Durable destination decision, committed in the same WAL entry as its PUT. */
 public record RenameReceipt(String token, String incarnation, String relayToken, int srcPartition,
                             String srcKey, Hlc srcHlc, String dstKey, CandyLocator result) {
+    /** Relay attempts may change; the durable logical transfer identity must not. */
+    public boolean sameTransfer(RenameReceipt other) {
+        return token.equals(other.token) && incarnation.equals(other.incarnation)
+                && srcPartition == other.srcPartition && srcKey.equals(other.srcKey)
+                && srcHlc.equals(other.srcHlc) && dstKey.equals(other.dstKey);
+    }
+
     public byte[] serialize() {
         BinaryWriter w = new BinaryWriter(128);
         w.writeByte(1);

@@ -22,13 +22,20 @@ import me.predatorray.candybox.common.exception.SerializationException;
 
 /** Commit publication followed by the source's durable-delete acknowledgement. */
 record RenameMarker(String incarnation, String srcKey, int srcPartition, Hlc srcHlc,
-                    String dstKey, boolean completed) {
+                    String dstKey, boolean completed, boolean committed) {
+    RenameMarker(String incarnation, String srcKey, int srcPartition, Hlc srcHlc,
+                 String dstKey, boolean completed) {
+        this(incarnation, srcKey, srcPartition, srcHlc, dstKey, completed, true);
+    }
+    RenameMarker commit() {
+        return new RenameMarker(incarnation, srcKey, srcPartition, srcHlc, dstKey, completed, true);
+    }
     byte[] serialize() {
         BinaryWriter w = new BinaryWriter(128);
-        w.writeByte(0); w.writeByte(1); w.writeString(incarnation); w.writeString(srcKey);
+        w.writeByte(0); w.writeByte(2); w.writeString(incarnation); w.writeString(srcKey);
         w.writeVarInt(srcPartition); w.writeVarLong(srcHlc.physicalMillis());
         w.writeVarInt(srcHlc.logicalCounter()); w.writeInt(srcHlc.nodeId());
-        w.writeString(dstKey); w.writeBoolean(completed);
+        w.writeString(dstKey); w.writeBoolean(completed); w.writeBoolean(committed);
         return w.toByteArray();
     }
     static RenameMarker deserialize(byte[] bytes) {
@@ -43,9 +50,10 @@ record RenameMarker(String incarnation, String srcKey, int srcPartition, Hlc src
             if (r.hasRemaining()) { throw new SerializationException("Trailing legacy rename marker bytes"); }
             return new RenameMarker("", source, partition, hlc, destination, false);
         }
-        if (r.readByte() != 1) { throw new SerializationException("Unsupported rename marker"); }
+        int version = r.readByte();
+        if (version != 1 && version != 2) { throw new SerializationException("Unsupported rename marker"); }
         var marker = new RenameMarker(r.readString(), r.readString(), r.readVarInt(),
-                new Hlc(r.readVarLong(), r.readVarInt(), r.readInt()), r.readString(), r.readBoolean());
+                new Hlc(r.readVarLong(), r.readVarInt(), r.readInt()), r.readString(), r.readBoolean(), version == 1 || r.readBoolean());
         if (r.hasRemaining()) { throw new SerializationException("Trailing rename marker bytes"); }
         return marker;
     }

@@ -581,6 +581,8 @@ final class NodeRequestHandler implements RequestHandler {
             var prepared = relayLocator(engine, m.box(), m.srcKey(), principal, m.renameToken(),
                     m.dstKey(), locator);
             try {
+                node.prepareRenameMarker(m.box(), m.renameToken(), m.srcKey(),
+                        node.descriptor(BoxName.of(m.box())).partitionOf(m.srcKey()), locator.hlc(), m.dstKey());
                 engine.recordRenameIntent(new RenameIntent(m.renameToken(), m.srcKey(), locator.hlc(),
                         m.dstKey(), m.dstPartition(), node.currentTimeMillis()));
                 return prepared;
@@ -604,7 +606,8 @@ final class NodeRequestHandler implements RequestHandler {
             if (meta == null) {
                 meta = relay.isRename()
                         ? engine.zeroCopyRename(CandyKey.of(m.dstKey()), source, relay.renameToken(),
-                                relay.consumer().incarnation(), m.relayToken(), m.srcPartition(), relay.srcKey())
+                                relay.consumer().incarnation(), m.relayToken(), m.srcPartition(), relay.srcKey(),
+                                () -> node.requirePendingRename(m.box(), m.srcPartition(), m.relayToken()))
                         : engine.zeroCopyPut(CandyKey.of(m.dstKey()), source.parts(),
                                 source.contentType(), source.userMetadata(), 0L, acl, m.idempotencyToken());
                 relay = node.recordCommittedLocatorRelay(m.box(), m.srcPartition(), m.relayToken(),
@@ -614,7 +617,7 @@ final class NodeRequestHandler implements RequestHandler {
             // already sees the new cross-partition reference (no premature reclaim of the shared Syrup).
             node.publishPartitionRefs(box, node.descriptor(box).partitionOf(m.dstKey()));
             if (relay.isRename()) {
-                node.writeRenameMarker(m.box(), relay.renameToken(), relay.srcKey(),
+                node.publishRenameMarker(m.box(), relay.renameToken(), relay.srcKey(),
                         m.srcPartition(), source.hlc(), m.dstKey(), relay.consumer().incarnation());
             }
             // Only now: committed retries finish publication without ever appending another locator.

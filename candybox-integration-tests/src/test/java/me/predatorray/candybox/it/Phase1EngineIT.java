@@ -82,6 +82,37 @@ class Phase1EngineIT {
     }
 
     @Test
+    void retainedRenameReceiptsStayCheckpointableAndDrainOnRealLedgers() {
+        BoxName box = BoxName.of("receipt-budget");
+        var config = CandyboxConfig.defaults();
+        try (BoxEngine owner = BoxEngine.createNew(box, config, store, 1, SystemClock.INSTANCE, 1)) {
+            CandyKey src = CandyKey.of("src");
+            owner.putCandy(src, bytes("A"), null, Map.of(), null);
+            var small = owner.resolveLocator(src);
+            var large = new me.predatorray.candybox.common.CandyLocator(small.hlc(), small.type(),
+                    small.contentType(), small.userMetadata(), small.createdAtMillis(),
+                    java.util.Collections.nCopies(10_000, small.parts().get(0)), small.acl());
+            int accepted = 0;
+            for (; accepted < 64; accepted++) {
+                try {
+                    owner.zeroCopyRename(CandyKey.of("dst-" + accepted), large, "token-" + accepted,
+                            "epoch", "relay-" + accepted, 0, "src");
+                } catch (me.predatorray.candybox.common.exception.BusyException full) { break; }
+            }
+            assertThat(accepted).isBetween(1, 63);
+            owner.flush();
+            try (BoxEngine recovered = BoxEngine.recover(box, config, store, 2,
+                    SystemClock.INSTANCE, owner.manifestLedgerId(), 2)) {
+                assertThat(recovered.listRenameReceipts()).hasSize(accepted);
+                for (var receipt : recovered.listRenameReceipts()) { recovered.clearRenameReceipt(receipt.token()); }
+                recovered.zeroCopyRename(CandyKey.of("after"), large, "after", "epoch", "relay", 0, "src");
+                recovered.flush();
+                assertThat(recovered.getCandy(CandyKey.of("after"))).hasSize(10_000);
+            }
+        }
+    }
+
+    @Test
     void putGetDeleteListOnRealLedgers() {
         BoxName box = BoxName.of("it-box");
         try (BoxEngine engine = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1,

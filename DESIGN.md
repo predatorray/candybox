@@ -184,6 +184,10 @@ source acknowledgement; v2–v6 read with no receipts. WAL kind 4 uses version 1
 mutation and receipt in the same BookKeeper entry. A receipt carries the rename token, Box
 incarnation, relay token, source partition/key/HLC, destination key, and full resulting locator.
 Flush and recovery checkpoint receipts in the same manifest edit that rotates away their WAL.
+Destination admission caps unacknowledged receipts at 1 MiB of serialized records (including
+per-record length overhead) and 1,024 records before WAL append. Excess requests receive Busy;
+ACK cleanup frees capacity. This reserves most of the default 5 MiB backend entry for other
+checkpoint metadata; the general manifest-size bound remains a separate concern.
 These new formats require upgraded readers before use; rolling format activation is a separate
 compatibility concern (#157).
 
@@ -276,14 +280,19 @@ consults range tombstones across all tables rather than pruning by point range.
   by `syrupId` alone, no partition scoping) and because **Box-global GC** (§9) keeps a Syrup alive
   while *any* partition references it. A cross-partition `rename` is still copy-then-delete across
   two owners, but now **eventually atomic**: the source owner records a durable rename intent (§5),
-  the destination commits its PUT and completion receipt in one WAL entry, publishes its refs,
-  and writes the rendezvous marker. Recovery checkpoints receipts across flush/WAL rotation and
-  maintenance republishes missing markers without a client retry. The source owner — via
+  preparation creates a pending rendezvous decision before exposing its intent. The destination
+  commits its PUT and completion receipt in one WAL entry, publishes its refs, then CAS-advances
+  the decision to committed. Recovery checkpoints receipts across flush/WAL rotation and
+  maintenance republishes uncommitted decisions without a client retry. Publication only updates
+  an existing decision; a delayed request or stale receipt snapshot cannot recreate a cleaned
+  decision. Marker format v2 adds the prepared state; older markers decode as committed. The source owner — via
   `CompleteRename`, maintenance, or handover — validates its durable intent against the marker and
   conditionally tombstones only the captured source HLC. It durably acknowledges that deletion in
   the marker before clearing the intent. A later source re-PUT survives. Destination maintenance
   then removes the receipt (first rotating away its WAL record), relay/pin, and marker, in that
   order; interrupted cleanup resumes even when the receipt or relay has already disappeared.
+  Retries compare the stable token/incarnation/source HLC/destination identity, not the random
+  relay attempt; cleanup releases every relay attempt for the acknowledged rename.
   Source timeout alone cannot abort a claimed transfer. Only CAS removal of an unclaimed relay,
   or a newer destination owner fencing/recovering the old WAL and finding no receipt, proves
   abort; otherwise the intent and pin remain pending. A reader may temporarily see both keys.

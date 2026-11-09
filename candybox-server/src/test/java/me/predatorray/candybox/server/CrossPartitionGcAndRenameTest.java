@@ -918,7 +918,7 @@ class CrossPartitionGcAndRenameTest {
                     new Message.PrepareRenameRequest(BOX.value(), src, dst, 1, "marker-failure"));
             coordination.failWritesTo = CandyboxKeys.renameMarkerKey(BOX.value(), "marker-failure");
             assertThat(send(node.requestHandler(), new Message.ZeroCopyPutRequest(BOX.value(), dst, 0,
-                    prepared.relayToken(), null, List.of(), null))).isInstanceOf(Message.ErrorResponse.class);
+                    prepared.relayToken(), null, List.of(), null))).isInstanceOf(Message.BusyResponse.class);
             if (rewriteSource) {
                 node.enginePartition(BOX, 0).putCandy(CandyKey.of(src), bytes("new"), null, Map.of(), null);
             }
@@ -970,6 +970,84 @@ class CrossPartitionGcAndRenameTest {
             recovered.collectGarbageOnce();
             assertThat(recovered.enginePartition(BOX, 1).getCandy(CandyKey.of(dst))).isEqualTo(bytes("original"));
         }
+    }
+
+    @Test
+    void freshPreparationAfterLostDestinationReplyReusesCommitAndCleansEveryRelay() {
+        ManualClock clock = new ManualClock(1_000_000);
+        var store = new InMemoryLedgerStore(clock);
+        var coordination = new InMemoryCoordinationService(clock);
+        var config = CandyboxConfig.builder().leaseRenewIntervalMillis(0).build();
+        try (CandyboxNode node = new CandyboxNode(1, config, store, coordination, clock)) {
+            node.createBox(BOX, PARTITIONS);
+            String src = keyIn(0, "src"); String dst = keyIn(1, "dst");
+            node.enginePartition(BOX, 0).putCandy(CandyKey.of(src), bytes("payload"), null, Map.of(), null);
+            for (int attempt = 0; attempt < 2; attempt++) {
+                var prepared = (Message.CandyLocatorResponse) send(node.requestHandler(),
+                        new Message.PrepareRenameRequest(BOX.value(), src, dst, 1, "retry"));
+                assertThat(send(node.requestHandler(), new Message.ZeroCopyPutRequest(BOX.value(), dst, 0,
+                        prepared.relayToken(), null, List.of(), "retry"))).isInstanceOf(Message.HeadCandyResponse.class);
+            }
+            assertThat(node.enginePartition(BOX, 1).listRenameReceipts()).hasSize(1);
+            node.finalizeRenameIntentsOnce();
+            node.reconcileClaimedLocatorRelaysOnce();
+            assertThat(coordination.children(CandyboxKeys.locatorRelaysPath(BOX.value(), 0))).isEmpty();
+            assertThat(node.renameMarkerPresent(BOX.value(), "retry")).isFalse();
+            assertThat(node.enginePartition(BOX, 1).getCandy(CandyKey.of(dst))).isEqualTo(bytes("payload"));
+        }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"request-read", "request-cas", "handover", "snapshot"})
+    void delayedPublicationCannotRecreateTerminalMarker(String mode) throws Exception {
+        ManualClock clock = new ManualClock(1_000_000);
+        var store = new InMemoryLedgerStore(clock);
+        var coordination = new FaultyCoordination(new InMemoryCoordinationService(clock));
+        var config = CandyboxConfig.builder().leaseRenewIntervalMillis(0)
+                .ownershipLeaseTtlMillis(3_600_000).build();
+        var entered = new CountDownLatch(1); var resume = new CountDownLatch(1);
+        var paused = new java.util.concurrent.atomic.AtomicReference<Thread>();
+        var once = new java.util.concurrent.atomic.AtomicBoolean();
+        var executor = Executors.newSingleThreadExecutor();
+        try (CandyboxNode node = new CandyboxNode(1, config, store, coordination, clock);
+             CandyboxNode successor = new CandyboxNode(2, config, store, coordination, clock)) {
+            node.createBox(BOX, PARTITIONS);
+            String src = keyIn(0, "src"); String dst = keyIn(1, "dst");
+            node.enginePartition(BOX, 0).putCandy(CandyKey.of(src), bytes("payload"), null, Map.of(), null);
+            var prepared = (Message.CandyLocatorResponse) send(node.requestHandler(),
+                    new Message.PrepareRenameRequest(BOX.value(), src, dst, 1, "paused"));
+            if (mode.equals("snapshot")) {
+                assertThat(send(node.requestHandler(), new Message.ZeroCopyPutRequest(BOX.value(), dst, 0,
+                        prepared.relayToken(), null, List.of(), null))).isInstanceOf(Message.HeadCandyResponse.class);
+            }
+            Consumer<String> pause = key -> {
+                if (Thread.currentThread() == paused.get()
+                        && key.equals(CandyboxKeys.renameMarkerKey(BOX.value(), "paused"))
+                        && once.compareAndSet(false, true)) { entered.countDown(); await(resume); }
+            };
+            if (mode.equals("request-cas")) { coordination.beforeCompareAndSet = pause; }
+            else { coordination.beforeGet = pause; }
+            var pending = executor.submit(() -> {
+                paused.set(Thread.currentThread());
+                if (mode.equals("snapshot")) { node.reconcileRenameReceiptsOnce(); return null; }
+                return send(node.requestHandler(), new Message.ZeroCopyPutRequest(BOX.value(), dst, 0,
+                        prepared.relayToken(), null, List.of(), null));
+            });
+            assertThat(entered.await(10, TimeUnit.SECONDS)).isTrue();
+            CandyboxNode destination = node;
+            if (mode.equals("handover")) {
+                node.releasePartition(BOX, 1); successor.openPartition(BOX, 1); destination = successor;
+            }
+            destination.reconcileRenameReceiptsOnce();
+            node.finalizeRenameIntentsOnce();
+            destination.reconcileClaimedLocatorRelaysOnce();
+            assertThat(destination.enginePartition(BOX, 1).listRenameReceipts()).isEmpty();
+            assertThat(node.renameMarkerPresent(BOX.value(), "paused")).isFalse();
+            resume.countDown(); pending.get(10, TimeUnit.SECONDS);
+            assertThat(node.renameMarkerPresent(BOX.value(), "paused")).isFalse();
+            assertThat(coordination.children(CandyboxKeys.locatorRelaysPath(BOX.value(), 0))).isEmpty();
+            assertThat(destination.enginePartition(BOX, 1).getCandy(CandyKey.of(dst))).isEqualTo(bytes("payload"));
+        } finally { resume.countDown(); executor.shutdownNow(); }
     }
 
     @Test
