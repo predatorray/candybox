@@ -63,6 +63,9 @@
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <maven.compiler.release>17</maven.compiler.release>
+        <!-- Keep test stdout/stderr in Surefire/Failsafe reports instead of flooding the console.
+             Override with -Dmaven.test.redirectTestOutputToFile=false for live diagnostics. -->
+        <maven.test.redirectTestOutputToFile>true</maven.test.redirectTestOutputToFile>
 
         <!-- dependency versions -->
         <bookkeeper.version>4.17.1</bookkeeper.version>

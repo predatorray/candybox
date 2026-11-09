@@ -37,6 +37,16 @@ jobs:
       - name: Run unit tests
         run: mvn -B -ntp test
 
+      - name: Upload test reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports
+          path: |
+            **/target/surefire-reports/**
+            **/target/failsafe-reports/**
+          retention-days: 7
+
   # Integration tests: *IT.java on embedded BookKeeper + in-JVM ZooKeeper.
   integration-tests:
     name: Integration tests (mvn verify)
@@ -59,6 +69,16 @@ jobs:
 
       - name: Run integration tests
         run: mvn -B -ntp verify
+
+      - name: Upload test reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-reports
+          path: |
+            **/target/surefire-reports/**
+            **/target/failsafe-reports/**
+          retention-days: 7
 
       # mvn verify runs the full reactor (unit + IT phases), so the aggregate report already
       # merges unit (jacoco.exec) and IT (jacoco-it.exec) coverage across every module.
