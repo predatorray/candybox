@@ -59,6 +59,30 @@ public abstract class CoordinationServiceContract {
     }
 
     @Test
+    void publicationRequiresLiveCurrentEpochAndExpectedPointerVersion() {
+        Lease first = service.tryAcquireLease("boxes/leased/owner", 1, 100).orElseThrow();
+        assertThat(service.compareAndSetWithLease("boxes/leased/manifest", b("one"), -1,
+                first.resource(), first.fencingToken())).isZero();
+        assertThatThrownBy(() -> service.compareAndSetWithLease("boxes/leased/manifest", b("bad"), -1,
+                first.resource(), first.fencingToken())).isInstanceOf(CasConflictException.class);
+        assertThat(service.compareAndSetWithLease("boxes/leased/manifest", b("two"), 0,
+                first.resource(), first.fencingToken())).isEqualTo(1);
+        clock.advance(101);
+        assertThatThrownBy(() -> service.compareAndSetWithLease("boxes/leased/manifest", b("expired"), 1,
+                first.resource(), first.fencingToken())).isInstanceOf(LeaseExpiredException.class);
+        Lease second = service.tryAcquireLease(first.resource(), 2, 100).orElseThrow();
+        assertThatThrownBy(() -> service.compareAndSetWithLease("boxes/leased/manifest", b("stale"), 1,
+                first.resource(), first.fencingToken())).isInstanceOf(LeaseExpiredException.class);
+        assertThat(service.get("boxes/leased/manifest").orElseThrow().value()).isEqualTo(b("two"));
+        assertThat(service.compareAndSetWithLease("boxes/leased/manifest", b("winner"), 1,
+                second.resource(), second.fencingToken())).isEqualTo(2);
+        second.release();
+        assertThatThrownBy(() -> service.compareAndSetWithLease("boxes/leased/manifest", b("released"), 2,
+                second.resource(), second.fencingToken())).isInstanceOf(LeaseExpiredException.class);
+        assertThat(service.get("boxes/leased/manifest").orElseThrow().value()).isEqualTo(b("winner"));
+    }
+
+    @Test
     void connectedUntilClosed() {
         assertThat(service.isConnected()).isTrue();
         service.close();

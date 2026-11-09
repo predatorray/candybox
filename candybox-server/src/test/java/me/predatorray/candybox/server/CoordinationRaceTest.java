@@ -24,6 +24,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import me.predatorray.candybox.bookkeeper.LedgerStore;
+import me.predatorray.candybox.bookkeeper.LedgerConfig;
+import me.predatorray.candybox.bookkeeper.ReadableLedger;
+import me.predatorray.candybox.bookkeeper.WritableLedger;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import me.predatorray.candybox.bookkeeper.fake.InMemoryLedgerStore;
@@ -181,6 +188,214 @@ class CoordinationRaceTest {
         try (PartitionOwnership second = recover(2)) {
             assertThat(second.engine().getCandy(KEY)).isEqualTo("v1".getBytes(StandardCharsets.UTF_8));
         }
+    }
+
+    @Test
+    void nodeHeartbeatIncludesBlockedRecovery() throws Exception {
+        createWriteAndRelease();
+        PausingStore paused = new PausingStore(store);
+        var executor = Executors.newSingleThreadExecutor();
+        try (CandyboxNode node = new CandyboxNode(2, config, paused, coordination, clock)) {
+            var future = executor.submit(() -> node.openPartition(BOX, 0));
+            assertThat(paused.entered.await(10, TimeUnit.SECONDS)).isTrue();
+            for (int i = 0; i < 3; i++) {
+                clock.advance(config.ownershipLeaseTtlMillis() * 2 / 3);
+                node.renewLeases();
+                assertThat(backing.tryAcquireLease(OWNER_RESOURCE, 3,
+                        config.ownershipLeaseTtlMillis())).isEmpty();
+            }
+            paused.resume.countDown();
+            future.get(10, TimeUnit.SECONDS);
+            assertThat(node.enginePartition(BOX, 0).getCandy(KEY)).isEqualTo("v1".getBytes(StandardCharsets.UTF_8));
+        } finally {
+            paused.resume.countDown();
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void nodeShutdownCancelsBlockedRecovery() throws Exception {
+        createWriteAndRelease();
+        PausingStore paused = new PausingStore(store);
+        var executor = Executors.newSingleThreadExecutor();
+        var closer = Executors.newSingleThreadExecutor();
+        CandyboxNode node = new CandyboxNode(2, config, paused, coordination, clock);
+        byte[] before = backing.get(MANIFEST_KEY).orElseThrow().value();
+        try {
+            var future = executor.submit(() -> node.openPartition(BOX, 0));
+            assertThat(paused.entered.await(10, TimeUnit.SECONDS)).isTrue();
+            CountDownLatch released = new CountDownLatch(1);
+            coordination.afterRelease = released::countDown;
+            var closed = closer.submit(node::close);
+            assertThat(released.await(10, TimeUnit.SECONDS)).isTrue();
+            paused.resume.countDown();
+            assertThatThrownBy(() -> future.get(10, TimeUnit.SECONDS))
+                    .hasCauseInstanceOf(me.predatorray.candybox.coordination.LeaseExpiredException.class);
+            closed.get(10, TimeUnit.SECONDS);
+            assertThat(backing.get(MANIFEST_KEY).orElseThrow().value()).isEqualTo(before);
+            assertThat(backing.leaseHolder(OWNER_RESOURCE)).isEmpty();
+        } finally {
+            paused.resume.countDown();
+            node.close();
+            executor.shutdownNow();
+            closer.shutdownNow();
+        }
+    }
+
+    @Test
+    void pausedRecoveryRenewsBeyondOriginalTtlAndTransfersWithoutRegistrationGap() throws Exception {
+        createWriteAndRelease();
+        OwnershipLeases leases = new OwnershipLeases();
+        PausingStore paused = new PausingStore(store);
+        var executor = Executors.newSingleThreadExecutor();
+        try {
+            var future = executor.submit(() -> PartitionOwnership.recover(BOX, 0, config, paused,
+                    coordination, 2, clock, leases));
+            assertThat(paused.entered.await(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(leases.size()).isEqualTo(1);
+            for (int i = 0; i < 3; i++) {
+                clock.advance(config.ownershipLeaseTtlMillis() * 2 / 3);
+                leases.renew();
+                assertThat(backing.tryAcquireLease(OWNER_RESOURCE, 3,
+                        config.ownershipLeaseTtlMillis())).isEmpty();
+            }
+            paused.resume.countDown();
+            try (PartitionOwnership recovered = future.get(10, TimeUnit.SECONDS)) {
+                assertThat(leases.size()).isEqualTo(1);
+                assertThat(recovered.engine().getCandy(KEY)).isEqualTo("v1".getBytes(StandardCharsets.UTF_8));
+            }
+            assertThat(leases.size()).isZero();
+        } finally {
+            paused.resume.countDown();
+            leases.close();
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void ambiguousRenewalFailurePermanentlyCancelsEvenWhileRemoteLeaseRemainsValid() throws Exception {
+        byte[] before = createWriteAndRelease().value();
+        coordination.failRenewals = true;
+        OwnershipLeases leases = new OwnershipLeases();
+        PausingStore paused = new PausingStore(store);
+        var executor = Executors.newSingleThreadExecutor();
+        try {
+            var future = executor.submit(() -> PartitionOwnership.recover(BOX, 0, config, paused,
+                    coordination, 2, clock, leases));
+            assertThat(paused.entered.await(10, TimeUnit.SECONDS)).isTrue();
+            leases.renew();
+            assertThat(leases.size()).isZero();
+            assertThat(backing.leaseHolder(OWNER_RESOURCE)).isPresent();
+            coordination.failRenewals = false;
+            leases.renew();
+            paused.resume.countDown();
+            assertThatThrownBy(() -> future.get(10, TimeUnit.SECONDS))
+                    .hasCauseInstanceOf(me.predatorray.candybox.coordination.LeaseExpiredException.class);
+            assertThat(backing.get(MANIFEST_KEY).orElseThrow().value()).isEqualTo(before);
+            assertThat(backing.leaseHolder(OWNER_RESOURCE)).isEmpty();
+        } finally {
+            paused.resume.countDown();
+            leases.close();
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void renewalFailureWhilePausedCannotOverwriteSuccessorOrServe() throws Exception {
+        VersionedValue before = createWriteAndRelease();
+        OwnershipLeases leases = new OwnershipLeases();
+        PausingStore paused = new PausingStore(store);
+        var executor = Executors.newSingleThreadExecutor();
+        try {
+            var future = executor.submit(() -> PartitionOwnership.recover(BOX, 0, config, paused,
+                    coordination, 2, clock, leases));
+            assertThat(paused.entered.await(10, TimeUnit.SECONDS)).isTrue();
+            clock.advance(config.ownershipLeaseTtlMillis() + 1);
+            leases.renew();
+            assertThat(leases.size()).isZero();
+            try (PartitionOwnership winner = recover(3)) {
+                byte[] committed = backing.get(MANIFEST_KEY).orElseThrow().value();
+                assertThat(committed).isNotEqualTo(before.value());
+                paused.resume.countDown();
+                assertThatThrownBy(() -> future.get(10, TimeUnit.SECONDS))
+                        .hasCauseInstanceOf(me.predatorray.candybox.coordination.LeaseExpiredException.class);
+                assertThat(backing.get(MANIFEST_KEY).orElseThrow().value()).isEqualTo(committed);
+                assertThat(winner.engine().getCandy(KEY)).isEqualTo("v1".getBytes(StandardCharsets.UTF_8));
+            }
+        } finally {
+            paused.resume.countDown();
+            leases.close();
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void shutdownCancelsPausedRecoveryAndRepeatedRetriesReleaseRegistrations() throws Exception {
+        createWriteAndRelease();
+        for (int attempt = 0; attempt < 3; attempt++) {
+            OwnershipLeases leases = new OwnershipLeases();
+            PausingStore paused = new PausingStore(store);
+            var executor = Executors.newSingleThreadExecutor();
+            byte[] before = backing.get(MANIFEST_KEY).orElseThrow().value();
+            try {
+                var future = executor.submit(() -> PartitionOwnership.recover(BOX, 0, config, paused,
+                        coordination, 2, clock, leases));
+                assertThat(paused.entered.await(10, TimeUnit.SECONDS)).isTrue();
+                leases.close();
+                assertThat(leases.size()).isZero();
+                paused.resume.countDown();
+                assertThatThrownBy(() -> future.get(10, TimeUnit.SECONDS))
+                        .hasCauseInstanceOf(me.predatorray.candybox.coordination.LeaseExpiredException.class);
+                assertThat(backing.get(MANIFEST_KEY).orElseThrow().value()).isEqualTo(before);
+                assertThat(backing.leaseHolder(OWNER_RESOURCE)).isEmpty();
+            } finally {
+                paused.resume.countDown();
+                leases.close();
+                executor.shutdownNow();
+            }
+        }
+        try (PartitionOwnership recovered = recover(3)) {
+            assertThat(recovered.engine().getCandy(KEY)).isEqualTo("v1".getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    void unknownCommittedPublicationKeepsEveryLedgerAndCanBeRecovered() {
+        createWriteAndRelease();
+        coordination.failAfterCompareAndSetWith = new CoordinationException("committed but response lost");
+        var before = store.listLedgers();
+        assertThatThrownBy(() -> recover(2)).isInstanceOf(CoordinationException.class);
+        assertThat(store.listLedgers()).containsAll(before);
+        long published = ManifestPointer.decode(backing.get(MANIFEST_KEY).orElseThrow().value()).ledgerId();
+        assertThat(store.listLedgers()).contains(published);
+        try (PartitionOwnership recovered = recover(3)) {
+            assertThat(recovered.engine().getCandy(KEY)).isEqualTo("v1".getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    private static final class PausingStore implements LedgerStore {
+        private final LedgerStore delegate;
+        final CountDownLatch entered = new CountDownLatch(1);
+        final CountDownLatch resume = new CountDownLatch(1);
+        private final AtomicInteger opens = new AtomicInteger();
+        PausingStore(LedgerStore delegate) { this.delegate = delegate; }
+        public WritableLedger createLedger(LedgerConfig config) { return delegate.createLedger(config); }
+        public ReadableLedger openLedger(long id) { return delegate.openLedger(id); }
+        public ReadableLedger recoverOpen(long id) {
+            if (opens.getAndIncrement() == 0) {
+                entered.countDown();
+                try {
+                    if (!resume.await(10, TimeUnit.SECONDS)) { throw new IllegalStateException("resume timed out"); }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(interrupted);
+                }
+            }
+            return delegate.recoverOpen(id);
+        }
+        public void deleteLedger(long id) { delegate.deleteLedger(id); }
+        public List<Long> listLedgers() { return delegate.listLedgers(); }
+        public void close() { }
     }
 
     private static byte[] pointerLike(VersionedValue pointer, long token) {
@@ -356,6 +571,9 @@ class CoordinationRaceTest {
         volatile Consumer<String> beforeCreate = key -> { };
         volatile Consumer<String> beforeDelete = key -> { };
         volatile RuntimeException failCompareAndSetWith;
+        volatile RuntimeException failAfterCompareAndSetWith;
+        volatile boolean failRenewals;
+        volatile Runnable afterRelease = () -> { };
 
         RacingCoordination(CoordinationService delegate) {
             this.delegate = delegate;
@@ -370,6 +588,25 @@ class CoordinationRaceTest {
         public long create(String key, byte[] value) {
             beforeCreate.accept(key);
             return delegate.create(key, value);
+        }
+
+        @Override
+        public long compareAndSetWithLease(String key, byte[] value, long expectedVersion,
+                                          String resource, long token) {
+            RuntimeException failure = failCompareAndSetWith;
+            if (failure != null) {
+                failCompareAndSetWith = null;
+                throw failure;
+            }
+            if (expectedVersion < 0) { beforeCreate.accept(key); }
+            else { beforeCompareAndSet.accept(key, expectedVersion); }
+            long version = delegate.compareAndSetWithLease(key, value, expectedVersion, resource, token);
+            if (failAfterCompareAndSetWith != null) {
+                RuntimeException failureAfter = failAfterCompareAndSetWith;
+                failAfterCompareAndSetWith = null;
+                throw failureAfter;
+            }
+            return version;
         }
 
         @Override
@@ -396,7 +633,17 @@ class CoordinationRaceTest {
 
         @Override
         public Optional<Lease> tryAcquireLease(String resource, int nodeId, long ttlMillis) {
-            return delegate.tryAcquireLease(resource, nodeId, ttlMillis);
+            return delegate.tryAcquireLease(resource, nodeId, ttlMillis).map(lease -> new Lease() {
+                public String resource() { return lease.resource(); }
+                public int ownerNodeId() { return lease.ownerNodeId(); }
+                public long fencingToken() { return lease.fencingToken(); }
+                public boolean isValid() { return lease.isValid(); }
+                public void renew() {
+                    if (failRenewals) { throw new CoordinationException("renewal response lost"); }
+                    lease.renew();
+                }
+                public void release() { lease.release(); afterRelease.run(); }
+            });
         }
 
         @Override

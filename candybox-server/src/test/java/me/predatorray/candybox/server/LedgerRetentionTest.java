@@ -178,7 +178,7 @@ class LedgerRetentionTest {
                     (proxy, method, args) -> {
                         try {
                             Object result = method.invoke(coordination, args);
-                            if (method.getName().equals("compareAndSet")
+                            if (method.getName().equals("compareAndSetWithLease")
                                     && ((String) args[0]).contains("/incarnations/")
                                     && armed.getAndSet(false)) {
                                 throw new me.predatorray.candybox.coordination.CoordinationException("lost response");

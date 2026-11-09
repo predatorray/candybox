@@ -1127,6 +1127,12 @@ class CrossPartitionGcAndRenameTest {
         }
 
         @Override
+        public long compareAndSetWithLease(String key, byte[] value, long expectedVersion,
+                                          String resource, long token) {
+            return delegate.compareAndSetWithLease(key, value, expectedVersion, resource, token);
+        }
+
+        @Override
         public long compareAndSet(String key, byte[] value, long expectedVersion) {
             beforeCompareAndSet.accept(key);
             failIfTargeted(key);

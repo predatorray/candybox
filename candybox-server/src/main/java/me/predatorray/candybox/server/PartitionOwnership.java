@@ -47,9 +47,8 @@ import org.slf4j.LoggerFactory;
  *   <li>read the {@code boxes/&lt;box&gt;/partitions/&lt;p&gt;/manifest} pointer;</li>
  *   <li>create a brand-new engine (pointer absent) or recover the prior one (pointer present), stamping
  *       every manifest edit with the lease's fencing token;</li>
- *   <li>publish the new manifest ledger id by creating / compare-and-setting the pointer — aborting and
- *       releasing the lease if the CAS loses, which (given we hold the lease) only happens on a stale
- *       read.</li>
+ *   <li>publish the new manifest ledger id by atomically checking the lease epoch and creating /
+ *       compare-and-setting the pointer; abort and release on conflict or lost ownership.</li>
  * </ol>
  *
  * <p>The lease is the real serialization point; the pointer CAS is a backstop. Engine access is gated
@@ -62,14 +61,14 @@ final class PartitionOwnership implements AutoCloseable {
     private final BoxName box;
     private final int partition;
     private final CoordinationService coordination;
-    private final Lease lease;
+    private final OwnershipLeases.Held lease;
     private final BoxEngine engine;
     private LedgerRetention.ScopedStore retentionScope;
     private String pointerKey;
     private String incarnation;
 
     private PartitionOwnership(BoxName box, int partition, CoordinationService coordination,
-                               Lease lease, BoxEngine engine) {
+                               OwnershipLeases.Held lease, BoxEngine engine) {
         this.box = box;
         this.partition = partition;
         this.coordination = coordination;
@@ -90,7 +89,13 @@ final class PartitionOwnership implements AutoCloseable {
     static PartitionOwnership createNew(BoxName box, int partition, CandyboxConfig config,
                                         LedgerStore store, CoordinationService coordination,
                                         int nodeId, Clock clock) {
-        Lease lease = acquireLease(box, partition, coordination, nodeId, config);
+        return createNew(box, partition, config, store, coordination, nodeId, clock, new OwnershipLeases());
+    }
+
+    static PartitionOwnership createNew(BoxName box, int partition, CandyboxConfig config,
+                                        LedgerStore store, CoordinationService coordination,
+                                        int nodeId, Clock clock, OwnershipLeases leases) {
+        OwnershipLeases.Held lease = leases.register(acquireLease(box, partition, coordination, nodeId, config));
         try {
             LedgerRetention.ScopedStore scope = null;
             String incarnation = coordination.get(CandyboxKeys.boxMetaKey(box.value()))
@@ -130,11 +135,14 @@ final class PartitionOwnership implements AutoCloseable {
             BoxEngine engine = BoxEngine.createNew(box, config, store, nodeId, clock,
                     lease.fencingToken());
             try {
-                coordination.create(pointerKey,
-                        new ManifestPointer(engine.manifestLedgerId(), lease.fencingToken(), incarnation).encode());
+                lease.publish(coordination, pointerKey,
+                        new ManifestPointer(engine.manifestLedgerId(), lease.fencingToken(), incarnation).encode(), -1);
             } catch (CasConflictException raced) {
                 engine.close(); // a concurrent creator won; abandon our ledgers (GC: phase-3)
                 throw new BoxAlreadyExistsException(box.value());
+            } catch (RuntimeException failure) {
+                engine.close();
+                throw failure;
             }
             if (scope != null) {
                 try {
@@ -144,6 +152,7 @@ final class PartitionOwnership implements AutoCloseable {
                     throw failure;
                 }
             }
+            lease.attach(engine);
             PartitionOwnership owned = new PartitionOwnership(box, partition, coordination, lease, engine);
             owned.retentionScope = scope;
             owned.pointerKey = pointerKey;
@@ -159,7 +168,13 @@ final class PartitionOwnership implements AutoCloseable {
     static PartitionOwnership recover(BoxName box, int partition, CandyboxConfig config,
                                       LedgerStore store, CoordinationService coordination,
                                       int nodeId, Clock clock) {
-        Lease lease = acquireLease(box, partition, coordination, nodeId, config);
+        return recover(box, partition, config, store, coordination, nodeId, clock, new OwnershipLeases());
+    }
+
+    static PartitionOwnership recover(BoxName box, int partition, CandyboxConfig config,
+                                      LedgerStore store, CoordinationService coordination,
+                                      int nodeId, Clock clock, OwnershipLeases leases) {
+        OwnershipLeases.Held lease = leases.register(acquireLease(box, partition, coordination, nodeId, config));
         try {
             LedgerRetention.ScopedStore scope = null;
             String incarnation = coordination.get(CandyboxKeys.boxMetaKey(box.value()))
@@ -194,11 +209,8 @@ final class PartitionOwnership implements AutoCloseable {
                     priorManifestLedgerId, lease.fencingToken());
             try {
                 byte[] next = new ManifestPointer(engine.manifestLedgerId(), lease.fencingToken(), incarnation).encode();
-                if (incarnationPointer.isEmpty() && scope != null) {
-                    coordination.create(pointerKey, next);
-                } else {
-                    coordination.compareAndSet(pointerKey, next, pointer.version());
-                }
+                lease.publish(coordination, pointerKey, next,
+                        incarnationPointer.isEmpty() && scope != null ? -1 : pointer.version());
             } catch (CasConflictException raced) {
                 engine.close();
                 throw new NotOwnerException(box.value()); // someone advanced the pointer; we lost
@@ -216,6 +228,7 @@ final class PartitionOwnership implements AutoCloseable {
                     throw failure;
                 }
             }
+            lease.attach(engine);
             PartitionOwnership owned = new PartitionOwnership(box, partition, coordination, lease, engine);
             owned.retentionScope = scope;
             owned.pointerKey = pointerKey;
@@ -262,7 +275,7 @@ final class PartitionOwnership implements AutoCloseable {
     boolean renew() {
         try {
             lease.renew();
-            return true;
+            return lease.isValid();
         } catch (RuntimeException e) {
             LOG.warn("Lost lease on box {} partition {}: {}", box, partition, e.getMessage());
             return false;
@@ -304,10 +317,6 @@ final class PartitionOwnership implements AutoCloseable {
 
     @Override
     public void close() {
-        try {
-            engine.close();
-        } finally {
-            lease.release();
-        }
+        lease.release();
     }
 }

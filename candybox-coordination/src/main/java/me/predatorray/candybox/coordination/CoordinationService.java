@@ -59,6 +59,21 @@ public interface CoordinationService extends AutoCloseable {
     long compareAndSet(String key, byte[] value, long expectedVersion);
 
     /**
+     * Versioned publication conditioned atomically on the current lease epoch. A negative expected
+     * version means create only if absent. The lease must be live when checked; a concurrent renewal,
+     * release or acquisition invalidates that check and the write must fail. Implementations may
+     * commit after wall-clock expiry if the epoch has not changed: a successor is serialized either
+     * before the write (which fails) or after it (and must read the published pointer).
+     *
+     * @throws LeaseExpiredException when the ownership condition fails
+     * @throws CasConflictException when the pointer version condition fails
+     */
+    default long compareAndSetWithLease(String key, byte[] value, long expectedVersion,
+                                       String resource, long fencingToken) {
+        throw new UnsupportedOperationException("Atomic lease-conditioned publication is required");
+    }
+
+    /**
      * Deletes {@code key} iff its current version equals {@code expectedVersion}.
      *
      * @throws CasConflictException if the key is absent or at a different version
