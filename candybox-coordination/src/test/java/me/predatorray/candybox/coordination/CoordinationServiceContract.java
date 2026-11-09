@@ -129,6 +129,20 @@ public abstract class CoordinationServiceContract {
     }
 
     @Test
+    void compareAndSetWithExpectedAbsentCreatesOnlyIfMissing() {
+        assertThat(service.compareAndSet("k", b("v"), -1)).isZero();
+        VersionedValue created = service.get("k").orElseThrow();
+        assertThat(created.value()).isEqualTo(b("v"));
+        assertThat(created.version()).isZero();
+
+        assertThatThrownBy(() -> service.compareAndSet("k", b("v2"), -1))
+                .isInstanceOf(CasConflictException.class);
+        VersionedValue unchanged = service.get("k").orElseThrow();
+        assertThat(unchanged.value()).isEqualTo(b("v"));
+        assertThat(unchanged.version()).isZero();
+    }
+
+    @Test
     void deleteRejectsStaleVersionAndRemovesOnMatch() {
         service.create("k", b("v"));
         assertThatThrownBy(() -> service.delete("k", 99)).isInstanceOf(CasConflictException.class);
@@ -194,6 +208,72 @@ public abstract class CoordinationServiceContract {
     }
 
     @Test
+    void staleHoldersReleaseAfterTakeoverDoesNotFreeTheNewHolder() {
+        Lease a = service.tryAcquireLease("r", 1, 5_000).orElseThrow();
+        clock.advance(6_000);
+        Lease b = service.tryAcquireLease("r", 2, 5_000).orElseThrow();
+
+        a.release();
+
+        assertThat(b.isValid()).isTrue();
+        LeaseInfo holder = service.leaseHolder("r").orElseThrow();
+        assertThat(holder.ownerNodeId()).isEqualTo(2);
+        assertThat(holder.fencingToken()).isEqualTo(b.fencingToken());
+        assertThat(service.tryAcquireLease("r", 3, 5_000)).isEmpty();
+    }
+
+    @Test
+    void renewAfterReleaseThrows() {
+        Lease lease = service.tryAcquireLease("r", 1, 5_000).orElseThrow();
+        lease.release();
+
+        assertThatThrownBy(lease::renew).isInstanceOf(LeaseExpiredException.class);
+        assertThat(lease.isValid()).isFalse();
+    }
+
+    @Test
+    void staleHolderCannotRenewOrValidateAfterTakeover() {
+        Lease a = service.tryAcquireLease("r", 1, 5_000).orElseThrow();
+        clock.advance(6_000);
+        Lease b = service.tryAcquireLease("r", 2, 5_000).orElseThrow();
+        // Attempt the stale renewal later, so an accidental extension is observable.
+        clock.advance(1_000);
+
+        assertThatThrownBy(a::renew).isInstanceOf(LeaseExpiredException.class);
+        assertThat(a.isValid()).isFalse();
+        clock.advance(3_999);
+        assertThat(b.isValid()).isTrue();
+        clock.advance(1);
+        assertThat(b.isValid()).isFalse();
+        assertThat(service.leaseHolder("r")).isEmpty();
+    }
+
+    @Test
+    void holderReacquireKeepsTokenAndExtendsExpiry() {
+        Lease original = service.tryAcquireLease("r", 1, 5_000).orElseThrow();
+        clock.advance(4_000);
+        Lease reacquired = service.tryAcquireLease("r", 1, 5_000).orElseThrow();
+        assertThat(reacquired.fencingToken()).isEqualTo(original.fencingToken());
+
+        clock.advance(4_000);
+        assertThat(reacquired.isValid()).isTrue();
+        LeaseInfo holder = service.leaseHolder("r").orElseThrow();
+        assertThat(holder.ownerNodeId()).isEqualTo(1);
+        assertThat(holder.fencingToken()).isEqualTo(original.fencingToken());
+    }
+
+    @Test
+    void releaseIsIdempotent() {
+        Lease lease = service.tryAcquireLease("r", 1, 5_000).orElseThrow();
+        lease.release();
+        lease.release();
+
+        Lease successor = service.tryAcquireLease("r", 2, 5_000).orElseThrow();
+        assertThat(successor.fencingToken()).isGreaterThan(lease.fencingToken());
+        assertThat(successor.isValid()).isTrue();
+    }
+
+    @Test
     void membershipRegistersListsAndExposesInfo() {
         service.registerMember(3, b("host-3:30"));
         service.registerMember(1, b("host-1:10"));
@@ -211,6 +291,18 @@ public abstract class CoordinationServiceContract {
         service.registerMember(1, b("host-1:11"));
         assertThat(service.members()).containsExactly(1);
         assertThat(service.memberInfo(1).map(String::new)).contains("host-1:11");
+    }
+
+    @Test
+    void unregisteringAnUnknownMemberIsANoOp() {
+        assertThat(service.members()).isEmpty();
+        service.unregisterMember(42);
+        assertThat(service.members()).isEmpty();
+
+        service.registerMember(1, b("host-1:10"));
+        service.unregisterMember(42);
+        assertThat(service.members()).containsExactly(1);
+        assertThat(service.memberInfo(1)).contains(b("host-1:10"));
     }
 
     @Test

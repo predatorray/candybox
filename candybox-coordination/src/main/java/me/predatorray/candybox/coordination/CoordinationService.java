@@ -52,9 +52,12 @@ public interface CoordinationService extends AutoCloseable {
     /**
      * Atomically sets {@code key} to {@code value} iff its current version equals
      * {@code expectedVersion}.
+     * An {@code expectedVersion} of {@code -1} means expected absent: create the key only if it
+     * does not exist, with initial version {@code 0}.
      *
      * @return the new version
-     * @throws CasConflictException if the key is absent or at a different version
+     * @throws CasConflictException if the key exists when expecting absent, or if a nonnegative
+     *     expected version does not match (including an absent key)
      */
     long compareAndSet(String key, byte[] value, long expectedVersion);
 
