@@ -93,6 +93,16 @@ public final class InMemoryCoordinationService implements CoordinationService {
     }
 
     @Override
+    public synchronized long compareAndSetWithLease(String key, byte[] value, long expectedVersion,
+                                                    String resource, long fencingToken) {
+        LeaseState state = leases.get(resource);
+        if (state == null || state.token != fencingToken || !isCurrentAndLive(state)) {
+            throw new LeaseExpiredException(resource, fencingToken);
+        }
+        return compareAndSet(key, value, expectedVersion);
+    }
+
+    @Override
     public synchronized void delete(String key, long expectedVersion) {
         Entry e = kv.get(key);
         long actual = e == null ? -1 : e.version;

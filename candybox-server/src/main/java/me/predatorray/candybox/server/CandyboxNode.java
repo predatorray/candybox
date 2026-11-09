@@ -93,6 +93,7 @@ public final class CandyboxNode implements AutoCloseable {
     private final ConcurrentMap<BoxPartition, PartitionOwnership> partitions =
             new ConcurrentHashMap<>();
     private final ConcurrentMap<String, BoxDescriptor> descriptorCache = new ConcurrentHashMap<>();
+    private final OwnershipLeases ownershipLeases = new OwnershipLeases();
     private final ScheduledExecutorService leaseHeartbeat;
     private final ScheduledExecutorService compactionWorker;
     private final ScheduledExecutorService balancerWorker;
@@ -257,7 +258,7 @@ public final class CandyboxNode implements AutoCloseable {
         try {
             for (int p = 0; p < count; p++) {
                 PartitionOwnership ownership = PartitionOwnership.createNew(box, p, config,
-                        ledgerStore, coordination, nodeId, clock);
+                        ledgerStore, coordination, nodeId, clock, ownershipLeases);
                 created.add(ownership);
                 partitions.put(new BoxPartition(box.value(), p), ownership);
             }
@@ -281,10 +282,16 @@ public final class CandyboxNode implements AutoCloseable {
             if (existing != null && existing.isOwner()) {
                 return existing; // already owned here
             }
+            if (existing != null) {
+                // Release the cancelled acquisition before re-acquiring on the same node. The
+                // remote renewal may have succeeded, so retaining its handles can also retain
+                // the same live epoch across retries.
+                existing.close();
+            }
             LOG.info("Opening (taking over) box {} partition {} on node {}", bp.box(),
                     bp.partition(), nodeId);
             return PartitionOwnership.recover(box, partition, config, ledgerStore, coordination,
-                    nodeId, clock);
+                    nodeId, clock, ownershipLeases);
         });
     }
 
@@ -546,13 +553,7 @@ public final class CandyboxNode implements AutoCloseable {
     }
 
     void renewLeases() {
-        for (PartitionOwnership ownership : partitions.values()) {
-            try {
-                ownership.renew();
-            } catch (RuntimeException e) {
-                LOG.warn("Lease renewal error for a partition on node {}", nodeId, e);
-            }
-        }
+        ownershipLeases.renew();
     }
 
     /**
@@ -1266,6 +1267,7 @@ public final class CandyboxNode implements AutoCloseable {
     @Override
     public void close() {
         closed = true;
+        ownershipLeases.close();
         if (leaseHeartbeat != null) {
             leaseHeartbeat.shutdownNow();
         }

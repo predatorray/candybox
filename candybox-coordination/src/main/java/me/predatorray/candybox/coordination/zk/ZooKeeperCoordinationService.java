@@ -191,6 +191,50 @@ public final class ZooKeeperCoordinationService implements CoordinationService {
     }
 
     @Override
+    public long compareAndSetWithLease(String key, byte[] value, long expectedVersion,
+                                      String resource, long fencingToken) {
+        String leasePath = path(resource);
+        Stat stat = new Stat();
+        LeaseRecord current = readLease(leasePath, stat);
+        if (current == null || current.token != fencingToken || current.released
+                || clock.currentTimeMillis() >= current.expiry) {
+            throw new LeaseExpiredException(resource, fencingToken);
+        }
+        try {
+            String target = path(key);
+            // Parent creation carries no pointer data and cannot grant ownership.
+            if (expectedVersion < 0) {
+                int slash = target.lastIndexOf('/');
+                if (slash > 0) {
+                    try {
+                        client.create().creatingParentsIfNeeded().forPath(target.substring(0, slash));
+                    } catch (KeeperException.NodeExistsException exists) {
+                        // Existing parent is the usual path.
+                    }
+                }
+            }
+            var check = client.transactionOp().check().withVersion(stat.getVersion()).forPath(leasePath);
+            var write = expectedVersion < 0
+                    ? client.transactionOp().create().forPath(target, value)
+                    : client.transactionOp().setData().withVersion((int) expectedVersion).forPath(target, value);
+            client.transaction().forOperations(check, write);
+            return expectedVersion + 1;
+        } catch (KeeperException.BadVersionException | KeeperException.NoNodeException
+                 | KeeperException.NodeExistsException conflict) {
+            // Distinguish the ownership guard from the pointer CAS. Conservatively fail if a
+            // renewal changed the guard too; callers must not retry a stale recovery blindly.
+            Stat now = new Stat();
+            LeaseRecord latest = readLease(leasePath, now);
+            if (latest == null || now.getVersion() != stat.getVersion()) {
+                throw new LeaseExpiredException(resource, fencingToken);
+            }
+            throw new CasConflictException(key, expectedVersion, currentVersion(key));
+        } catch (Exception failure) {
+            throw wrap("compareAndSetWithLease", key, failure);
+        }
+    }
+
+    @Override
     public void delete(String key, long expectedVersion) {
         try {
             client.delete().withVersion((int) expectedVersion).forPath(path(key));

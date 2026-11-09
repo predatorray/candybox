@@ -642,3 +642,31 @@ cursor survive coordinator handover, and failed physical deletes are retried.
 See [the namespace lifecycle contract](docs/design/namespace-lifecycle.md) for
 owner-admission timestamps, atomic renewal/retirement, native examples, resource
 overhead, bounded cleanup, error/retry semantics and upgrade/rollback limits.
+
+### Ownership during slow recovery
+
+The node's lease registry contains both recovering and serving partitions. Acquisition registers
+before any replay, fencing, or checkpoint I/O. The existing node heartbeat renews this registry;
+there are no per-partition schedulers and no registration transfer when recovery succeeds. Failed
+renewal cancels the acquisition permanently, even if the renewal's remote outcome is unknown.
+Recovery checks cancellation before publication and serving, closes local handles after blocked I/O
+returns, and unregisters on failure. Cancelled acquisitions leave the renewal set but remain in the
+cleanup registry until released; same-node retry closes the old engine before reacquisition.
+Shutdown cancels and closes registrations, including in-flight recovery.
+
+Manifest publication uses `CoordinationService.compareAndSetWithLease`: ZooKeeper checks the lease
+record's data version and creates/CAS-updates the pointer in one transaction; the fake checks both
+under one monitor. The operation first verifies the expected live fencing token. Renewal and
+publication on a registration are serialized, avoiding conflicts with its own heartbeat. An epoch
+change or release between that read and the transaction changes the lease version, rejecting the
+entire publication even if the pointer has not yet changed. Pointer conflicts also reject the whole
+transaction. BookKeeper recover-open fencing remains mandatory.
+
+Wall-clock expiry alone is not a ZooKeeper transaction predicate. If execution pauses after the
+lease read until after its TTL, publication can still commit only if the checked lease version has
+not changed. This is safe: a successor acquisition serialized before publication invalidates the
+check; acquisition serialized afterward must read the newly committed pointer before fencing and
+replaying. The expired recoverer cannot serve because engine access rechecks the lease. A late
+publication therefore cannot overwrite a successor's recovery source. A lost transaction response
+may mean publication committed; local handles are closed but allocated ledgers are never deleted
+on this error path, so the next owner can recover whichever pointer actually committed.

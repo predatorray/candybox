@@ -16,6 +16,7 @@
 package me.predatorray.candybox.it;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -23,6 +24,12 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import me.predatorray.candybox.common.ManualClock;
+import me.predatorray.candybox.coordination.LeaseExpiredException;
 import java.util.function.BooleanSupplier;
 import me.predatorray.candybox.common.Clock;
 import me.predatorray.candybox.common.SystemClock;
@@ -79,6 +86,46 @@ class ZooKeeperCoordinationServiceContractIT extends CoordinationServiceContract
     @Override
     protected CoordinationService newService(Clock clock) {
         return new ZooKeeperCoordinationService(newClient("ct-" + NAMESPACE_SEQ.incrementAndGet()), clock);
+    }
+
+    @Test
+    void newerEpochBetweenLeaseReadAndPublicationPreventsPointerWrite() throws Exception {
+        ManualClock time = new ManualClock(1_000);
+        AtomicBoolean pause = new AtomicBoolean();
+        CountDownLatch checked = new CountDownLatch(1);
+        CountDownLatch resume = new CountDownLatch(1);
+        Clock clock = () -> {
+            long now = time.currentTimeMillis();
+            if (pause.compareAndSet(true, false)) {
+                checked.countDown();
+                try {
+                    if (!resume.await(10, TimeUnit.SECONDS)) { throw new IllegalStateException("resume timed out"); }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(interrupted);
+                }
+            }
+            return now;
+        };
+        var executor = Executors.newSingleThreadExecutor();
+        try (CoordinationService service = newService(clock)) {
+            var old = service.tryAcquireLease("publication/owner", 1, 100).orElseThrow();
+            service.create("publication/manifest", new byte[]{1});
+            pause.set(true);
+            var future = executor.submit(() -> service.compareAndSetWithLease("publication/manifest",
+                    new byte[]{2}, 0, old.resource(), old.fencingToken()));
+            assertThat(checked.await(10, TimeUnit.SECONDS)).isTrue();
+            time.advance(101);
+            var successor = service.tryAcquireLease(old.resource(), 2, 100).orElseThrow();
+            resume.countDown();
+            assertThatThrownBy(() -> future.get(10, TimeUnit.SECONDS)).hasCauseInstanceOf(LeaseExpiredException.class);
+            assertThat(service.get("publication/manifest").orElseThrow().value()).containsExactly((byte) 1);
+            assertThat(service.compareAndSetWithLease("publication/manifest", new byte[]{3}, 0,
+                    successor.resource(), successor.fencingToken())).isEqualTo(1);
+        } finally {
+            resume.countDown();
+            executor.shutdownNow();
+        }
     }
 
     private static CuratorFramework newClient(String namespace) {
