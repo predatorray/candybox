@@ -58,8 +58,8 @@ All knobs are configurable; pick defaults unless a workload demands otherwise.
 | `maxClockSkewMillis` | 5 min | HLC skew-rejection bound on observed timestamps. |
 | `tombstoneGcGraceMillis` | 24 h | Late-write window before a bottommost tombstone may be dropped. |
 | `ledgerGcGraceMillis` | 5 min | Grace before an obsoleted ledger (compaction input, dead Syrup, rotated WAL, prior owner's manifest) is deleted; also gates Box-global GC of cross-partition-shared Syrups. |
-| `zero.copy.relay.budget.bytes` | 32 MiB | Bytes of cross-partition zero-copy locator relays one node may have pending in ZooKeeper; past it, cross-partition copy/rename answers BUSY. Env `CANDYBOX_ZERO_COPY_RELAY_BUDGET_BYTES`. |
-| `rename.intent.abandon.millis` | 60 s | Cross-partition rename: a rename intent whose rendezvous marker never appears is dropped after this (the source stays live, the rename never reached the destination); unconsumed zero-copy locator relays are reaped after the same age (by the maintenance tick, or inline once a partition reaches its cap of 1024 pending relays). A relay embeds the source locator, so `sizeLimits.maxLocatorBytes` must stay below ZooKeeper's `jute.maxbuffer` (1 MiB by default). Env `CANDYBOX_RENAME_INTENT_ABANDON_MILLIS`. |
+| `zero.copy.relay.budget.bytes` | 32 MiB | Bytes of cross-partition zero-copy locator relays one node may retain in ZooKeeper, including claimed transfers; past it, cross-partition copy/rename answers BUSY. Env `CANDYBOX_ZERO_COPY_RELAY_BUDGET_BYTES`. |
+| `rename.intent.abandon.millis` | 60 s | Cross-partition rename: a rename intent whose rendezvous marker never appears is dropped after this (the source stays live); pending, unclaimed zero-copy locator relays are reaped after the same age (by maintenance, or inline once a partition reaches its cap of 1024 retained relays). Claimed transfers never expire. A relay embeds the source locator and a committed transfer also stores its result, so allow space below ZooKeeper's `jute.maxbuffer` (1 MiB by default). Env `CANDYBOX_RENAME_INTENT_ABANDON_MILLIS`. |
 
 Leveled compaction also takes a per-level byte budget (`levelBaseBytes` 10 MiB, `levelMultiplier` 10):
 level N's budget is `levelBaseBytes × multiplier^(N-1)`.
@@ -69,6 +69,21 @@ level N's budget is `levelBaseBytes × multiplier^(N-1)`.
 > obsolete ledgers. A failing step is logged at ERROR as `Background <step> failed on node <id>` and does not stop the others. The bare
 > `CandyboxConfig` builder still defaults to `0` so tests are deterministic; the steps can also be run
 > manually via `CandyboxNode.compactOwnedBoxesOnce()` / `collectGarbageOnce()`.
+
+Cross-partition transfers claim a durable relay before the destination WAL append. Claimed relays
+keep their bytes pinned regardless of elapsed time. If a request fails before its committed result
+is recorded, retry the operation with a fresh relay; its original claim remains protected until
+destination handover. Releasing/reopening that partition fences and recovers its old WAL; the next
+GC maintenance pass publishes recovered refs before reclaiming old claims. A committed relay whose
+refs/rename marker publication failed can instead finish via the same relay without another write.
+Do not delete claimed relay keys manually: a paused consumer may still append. A force-deleted Box
+with live remote owners retains claimed relays until their destination engines close or the
+allocation registry fences/retires the matching destination writer epochs. Recreated Box names do
+not release an old incarnation's claims. Missing fencing evidence leaves a claim held.
+
+Relay format v2 requires a stopped-cluster upgrade from earlier releases. Stop every older server
+before starting upgraded servers; mixed-version rolling operation cannot enforce claim retention.
+Pending v1 relays remain readable after the upgrade.
 
 ## Consistency & backpressure
 

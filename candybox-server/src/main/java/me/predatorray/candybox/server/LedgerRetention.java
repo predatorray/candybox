@@ -236,7 +236,45 @@ public final class LedgerRetention {
             coordination.compareAndSet(epochKey(id), new Epoch(e.box(), e.incarnation(), e.partition(),
                     e.createdAt(), e.ownerToken(), true, true, e.writers()).encode(), current.version());
         }
+        cleanupDeletedRelayClaims();
     }
+
+    /** Deleted Boxes have no owner to reconcile transfers; use the durable writer-fencing registry. */
+    private void cleanupDeletedRelayClaims() {
+        List<Epoch> epochs = coordination.children(ROOT + "/epochs").stream().map(this::epoch).toList();
+        Set<DeletedPartition> visited = new HashSet<>();
+        for (Epoch source : epochs) {
+            if (!source.retired() || !visited.add(new DeletedPartition(
+                    source.box(), source.incarnation(), source.partition()))) { continue; }
+            var descriptor = coordination.get(CandyboxKeys.boxMetaKey(source.box()));
+            if (descriptor.isPresent() && BoxDescriptor.decode(descriptor.get().value()).incarnation()
+                    .equals(source.incarnation())) { continue; }
+            for (String token : coordination.children(CandyboxKeys.locatorRelaysPath(
+                    source.box(), source.partition()))) {
+                String key = CandyboxKeys.locatorRelayKey(source.box(), source.partition(), token);
+                var value = coordination.get(key);
+                if (value.isEmpty()) { continue; }
+                LocatorRelay relay;
+                try { relay = LocatorRelay.deserialize(value.get().value()); }
+                catch (RuntimeException undecodable) {
+                    // Retain this relay and its pins; one Box must not block unrelated enumeration.
+                    continue;
+                }
+                var consumer = relay.consumer();
+                if (consumer == null || !consumer.incarnation().equals(source.incarnation())) { continue; }
+                List<Epoch> writers = epochs.stream().filter(e -> e.box().equals(source.box())
+                        && e.incarnation().equals(consumer.incarnation())
+                        && e.partition() == consumer.partition()
+                        && e.ownerToken() == consumer.fencingToken()).toList();
+                if (!writers.isEmpty() && writers.stream().allMatch(Epoch::retired)) {
+                    try { coordination.delete(key, value.get().version()); }
+                    catch (CasConflictException raced) { /* a later bounded pass reconciles it */ }
+                }
+            }
+        }
+    }
+
+    private record DeletedPartition(String box, String incarnation, int partition) { }
 
     /** A bounded, restartable pass. Legacy allocations and unknown roles are always held. */
     public Report reconcile(long graceMillis, int limit, boolean reportOnly) {

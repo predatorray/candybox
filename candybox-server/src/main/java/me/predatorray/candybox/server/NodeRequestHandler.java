@@ -593,15 +593,20 @@ final class NodeRequestHandler implements RequestHandler {
             BoxName box = BoxName.of(m.box());
             BoxEngine engine = node.engine(box, m.dstKey());
             // The parts and a rename's ACL come from the source owner's relay, never from the client.
-            LocatorRelay relay = consumableRelay(m, principal);
+            LocatorRelay relay = consumableRelay(m, principal, engine);
             CandyLocator source = relay.locator();
             // A rename keeps the object's identity, so the source's owner/grants travel with it; a
             // copy belongs to the requester (effectiveAcl applies the super-user owner rule).
             ObjectAcl acl = relay.isRename()
                     ? source.acl()
                     : effectiveAcl(principal, m.owner(), m.grants());
-            CandyMetadata meta = engine.zeroCopyPut(CandyKey.of(m.dstKey()), source.parts(),
-                    source.contentType(), source.userMetadata(), 0L, acl, m.idempotencyToken());
+            CandyMetadata meta = relay.consumer().committed();
+            if (meta == null) {
+                meta = engine.zeroCopyPut(CandyKey.of(m.dstKey()), source.parts(),
+                        source.contentType(), source.userMetadata(), 0L, acl, m.idempotencyToken());
+                relay = node.recordCommittedLocatorRelay(m.box(), m.srcPartition(), m.relayToken(),
+                        relay, meta);
+            }
             // Publish this partition's refs before the source delete can run, so the Box-global GC
             // already sees the new cross-partition reference (no premature reclaim of the shared Syrup).
             node.publishPartitionRefs(box, node.descriptor(box).partitionOf(m.dstKey()));
@@ -609,8 +614,8 @@ final class NodeRequestHandler implements RequestHandler {
                 node.writeRenameMarker(m.box(), relay.renameToken(), relay.srcKey(),
                         m.srcPartition(), source.hlc(), m.dstKey());
             }
-            // Only now: a put that failed (MOVED, BUSY, marker write) stays retryable with this token.
-            node.deleteLocatorRelay(m.box(), m.srcPartition(), m.relayToken());
+            // Only now: committed retries finish publication without ever appending another locator.
+            node.completeLocatorRelay(m.box(), m.srcPartition(), m.relayToken(), relay);
             return new Message.HeadCandyResponse(meta.contentLength(), meta.contentType(),
                     meta.userMetadata(), meta.crc32c(), meta.createdAtMillis());
         } else if (message instanceof Message.CompleteRenameRequest m) {
@@ -798,14 +803,15 @@ final class NodeRequestHandler implements RequestHandler {
     }
 
     /**
-     * The relay a zero-copy put names, provided the same principal created it and, for a rename, it
-     * was prepared for this destination key. Anything else, including an expired relay, is
+     * Claims the relay a zero-copy put names, provided the same principal created it and, for a rename,
+     * it was prepared for this destination key. Anything else, including an expired pending relay, is
      * indistinguishable from a missing one.
      */
-    private LocatorRelay consumableRelay(Message.ZeroCopyPutRequest m, Principal principal) {
+    private LocatorRelay consumableRelay(Message.ZeroCopyPutRequest m, Principal principal,
+                                          BoxEngine engine) {
         Optional<LocatorRelay> relay = m.relayToken() != null
                 && RELAY_TOKEN.matcher(m.relayToken()).matches()
-                ? node.readLocatorRelay(m.box(), m.srcPartition(), m.relayToken(),
+                ? node.claimLocatorRelay(m.box(), m.srcPartition(), m.relayToken(), m.dstKey(), engine,
                         r -> r.requester().equals(principal.toString())
                                 && (!r.isRename() || r.dstKey().equals(m.dstKey())))
                 : Optional.empty();

@@ -23,7 +23,16 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.Collection;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import me.predatorray.candybox.bookkeeper.LedgerConfig;
+import me.predatorray.candybox.bookkeeper.LedgerMetadata;
+import me.predatorray.candybox.bookkeeper.LedgerStore;
+import me.predatorray.candybox.bookkeeper.ReadableLedger;
+import me.predatorray.candybox.bookkeeper.WritableLedger;
 import me.predatorray.candybox.bookkeeper.fake.InMemoryLedgerStore;
 import me.predatorray.candybox.common.BoxName;
 import me.predatorray.candybox.common.CandyKey;
@@ -33,6 +42,7 @@ import me.predatorray.candybox.common.Partitioning;
 import me.predatorray.candybox.common.auth.ObjectAcl;
 import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.exception.CandyNotFoundException;
+import me.predatorray.candybox.common.exception.FencedException;
 import me.predatorray.candybox.common.exception.NotOwnerException;
 import me.predatorray.candybox.common.serial.BinaryWriter;
 import me.predatorray.candybox.coordination.CandyboxKeys;
@@ -84,6 +94,324 @@ class CrossPartitionGcAndRenameTest {
                 .leaseRenewIntervalMillis(0)
                 .compactionIntervalMillis(0)       // manual control
                 .build();
+    }
+
+    @Test
+    void consumerPausedBeforeWalAppendKeepsItsPinPastRelayExpiry() throws Exception {
+        ManualClock clock = new ManualClock(1_000_000);
+        InMemoryLedgerStore store = new InMemoryLedgerStore(clock);
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        ImportStore destinationStore = new ImportStore(store);
+        CandyboxConfig config = CandyboxConfig.builder()
+                .memtableFlushThresholdBytes(1).syrupRolloverBytes(1).l0CompactionTrigger(2)
+                .ledgerGcGraceMillis(100).renameIntentAbandonMillis(1_000)
+                .ownershipLeaseTtlMillis(3_600_000).leaseRenewIntervalMillis(0).build();
+        var executor = Executors.newSingleThreadExecutor();
+        CountDownLatch beforeWal = new CountDownLatch(1);
+        CountDownLatch resume = new CountDownLatch(1);
+        try (CandyboxNode source = new CandyboxNode(1, config, store, coordination, clock);
+             CandyboxNode destination = new CandyboxNode(2, config, destinationStore,
+                     coordination, clock);
+             CandyboxNode recoveredSource = new CandyboxNode(3, config, store, coordination, clock)) {
+            source.createBox(BOX, PARTITIONS);
+            source.releasePartition(BOX, 1);
+            destination.openPartition(BOX, 1);
+            String src = keyIn(0, "src");
+            String dst = keyIn(1, "dst");
+            long syrup = putAndFlush(source, src);
+            String token = relayToken(source.requestHandler(), src);
+            destinationStore.beforeImport = ids -> {
+                beforeWal.countDown();
+                await(resume);
+            };
+            var put = executor.submit(() -> send(destination.requestHandler(),
+                    new Message.ZeroCopyPutRequest(BOX.value(), dst, 0, token, null,
+                            List.of(), null)));
+            assertThat(beforeWal.await(10, TimeUnit.SECONDS)).isTrue();
+            orphanSource(source, src);
+            source.releasePartition(BOX, 0);
+            recoveredSource.openPartition(BOX, 0);
+            clock.advance(2_000);
+            recoveredSource.sweepStaleLocatorRelaysOnce();
+            recoveredSource.collectGarbageOnce();
+            try {
+                assertThat(store.listLedgers()).contains(syrup);
+                assertThat(send(destination.requestHandler(), new Message.ZeroCopyPutRequest(
+                        BOX.value(), keyIn(1, "duplicate"), 0, token, null, List.of(), null)))
+                        .isInstanceOf(Message.ErrorResponse.class);
+            } finally {
+                resume.countDown();
+            }
+            assertThat(put.get(10, TimeUnit.SECONDS)).isInstanceOf(Message.HeadCandyResponse.class);
+            assertThat(destination.enginePartition(BOX, 1).getCandy(CandyKey.of(dst)))
+                    .isEqualTo(bytes("payload"));
+        } finally {
+            resume.countDown();
+            executor.shutdownNow();
+            store.close();
+        }
+    }
+
+    @Test
+    void newerDestinationOwnerFencesPausedConsumerBeforeReleasingItsClaim() throws Exception {
+        ManualClock clock = new ManualClock(1_000_000);
+        InMemoryLedgerStore store = new InMemoryLedgerStore(clock);
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        ImportStore destinationStore = new ImportStore(store);
+        CandyboxConfig sourceConfig = CandyboxConfig.builder().memtableFlushThresholdBytes(1)
+                .syrupRolloverBytes(1).l0CompactionTrigger(2).ledgerGcGraceMillis(0)
+                .ownershipLeaseTtlMillis(3_600_000).leaseRenewIntervalMillis(0).build();
+        CandyboxConfig destinationConfig = CandyboxConfig.builder().leaseRenewIntervalMillis(0).build();
+        var executor = Executors.newSingleThreadExecutor();
+        CountDownLatch beforeWal = new CountDownLatch(1);
+        CountDownLatch resume = new CountDownLatch(1);
+        try (CandyboxNode source = new CandyboxNode(1, sourceConfig, store, coordination, clock);
+             CandyboxNode oldDestination = new CandyboxNode(2, destinationConfig, destinationStore,
+                     coordination, clock);
+             CandyboxNode newDestination = new CandyboxNode(3, destinationConfig, store,
+                     coordination, clock)) {
+            source.createBox(BOX, PARTITIONS);
+            source.releasePartition(BOX, 1);
+            oldDestination.openPartition(BOX, 1);
+            String src = keyIn(0, "src");
+            String dst = keyIn(1, "dst");
+            long syrup = putAndFlush(source, src);
+            String token = relayToken(source.requestHandler(), src);
+            destinationStore.beforeImport = ids -> { beforeWal.countDown(); await(resume); };
+            var put = executor.submit(() -> send(oldDestination.requestHandler(),
+                    new Message.ZeroCopyPutRequest(BOX.value(), dst, 0, token, null, List.of(), null)));
+            assertThat(beforeWal.await(10, TimeUnit.SECONDS)).isTrue();
+            try {
+                orphanSource(source, src);
+                clock.advance(11_000);
+                source.collectGarbageOnce();
+                assertThat(store.listLedgers()).contains(syrup);
+                newDestination.openPartition(BOX, 1); // fences the old WAL before claim cleanup
+                assertThat(newDestination.reconcileClaimedLocatorRelaysOnce()).isEqualTo(1);
+                source.collectGarbageOnce();
+                assertThat(store.listLedgers()).doesNotContain(syrup);
+            } finally {
+                resume.countDown();
+            }
+            assertThat(put.get(10, TimeUnit.SECONDS)).isInstanceOf(Message.ErrorResponse.class);
+            assertThatThrownBy(() -> newDestination.enginePartition(BOX, 1)
+                    .getCandy(CandyKey.of(dst))).isInstanceOf(CandyNotFoundException.class);
+        } finally {
+            resume.countDown();
+            executor.shutdownNow();
+            store.close();
+        }
+    }
+
+    @Test
+    void recoveryPublishesCommittedDestinationBeforeReleasingFailedPublishClaim() {
+        assertRecoveryAfterDestinationFailure("publish");
+    }
+
+    @Test
+    void recoveryReconcilesWalAppendWhoseCommittedRelayWriteFailed() {
+        assertRecoveryAfterDestinationFailure("committed");
+    }
+
+    @Test
+    void recoveryReconcilesPublishedDestinationWhoseClaimDeleteFailed() {
+        assertRecoveryAfterDestinationFailure("delete");
+    }
+
+    private static void assertRecoveryAfterDestinationFailure(String transition) {
+        ManualClock clock = new ManualClock(1_000_000);
+        InMemoryLedgerStore store = new InMemoryLedgerStore(clock);
+        FaultyCoordination coordination = new FaultyCoordination(new InMemoryCoordinationService(clock));
+        CandyboxConfig config = aggressiveGcConfig();
+        try (CandyboxNode node = new CandyboxNode(1, config, store, coordination, clock)) {
+            node.createBox(BOX, PARTITIONS);
+            String src = keyIn(0, "src");
+            String dst = keyIn(1, "dst");
+            long syrup = putAndFlush(node, src);
+            String token = relayToken(node.requestHandler(), src);
+            String relayKey = CandyboxKeys.locatorRelayKey(BOX.value(), 0, token);
+            if (transition.equals("publish")) {
+                coordination.failWritesTo = CandyboxKeys.partitionRefsKey(BOX.value(), 1);
+            } else if (transition.equals("committed")) {
+                int[] writes = {0};
+                coordination.beforeCompareAndSet = key -> {
+                    if (key.equals(relayKey) && ++writes[0] == 2) {
+                        throw new CasConflictException(key, 1, 2);
+                    }
+                };
+            } else {
+                coordination.beforeDelete = key -> {
+                    if (key.equals(relayKey)) { throw new IllegalStateException("delete outcome lost"); }
+                };
+            }
+            assertThat(send(node.requestHandler(), new Message.ZeroCopyPutRequest(BOX.value(), dst,
+                    0, token, null, List.of(), null))).isNotInstanceOf(Message.HeadCandyResponse.class);
+            assertThat(coordination.get(relayKey)).isPresent();
+            coordination.failWritesTo = null;
+            coordination.beforeCompareAndSet = key -> { };
+            coordination.beforeDelete = key -> { };
+            node.releasePartition(BOX, 1);
+            node.openPartition(BOX, 1);
+            orphanSource(node, src);
+            assertThat(node.reconcileClaimedLocatorRelaysOnce()).isEqualTo(1);
+            assertThat(coordination.get(CandyboxKeys.locatorRelayKey(BOX.value(), 0, token))).isEmpty();
+            node.collectGarbageOnce();
+            assertThat(store.listLedgers()).contains(syrup);
+            assertThat(node.enginePartition(BOX, 1).getCandy(CandyKey.of(dst)))
+                    .isEqualTo(bytes("payload"));
+        } finally {
+            store.close();
+        }
+    }
+
+    @Test
+    void expiryWinningTheClaimCasRejectsTheConsumerAfterGc() {
+        ManualClock clock = new ManualClock(1_000_000);
+        InMemoryLedgerStore store = new InMemoryLedgerStore(clock);
+        FaultyCoordination coordination = new FaultyCoordination(new InMemoryCoordinationService(clock));
+        CandyboxConfig config = CandyboxConfig.builder().memtableFlushThresholdBytes(1)
+                .syrupRolloverBytes(1).l0CompactionTrigger(2).ledgerGcGraceMillis(0)
+                .renameIntentAbandonMillis(1_000).leaseRenewIntervalMillis(0).build();
+        try (CandyboxNode node = new CandyboxNode(1, config, store, coordination, clock)) {
+            node.createBox(BOX, PARTITIONS);
+            String src = keyIn(0, "src");
+            String dst = keyIn(1, "dst");
+            long syrup = putAndFlush(node, src);
+            String token = relayToken(node.requestHandler(), src);
+            String relayKey = CandyboxKeys.locatorRelayKey(BOX.value(), 0, token);
+            coordination.beforeCompareAndSet = key -> {
+                if (key.equals(relayKey)) {
+                    coordination.beforeCompareAndSet = ignored -> { };
+                    orphanSource(node, src);
+                    clock.advance(2_000);
+                    node.sweepStaleLocatorRelaysOnce();
+                    node.collectGarbageOnce();
+                    assertThat(store.listLedgers()).doesNotContain(syrup);
+                }
+            };
+            assertThat(send(node.requestHandler(), new Message.ZeroCopyPutRequest(BOX.value(), dst,
+                    0, token, null, List.of(), null))).isInstanceOf(Message.ErrorResponse.class);
+            assertThatThrownBy(() -> node.enginePartition(BOX, 1).getCandy(CandyKey.of(dst)))
+                    .isInstanceOf(CandyNotFoundException.class);
+        } finally {
+            store.close();
+        }
+    }
+
+    private static void await(CountDownLatch latch) {
+        try {
+            if (!latch.await(10, TimeUnit.SECONDS)) {
+                throw new AssertionError("Paused transfer was not resumed");
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(interrupted);
+        }
+    }
+
+    @Test
+    void deletedBoxClaimsAreCleanedAfterTheirRemoteWriterEpochIsFenced() {
+        assertDeletedClaimCleanup(false);
+    }
+
+    @Test
+    void recreatedBoxCannotReleaseOldClaimsBeforeTheOldWriterIsFenced() {
+        assertDeletedClaimCleanup(true);
+    }
+
+    private static void assertDeletedClaimCleanup(boolean recreate) {
+        ManualClock clock = new ManualClock(1_000_000);
+        InMemoryLedgerStore store = new InMemoryLedgerStore(clock);
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        CandyboxConfig config = CandyboxConfig.builder().leaseRenewIntervalMillis(0)
+                .ledgerEnumerationGraceMillis(100).build();
+        try (CandyboxNode source = new CandyboxNode(1, config, store, coordination, clock);
+             CandyboxNode destination = new CandyboxNode(2, config, store, coordination, clock)) {
+            source.createBox(BOX, PARTITIONS);
+            source.releasePartition(BOX, 1);
+            destination.openPartition(BOX, 1);
+            String src = keyIn(0, "src");
+            String dst = keyIn(1, "dst");
+            long syrup = putAndFlush(source, src);
+            CandyLocator locator = source.enginePartition(BOX, 0).resolveLocator(CandyKey.of(src));
+            BoxEngine staleDestination = destination.enginePartition(BOX, 1);
+            String token = relayToken(source.requestHandler(), src);
+            String relayKey = CandyboxKeys.locatorRelayKey(BOX.value(), 0, token);
+            // A client error after claiming leaves the same durable state as a crash before append.
+            assertThat(send(destination.requestHandler(), new Message.ZeroCopyPutRequest(
+                    BOX.value(), dst, 0, token, null, List.of("invalid-grant"), null)))
+                    .isInstanceOf(Message.ErrorResponse.class);
+            source.deleteBox(BOX, true);
+            assertThat(coordination.get(relayKey)).isPresent(); // remote writer is not fenced yet
+            clock.advance(11_000);
+            String newRelayKey = null;
+            if (recreate) {
+                source.createBox(BOX, PARTITIONS);
+                putAndFlush(source, src);
+                String newToken = relayToken(source.requestHandler(), src);
+                newRelayKey = CandyboxKeys.locatorRelayKey(BOX.value(), 0, newToken);
+                assertThat(source.claimLocatorRelay(BOX.value(), 0, newToken, dst,
+                        source.enginePartition(BOX, 1), relay -> true)).isPresent();
+                source.reconcileClaimedLocatorRelaysOnce();
+                assertThat(coordination.get(relayKey)).isPresent();
+            }
+            LedgerRetention retention = new LedgerRetention(store, coordination, clock);
+            for (int i = 0; i < 3; i++) { retention.reconcile(100, 1024, false); }
+            assertThat(coordination.get(relayKey)).isEmpty();
+            assertThat(store.listLedgers()).doesNotContain(syrup);
+            assertThatThrownBy(() -> staleDestination.zeroCopyPut(CandyKey.of(dst), locator.parts(),
+                    null, Map.of(), 0L, ObjectAcl.NONE, null)).isInstanceOf(FencedException.class);
+            if (newRelayKey != null) {
+                assertThat(coordination.get(newRelayKey)).isPresent();
+                assertThat(source.enginePartition(BOX, 0).getCandy(CandyKey.of(src)))
+                        .isEqualTo(bytes("payload"));
+            }
+        } finally {
+            store.close();
+        }
+    }
+
+    @Test
+    void remoteDestinationCloseCleansItsDeletedBoxClaimWithoutEnumeration() {
+        ManualClock clock = new ManualClock(1_000_000);
+        InMemoryLedgerStore store = new InMemoryLedgerStore(clock);
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        CandyboxConfig config = CandyboxConfig.builder().leaseRenewIntervalMillis(0).build();
+        try (CandyboxNode source = new CandyboxNode(1, config, store, coordination, clock);
+             CandyboxNode destination = new CandyboxNode(2, config, store, coordination, clock)) {
+            source.createBox(BOX, PARTITIONS);
+            source.releasePartition(BOX, 1);
+            destination.openPartition(BOX, 1);
+            String src = keyIn(0, "src");
+            putAndFlush(source, src);
+            String token = relayToken(source.requestHandler(), src);
+            String relayKey = CandyboxKeys.locatorRelayKey(BOX.value(), 0, token);
+            assertThat(send(destination.requestHandler(), new Message.ZeroCopyPutRequest(
+                    BOX.value(), keyIn(1, "dst"), 0, token, null, List.of("invalid-grant"), null)))
+                    .isInstanceOf(Message.ErrorResponse.class);
+            source.deleteBox(BOX, true);
+            assertThat(coordination.get(relayKey)).isPresent();
+            destination.releaseBox(BOX);
+            assertThat(coordination.get(relayKey)).isEmpty();
+        } finally {
+            store.close();
+        }
+    }
+
+    /** Injects a pause after relay acceptance and immediately before the destination WAL append. */
+    private static final class ImportStore implements LedgerStore {
+        private final LedgerStore delegate;
+        volatile Consumer<Collection<Long>> beforeImport = ids -> { };
+
+        ImportStore(LedgerStore delegate) { this.delegate = delegate; }
+        @Override public void retainLedgers(Collection<Long> ids) { beforeImport.accept(ids); }
+        @Override public WritableLedger createLedger(LedgerConfig config) { return delegate.createLedger(config); }
+        @Override public ReadableLedger openLedger(long id) { return delegate.openLedger(id); }
+        @Override public ReadableLedger recoverOpen(long id) { return delegate.recoverOpen(id); }
+        @Override public void deleteLedger(long id) { delegate.deleteLedger(id); }
+        @Override public List<Long> listLedgers() { return delegate.listLedgers(); }
+        @Override public LedgerMetadata readMetadata(long id) { return delegate.readMetadata(id); }
+        @Override public void close() { }
     }
 
     @Test
@@ -382,6 +710,40 @@ class CrossPartitionGcAndRenameTest {
             assertThat(send(handler, put)).isInstanceOf(Message.HeadCandyResponse.class);
             assertThat(coordination.children(CandyboxKeys.locatorRelaysPath(BOX.value(), 0)))
                     .isEmpty();
+        }
+    }
+
+    @Test
+    void committedRetryCannotReinsertADeletedDestinationEvenWithoutAnIdempotencyToken() {
+        ManualClock clock = new ManualClock(1_000_000);
+        InMemoryLedgerStore store = new InMemoryLedgerStore(clock);
+        FaultyCoordination coordination = new FaultyCoordination(new InMemoryCoordinationService(clock));
+        CandyboxConfig config = CandyboxConfig.builder().memtableFlushThresholdBytes(1)
+                .syrupRolloverBytes(1).l0CompactionTrigger(2).ledgerGcGraceMillis(0)
+                .ownershipLeaseTtlMillis(3_600_000).leaseRenewIntervalMillis(0).build();
+        try (CandyboxNode node = new CandyboxNode(1, config, store, coordination, clock)) {
+            node.createBox(BOX, PARTITIONS);
+            String src = keyIn(0, "src");
+            String dst = keyIn(1, "dst");
+            long syrup = putAndFlush(node, src);
+            String token = relayToken(node.requestHandler(), src);
+            Message put = new Message.ZeroCopyPutRequest(BOX.value(), dst, 0, token, null,
+                    List.of(), null);
+            coordination.failWritesTo = CandyboxKeys.partitionRefsKey(BOX.value(), 1);
+            assertThat(send(node.requestHandler(), put)).isInstanceOf(Message.BusyResponse.class);
+            coordination.failWritesTo = null;
+            node.enginePartition(BOX, 1).deleteCandy(CandyKey.of(dst));
+            node.enginePartition(BOX, 1).flush();
+            orphanSource(node, src);
+            clock.advance(config.renameIntentAbandonMillis() + 1);
+            node.sweepStaleLocatorRelaysOnce();
+            assertThat(send(node.requestHandler(), put)).isInstanceOf(Message.HeadCandyResponse.class);
+            assertThatThrownBy(() -> node.enginePartition(BOX, 1).getCandy(CandyKey.of(dst)))
+                    .isInstanceOf(CandyNotFoundException.class);
+            node.collectGarbageOnce();
+            assertThat(store.listLedgers()).doesNotContain(syrup);
+        } finally {
+            store.close();
         }
     }
 
@@ -734,6 +1096,8 @@ class CrossPartitionGcAndRenameTest {
         volatile Consumer<String> beforeCreate = key -> { };
         volatile Consumer<String> beforeGet = key -> { };
         volatile Consumer<String> beforeChildren = path -> { };
+        volatile Consumer<String> beforeCompareAndSet = key -> { };
+        volatile Consumer<String> beforeDelete = key -> { };
 
         FaultyCoordination(CoordinationService delegate) {
             this.delegate = delegate;
@@ -764,6 +1128,7 @@ class CrossPartitionGcAndRenameTest {
 
         @Override
         public long compareAndSet(String key, byte[] value, long expectedVersion) {
+            beforeCompareAndSet.accept(key);
             failIfTargeted(key);
             return delegate.compareAndSet(key, value, expectedVersion);
         }
@@ -777,6 +1142,7 @@ class CrossPartitionGcAndRenameTest {
 
         @Override
         public void delete(String key, long expectedVersion) {
+            beforeDelete.accept(key);
             delegate.delete(key, expectedVersion);
         }
 
