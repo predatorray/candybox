@@ -373,6 +373,66 @@ class CoordinationRaceTest {
         }
     }
 
+    @Test
+    void cancelledServingOwnershipClosesHandlesBeforeRepeatedSameNodeRetries() {
+        var closed = new java.util.ArrayList<java.util.concurrent.atomic.AtomicBoolean>();
+        LedgerStore tracking = trackingStore(closed);
+        try (var node = new CandyboxNode(1, config, tracking, coordination, clock)) {
+            node.createBox(BOX, 1);
+            node.enginePartition(BOX, 0).putCandy(KEY, new byte[]{7}, null, Map.of(), null);
+            for (int attempt = 0; attempt < 3; attempt++) {
+                var initialHandles = List.copyOf(closed);
+                coordination.failRenewals = true;
+                node.renewLeases();
+                coordination.failRenewals = false;
+                node.openPartition(BOX, 0);
+                assertThat(initialHandles).isNotEmpty().allMatch(java.util.concurrent.atomic.AtomicBoolean::get,
+                        "prior serving handles closed before retry returns");
+                assertThat(node.enginePartition(BOX, 0).getCandy(KEY)).containsExactly((byte) 7);
+            }
+        }
+        assertThat(closed).allMatch(java.util.concurrent.atomic.AtomicBoolean::get,
+                "all created handles closed after shutdown");
+    }
+
+    @Test
+    void registryShutdownClosesCancelledServingAcquisitionsWithoutPartitionMap() {
+        createWriteAndRelease();
+        var closed = new java.util.ArrayList<java.util.concurrent.atomic.AtomicBoolean>();
+        try (OwnershipLeases leases = new OwnershipLeases();
+             PartitionOwnership recovered = PartitionOwnership.recover(BOX, 0, config,
+                     trackingStore(closed), coordination, 2, clock, leases)) {
+            coordination.failRenewals = true;
+            leases.renew();
+            assertThat(leases.size()).isZero();
+            leases.close();
+            assertThat(closed).isNotEmpty().allMatch(java.util.concurrent.atomic.AtomicBoolean::get,
+                    "cancelled acquisitions remain reachable for cleanup before map installation");
+        }
+    }
+
+    private LedgerStore trackingStore(List<java.util.concurrent.atomic.AtomicBoolean> closed) {
+        return new LedgerStore() {
+            public WritableLedger createLedger(LedgerConfig cfg) {
+                WritableLedger actual = store.createLedger(cfg);
+                var wasClosed = new java.util.concurrent.atomic.AtomicBoolean();
+                closed.add(wasClosed);
+                return (WritableLedger) java.lang.reflect.Proxy.newProxyInstance(
+                        WritableLedger.class.getClassLoader(), new Class<?>[]{WritableLedger.class},
+                        (proxy, method, args) -> {
+                            if (method.getName().equals("close")) { wasClosed.set(true); }
+                            try { return method.invoke(actual, args); }
+                            catch (java.lang.reflect.InvocationTargetException e) { throw e.getCause(); }
+                        });
+            }
+            public ReadableLedger openLedger(long id) { return store.openLedger(id); }
+            public ReadableLedger recoverOpen(long id) { return store.recoverOpen(id); }
+            public List<Long> listLedgers() { return store.listLedgers(); }
+            public void deleteLedger(long id) { store.deleteLedger(id); }
+            public void close() { }
+        };
+    }
+
     private static final class PausingStore implements LedgerStore {
         private final LedgerStore delegate;
         final CountDownLatch entered = new CountDownLatch(1);

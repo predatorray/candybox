@@ -282,6 +282,12 @@ public final class CandyboxNode implements AutoCloseable {
             if (existing != null && existing.isOwner()) {
                 return existing; // already owned here
             }
+            if (existing != null) {
+                // Release the cancelled acquisition before re-acquiring on the same node. The
+                // remote renewal may have succeeded, so retaining its handles can also retain
+                // the same live epoch across retries.
+                existing.close();
+            }
             LOG.info("Opening (taking over) box {} partition {} on node {}", bp.box(),
                     bp.partition(), nodeId);
             return PartitionOwnership.recover(box, partition, config, ledgerStore, coordination,

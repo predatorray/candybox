@@ -650,7 +650,9 @@ before any replay, fencing, or checkpoint I/O. The existing node heartbeat renew
 there are no per-partition schedulers and no registration transfer when recovery succeeds. Failed
 renewal cancels the acquisition permanently, even if the renewal's remote outcome is unknown.
 Recovery checks cancellation before publication and serving, closes local handles after blocked I/O
-returns, and unregisters on failure. Shutdown cancels registrations, including in-flight recovery.
+returns, and unregisters on failure. Cancelled acquisitions leave the renewal set but remain in the
+cleanup registry until released; same-node retry closes the old engine before reacquisition.
+Shutdown cancels and closes registrations, including in-flight recovery.
 
 Manifest publication uses `CoordinationService.compareAndSetWithLease`: ZooKeeper checks the lease
 record's data version and creates/CAS-updates the pointer in one transaction; the fake checks both

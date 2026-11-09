@@ -27,7 +27,10 @@ import org.slf4j.LoggerFactory;
 /** Node-scoped renewal registry: recovering and serving partitions have the same registration. */
 final class OwnershipLeases implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(OwnershipLeases.class);
+    // Cleanup ownership outlives renewal eligibility: a cancelled engine must remain reachable
+    // until its caller releases it or node shutdown closes it.
     private final Set<Held> held = ConcurrentHashMap.newKeySet();
+    private final Set<Held> renewing = ConcurrentHashMap.newKeySet();
     private boolean closed;
 
     synchronized Held register(Lease lease) {
@@ -37,16 +40,17 @@ final class OwnershipLeases implements AutoCloseable {
         }
         Held registration = new Held(lease);
         held.add(registration);
+        renewing.add(registration);
         return registration;
     }
 
     void renew() {
-        for (Held lease : held) {
+        for (Held lease : renewing) {
             lease.renew();
         }
     }
 
-    int size() { return held.size(); }
+    int size() { return renewing.size(); }
 
     @Override
     public synchronized void close() {
@@ -88,7 +92,7 @@ final class OwnershipLeases implements AutoCloseable {
             } catch (RuntimeException failure) {
                 // Fail closed even for an ambiguous renewal result. Never revive this acquisition.
                 cancelled = true;
-                held.remove(this);
+                renewing.remove(this);
                 LOG.warn(
                         "Cancelled ownership of {} after lease renewal failure", resource(), failure);
             }
@@ -103,6 +107,7 @@ final class OwnershipLeases implements AutoCloseable {
         public synchronized void release() {
             cancelled = true;
             held.remove(this);
+            renewing.remove(this);
             try {
                 if (engine != null) {
                     engine.close();
