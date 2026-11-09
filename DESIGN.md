@@ -285,7 +285,8 @@ consults range tombstones across all tables rather than pruning by point range.
   the decision to committed. Recovery checkpoints receipts across flush/WAL rotation and
   maintenance republishes uncommitted decisions without a client retry. Publication only updates
   an existing decision; a delayed request or stale receipt snapshot cannot recreate a cleaned
-  decision. Marker format v2 adds the prepared state; older markers decode as committed. The source owner — via
+  decision. Marker format v3 adds a reserved state (v2 added prepared); older committed markers
+  remain decodable. The source owner — via
   `CompleteRename`, maintenance, or handover — validates its durable intent against the marker and
   conditionally tombstones only the captured source HLC. It durably acknowledges that deletion in
   the marker before clearing the intent. A later source re-PUT survives. Destination maintenance
@@ -293,7 +294,10 @@ consults range tombstones across all tables rather than pruning by point range.
   order; interrupted cleanup resumes even when the receipt or relay has already disappeared.
   Retries compare the stable token/incarnation/source HLC/destination identity, not the random
   relay attempt; cleanup releases every relay attempt for the acknowledged rename.
-  Source timeout alone cannot abort a claimed transfer. Only CAS removal of an unclaimed relay,
+  Source preparation and retirement serialize per source engine; maintenance revalidates stale
+  intent snapshots. Before WAL append, the destination CAS-reserves the logical decision under
+  its engine lock. Source abort CAS-deletes only an unreserved prepared decision, so a fresh
+  retry cannot commit through an abandonment snapshot. Source timeout alone cannot abort a claimed transfer. Only CAS removal of an unclaimed relay,
   or a newer destination owner fencing/recovering the old WAL and finding no receipt, proves
   abort; otherwise the intent and pin remain pending. A reader may temporarily see both keys.
   Eventual convergence requires participant recovery and successful maintenance/coordination;

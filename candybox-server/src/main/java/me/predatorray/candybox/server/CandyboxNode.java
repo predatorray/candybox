@@ -703,12 +703,15 @@ public final class CandyboxNode implements AutoCloseable {
             }
             for (RenameIntent intent : intents) {
                 try {
-                    if (finalizeRenameIntent(engine, box, intent.token(), intent.srcKey())) {
-                        finalized++;
-                    } else if (clock.currentTimeMillis() - intent.createdAtMillis() > abandon
-                            && abortUnclaimedRename(box, ownership.partition(), intent.token())) {
-                        engine.clearRenameIntent(intent.token());
-                        deleteRenameMarker(box, intent.token());
+                    synchronized (engine) {
+                        // A fresh Prepare may have refreshed this token since the maintenance snapshot.
+                        if (!engine.listRenameIntents().contains(intent)) { continue; }
+                        if (finalizeRenameIntent(engine, box, intent.token(), intent.srcKey())) {
+                            finalized++;
+                        } else if (clock.currentTimeMillis() - intent.createdAtMillis() > abandon
+                                && abortUnclaimedRename(box, ownership.partition(), intent.token())) {
+                            engine.clearRenameIntent(intent.token());
+                        }
                     }
                 } catch (NotOwnerException lost) {
                     break;
@@ -1001,10 +1004,20 @@ public final class CandyboxNode implements AutoCloseable {
         var relayValue = coordination.get(CandyboxKeys.locatorRelayKey(box, srcPartition, relayToken));
         if (relayValue.isEmpty()) { throw new BusyException("Rename attempt already retired"); }
         var relay = LocatorRelay.deserialize(relayValue.get().value());
-        var decision = coordination.get(CandyboxKeys.renameMarkerKey(box, relay.renameToken()));
-        if (decision.isEmpty() || RenameMarker.deserialize(decision.get().value()).completed()) {
-            throw new BusyException("Rename decision already retired");
+        String key = CandyboxKeys.renameMarkerKey(box, relay.renameToken());
+        for (int attempt = 0; attempt < 4; attempt++) {
+            var decision = coordination.get(key);
+            if (decision.isEmpty()) { throw new BusyException("Rename decision already retired"); }
+            var marker = RenameMarker.deserialize(decision.get().value());
+            if (marker.completed()) { throw new BusyException("Rename decision already acknowledged"); }
+            if (marker.reserved()) { return; }
+            try {
+                // A source abort deletes only this unreserved version. Exactly one CAS wins.
+                coordination.compareAndSet(key, marker.reserve().serialize(), decision.get().version());
+                return;
+            } catch (CasConflictException raced) { /* retry decision; never append after abort */ }
         }
+        throw new BusyException("Rename reservation raced repeatedly");
     }
 
     /** Only preparation may create a decision. Publication can never recreate a cleaned token. */
@@ -1080,6 +1093,12 @@ public final class CandyboxNode implements AutoCloseable {
 
     /** Uses only the source's durable expected HLC; a client cannot choose the deleted version. */
     boolean finalizeRenameIntent(BoxEngine engine, String box, String token, String srcKey) {
+        synchronized (engine) {
+            return finalizeRenameIntentLocked(engine, box, token, srcKey);
+        }
+    }
+
+    private boolean finalizeRenameIntentLocked(BoxEngine engine, String box, String token, String srcKey) {
         var intent = engine.listRenameIntents().stream().filter(i -> i.token().equals(token))
                 .findFirst().orElse(null);
         if (intent == null || !intent.srcKey().equals(srcKey)) { return false; }
@@ -1118,6 +1137,12 @@ public final class CandyboxNode implements AutoCloseable {
 
     /** Pending-to-aborted races the destination's pending-to-claimed CAS on the same record. */
     private boolean abortUnclaimedRename(String box, int partition, String renameToken) {
+        String markerKey = CandyboxKeys.renameMarkerKey(box, renameToken);
+        var decision = coordination.get(markerKey);
+        if (decision.isPresent()) {
+            var marker = RenameMarker.deserialize(decision.get().value());
+            if (marker.reserved() || marker.committed()) { return false; }
+        }
         for (String token : coordination.children(CandyboxKeys.locatorRelaysPath(box, partition))) {
             var value = coordination.get(CandyboxKeys.locatorRelayKey(box, partition, token));
             if (value.isEmpty()) { continue; }
@@ -1127,6 +1152,7 @@ public final class CandyboxNode implements AutoCloseable {
             coordination.delete(CandyboxKeys.locatorRelayKey(box, partition, token), value.get().version());
             if (config.ledgerEnumerationGraceMillis() > 0) { releaseRelayPins(token, relay); }
         }
+        if (decision.isPresent()) { coordination.delete(markerKey, decision.get().version()); }
         return true;
     }
 

@@ -571,25 +571,24 @@ final class NodeRequestHandler implements RequestHandler {
             sourceReadCheck(principal, m.box(), m.key()).accept(locator.acl());
             return relayLocator(engine, m.box(), m.key(), principal, null, null, locator);
         } else if (message instanceof Message.PrepareRenameRequest m) {
-            // The source partition's owner: resolve the locator (relayed to the destination) and
-            // durably record the rename intent so the owed source delete survives a crash/handover.
             BoxEngine engine = node.engine(BoxName.of(m.box()), m.srcKey());
-            CandyLocator locator = engine.resolveLocator(CandyKey.of(m.srcKey()));
-            sourceReadCheck(principal, m.box(), m.srcKey()).accept(locator.acl());
-            // Publish the abort/claim rendezvous before the intent. A paused prepare must never
-            // expose a consumable relay after maintenance has already abandoned its intent.
-            var prepared = relayLocator(engine, m.box(), m.srcKey(), principal, m.renameToken(),
-                    m.dstKey(), locator);
-            try {
-                node.prepareRenameMarker(m.box(), m.renameToken(), m.srcKey(),
-                        node.descriptor(BoxName.of(m.box())).partitionOf(m.srcKey()), locator.hlc(), m.dstKey());
-                engine.recordRenameIntent(new RenameIntent(m.renameToken(), m.srcKey(), locator.hlc(),
-                        m.dstKey(), m.dstPartition(), node.currentTimeMillis()));
-                return prepared;
-            } catch (RuntimeException e) {
-                node.deleteLocatorRelay(m.box(), node.descriptor(BoxName.of(m.box())).partitionOf(m.srcKey()),
-                        prepared.relayToken());
-                throw e;
+            // The same source-engine monitor protects maintenance retirement and preparation.
+            synchronized (engine) {
+                CandyLocator locator = engine.resolveLocator(CandyKey.of(m.srcKey()));
+                sourceReadCheck(principal, m.box(), m.srcKey()).accept(locator.acl());
+                var prepared = relayLocator(engine, m.box(), m.srcKey(), principal, m.renameToken(),
+                        m.dstKey(), locator);
+                try {
+                    node.prepareRenameMarker(m.box(), m.renameToken(), m.srcKey(),
+                            node.descriptor(BoxName.of(m.box())).partitionOf(m.srcKey()), locator.hlc(), m.dstKey());
+                    engine.recordRenameIntent(new RenameIntent(m.renameToken(), m.srcKey(), locator.hlc(),
+                            m.dstKey(), m.dstPartition(), node.currentTimeMillis()));
+                    return prepared;
+                } catch (RuntimeException e) {
+                    node.deleteLocatorRelay(m.box(), node.descriptor(BoxName.of(m.box())).partitionOf(m.srcKey()),
+                            prepared.relayToken());
+                    throw e;
+                }
             }
         } else if (message instanceof Message.ZeroCopyPutRequest m) {
             BoxName box = BoxName.of(m.box());

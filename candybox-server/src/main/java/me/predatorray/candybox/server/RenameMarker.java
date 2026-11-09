@@ -22,7 +22,14 @@ import me.predatorray.candybox.common.exception.SerializationException;
 
 /** Commit publication followed by the source's durable-delete acknowledgement. */
 record RenameMarker(String incarnation, String srcKey, int srcPartition, Hlc srcHlc,
-                    String dstKey, boolean completed, boolean committed) {
+                    String dstKey, boolean completed, boolean committed, boolean reserved) {
+    RenameMarker(String incarnation, String srcKey, int srcPartition, Hlc srcHlc,
+                 String dstKey, boolean completed, boolean committed) {
+        this(incarnation, srcKey, srcPartition, srcHlc, dstKey, completed, committed, committed);
+    }
+    RenameMarker reserve() {
+        return new RenameMarker(incarnation, srcKey, srcPartition, srcHlc, dstKey, completed, committed, true);
+    }
     RenameMarker(String incarnation, String srcKey, int srcPartition, Hlc srcHlc,
                  String dstKey, boolean completed) {
         this(incarnation, srcKey, srcPartition, srcHlc, dstKey, completed, true);
@@ -32,10 +39,10 @@ record RenameMarker(String incarnation, String srcKey, int srcPartition, Hlc src
     }
     byte[] serialize() {
         BinaryWriter w = new BinaryWriter(128);
-        w.writeByte(0); w.writeByte(2); w.writeString(incarnation); w.writeString(srcKey);
+        w.writeByte(0); w.writeByte(3); w.writeString(incarnation); w.writeString(srcKey);
         w.writeVarInt(srcPartition); w.writeVarLong(srcHlc.physicalMillis());
         w.writeVarInt(srcHlc.logicalCounter()); w.writeInt(srcHlc.nodeId());
-        w.writeString(dstKey); w.writeBoolean(completed); w.writeBoolean(committed);
+        w.writeString(dstKey); w.writeBoolean(completed); w.writeBoolean(committed); w.writeBoolean(reserved);
         return w.toByteArray();
     }
     static RenameMarker deserialize(byte[] bytes) {
@@ -51,9 +58,13 @@ record RenameMarker(String incarnation, String srcKey, int srcPartition, Hlc src
             return new RenameMarker("", source, partition, hlc, destination, false);
         }
         int version = r.readByte();
-        if (version != 1 && version != 2) { throw new SerializationException("Unsupported rename marker"); }
-        var marker = new RenameMarker(r.readString(), r.readString(), r.readVarInt(),
-                new Hlc(r.readVarLong(), r.readVarInt(), r.readInt()), r.readString(), r.readBoolean(), version == 1 || r.readBoolean());
+        if (version != 1 && version != 2 && version != 3) { throw new SerializationException("Unsupported rename marker"); }
+        String incarnation = r.readString(); String source = r.readString(); int partition = r.readVarInt();
+        Hlc hlc = new Hlc(r.readVarLong(), r.readVarInt(), r.readInt());
+        String destination = r.readString(); boolean completed = r.readBoolean();
+        boolean committed = version == 1 || r.readBoolean();
+        var marker = new RenameMarker(incarnation, source, partition, hlc, destination, completed,
+                committed, version < 3 ? committed : r.readBoolean());
         if (r.hasRemaining()) { throw new SerializationException("Trailing rename marker bytes"); }
         return marker;
     }

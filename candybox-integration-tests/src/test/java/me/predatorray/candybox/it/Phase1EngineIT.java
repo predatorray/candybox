@@ -107,7 +107,10 @@ class Phase1EngineIT {
                 for (var receipt : recovered.listRenameReceipts()) { recovered.clearRenameReceipt(receipt.token()); }
                 recovered.zeroCopyRename(CandyKey.of("after"), large, "after", "epoch", "relay", 0, "src");
                 recovered.flush();
-                assertThat(recovered.getCandy(CandyKey.of("after"))).hasSize(10_000);
+                assertThat(recovered.resolveLocator(CandyKey.of("after")).contentLength()).isEqualTo(10_000);
+                var out = new java.io.ByteArrayOutputStream();
+                recovered.getCandyRange(CandyKey.of("after"), 0, 0, out);
+                assertThat(out.toByteArray()).isEqualTo(bytes("A"));
             }
         }
     }

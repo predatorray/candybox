@@ -877,6 +877,9 @@ class CrossPartitionGcAndRenameTest {
                 coordination.failWritesTo = failurePoint.equals("refs")
                         ? CandyboxKeys.partitionRefsKey(BOX.value(), 1)
                         : CandyboxKeys.renameMarkerKey(BOX.value(), "crash-rename");
+                if (failurePoint.equals("marker")) {
+                    coordination.failValue = value -> RenameMarker.deserialize(value).committed();
+                }
             }
             assertThat(send(destination.requestHandler(), new Message.ZeroCopyPutRequest(BOX.value(),
                     dst, 0, prepared.relayToken(), null, List.of(), null)))
@@ -917,6 +920,7 @@ class CrossPartitionGcAndRenameTest {
             var prepared = (Message.CandyLocatorResponse) send(node.requestHandler(),
                     new Message.PrepareRenameRequest(BOX.value(), src, dst, 1, "marker-failure"));
             coordination.failWritesTo = CandyboxKeys.renameMarkerKey(BOX.value(), "marker-failure");
+            coordination.failValue = value -> RenameMarker.deserialize(value).committed();
             assertThat(send(node.requestHandler(), new Message.ZeroCopyPutRequest(BOX.value(), dst, 0,
                     prepared.relayToken(), null, List.of(), null))).isInstanceOf(Message.BusyResponse.class);
             if (rewriteSource) {
@@ -972,6 +976,60 @@ class CrossPartitionGcAndRenameTest {
         }
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void abandonmentSerializesFreshPreparationAndCannotRetireItsDecision(boolean sourceHandover) throws Exception {
+        var clock = new ManualClock(1_000_000);
+        var store = new InMemoryLedgerStore(clock);
+        var coordination = new FaultyCoordination(new InMemoryCoordinationService(clock));
+        var config = CandyboxConfig.builder().leaseRenewIntervalMillis(0)
+                .renameIntentAbandonMillis(1_000).build();
+        var snapshot = new CountDownLatch(1); var resume = new CountDownLatch(1);
+        var attempting = new CountDownLatch(1);
+        var once = new java.util.concurrent.atomic.AtomicBoolean();
+        var executor = Executors.newFixedThreadPool(2);
+        try (CandyboxNode node = new CandyboxNode(1, config, store, coordination, clock);
+             CandyboxNode successor = new CandyboxNode(2, config, store, coordination, clock)) {
+            node.createBox(BOX, PARTITIONS);
+            String src = keyIn(0, "src"); String dst = keyIn(1, "dst");
+            node.enginePartition(BOX, 0).putCandy(CandyKey.of(src), bytes("payload"), null, Map.of(), null);
+            var request = new Message.PrepareRenameRequest(BOX.value(), src, dst, 1, "abandon-retry");
+            assertThat(send(node.requestHandler(), request)).isInstanceOf(Message.CandyLocatorResponse.class);
+            clock.advance(2_000);
+            coordination.afterChildren = path -> {
+                if (path.equals(CandyboxKeys.locatorRelaysPath(BOX.value(), 0))
+                        && once.compareAndSet(false, true)) { snapshot.countDown(); await(resume); }
+            };
+            var abandon = executor.submit(node::finalizeRenameIntentsOnce);
+            assertThat(snapshot.await(10, TimeUnit.SECONDS)).isTrue();
+            CandyboxNode source = node;
+            if (sourceHandover) {
+                node.releasePartition(BOX, 0); successor.openPartition(BOX, 0); source = successor;
+            }
+            CandyboxNode preparer = source;
+            var retry = executor.submit(() -> { attempting.countDown(); return send(preparer.requestHandler(), request); });
+            assertThat(attempting.await(10, TimeUnit.SECONDS)).isTrue();
+            if (!sourceHandover) {
+                // Same-generation preparation waits for the captured retirement snapshot.
+                assertThatThrownBy(() -> retry.get(100, TimeUnit.MILLISECONDS))
+                        .isInstanceOf(java.util.concurrent.TimeoutException.class);
+                resume.countDown(); abandon.get(10, TimeUnit.SECONDS);
+            }
+            var prepared = (Message.CandyLocatorResponse) retry.get(10, TimeUnit.SECONDS);
+            assertThat(send(node.requestHandler(), new Message.ZeroCopyPutRequest(BOX.value(), dst, 0,
+                    prepared.relayToken(), null, List.of(), null))).isInstanceOf(Message.HeadCandyResponse.class);
+            // A stale source generation cannot retire a newly reserved/committed decision either.
+            resume.countDown(); abandon.get(10, TimeUnit.SECONDS);
+            source.finalizeRenameIntentsOnce(); node.reconcileClaimedLocatorRelaysOnce();
+            assertThatThrownBy(() -> preparer.enginePartition(BOX, 0).getCandy(CandyKey.of(src)))
+                    .isInstanceOf(CandyNotFoundException.class);
+            assertThat(node.enginePartition(BOX, 1).getCandy(CandyKey.of(dst))).isEqualTo(bytes("payload"));
+            assertThat(source.enginePartition(BOX, 0).listRenameIntents()).isEmpty();
+            assertThat(node.enginePartition(BOX, 1).listRenameReceipts()).isEmpty();
+            assertThat(node.renameMarkerPresent(BOX.value(), "abandon-retry")).isFalse();
+        } finally { resume.countDown(); executor.shutdownNow(); }
+    }
+
     @Test
     void freshPreparationAfterLostDestinationReplyReusesCommitAndCleansEveryRelay() {
         ManualClock clock = new ManualClock(1_000_000);
@@ -1023,6 +1081,7 @@ class CrossPartitionGcAndRenameTest {
             Consumer<String> pause = key -> {
                 if (Thread.currentThread() == paused.get()
                         && key.equals(CandyboxKeys.renameMarkerKey(BOX.value(), "paused"))
+                        && !once.get() && !node.enginePartition(BOX, 1).listRenameReceipts().isEmpty()
                         && once.compareAndSet(false, true)) { entered.countDown(); await(resume); }
             };
             if (mode.equals("request-cas")) { coordination.beforeCompareAndSet = pause; }
@@ -1359,9 +1418,11 @@ class CrossPartitionGcAndRenameTest {
         volatile boolean failChildren;
         volatile boolean omitWriteMetadata;
         volatile String failWritesTo;
+        volatile java.util.function.Predicate<byte[]> failValue = value -> true;
         volatile Consumer<String> beforeCreate = key -> { };
         volatile Consumer<String> beforeGet = key -> { };
         volatile Consumer<String> beforeChildren = path -> { };
+        volatile Consumer<String> afterChildren = path -> { };
         volatile Consumer<String> beforeCompareAndSet = key -> { };
         volatile Consumer<String> beforeDelete = key -> { };
 
@@ -1375,7 +1436,9 @@ class CrossPartitionGcAndRenameTest {
             if (failChildren) {
                 throw new IllegalStateException("connection loss");
             }
-            return delegate.children(path);
+            var children = delegate.children(path);
+            afterChildren.accept(path);
+            return children;
         }
 
         @Override
@@ -1388,20 +1451,20 @@ class CrossPartitionGcAndRenameTest {
         @Override
         public long create(String key, byte[] value) {
             beforeCreate.accept(key);
-            failIfTargeted(key);
+            failIfTargeted(key, value);
             return delegate.create(key, value);
         }
 
         @Override
         public long compareAndSet(String key, byte[] value, long expectedVersion) {
             beforeCompareAndSet.accept(key);
-            failIfTargeted(key);
+            failIfTargeted(key, value);
             return delegate.compareAndSet(key, value, expectedVersion);
         }
 
-        private void failIfTargeted(String key) {
+        private void failIfTargeted(String key, byte[] value) {
             String target = failWritesTo;
-            if (target != null && key.contains(target)) {
+            if (target != null && key.contains(target) && failValue.test(value)) {
                 throw new CasConflictException(key, 0, 1);
             }
         }
