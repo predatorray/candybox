@@ -40,7 +40,7 @@ import me.predatorray.candybox.lsm.sstable.SSTableMeta;
 public final class ManifestState {
 
     private static final ManifestState EMPTY =
-            new ManifestState(List.of(), Set.of(), -1L, Map.of(), Map.of(), Map.of(), Hlc.MIN);
+            new ManifestState(List.of(), Set.of(), -1L, Map.of(), Map.of(), Map.of(), Hlc.MIN, Map.of());
 
     private final List<SSTableMeta> tables;
     private final Set<Long> liveSyrups;
@@ -49,11 +49,14 @@ public final class ManifestState {
     private final Map<String, RenameIntent> renameIntents;
     private final Map<Long, Long> pendingDeletes;
     private final Hlc maxHlc;
+    private final Map<String, RenameReceipt> renameReceipts;
+
+    public Map<String, RenameReceipt> renameReceipts() { return renameReceipts; }
 
     private ManifestState(List<SSTableMeta> tables, Set<Long> liveSyrups, long walLedgerId,
                           Map<String, MultipartUploadState> multipartUploads,
                           Map<String, RenameIntent> renameIntents, Map<Long, Long> pendingDeletes,
-                          Hlc maxHlc) {
+                          Hlc maxHlc, Map<String, RenameReceipt> renameReceipts) {
         this.tables = List.copyOf(tables);
         this.liveSyrups = Set.copyOf(liveSyrups);
         this.walLedgerId = walLedgerId;
@@ -61,6 +64,7 @@ public final class ManifestState {
         this.renameIntents = Collections.unmodifiableMap(new LinkedHashMap<>(renameIntents));
         this.pendingDeletes = Collections.unmodifiableMap(new LinkedHashMap<>(pendingDeletes));
         this.maxHlc = maxHlc;
+        this.renameReceipts = Map.copyOf(renameReceipts);
     }
 
     public static ManifestState empty() {
@@ -194,7 +198,10 @@ public final class ManifestState {
         edit.addedPendingDeletes().forEach(newPendingDeletes::putIfAbsent);
         newPendingDeletes.keySet().removeAll(edit.removedPendingDeletes());
         Hlc newMaxHlc = edit.maxHlc().isAfter(maxHlc) ? edit.maxHlc() : maxHlc;
+        Map<String, RenameReceipt> receipts = new LinkedHashMap<>(renameReceipts);
+        edit.addedRenameReceipts().forEach(r -> receipts.put(r.token(), r));
+        receipts.keySet().removeAll(edit.removedRenameReceipts());
         return new ManifestState(newTables, newSyrups, newWal, newUploads, newIntents,
-                newPendingDeletes, newMaxHlc);
+                newPendingDeletes, newMaxHlc, receipts);
     }
 }

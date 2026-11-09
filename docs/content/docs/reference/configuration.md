@@ -27,7 +27,7 @@ and configure each instance through the environment.
 | `compaction.interval.millis` | Background maintenance tick: compaction, ledger GC, rename-intent finalize, and the multipart and locator-relay sweeps. `0` disables it. | 15000 (15 s) |
 | `multipart.upload.ttl.millis` | How long an abandoned multipart upload is kept before a background sweep aborts it. | 7 days |
 | `zero.copy.relay.budget.bytes` | Cross-partition copy/rename: bytes of locator relays one node may have pending in ZooKeeper before it answers BUSY. | 33554432 (32 MiB) |
-| `rename.intent.abandon.millis` | Cross-partition rename: how long the source owner keeps a rename intent whose destination rendezvous marker never appears before dropping it (the source stays live); also the age after which an unconsumed zero-copy locator relay is reaped. | 60000 (60 s) |
+| `rename.intent.abandon.millis` | Cross-partition rename: age after which an unclaimed preparation can be CAS-aborted (source stays live); also the unclaimed locator relay expiry age. Claimed transfers retain their intent and byte pins until committed completion or a fenced destination recovery proves abort. | 60000 (60 s) |
 
 ## Full reference
 

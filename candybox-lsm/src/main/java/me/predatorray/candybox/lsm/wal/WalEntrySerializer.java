@@ -56,6 +56,11 @@ public final class WalEntrySerializer {
         } else if (entry instanceof WalEntry.RangeDelete rd) {
             w.writeByte(KIND_RANGE_DELETE);
             w.writeRaw(RangeTombstoneSerializer.serialize(rd.tombstone()));
+        } else if (entry instanceof WalEntry.RenamePut rename) {
+            w.writeByte(4).writeByte(1);
+            w.writeBytes(MutationSerializer.serialize(rename.mutation()));
+            w.writeBytes(rename.receipt().serialize());
+            if (w.size() > MAX_BATCH_BYTES) { throw new LimitExceededException("Oversized rename WAL entry"); }
         } else if (entry instanceof WalEntry.Batch batch) {
             w.writeByte(KIND_BATCH).writeByte(BATCH_VERSION).writeVarInt(batch.mutations().size());
             for (Mutation mutation : batch.mutations()) {
@@ -82,6 +87,18 @@ public final class WalEntrySerializer {
             case KIND_MUTATION -> WalEntry.of(MutationSerializer.deserialize(r));
             case KIND_RANGE_DELETE -> WalEntry.of(RangeTombstoneSerializer.deserialize(r));
             case KIND_BATCH -> deserializeBatch(r, data.length);
+            case 4 -> {
+                if (data.length > MAX_BATCH_BYTES || r.readByte() != 1) {
+                    throw new SerializationException("Invalid rename WAL entry");
+                }
+                BinaryReader member = new BinaryReader(r.readBytes());
+                var mutation = MutationSerializer.deserialize(member);
+                var receipt = me.predatorray.candybox.lsm.manifest.RenameReceipt.deserialize(r.readBytes());
+                if (member.hasRemaining() || r.hasRemaining()) {
+                    throw new SerializationException("Trailing rename WAL bytes");
+                }
+                yield new WalEntry.RenamePut(mutation, receipt);
+            }
             default -> throw new SerializationException("Unknown WAL entry kind: " + kind);
         };
     }

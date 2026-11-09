@@ -576,17 +576,17 @@ final class NodeRequestHandler implements RequestHandler {
             BoxEngine engine = node.engine(BoxName.of(m.box()), m.srcKey());
             CandyLocator locator = engine.resolveLocator(CandyKey.of(m.srcKey()));
             sourceReadCheck(principal, m.box(), m.srcKey()).accept(locator.acl());
-            engine.recordRenameIntent(new RenameIntent(m.renameToken(), m.srcKey(), locator.hlc(),
-                    m.dstKey(), m.dstPartition(), node.currentTimeMillis()));
+            // Publish the abort/claim rendezvous before the intent. A paused prepare must never
+            // expose a consumable relay after maintenance has already abandoned its intent.
+            var prepared = relayLocator(engine, m.box(), m.srcKey(), principal, m.renameToken(),
+                    m.dstKey(), locator);
             try {
-                return relayLocator(engine, m.box(), m.srcKey(), principal, m.renameToken(),
-                        m.dstKey(), locator);
+                engine.recordRenameIntent(new RenameIntent(m.renameToken(), m.srcKey(), locator.hlc(),
+                        m.dstKey(), m.dstPartition(), node.currentTimeMillis()));
+                return prepared;
             } catch (RuntimeException e) {
-                try {
-                    engine.clearRenameIntent(m.renameToken());
-                } catch (RuntimeException cleanup) {
-                    e.addSuppressed(cleanup); // the abandon sweep drops the intent instead
-                }
+                node.deleteLocatorRelay(m.box(), node.descriptor(BoxName.of(m.box())).partitionOf(m.srcKey()),
+                        prepared.relayToken());
                 throw e;
             }
         } else if (message instanceof Message.ZeroCopyPutRequest m) {
@@ -602,8 +602,11 @@ final class NodeRequestHandler implements RequestHandler {
                     : effectiveAcl(principal, m.owner(), m.grants());
             CandyMetadata meta = relay.consumer().committed();
             if (meta == null) {
-                meta = engine.zeroCopyPut(CandyKey.of(m.dstKey()), source.parts(),
-                        source.contentType(), source.userMetadata(), 0L, acl, m.idempotencyToken());
+                meta = relay.isRename()
+                        ? engine.zeroCopyRename(CandyKey.of(m.dstKey()), source, relay.renameToken(),
+                                relay.consumer().incarnation(), m.relayToken(), m.srcPartition(), relay.srcKey())
+                        : engine.zeroCopyPut(CandyKey.of(m.dstKey()), source.parts(),
+                                source.contentType(), source.userMetadata(), 0L, acl, m.idempotencyToken());
                 relay = node.recordCommittedLocatorRelay(m.box(), m.srcPartition(), m.relayToken(),
                         relay, meta);
             }
@@ -612,19 +615,20 @@ final class NodeRequestHandler implements RequestHandler {
             node.publishPartitionRefs(box, node.descriptor(box).partitionOf(m.dstKey()));
             if (relay.isRename()) {
                 node.writeRenameMarker(m.box(), relay.renameToken(), relay.srcKey(),
-                        m.srcPartition(), source.hlc(), m.dstKey());
+                        m.srcPartition(), source.hlc(), m.dstKey(), relay.consumer().incarnation());
             }
             // Only now: committed retries finish publication without ever appending another locator.
-            node.completeLocatorRelay(m.box(), m.srcPartition(), m.relayToken(), relay);
+            // Rename claims remain the durable transfer decision until the source acknowledges.
+            if (!relay.isRename()) {
+                node.completeLocatorRelay(m.box(), m.srcPartition(), m.relayToken(), relay);
+            }
             return new Message.HeadCandyResponse(meta.contentLength(), meta.contentType(),
                     meta.userMetadata(), meta.crc32c(), meta.createdAtMillis());
         } else if (message instanceof Message.CompleteRenameRequest m) {
             // The source partition's owner finalizes the rename (also reachable via the maintenance
             // sweep / after handover): LWW-conditioned delete of the source, then clear intent + marker.
             BoxEngine engine = node.engine(BoxName.of(m.box()), m.srcKey());
-            engine.deleteCandyConditional(CandyKey.of(m.srcKey()), m.srcHlc());
-            engine.clearRenameIntent(m.renameToken());
-            node.deleteRenameMarker(m.box(), m.renameToken());
+            node.finalizeRenameIntent(engine, m.box(), m.renameToken(), m.srcKey());
             return new Message.OkResponse();
         } else if (message instanceof Message.DeleteRangeRequest m) {
             BoxEngine engine = node.enginePartition(BoxName.of(m.box()), m.partition());

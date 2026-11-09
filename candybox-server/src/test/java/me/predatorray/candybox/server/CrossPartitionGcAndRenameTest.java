@@ -846,6 +846,194 @@ class CrossPartitionGcAndRenameTest {
         }
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"result", "refs", "marker"})
+    void destinationHandoverFinishesRenameAfterCommitBeforePublication(String failurePoint) {
+        ManualClock clock = new ManualClock(1_000_000);
+        InMemoryLedgerStore store = new InMemoryLedgerStore(clock);
+        FaultyCoordination coordination = new FaultyCoordination(new InMemoryCoordinationService(clock));
+        CandyboxConfig config = CandyboxConfig.builder().leaseRenewIntervalMillis(0)
+                .ownershipLeaseTtlMillis(3_600_000).renameIntentAbandonMillis(1_000).build();
+        try (CandyboxNode source = new CandyboxNode(1, config, store, coordination, clock);
+             CandyboxNode destination = new CandyboxNode(2, config, store, coordination, clock);
+             CandyboxNode recovered = new CandyboxNode(3, config, store, coordination, clock)) {
+            source.createBox(BOX, PARTITIONS);
+            source.releasePartition(BOX, 1);
+            destination.openPartition(BOX, 1);
+            String src = keyIn(0, "src");
+            String dst = keyIn(1, "dst");
+            source.enginePartition(BOX, 0).putCandy(CandyKey.of(src), bytes("payload"), null, Map.of(), null);
+            var prepared = (Message.CandyLocatorResponse) send(source.requestHandler(),
+                    new Message.PrepareRenameRequest(BOX.value(), src, dst, 1, "crash-rename"));
+            if (failurePoint.equals("result")) {
+                coordination.beforeCompareAndSet = key -> {
+                    if (key.equals(CandyboxKeys.locatorRelayKey(BOX.value(), 0, prepared.relayToken()))
+                            && LocatorRelay.deserialize(coordination.delegate.get(key).orElseThrow().value())
+                                    .consumer() != null) {
+                        throw new IllegalStateException("crashed before result publication");
+                    }
+                };
+            } else {
+                coordination.failWritesTo = failurePoint.equals("refs")
+                        ? CandyboxKeys.partitionRefsKey(BOX.value(), 1)
+                        : CandyboxKeys.renameMarkerKey(BOX.value(), "crash-rename");
+            }
+            assertThat(send(destination.requestHandler(), new Message.ZeroCopyPutRequest(BOX.value(),
+                    dst, 0, prepared.relayToken(), null, List.of(), null)))
+                    .isInstanceOfAny(Message.ErrorResponse.class, Message.BusyResponse.class);
+            assertThat(destination.enginePartition(BOX, 1).getCandy(CandyKey.of(dst)))
+                    .isEqualTo(bytes("payload"));
+            coordination.failWritesTo = null;
+            coordination.beforeCompareAndSet = key -> { };
+            destination.releasePartition(BOX, 1);
+            recovered.openPartition(BOX, 1);
+            clock.advance(2_000);
+            // Source cannot abandon an uncertain claimed transfer even past its timeout.
+            source.finalizeRenameIntentsOnce();
+            recovered.reconcileClaimedLocatorRelaysOnce();
+            source.finalizeRenameIntentsOnce();
+            assertThatThrownBy(() -> source.enginePartition(BOX, 0).getCandy(CandyKey.of(src)))
+                    .isInstanceOf(CandyNotFoundException.class);
+            assertThat(recovered.enginePartition(BOX, 1).getCandy(CandyKey.of(dst)))
+                    .isEqualTo(bytes("payload"));
+        }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void receiptSurvivesMarkerFailureAndSourceHandover(boolean rewriteSource) {
+        ManualClock clock = new ManualClock(1_000_000);
+        InMemoryLedgerStore store = new InMemoryLedgerStore(clock);
+        FaultyCoordination coordination = new FaultyCoordination(new InMemoryCoordinationService(clock));
+        CandyboxConfig config = CandyboxConfig.builder().leaseRenewIntervalMillis(0)
+                .ownershipLeaseTtlMillis(3_600_000).renameIntentAbandonMillis(1_000)
+                .memtableFlushThresholdBytes(1).syrupRolloverBytes(1).build();
+        try (CandyboxNode node = new CandyboxNode(1, config, store, coordination, clock);
+             CandyboxNode recovered = new CandyboxNode(2, config, store, coordination, clock)) {
+            node.createBox(BOX, PARTITIONS);
+            String src = keyIn(0, "src");
+            String dst = keyIn(1, "dst");
+            node.enginePartition(BOX, 0).putCandy(CandyKey.of(src), bytes("original"), null, Map.of(), null);
+            var prepared = (Message.CandyLocatorResponse) send(node.requestHandler(),
+                    new Message.PrepareRenameRequest(BOX.value(), src, dst, 1, "marker-failure"));
+            coordination.failWritesTo = CandyboxKeys.renameMarkerKey(BOX.value(), "marker-failure");
+            assertThat(send(node.requestHandler(), new Message.ZeroCopyPutRequest(BOX.value(), dst, 0,
+                    prepared.relayToken(), null, List.of(), null))).isInstanceOf(Message.ErrorResponse.class);
+            if (rewriteSource) {
+                node.enginePartition(BOX, 0).putCandy(CandyKey.of(src), bytes("new"), null, Map.of(), null);
+            }
+            node.releasePartition(BOX, 0);
+            recovered.openPartition(BOX, 0);
+            node.releasePartition(BOX, 1);
+            recovered.openPartition(BOX, 1);
+            clock.advance(2_000);
+            recovered.finalizeRenameIntentsOnce();
+            assertThat(recovered.enginePartition(BOX, 0).listRenameIntents()).hasSize(1);
+            coordination.failWritesTo = null;
+            recovered.reconcileClaimedLocatorRelaysOnce();
+            coordination.beforeCompareAndSet = key -> {
+                if (key.equals(CandyboxKeys.renameMarkerKey(BOX.value(), "marker-failure"))) {
+                    throw new IllegalStateException("crashed after source tombstone before acknowledgement");
+                }
+            };
+            recovered.finalizeRenameIntentsOnce();
+            assertThat(recovered.enginePartition(BOX, 0).listRenameIntents()).hasSize(1);
+            recovered.releasePartition(BOX, 0);
+            recovered.openPartition(BOX, 0);
+            coordination.beforeCompareAndSet = key -> { };
+            recovered.finalizeRenameIntentsOnce();
+            recovered.finalizeRenameIntentsOnce(); // duplicate completion
+            if (rewriteSource) {
+                assertThat(recovered.enginePartition(BOX, 0).getCandy(CandyKey.of(src))).isEqualTo(bytes("new"));
+            } else {
+                assertThatThrownBy(() -> recovered.enginePartition(BOX, 0).getCandy(CandyKey.of(src)))
+                        .isInstanceOf(CandyNotFoundException.class);
+            }
+            // Fail cleanup after the receipt was durably removed; the same owner must retry it.
+            coordination.beforeDelete = key -> {
+                if (key.equals(CandyboxKeys.locatorRelayKey(BOX.value(), 0, prepared.relayToken()))) {
+                    throw new IllegalStateException("cleanup interrupted");
+                }
+            };
+            recovered.reconcileClaimedLocatorRelaysOnce();
+            assertThat(recovered.enginePartition(BOX, 1).listRenameReceipts()).isEmpty();
+            coordination.beforeDelete = key -> {
+                if (key.equals(CandyboxKeys.renameMarkerKey(BOX.value(), "marker-failure"))) {
+                    throw new IllegalStateException("crashed after relay cleanup before marker cleanup");
+                }
+            };
+            recovered.reconcileClaimedLocatorRelaysOnce();
+            coordination.beforeDelete = key -> { };
+            recovered.reconcileClaimedLocatorRelaysOnce();
+            assertThat(coordination.children(CandyboxKeys.locatorRelaysPath(BOX.value(), 0))).isEmpty();
+            assertThat(recovered.renameMarkerPresent(BOX.value(), "marker-failure")).isFalse();
+            recovered.collectGarbageOnce();
+            assertThat(recovered.enginePartition(BOX, 1).getCandy(CandyKey.of(dst))).isEqualTo(bytes("original"));
+        }
+    }
+
+    @Test
+    void sourceCannotAbandonADestinationPausedBeforeCommit() throws Exception {
+        ManualClock clock = new ManualClock(1_000_000);
+        InMemoryLedgerStore store = new InMemoryLedgerStore(clock);
+        ImportStore destinationStore = new ImportStore(store);
+        InMemoryCoordinationService coordination = new InMemoryCoordinationService(clock);
+        CandyboxConfig config = CandyboxConfig.builder().leaseRenewIntervalMillis(0)
+                .ownershipLeaseTtlMillis(3_600_000).renameIntentAbandonMillis(1_000).build();
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch resume = new CountDownLatch(1);
+        var executor = Executors.newSingleThreadExecutor();
+        try (CandyboxNode source = new CandyboxNode(1, config, store, coordination, clock);
+             CandyboxNode destination = new CandyboxNode(2, config, destinationStore, coordination, clock)) {
+            source.createBox(BOX, PARTITIONS);
+            source.releasePartition(BOX, 1);
+            destination.openPartition(BOX, 1);
+            String src = keyIn(0, "src");
+            String dst = keyIn(1, "dst");
+            source.enginePartition(BOX, 0).putCandy(CandyKey.of(src), bytes("payload"), null, Map.of(), null);
+            var prepared = (Message.CandyLocatorResponse) send(source.requestHandler(),
+                    new Message.PrepareRenameRequest(BOX.value(), src, dst, 1, "delayed-rename"));
+            destinationStore.beforeImport = ids -> { entered.countDown(); await(resume); };
+            var response = executor.submit(() -> send(destination.requestHandler(),
+                    new Message.ZeroCopyPutRequest(BOX.value(), dst, 0, prepared.relayToken(), null, List.of(), null)));
+            assertThat(entered.await(10, TimeUnit.SECONDS)).isTrue();
+            clock.advance(2_000);
+            source.finalizeRenameIntentsOnce();
+            source.sweepStaleLocatorRelaysOnce();
+            assertThat(source.enginePartition(BOX, 0).listRenameIntents()).hasSize(1);
+            resume.countDown();
+            assertThat(response.get(10, TimeUnit.SECONDS)).isInstanceOf(Message.HeadCandyResponse.class);
+            source.finalizeRenameIntentsOnce();
+            assertThatThrownBy(() -> source.enginePartition(BOX, 0).getCandy(CandyKey.of(src)))
+                    .isInstanceOf(CandyNotFoundException.class);
+            assertThat(destination.enginePartition(BOX, 1).getCandy(CandyKey.of(dst))).isEqualTo(bytes("payload"));
+        } finally { resume.countDown(); executor.shutdownNow(); }
+    }
+
+    @Test
+    void unclaimedRenameIsAbortedBeforeALateDestinationCanCommit() {
+        ManualClock clock = new ManualClock(1_000_000);
+        CandyboxConfig config = CandyboxConfig.builder().leaseRenewIntervalMillis(0)
+                .ownershipLeaseTtlMillis(3_600_000).renameIntentAbandonMillis(1_000).build();
+        try (CandyboxNode node = new CandyboxNode(1, config, new InMemoryLedgerStore(),
+                new InMemoryCoordinationService(clock), clock)) {
+            node.createBox(BOX, PARTITIONS);
+            String src = keyIn(0, "src");
+            String dst = keyIn(1, "dst");
+            node.enginePartition(BOX, 0).putCandy(CandyKey.of(src), bytes("payload"), null, Map.of(), null);
+            var prepared = (Message.CandyLocatorResponse) send(node.requestHandler(),
+                    new Message.PrepareRenameRequest(BOX.value(), src, dst, 1, "abort-rename"));
+            clock.advance(2_000);
+            node.finalizeRenameIntentsOnce();
+            assertThat(node.enginePartition(BOX, 0).listRenameIntents()).isEmpty();
+            assertThat(send(node.requestHandler(), new Message.ZeroCopyPutRequest(BOX.value(), dst, 0,
+                    prepared.relayToken(), null, List.of(), null))).isInstanceOf(Message.ErrorResponse.class);
+            assertThat(node.enginePartition(BOX, 0).getCandy(CandyKey.of(src))).isEqualTo(bytes("payload"));
+            assertThatThrownBy(() -> node.enginePartition(BOX, 1).getCandy(CandyKey.of(dst)))
+                    .isInstanceOf(CandyNotFoundException.class);
+        }
+    }
+
     @Test
     void renameIntentIsFinalizedWhenTheRendezvousMarkerIsPresent() {
         InMemoryLedgerStore store = new InMemoryLedgerStore();

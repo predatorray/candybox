@@ -42,14 +42,16 @@ to move across partitions; what broke is purely the *bookkeeping* (GC liveness) 
    zero-copy put commits, and the **source partition's owner finalizes its own intents** — on its
    maintenance loop and after handover replay — by reading that marker and tombstoning the source
    (LWW-conditioned on the source's HLC, so a legitimately recreated source is never clobbered).
-   Roll-forward only; no abort.
+   The destination PUT and receipt share one WAL entry; recovery republishes missing markers.
+   Claimed transfers roll forward when committed. Only unclaimed CAS abort or fenced recovery
+   proving no commit may abort a preparation; elapsed time alone cannot decide uncertainty.
    - *Why not the "coordinator-driven resumer" originally sketched:* completing a rename means
      deleting the source key on a possibly-different partition's owner. The architecture has **no
      server-to-server RPC** (the server module doesn't depend on the client, and `CandyboxNode` has
      no outbound transport). Owner-local completion via a ZK rendezvous delivers the identical
      roll-forward guarantee using only the existing `CoordinationService` primitives, with no new
      cross-node call path, and is strictly simpler. The coordinator (balancer holder) retains a
-     minor janitor role: reaping abandoned intents/markers past a long timeout.
+     no role in committing participant state; owner-local maintenance reconciles receipts and cleanup.
 
 ## Design
 
@@ -62,9 +64,9 @@ to move across partitions; what broke is purely the *bookkeeping* (GC liveness) 
   destination present or absent, and the idempotency token makes retry safe.
 - **Cross-partition `rename`** becomes **eventually atomic** (converges to completed). A reader
   between the destination commit and the source delete may still momentarily observe both keys —
-  this is eventual, not linearizable, atomicity, and matches what "move" usually means. The one
-  residual non-atomic window (destination committed, completion marker not yet durable, then a
-  crash) degrades to "both keys live", i.e. exactly today's behavior — never data loss.
+  this is eventual, not linearizable, atomicity. A destination receipt committed atomically with
+  the PUT closes the former pre-marker crash window. Convergence requires participant recovery
+  and successful maintenance/coordination, but does not require the original client to retry.
 - **Recreate-safety:** the source delete is LWW-conditioned on the source HLC captured at intent
   time, so a source key legitimately re-`put` after the rename began is never deleted by a delayed
   completion.
@@ -107,13 +109,14 @@ New wire ops:
   `HeadCandyResponse` — the destination owner reads the relay (it must belong to the same
   principal, be younger than half of `rename.intent.abandon.millis`, and a rename relay must name
   this `dstKey`), writes a destination locator reusing the
-  relayed parts verbatim, commits it to WAL + memtable, publishes its refs, and for a rename relay
-  writes the completion marker `boxes/<box>/renames/<token>` = `{dstKey, srcKey, srcPartition,
-  srcHlc}` after the locator is durable, then deletes the relay (a failed put stays retryable). A copy is owned by the requester
+  relayed parts verbatim. A rename PUT and receipt (token, incarnation, relay token, source
+  partition/key/HLC, destination key, resulting locator) commit in one WAL entry. It then publishes
+  refs and a versioned commit marker. A copy deletes its relay after publication; a rename retains
+  it until source acknowledgement. An uncertain append keeps its claim until fenced recovery. A copy is owned by the requester
   (`owner`/`grants` follow the plain-put rules); a rename keeps the relayed ACL.
 - `CompleteRenameRequest(box, srcKey, srcPartition, renameToken, srcHlc)` → `OkResponse` — the
-  source owner finalizes the rename: LWW-conditioned tombstone of `srcKey`, clear the intent, delete
-  the marker. (Same code path the maintenance loop uses; this is just the synchronous fast path.)
+  source owner validates its durable intent and commit marker, conditionally tombstones the
+  intent's expected HLC, acknowledges the durable delete in coordination, then clears the intent. (Same code path the maintenance loop uses; this is just the synchronous fast path.)
 
 Client `renameCandy` (cross-partition):
 
@@ -134,27 +137,31 @@ therefore replayed on handover — a new source owner re-acquires the obligation
 Lifecycle on the source owner:
 
 - **Record** at prepare (step 1) via a manifest edit.
-- **Finalize** (step 3, or the maintenance loop, or post-handover replay): read
-  `boxes/<box>/renames/<token>`. If present → tombstone `srcKey` LWW-conditioned on `srcHlc`, clear
-  the intent (manifest edit), delete the marker. If absent and the intent is older than
-  `rename.intent.abandon.millis` → drop the intent (the rename never reached the destination; the
-  source stays live). Idempotent throughout.
+- **Finalize** (step 3, maintenance, or post-handover): match the marker to the durable intent,
+  conditionally delete the recorded source HLC, publish ACK after that durable delete, then clear
+  the intent. Destination maintenance removes receipt, relay/pin, and marker, in that order.
+  Receipt removal first flushes/rotates its WAL so recovery cannot resurrect a cleaned receipt.
+- **Abort** past the preparation window only by CAS-deleting an unclaimed relay. A claimed relay
+  and source intent never expire. A newer destination owner may abort its predecessor's claim
+  only after recover-open fences its WAL and no receipt is found. A receipt instead republishes
+  the commit marker. Relays are bounded by existing per-partition count/node-byte caps; every
+  cleanup step is idempotent and retryable after a crash, including after receipt removal.
 
 Crash windows (all converge; none lose data):
 
 | Crash point | State | Resolution |
 |---|---|---|
 | before step 1 durable | src live, dst absent | client retry |
-| after step 1, before step 2 | src live (intent PENDING), dst absent, no marker | maintenance abandons the intent; retry restarts |
+| after step 1, before step 2 | src live (intent PENDING), dst absent, no marker | CAS-abort if unclaimed; otherwise destination fencing/recovery decides commit or abort |
 | after step 2, before step 3 (old W2) | both keys live, intent PENDING, **marker present** | maintenance finalizes → src tombstoned |
 | after step 3 | dst live, src gone | done |
-| dst committed, marker not yet durable, crash | both keys live, no marker | abandoned → both live (== today's behavior, no data loss) |
+| dst committed, marker not yet durable, crash | both keys live, no marker | receipt replay republishes marker → conditional source delete, no client retry |
 
 ### Coordination layout (additions)
 
 ```
 boxes/<box>/partitions/<p>/refs       versioned KV: this partition's referenced-Syrup id set (Box-global GC)
-boxes/<box>/renames/<token>           rename completion marker: {dstKey, srcKey, srcPartition, srcHlc}
+boxes/<box>/renames/<token>           rename commit/ack marker: {incarnation, dstKey, srcKey, srcPartition, srcHlc, completed}
 boxes/<box>/partitions/<p>/relays/<t> source locator snapshot for one zero-copy put (consumed once)
 ```
 
@@ -162,7 +169,7 @@ boxes/<box>/partitions/<p>/relays/<t> source locator snapshot for one zero-copy 
 
 | Key | Default | Meaning |
 |---|---|---|
-| `rename.intent.abandon.millis` | 60000 | Age after which a source-side rename intent with no completion marker, or an unconsumed locator relay, is abandoned. |
+| `rename.intent.abandon.millis` | 60000 | Age after which unclaimed preparations/relays may be CAS-aborted; claimed transfers never time out. |
 
 Box-global GC reuses the existing `ledger.gc.grace.millis`.
 
@@ -180,7 +187,7 @@ Box-global GC reuses the existing `ledger.gc.grace.millis`.
    public `referencedSyrups()` accessor for publishing.
 4. **server** — `CandyboxNode`: publish per-partition refs; Box-global GC gate in
    `GarbageCollector` (consult sibling `refs`); a rename-intent maintenance sweep (finalize via
-   marker / abandon by age) on the existing maintenance worker; replay-driven finalize after
+   marker / CAS-abort unclaimed preparations) on the existing maintenance worker; replay-driven finalize after
    takeover. `NodeRequestHandler`: handlers for the new ops. `ServerConfig`/`CandyboxConfig`:
    `renameIntentAbandonMillis`.
 5. **client** — `CandyboxClient.renameCandy`/`copyCandy` cross-partition zero-copy via
@@ -190,7 +197,7 @@ Box-global GC reuses the existing `ledger.gc.grace.millis`.
    - lsm: zero-copy put from relayed parts; conditional delete LWW; rename-intent record/clear/list
      + serializer round-trip + handover replay; `referencedSyrups` accessor.
    - server: Box-global GC keeps a cross-referenced Syrup alive then reclaims it once unreferenced;
-     intent finalize via marker; intent abandon by age; handover replays an intent and finalizes.
+     intent finalize via marker; CAS-abort unclaimed preparations; handover replays intents and receipts, republishing missing markers.
    - protocol: codec round-trips for the new messages.
    - client: cross-partition copy/rename now stay zero-copy (no `get`+`put`); the 3-step rename flow;
      idempotent retry.

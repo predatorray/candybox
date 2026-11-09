@@ -65,6 +65,7 @@ import me.predatorray.candybox.lsm.manifest.ManifestEdit;
 import me.predatorray.candybox.lsm.manifest.ManifestState;
 import me.predatorray.candybox.lsm.manifest.MultipartUploadState;
 import me.predatorray.candybox.lsm.manifest.RenameIntent;
+import me.predatorray.candybox.lsm.manifest.RenameReceipt;
 import me.predatorray.candybox.lsm.memtable.Memtable;
 import me.predatorray.candybox.lsm.sstable.SSTableMeta;
 import me.predatorray.candybox.lsm.sstable.SSTableReader;
@@ -119,6 +120,9 @@ public final class BoxEngine implements AutoCloseable {
     // GC sees them; held for siblings' GC until then (heldSyrups). Guarded by the write lock, which
     // every Syrup write holds.
     private final Set<Long> unflushedSyrups = new LinkedHashSet<>();
+
+    // Destination commit decisions survive independently of mutable user keys. Guarded by lock.
+    private final Map<String, RenameReceipt> renameReceipts = new LinkedHashMap<>();
 
     // Lightweight operational counters (snapshotted via stats()).
     private final AtomicLong putCount = new AtomicLong();
@@ -192,6 +196,7 @@ public final class BoxEngine implements AutoCloseable {
             Set<Long> replayedSyrups = new LinkedHashSet<>();
             Hlc highWater = state.maxHlc();
             long priorWalId = state.walLedgerId();
+            Map<String, RenameReceipt> recoveredReceipts = new LinkedHashMap<>(state.renameReceipts());
             int replayedEntries = 0;
             if (priorWalId >= 0) {
                 // recover-open fences the prior WAL so a resurrected old owner cannot keep appending.
@@ -207,8 +212,12 @@ public final class BoxEngine implements AutoCloseable {
                     if (e instanceof WalEntry.RangeDelete rd) {
                         memtable.delete(rd.tombstone());
                     } else {
+                        if (e instanceof WalEntry.RenamePut rename) {
+                            recoveredReceipts.put(rename.receipt().token(), rename.receipt());
+                        }
                         List<Mutation> mutations = e instanceof WalEntry.PointMutation pm
-                                ? List.of(pm.mutation()) : ((WalEntry.Batch) e).mutations();
+                                ? List.of(pm.mutation()) : e instanceof WalEntry.RenamePut rename
+                                ? List.of(rename.mutation()) : ((WalEntry.Batch) e).mutations();
                         for (Mutation mutation : mutations) {
                             memtable.put(mutation);
                             for (SegmentRef seg : mutation.locator().segments()) {
@@ -237,6 +246,7 @@ public final class BoxEngine implements AutoCloseable {
             newWal = WriteAheadLog.create(ledgerStore,
                     roleConfig(config, ledgerStore, box, LedgerRole.WAL));
             engine = new BoxEngine(box, config, ledgerStore, hlc, clock, manifest, newWal);
+            engine.renameReceipts.putAll(recoveredReceipts);
             engine.openReadersFor(state);
             // The prior manifest and WAL are superseded by this one: the rotation below leaves the
             // prior WAL unreachable, so a non-empty replay is flushed to L0 in the same edit, or the
@@ -250,13 +260,15 @@ public final class BoxEngine implements AutoCloseable {
             }
             if (memtable.isEmpty()) {
                 manifest.apply(ManifestEdit.builder().newWalLedgerId(newWal.ledgerId())
-                        .maxHlc(highWater).addedPendingDeletes(superseded).build());
+                        .maxHlc(highWater).addedPendingDeletes(superseded)
+                        .addedRenameReceipts(new ArrayList<>(recoveredReceipts.values())).build());
             } else {
                 L0Table table = engine.writeL0(memtable);
                 Set<Long> syrups = new LinkedHashSet<>(table.syrups());
                 syrups.addAll(replayedSyrups);
                 manifest.apply(ManifestEdit.flush(table.meta(), syrups, newWal.ledgerId(), highWater)
-                        .withAddedPendingDeletes(superseded));
+                        .withAddedPendingDeletes(superseded)
+                        .withRenameReceipts(new ArrayList<>(recoveredReceipts.values())));
                 engine.readers.put(table.meta().ledgerId(),
                         new SSTableReader(ledgerStore, table.meta().ledgerId()));
                 engine.flushCount.incrementAndGet();
@@ -1036,6 +1048,32 @@ public final class BoxEngine implements AutoCloseable {
                 .orElseThrow(() -> new CandyNotFoundException(box.value(), key.value()));
     }
 
+    /** Pending destination decisions to publish or clean after source acknowledgement. */
+    public List<RenameReceipt> listRenameReceipts() {
+        lock.readLock().lock();
+        try { return List.copyOf(renameReceipts.values()); }
+        finally { lock.readLock().unlock(); }
+    }
+
+    /** Forget an acknowledged receipt without allowing its old WAL entry to resurrect it. */
+    public void clearRenameReceipt(String token) {
+        lock.writeLock().lock();
+        try {
+            // Rotate away the commit record before recording its removal: replay must not resurrect it.
+            flushLocked();
+            manifest.apply(ManifestEdit.builder().removedRenameReceipts(Set.of(token)).build());
+            renameReceipts.remove(token);
+        } finally { lock.writeLock().unlock(); }
+    }
+
+    /** Commit the destination PUT and its recovery receipt in one ledger entry. */
+    public CandyMetadata zeroCopyRename(CandyKey dst, CandyLocator source, String token,
+            String incarnation, String relayToken, int srcPartition, String srcKey) {
+        return zeroCopyPut(dst, source.parts(), source.contentType(), source.userMetadata(), 0,
+                source.acl(), null, result -> new RenameReceipt(token, incarnation, relayToken,
+                        srcPartition, srcKey, source.hlc(), dst.value(), result), token);
+    }
+
     /**
      * Writes a fresh PUT at {@code dst} that reuses {@code parts} verbatim — the zero-copy trick, but
      * across partitions: the {@code parts} were resolved from a source Candy in <em>another</em>
@@ -1047,6 +1085,14 @@ public final class BoxEngine implements AutoCloseable {
     public CandyMetadata zeroCopyPut(CandyKey dst, List<Part> parts, String contentType,
                                      Map<String, String> userMetadata, long createdAtMillis,
                                      ObjectAcl acl, String idempotencyToken) {
+        return zeroCopyPut(dst, parts, contentType, userMetadata, createdAtMillis, acl,
+                idempotencyToken, null, null);
+    }
+
+    private CandyMetadata zeroCopyPut(CandyKey dst, List<Part> parts, String contentType,
+            Map<String, String> userMetadata, long createdAtMillis, ObjectAcl acl,
+            String idempotencyToken, java.util.function.Function<CandyLocator, RenameReceipt> receiptFactory,
+            String renameToken) {
         Validation.checkCandyKey(dst, config.sizeLimits());
         Map<String, String> metadata = userMetadata == null ? Map.of() : Map.copyOf(userMetadata);
         CandyMetadata cached = idempotentResult(idempotencyToken);
@@ -1055,6 +1101,13 @@ public final class BoxEngine implements AutoCloseable {
         }
         lock.writeLock().lock();
         try {
+            RenameReceipt prior = renameReceipts.get(renameToken);
+            if (prior != null) {
+                if (!prior.equals(receiptFactory.apply(prior.result()))) {
+                    throw new ValidationException("Rename token belongs to a different transfer");
+                }
+                return CandyMetadata.from(prior.result());
+            }
             CandyMetadata replay = idempotentResult(idempotencyToken);
             if (replay != null) {
                 return replay;
@@ -1067,7 +1120,9 @@ public final class BoxEngine implements AutoCloseable {
             Mutation mutation = new Mutation(dst, dstLocator);
             ledgerStore.retainLedgers(dstLocator.segments().stream()
                     .map(SegmentRef::syrupId).toList());
-            wal.append(mutation);
+            RenameReceipt receipt = receiptFactory == null ? null : receiptFactory.apply(dstLocator);
+            wal.append(receipt == null ? WalEntry.of(mutation) : new WalEntry.RenamePut(mutation, receipt));
+            if (receipt != null) { renameReceipts.put(receipt.token(), receipt); }
             active.put(mutation);
             // The parts may point at a Syrup this partition already counts as a pending orphan. Clear it
             // here so its grace period restarts: the next recompute may only run once this reference is
@@ -1953,7 +2008,8 @@ public final class BoxEngine implements AutoCloseable {
         // manifest then points at the new WAL, so it is no longer a recovery source.
         long now = clock.currentTimeMillis();
         manifest.apply(ManifestEdit.flush(table.meta(), table.syrups(), newWal.ledgerId(),
-                table.maxHlc()).withAddedPendingDeletes(Map.of(wal.ledgerId(), now)));
+                table.maxHlc()).withAddedPendingDeletes(Map.of(wal.ledgerId(), now))
+                .withRenameReceipts(new ArrayList<>(renameReceipts.values())));
         unflushedSyrups.clear();
         wal.close();
         wal = newWal;

@@ -115,6 +115,48 @@ class BoxEngineRenameRecoveryTest {
         checkRecovery(true, true);
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void renameReceiptAndDestinationHaveOneDurabilityDecision(boolean durable) {
+        try (FaultStore store = new FaultStore();
+             BoxEngine owner = BoxEngine.createNew(BOX, CONFIG, store, 1, new ManualClock(1000), 1)) {
+            owner.putCandy(SRC, new byte[]{1}, null, Map.of(), null);
+            var source = owner.resolveLocator(SRC);
+            store.failNext = true;
+            store.durable = durable;
+            assertThatThrownBy(() -> owner.zeroCopyRename(DST, source, "rename-token", "box-epoch",
+                    "relay-token", 0, SRC.value())).isInstanceOf(StorageException.class);
+            try (BoxEngine recovered = BoxEngine.recover(BOX, CONFIG, store, 2,
+                    new ManualClock(1000), owner.manifestLedgerId(), 2)) {
+                if (durable) {
+                    assertThat(recovered.getCandy(DST)).containsExactly((byte) 1);
+                    assertThat(recovered.listRenameReceipts()).singleElement().satisfies(receipt -> {
+                        assertThat(receipt.srcHlc()).isEqualTo(source.hlc());
+                        assertThat(receipt.incarnation()).isEqualTo("box-epoch");
+                        assertThat(receipt.result()).isEqualTo(recovered.resolveLocator(DST));
+                    });
+                    recovered.flush();
+                    try (BoxEngine successor = BoxEngine.recover(BOX, CONFIG, store, 3,
+                            new ManualClock(1000), recovered.manifestLedgerId(), 3)) {
+                        assertThat(successor.listRenameReceipts()).hasSize(1);
+                        var original = successor.resolveLocator(DST);
+                        successor.zeroCopyRename(DST, source, "rename-token", "box-epoch", "relay-token", 0, SRC.value());
+                        assertThat(successor.resolveLocator(DST)).isEqualTo(original);
+                        successor.clearRenameReceipt("rename-token");
+                        try (BoxEngine cleaned = BoxEngine.recover(BOX, CONFIG, store, 4,
+                                new ManualClock(1000), successor.manifestLedgerId(), 4)) {
+                            assertThat(cleaned.listRenameReceipts()).isEmpty();
+                            assertThat(cleaned.getCandy(DST)).containsExactly((byte) 1);
+                        }
+                    }
+                } else {
+                    assertThat(recovered.listRenameReceipts()).isEmpty();
+                    assertThatThrownBy(() -> recovered.getCandy(DST)).isInstanceOf(CandyNotFoundException.class);
+                }
+            }
+        }
+    }
+
     private void checkRecovery(boolean durable, boolean crash) {
         try (FaultStore store = new FaultStore();
              BoxEngine owner = BoxEngine.createNew(BOX, CONFIG, store, 1, new ManualClock(1000), 1)) {

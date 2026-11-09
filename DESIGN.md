@@ -68,8 +68,10 @@ Dependency rule: `candybox-lsm` depends **only** on the two SPIs (`bookkeeper`, 
   listings are scatter-gather merges (each partition's page is consistent; the merged page is not a
   snapshot), and a cross-partition `rename` is copy-then-delete across two owners and only
   **eventually atomic** — it converges to "source gone, destination present" via a durable
-  rename-intent journal plus a coordination rendezvous marker (§6), so a reader can momentarily
-  observe both keys, but the rename never leaves both keys live forever and never loses data. A
+  rename-intent journal, an atomic destination receipt, and a coordination rendezvous marker (§6).
+  With participant recovery and successful maintenance/coordination, the captured source version
+  is eventually deleted without client retry; a later source rewrite survives. Readers may see
+  both keys during reconciliation. A
   same-partition `rename` is still fully atomic (one owner, one write lock). This is the guarantee
   Candybox documents — not general eventual consistency.
 
@@ -148,7 +150,7 @@ locator HLC is older.
 
 **WAL entry** (`WalEntrySerializer`) — the WAL is a kind-tagged log so point mutations and range
 deletes and atomic batches replay in one ordered pass: `byte kind (1=point mutation, 2=range delete,
-3=atomic batch) | payload`. Kinds 1 and 2 retain their original payloads. Kind 3 has
+3=atomic batch, 4=rename PUT plus receipt) | payload`. Kinds 1 and 2 retain their original payloads. Kind 3 has
 `byte batchVersion (=1) | varint count | bytes(serialized Mutation)[count]`, bounded to 128 mutations
 and 1 MiB including framing (below BookKeeper's default 5 MiB frame limit; deployments must allow
 at least this payload plus BookKeeper overhead). Same-partition rename writes the destination PUT
@@ -156,15 +158,15 @@ and source DELETE as one batch in one ledger entry; neither memtable mutation is
 is durable. Recovery decodes the entire batch before applying any member and reports the maximum
 HLC across all members, point records and range deletes. Unknown versions, truncated members,
 invalid counts and trailing batch bytes fail recovery. Legacy point/range WAL entries stay readable.
-See OPERATIONS.md for the required coordinated upgrade before writing kind 3.
+See OPERATIONS.md for the required coordinated upgrade before writing kinds 3/4 or manifest v7.
 
 **Syrup chunk entry**: `int crc32c | payload[<= chunkSize]`. The crc covers the payload only.
 
-**ManifestEdit** (`ManifestSerializer`, **version 6**): `version | addedTables[]
+**ManifestEdit** (`ManifestSerializer`, **version 7**): `version | addedTables[]
 | removedTableLedgerIds[] | addedSyrups[] | removedSyrups[] | (bool, varlong) newWalLedgerId
 | ownerFencingToken | addedUploads[] | upsertParts[] | removedUploads[] | addedRenameIntents[]
 | removedRenameIntents[] | (bool, hlc) maxHlc | addedPendingDeletes[(varlong id, varlong since)]
-| removedPendingDeletes[]`, where each `SSTableMeta`
+| removedPendingDeletes[] | addedRenameReceipts[] | removedRenameReceipts[]`, where each `SSTableMeta`
 is `varlong ledgerId | varint level | bytes minKey | bytes maxKey | varlong entryCount
 | varlong sizeBytes | referencedSyrups[] | (bool, span) rangeTombstoneSpan | (bool, hlc) minPointHlc`
 (v5+: the keys its range tombstones cover, each bound optional, used to pick compaction inputs; and
@@ -177,7 +179,13 @@ per `removedUpload`. The v3 trailing fields carry in-flight **rename intents** (
 state they are replayed on handover, so a takeover finalizes (or abandons) a rename exactly where
 the prior owner left it. The v4 trailing `maxHlc` is the HLC high-water mark (see §3); v2/v3 records
 read back without one. The v6 trailing fields are the ledgers awaiting physical deletion by GC (§9);
-v2–v5 records read back with none.
+v2–v5 records read back with none. Version 7 adds destination rename receipts, retained until
+source acknowledgement; v2–v6 read with no receipts. WAL kind 4 uses version 1 and encodes the
+mutation and receipt in the same BookKeeper entry. A receipt carries the rename token, Box
+incarnation, relay token, source partition/key/HLC, destination key, and full resulting locator.
+Flush and recovery checkpoint receipts in the same manifest edit that rotates away their WAL.
+These new formats require upgraded readers before use; rolling format activation is a separate
+compatibility concern (#157).
 
 **Protocol frame** (`FrameCodec`): `magic(2)=0xCB0F | version(1)=1 | opcode(1) | length(4) | payload`.
 **Message body** (`MessageCodec`): `bodyVersion(1) | <per-opcode fields>`.
@@ -253,10 +261,10 @@ consults range tombstones across all tables rather than pruning by point range.
   (`boxes/<box>/partitions/<p>/relays/<token>`) and hands the client only the token; the destination
   owner (`ZeroCopyPut`) reads that relay — so the parts and a rename's ACL it writes never pass
   through the client — and writes a destination locator reusing the very same Syrup segments. No
-  object bytes are ever moved or re-stored. A relay is bound to the requesting principal, deleted
-  once its put succeeds, consumable only within half of `rename.intent.abandon.millis` (so it can
-  never outlive its rename intent, with the rest as clock-skew margin), and reaped by the source
-  owner past the full window. Source READ authorization checks the ACL of the exact locator being
+  object bytes are ever moved or re-stored. A relay is bound to the requesting principal. An
+  unclaimed relay is consumable within half of `rename.intent.abandon.millis` and may be reaped
+  past the full window. Claiming it races expiry by CAS; a claimed relay never expires and pins
+  the bytes until destination reference publication and, for rename, source acknowledgement. Source READ authorization checks the ACL of the exact locator being
   read, copied, or relayed, in union with Box READ permission. For local copy, part-copy, and rename,
   the engine checks the resolved source ACL before changing state under its write lock. A relay is
   a bounded capability for that authorized version: later ACL revocation or source overwrite cannot
@@ -268,12 +276,19 @@ consults range tombstones across all tables rather than pruning by point range.
   by `syrupId` alone, no partition scoping) and because **Box-global GC** (§9) keeps a Syrup alive
   while *any* partition references it. A cross-partition `rename` is still copy-then-delete across
   two owners, but now **eventually atomic**: the source owner records a durable rename intent (§5),
-  the destination owner writes a rendezvous marker once its zero-copy put is durable, and the source
-  owner — synchronously via the client's `CompleteRename`, on its maintenance sweep, or after a
-  handover replays the intent — reads the marker and LWW-conditionally tombstones the source (so a
-  re-PUT source is never clobbered), then clears the intent and marker. A reader may momentarily see
-  both keys; the one residual crash window degrades to "both keys live" (the old observable outcome),
-  never data loss.
+  the destination commits its PUT and completion receipt in one WAL entry, publishes its refs,
+  and writes the rendezvous marker. Recovery checkpoints receipts across flush/WAL rotation and
+  maintenance republishes missing markers without a client retry. The source owner — via
+  `CompleteRename`, maintenance, or handover — validates its durable intent against the marker and
+  conditionally tombstones only the captured source HLC. It durably acknowledges that deletion in
+  the marker before clearing the intent. A later source re-PUT survives. Destination maintenance
+  then removes the receipt (first rotating away its WAL record), relay/pin, and marker, in that
+  order; interrupted cleanup resumes even when the receipt or relay has already disappeared.
+  Source timeout alone cannot abort a claimed transfer. Only CAS removal of an unclaimed relay,
+  or a newer destination owner fencing/recovering the old WAL and finding no receipt, proves
+  abort; otherwise the intent and pin remain pending. A reader may temporarily see both keys.
+  Eventual convergence requires participant recovery and successful maintenance/coordination;
+  it never depends on a live original client or on guessing an uncertain outcome from elapsed time.
 - **range get**: `getCandyRange(key, firstByte, lastByte)` over HTTP `Range: bytes=…` semantics
   (inclusive on both ends). Prefix-sums the part lengths to find the first/last parts, then indexes
   into chunks by `byteWithinPart / part.chunkSize`. Chunks at the slice boundary are read whole —
@@ -335,7 +350,7 @@ boxes/<box>/meta                      BoxDescriptor {partitionCount} — immutab
 boxes/<box>/partitions/<p>/owner      partition p's ownership lease (fenced, TTL'd)
 boxes/<box>/partitions/<p>/manifest   partition p's manifest-ledger pointer (versioned CAS)
 boxes/<box>/partitions/<p>/refs       partition p's published held-Syrup set (Box-global GC, §9(f))
-boxes/<box>/renames/<token>           cross-partition rename rendezvous marker (§6); cleared on finalize
+boxes/<box>/renames/<token>           cross-partition rename commit/ack marker (§6); removed after receipt/relay cleanup
 cluster/balancer                      the balancer's coordinator-election lease
 cluster/assignment                    the desired partition→node assignment table (versioned CAS)
 members/<nodeId>                      membership (advertised host:port); ephemeral, session-bound
@@ -543,7 +558,7 @@ Per-role BK quorum (E/Qw/Qa) defaults: **WAL 3/3/2, Manifest 3/3/2, SSTable 3/2/
 | Compaction + GC worker interval | configurable; 0 disables | Background maintenance cadence on the owner. |
 | Tombstone-GC time bound | 24 h | Covers in-flight late writes before a delete is reclaimable. |
 | Ledger-GC grace | 5 min | Margin for in-flight readers / continuation tokens before a physical delete; also gates Box-global GC (§9(f)). |
-| Rename-intent abandon | 60 s (`rename.intent.abandon.millis`) | A cross-partition rename intent whose rendezvous marker never appears is dropped after this (the source stays live). |
+| Rename-intent abandon | 60 s (`rename.intent.abandon.millis`) | An unclaimed preparation may be CAS-aborted after this age (source stays live). Claimed transfers wait for a durable commit or fenced abort decision, regardless of age. |
 | Client router cache TTL | 5 s | How long the client caches a Box→owner mapping before re-resolving. |
 | Continuation token | `lastKey` | `lastKey` alone resumes a range/reverse scan, exclusive in the scan direction. |
 | LWW tiebreaker | `nodeId` (locked) | Deterministic, coordination-free. |
