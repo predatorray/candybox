@@ -49,6 +49,22 @@ mvn -DskipTests -Pfrontend package   # also build the React dashboard into candy
 mvn -Prelease,frontend -DskipUpload=true deploy   # Maven Central dry run (needs a GPG key); see RELEASING.md
 ```
 
+### Keep tool output concise
+
+- `.mvn/maven.config` enables `-q` and `--no-transfer-progress` for all Maven commands,
+  including the examples above. Maven errors and test failure summaries still reach the console.
+  Use `mvn --log-file /tmp/candybox-maven.log ...` to capture a build log when needed.
+  For verbose Maven diagnostics, use `mvn -X ...` and capture the output to a file.
+- Test stdout/stderr is saved in each module's `target/surefire-reports/*-output.txt`
+  or `target/failsafe-reports/*-output.txt`. On failure, inspect the failing test's report
+  and a bounded excerpt of its output. Use `-Dmaven.test.redirectTestOutputToFile=false`
+  only when live test output is needed.
+- Use targeted `rg -n` searches and bounded file reads. Avoid dumping whole logs,
+  generated files, or broad directory listings into the conversation.
+- Capture noisy command output to a temporary file, preserve its exit status, and show
+  only the relevant failure excerpt. Do not hide failures with `|| true` or a pipeline
+  that loses the command's exit status. Summarize successful checks briefly.
+
 - `verify` runs `license-maven-plugin:check`, so every `src/{main,test}/java/**/*.java` file needs the
   license header.
 - Integration tests only run under `verify`. Surefire is disabled in `candybox-integration-tests`, and
