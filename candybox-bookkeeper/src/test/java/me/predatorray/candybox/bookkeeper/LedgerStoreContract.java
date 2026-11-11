@@ -17,10 +17,13 @@ package me.predatorray.candybox.bookkeeper;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.jupiter.api.Assertions.assertTimeout;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.List;
 import me.predatorray.candybox.common.config.LedgerRole;
+import me.predatorray.candybox.common.config.QuorumConfig;
 import me.predatorray.candybox.common.exception.FencedException;
 import me.predatorray.candybox.common.exception.StorageException;
 import org.junit.jupiter.api.AfterEach;
@@ -41,6 +44,9 @@ public abstract class LedgerStoreContract {
 
     /** Produces a fresh, empty store for one test. */
     protected abstract LedgerStore newStore();
+
+    /** Number of bookies available to this test store. */
+    protected abstract int availableBookies();
 
     /** The ledger config (quorum) the contract uses. Default: the SSTABLE role's 3/2/2. */
     protected LedgerConfig config() {
@@ -166,6 +172,46 @@ public abstract class LedgerStoreContract {
         w.close();
         ReadableLedger r = store.openLedger(w.ledgerId());
         assertThatThrownBy(() -> r.read(5)).isInstanceOf(StorageException.class);
+    }
+
+    @Test
+    void readRangeRejectsAnInvertedOrNegativeRange() {
+        WritableLedger writer = store.createLedger(config());
+        writer.append(bytes("one"));
+        writer.append(bytes("two"));
+        writer.append(bytes("three"));
+        writer.close();
+
+        try (ReadableLedger reader = store.openLedger(writer.ledgerId())) {
+            assertThatThrownBy(() -> reader.readRange(2, 1)).isInstanceOf(StorageException.class);
+            assertThatThrownBy(() -> reader.readRange(-1, 0)).isInstanceOf(StorageException.class);
+        }
+    }
+
+    @Test
+    void recoverOpenOfAMissingLedgerThrowsLedgerNotFound() {
+        WritableLedger writer = store.createLedger(config());
+        writer.close();
+        long id = writer.ledgerId();
+        store.deleteLedger(id);
+
+        assertThatThrownBy(() -> store.recoverOpen(id)).isInstanceOf(LedgerNotFoundException.class);
+    }
+
+    @Test
+    void createLedgerFailsWhenTheEnsembleExceedsAvailableBookies() {
+        LedgerConfig tooLarge = new LedgerConfig(new QuorumConfig(availableBookies() + 1, 2, 2));
+        // Placement must reject an impossible ensemble without waiting for bookies to appear.
+        assertTimeout(Duration.ofSeconds(2), () ->
+                assertThatThrownBy(() -> store.createLedger(tooLarge))
+                        .isInstanceOf(StorageException.class));
+    }
+
+    @Test
+    void operationsAfterCloseFail() {
+        store.close();
+        assertThatThrownBy(() -> store.createLedger(config())).isInstanceOf(StorageException.class);
+        // @AfterEach closes it again, also verifying that close is idempotent.
     }
 
     @Test
