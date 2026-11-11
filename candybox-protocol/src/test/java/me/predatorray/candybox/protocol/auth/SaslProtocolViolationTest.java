@@ -61,7 +61,7 @@ class SaslProtocolViolationTest {
     }
 
     @Test
-    void handshakeAfterSuccessIsRejectedAndPreservesPrincipal() {
+    void handshakeAndAuthenticateAfterSuccessAreRejectedAndPreservePrincipal() {
         ConnectionContext context = new ConnectionContext();
         handshake(context);
         byte[] token = new PlainAuthenticationProvider()
@@ -72,6 +72,8 @@ class SaslProtocolViolationTest {
                 auth -> assertThat(auth.complete()).isTrue());
         assertThat(context.principal()).isEqualTo(Principal.user("alice"));
         assertFailed(gate.handle(context, CODEC.encode(new Message.SaslHandshakeRequest("PLAIN"))),
+                "Connection is already authenticated");
+        assertFailed(gate.handle(context, CODEC.encode(new Message.SaslAuthenticateRequest(token))),
                 "Connection is already authenticated");
         assertThat(context.principal()).isEqualTo(Principal.user("alice"));
     }
