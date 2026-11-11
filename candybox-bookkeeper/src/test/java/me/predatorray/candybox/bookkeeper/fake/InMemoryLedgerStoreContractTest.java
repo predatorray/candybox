@@ -22,7 +22,14 @@ import me.predatorray.candybox.bookkeeper.LedgerStoreContract;
 class InMemoryLedgerStoreContractTest extends LedgerStoreContract {
 
     @Override
+    protected int availableBookies() {
+        return 3;
+    }
+
+    @Override
     protected LedgerStore newStore() {
-        return new InMemoryLedgerStore();
+        InMemoryLedgerStore store = new InMemoryLedgerStore();
+        store.setAvailableBookies(availableBookies());
+        return store;
     }
 }
