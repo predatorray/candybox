@@ -156,7 +156,7 @@ final class NodeRequestHandler implements RequestHandler {
         return Message.maxInlineDataBytes(node.config().maxFrameSizeBytes());
     }
 
-    /** What a request needs the caller to be allowed to do, or {@code null} for SASL frames. */
+    /** Required permission, or {@code null} for routing metadata and SASL frames. */
     private record Access(Operation operation, Resource resource) {
     }
 
@@ -259,8 +259,11 @@ final class NodeRequestHandler implements RequestHandler {
         if (message instanceof Message.HeadBoxRequest m) {
             return new Access(Operation.READ, Resource.box(m.box()));
         }
-        if (message instanceof Message.BoxInfoRequest m) {
-            return new Access(Operation.READ, Resource.box(m.box()));
+        if (message instanceof Message.BoxInfoRequest) {
+            // Partition discovery precedes every fresh client's keyed request, including object-only
+            // READ/READ_ACP/WRITE_ACP grants. This reveals only Box existence and partition count;
+            // the eventual data/ACL request must still pass its own authorization check at the owner.
+            return null;
         }
         String box = boxOf(message);
         if (message instanceof Message.NamespaceRequest m) {

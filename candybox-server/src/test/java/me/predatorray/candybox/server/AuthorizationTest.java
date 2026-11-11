@@ -112,6 +112,28 @@ class AuthorizationTest {
     }
 
     @Test
+    void partitionMetadataDoesNotRequireBoxReadButDataOperationsStillDo() {
+        try (CandyboxNode node = newAuthorizedNode()) {
+            RequestHandler handler = node.requestHandler();
+            call(handler, ALICE, new Message.CreateBoxRequest("private-box", 3));
+            call(handler, ALICE, put("private-box", "k"));
+            for (Principal principal : new Principal[] {BOB, null}) {
+                // Clients need this routing metadata before the owner can check object grants.
+                assertThat(call(handler, principal, new Message.BoxInfoRequest("private-box")))
+                        .isEqualTo(new Message.BoxInfoResponse(3));
+                assertThat(call(handler, principal, new Message.GetCandyRequest("private-box", "k")))
+                        .isInstanceOf(Message.AccessDeniedResponse.class);
+                assertThat(call(handler, principal, new Message.GetCandyRequest("private-box", "missing")))
+                        .isInstanceOf(Message.AccessDeniedResponse.class);
+                assertThat(call(handler, principal, new Message.HeadBoxRequest("private-box")))
+                        .isInstanceOf(Message.AccessDeniedResponse.class);
+                assertThat(call(handler, principal, new Message.GetBoxAclRequest("private-box")))
+                        .isInstanceOf(Message.AccessDeniedResponse.class);
+            }
+        }
+    }
+
+    @Test
     void grantsOpenTheBoxSelectively() {
         try (CandyboxNode node = newAuthorizedNode()) {
             RequestHandler handler = node.requestHandler();

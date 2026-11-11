@@ -277,12 +277,17 @@ The CLI takes the same via `--user/--password-file/--mechanism/--tls/--tls-ca` o
 
 ### Authorization (ACLs)
 
-Every request is authorized against the caller's principal (`User:alice`, `Gateway:s3-gw`, ...).
+Data and ACL requests are authorized against the caller's principal (`User:alice`, `Gateway:s3-gw`, ...).
 A Box's ACL document (owner + additive grants, stored in ZooKeeper) governs READ / WRITE /
 READ_ACP / WRITE_ACP / ADMIN; the creator owns the Box, and `ListBoxes` only reveals READable
 Boxes. Objects additionally carry their own owner + grants inside the `CandyLocator` (the S3
 union rule: an object grant can open READ on a single object inside a private Box). Copy, rename and
-upload-part-copy need WRITE on the Box plus READ on the source object. Manage with:
+upload-part-copy need WRITE on the Box plus READ on the source object.
+
+`BoxInfo` is routing metadata: after any configured SASL authentication, callers can discover a
+named Box's existence and partition count without Box READ. Fresh clients need this lookup before
+the owning node can evaluate object-only grants. It grants no data or ACL access; `HeadBox`,
+listings, and the actual keyed requests retain their permission checks. Manage ACLs with:
 
 ```
 candybox acl get|set|grant|revoke <box> [--object <key>]

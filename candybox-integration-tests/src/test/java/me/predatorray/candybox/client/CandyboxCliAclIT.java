@@ -16,6 +16,7 @@
 package me.predatorray.candybox.client;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -25,11 +26,14 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.function.Consumer;
 import me.predatorray.candybox.bookkeeper.bk.BookKeeperLedgerStore;
 import me.predatorray.candybox.common.SystemClock;
 import me.predatorray.candybox.common.auth.AuthenticationProviders;
 import me.predatorray.candybox.common.auth.Authorizer;
 import me.predatorray.candybox.common.auth.BoxAcl;
+import me.predatorray.candybox.common.auth.ObjectAcl;
+import me.predatorray.candybox.common.exception.AccessDeniedException;
 import me.predatorray.candybox.common.auth.InMemoryCredentialStore;
 import me.predatorray.candybox.common.auth.StandardAuthorizer;
 import me.predatorray.candybox.common.config.CandyboxConfig;
@@ -37,11 +41,8 @@ import me.predatorray.candybox.coordination.CandyboxKeys;
 import me.predatorray.candybox.coordination.zk.ZooKeeperCoordinationService;
 import me.predatorray.candybox.it.EmbeddedBookKeeper;
 import me.predatorray.candybox.protocol.FrameCodec;
-import me.predatorray.candybox.protocol.Message;
-import me.predatorray.candybox.protocol.MessageCodec;
 import me.predatorray.candybox.protocol.auth.AuthenticatingRequestHandler;
 import me.predatorray.candybox.protocol.auth.AuthenticatingTransport;
-import me.predatorray.candybox.protocol.transport.Connection;
 import me.predatorray.candybox.protocol.transport.TcpTransport;
 import me.predatorray.candybox.protocol.transport.TcpTransportServer;
 import me.predatorray.candybox.server.CandyboxNode;
@@ -50,6 +51,8 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * End-to-end tests for {@code candybox acl} (Box and object ACLs) against a live node. The node runs
@@ -144,27 +147,67 @@ class CandyboxCliAclIT {
             assertThat(asUser("bob", "get", "acl-enforced", "k")).isEqualTo(1);
             assertThat(asUser("alice", "acl", "grant", "acl-enforced", "--object", "k", "user:bob:READ"))
                     .isZero();
-            // A fresh CandyboxClient needs Box READ for its BoxInfo lookup. Send GET_CANDY
-            // directly to isolate object-only grants from that routing limitation (#189).
-            assertThat(readObjectAsBob()).isInstanceOfSatisfying(Message.CandyDataResponse.class,
-                    data -> assertThat(data.data())
-                            .isEqualTo("shared bytes".getBytes(StandardCharsets.UTF_8)));
+            assertThat(asUser("bob", "get", "acl-enforced", "k")).as(stderr()).isZero();
+            assertThat(stdout()).isEqualTo("shared bytes");
             assertThat(asUser("alice", "acl", "revoke", "acl-enforced", "--object", "k", "USER:bob"))
                     .isZero();
-            assertThat(readObjectAsBob()).isInstanceOf(Message.AccessDeniedResponse.class);
+            assertThat(asUser("bob", "get", "acl-enforced", "k")).isEqualTo(1);
         } finally {
             node.authorizer(Authorizer.ALLOW_ALL);
         }
     }
 
-    private Message readObjectAsBob() {
-        MessageCodec codec = new MessageCodec();
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void freshClientsUseObjectOnlyGrants(boolean clustered, @TempDir Path tmp) throws IOException {
+        node.authorizer(new StandardAuthorizer(List.of(), box ->
+                nodeCoord.get(CandyboxKeys.boxAclKey(box)).map(v -> BoxAcl.fromBytes(v.value()))));
+        String box = clustered ? "object-only-cluster" : "object-only-direct";
+        try {
+            Path file = tmp.resolve("data");
+            Files.writeString(file, "shared bytes");
+            assertThat(asUser("alice", "create-box", box, "3")).isZero();
+            assertThat(asUser("alice", "put", box, "shared", file.toString())).isZero();
+            assertThat(asUser("alice", "put", box, "private", file.toString())).isZero();
+            assertThat(asUser("alice", "acl", "grant", box, "--object", "shared", "User:bob:READ"))
+                    .isZero();
+            withFreshBob(clustered, client -> assertThat(client.getCandy(box, "shared"))
+                    .isEqualTo("shared bytes".getBytes(StandardCharsets.UTF_8)));
+            withFreshBob(clustered, client -> assertThat(client.headCandy(box, "shared").contentLength())
+                    .isEqualTo(12));
+            withFreshBob(clustered, client -> assertThat(client.getCandyRange(box, "shared", 0, 5).data())
+                    .isEqualTo("shared".getBytes(StandardCharsets.UTF_8)));
+            for (String key : List.of("private", "missing")) {
+                withFreshBob(clustered, client -> assertThatThrownBy(() -> client.getCandy(box, key))
+                        .isInstanceOf(AccessDeniedException.class));
+            }
+            withFreshBob(clustered, client -> assertThatThrownBy(() -> client.listCandies(box, "", null, 10))
+                    .isInstanceOf(AccessDeniedException.class));
+            withFreshBob(clustered, client -> assertThatThrownBy(() -> client.getCandyAcl(box, "shared"))
+                    .isInstanceOf(AccessDeniedException.class));
+
+            // Each ACL operation also starts without a cached partition count or Box READ.
+            assertThat(asUser("alice", "acl", "set", box, "--object", "shared", "User:alice",
+                    "User:bob:READ_ACP+WRITE_ACP")).isZero();
+            withFreshBob(clustered, client -> assertThat(client.getCandyAcl(box, "shared").owner())
+                    .isEqualTo("User:alice"));
+            withFreshBob(clustered, client -> client.setCandyAcl(box, "shared",
+                    new ObjectAcl("User:alice", List.of())));
+            withFreshBob(clustered, client -> assertThatThrownBy(() -> client.getCandyAcl(box, "shared"))
+                    .isInstanceOf(AccessDeniedException.class));
+        } finally {
+            node.authorizer(Authorizer.ALLOW_ALL);
+        }
+    }
+
+    private void withFreshBob(boolean clustered, Consumer<CandyboxClient> action) {
         try (AuthenticatingTransport transport = new AuthenticatingTransport(
                 new TcpTransport(), "PLAIN", "bob", "bob-pw");
-             Connection connection = transport.connect("127.0.0.1",
-                     Integer.parseInt(server.substring(server.lastIndexOf(':') + 1)))) {
-            return codec.decode(connection.call(codec.encode(
-                    new Message.GetCandyRequest("acl-enforced", "k"))));
+             CandyboxClient client = clustered
+                     ? new CandyboxClient(transport, nodeCoord, CandyboxConfig.builder().build())
+                     : new CandyboxClient(transport, "127.0.0.1",
+                             Integer.parseInt(server.substring(server.lastIndexOf(':') + 1)))) {
+            action.accept(client);
         }
     }
 
