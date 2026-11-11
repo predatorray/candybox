@@ -26,7 +26,7 @@ import me.predatorray.candybox.common.RangeTombstone;
  * recovering owner observe the maximum HLC across every mutation and range delete (DESIGN §3,§7).
  */
 public sealed interface WalEntry permits WalEntry.PointMutation, WalEntry.RangeDelete,
-        WalEntry.Batch {
+        WalEntry.Batch, WalEntry.RenamePut {
 
     /** The maximum HLC in this record (the value the recovering owner must advance past). */
     Hlc hlc();
@@ -59,6 +59,16 @@ public sealed interface WalEntry permits WalEntry.PointMutation, WalEntry.RangeD
         public Hlc hlc() {
             return mutations.stream().map(Mutation::hlc).max(Hlc::compareTo).orElseThrow();
         }
+    }
+
+    record RenamePut(Mutation mutation, me.predatorray.candybox.lsm.manifest.RenameReceipt receipt)
+            implements WalEntry {
+        public RenamePut {
+            if (!mutation.key().value().equals(receipt.dstKey()) || !mutation.locator().equals(receipt.result())) {
+                throw new IllegalArgumentException("Rename receipt does not match destination PUT");
+            }
+        }
+        @Override public Hlc hlc() { return mutation.hlc(); }
     }
 
     record PointMutation(Mutation mutation) implements WalEntry {

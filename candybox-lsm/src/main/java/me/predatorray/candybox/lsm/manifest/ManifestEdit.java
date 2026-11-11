@@ -73,9 +73,13 @@ public record ManifestEdit(
         Map<Long, Long> addedPendingDeletes,
         Set<Long> removedPendingDeletes,
         Hlc maxHlc,
-        long ownerFencingToken) {
+        long ownerFencingToken,
+        List<RenameReceipt> addedRenameReceipts,
+        Set<String> removedRenameReceipts) {
 
     public ManifestEdit {
+        addedRenameReceipts = addedRenameReceipts == null ? List.of() : List.copyOf(addedRenameReceipts);
+        removedRenameReceipts = removedRenameReceipts == null ? Set.of() : Set.copyOf(removedRenameReceipts);
         addedTables = List.copyOf(addedTables);
         removedTableLedgerIds = Set.copyOf(removedTableLedgerIds);
         addedSyrups = Set.copyOf(addedSyrups);
@@ -93,6 +97,24 @@ public record ManifestEdit(
         }
     }
 
+    public ManifestEdit(List<SSTableMeta> addedTables, Set<Long> removedTableLedgerIds,
+            Set<Long> addedSyrups, Set<Long> removedSyrups, Long newWalLedgerId,
+            List<MultipartUploadState> addedUploads, List<PartUpsert> upsertParts,
+            Set<String> removedUploads, List<RenameIntent> addedRenameIntents,
+            Set<String> removedRenameIntents, Map<Long, Long> addedPendingDeletes,
+            Set<Long> removedPendingDeletes, Hlc maxHlc, long ownerFencingToken) {
+        this(addedTables, removedTableLedgerIds, addedSyrups, removedSyrups, newWalLedgerId,
+                addedUploads, upsertParts, removedUploads, addedRenameIntents, removedRenameIntents,
+                addedPendingDeletes, removedPendingDeletes, maxHlc, ownerFencingToken, List.of(), Set.of());
+    }
+
+    public ManifestEdit withRenameReceipts(List<RenameReceipt> receipts) {
+        return new ManifestEdit(addedTables, removedTableLedgerIds, addedSyrups, removedSyrups,
+                newWalLedgerId, addedUploads, upsertParts, removedUploads, addedRenameIntents,
+                removedRenameIntents, addedPendingDeletes, removedPendingDeletes, maxHlc,
+                ownerFencingToken, receipts, removedRenameReceipts);
+    }
+
     public static Builder builder() {
         return new Builder();
     }
@@ -108,7 +130,8 @@ public record ManifestEdit(
     public ManifestEdit withOwnerFencingToken(long token) {
         return new ManifestEdit(addedTables, removedTableLedgerIds, addedSyrups, removedSyrups,
                 newWalLedgerId, addedUploads, upsertParts, removedUploads, addedRenameIntents,
-                removedRenameIntents, addedPendingDeletes, removedPendingDeletes, maxHlc, token);
+                removedRenameIntents, addedPendingDeletes, removedPendingDeletes, maxHlc, token,
+                addedRenameReceipts, removedRenameReceipts);
     }
 
     /** Returns a copy that additionally schedules {@code pendingDeletes} (ledger id to since-millis). */
@@ -117,7 +140,8 @@ public record ManifestEdit(
         merged.putAll(pendingDeletes);
         return new ManifestEdit(addedTables, removedTableLedgerIds, addedSyrups, removedSyrups,
                 newWalLedgerId, addedUploads, upsertParts, removedUploads, addedRenameIntents,
-                removedRenameIntents, merged, removedPendingDeletes, maxHlc, ownerFencingToken);
+                removedRenameIntents, merged, removedPendingDeletes, maxHlc, ownerFencingToken,
+                addedRenameReceipts, removedRenameReceipts);
     }
 
     /**
@@ -152,6 +176,8 @@ public record ManifestEdit(
         private Set<String> removedRenameIntents = Set.of();
         private Map<Long, Long> addedPendingDeletes = Map.of();
         private Set<Long> removedPendingDeletes = Set.of();
+        private List<RenameReceipt> addedRenameReceipts = List.of();
+        private Set<String> removedRenameReceipts = Set.of();
         private Hlc maxHlc = Hlc.MIN;
         private long ownerFencingToken = 0L;
 
@@ -223,6 +249,13 @@ public record ManifestEdit(
             return this;
         }
 
+        public Builder addedRenameReceipts(List<RenameReceipt> v) {
+            this.addedRenameReceipts = v; return this;
+        }
+        public Builder removedRenameReceipts(Set<String> v) {
+            this.removedRenameReceipts = v; return this;
+        }
+
         public Builder maxHlc(Hlc v) {
             this.maxHlc = v;
             return this;
@@ -253,7 +286,7 @@ public record ManifestEdit(
             return new ManifestEdit(addedTables, removedTableLedgerIds, addedSyrups, removedSyrups,
                     newWalLedgerId, addedUploads, upsertParts, removedUploads, addedRenameIntents,
                     removedRenameIntents, addedPendingDeletes, removedPendingDeletes, maxHlc,
-                    ownerFencingToken);
+                    ownerFencingToken, addedRenameReceipts, removedRenameReceipts);
         }
     }
 

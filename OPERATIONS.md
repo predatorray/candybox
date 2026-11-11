@@ -59,7 +59,7 @@ All knobs are configurable; pick defaults unless a workload demands otherwise.
 | `tombstoneGcGraceMillis` | 24 h | Late-write window before a bottommost tombstone may be dropped. |
 | `ledgerGcGraceMillis` | 5 min | Grace before an obsoleted ledger (compaction input, dead Syrup, rotated WAL, prior owner's manifest) is deleted; also gates Box-global GC of cross-partition-shared Syrups. |
 | `zero.copy.relay.budget.bytes` | 32 MiB | Bytes of cross-partition zero-copy locator relays one node may retain in ZooKeeper, including claimed transfers; past it, cross-partition copy/rename answers BUSY. Env `CANDYBOX_ZERO_COPY_RELAY_BUDGET_BYTES`. |
-| `rename.intent.abandon.millis` | 60 s | Cross-partition rename: a rename intent whose rendezvous marker never appears is dropped after this (the source stays live); pending, unclaimed zero-copy locator relays are reaped after the same age (by maintenance, or inline once a partition reaches its cap of 1024 retained relays). Claimed transfers never expire. A relay embeds the source locator and a committed transfer also stores its result, so allow space below ZooKeeper's `jute.maxbuffer` (1 MiB by default). Env `CANDYBOX_RENAME_INTENT_ABANDON_MILLIS`. |
+| `rename.intent.abandon.millis` | 60 s | Cross-partition rename: unclaimed preparations can be CAS-aborted after this age (source stays live); pending, unclaimed zero-copy locator relays are reaped after the same age (by maintenance, or inline once a partition reaches its cap of 1024 retained relays). Claimed transfers never expire. A relay embeds the source locator and a committed transfer also stores its result, so allow space below ZooKeeper's `jute.maxbuffer` (1 MiB by default). Env `CANDYBOX_RENAME_INTENT_ABANDON_MILLIS`. |
 
 Leveled compaction also takes a per-level byte budget (`levelBaseBytes` 10 MiB, `levelMultiplier` 10):
 level N's budget is `levelBaseBytes × multiplier^(N-1)`.
@@ -76,6 +76,13 @@ is recorded, retry the operation with a fresh relay; its original claim remains 
 destination handover. Releasing/reopening that partition fences and recovers its old WAL; the next
 GC maintenance pass publishes recovered refs before reclaiming old claims. A committed relay whose
 refs/rename marker publication failed can instead finish via the same relay without another write.
+Renames also commit a destination receipt atomically with the PUT. Maintenance republishes missing
+markers after recovery, including when the relay's committed-result write failed. Source timeout
+never discards an intent whose relay is claimed. A newer destination owner fences/replays its old
+WAL before deciding commit (receipt present) or abort (receipt absent). After the source's durable
+HLC-conditioned delete is acknowledged, maintenance clears the receipt, relay/pin, then marker;
+interrupted cleanup retries. While a participant or coordination remains unavailable, unresolved
+intents and pins remain protected rather than guessing a timeout outcome.
 Do not delete claimed relay keys manually: a paused consumer may still append. A force-deleted Box
 with live remote owners retains claimed relays until their destination engines close or the
 allocation registry fences/retires the matching destination writer epochs. Recreated Box names do
@@ -93,8 +100,9 @@ Pending v1 relays remain readable after the upgrade.
   ownership handover. Cross-partition operations are weaker: listings are scatter-gather merges,
   `deleteRange` is one tombstone per partition (idempotent, not atomic), and a cross-partition
   rename is copy-then-delete across two owners — only **eventually atomic**, converging to "source
-  gone, destination present" via a durable rename-intent journal plus a coordination rendezvous
-  marker (so a reader may briefly see both keys, but the rename never strands both keys forever). A
+  gone, destination present" via a durable rename intent, atomic destination receipt, and
+  coordination marker. Convergence requires recovery and successful maintenance/coordination;
+  a newer source version survives. Readers may temporarily see both keys. A
   same-partition rename is fully atomic.
 - **Backpressure.** When a Box accumulates `l0StallThreshold` L0 SSTables, writes return a retriable
   `BUSY` (protocol `RESPONSE_BUSY`) instead of blocking. Clients should back off and retry; the stall
@@ -117,7 +125,7 @@ Pending v1 relays remain readable after the upgrade.
 | **Client hits the wrong node** | The node replies `RESPONSE_MOVED(ownerNodeId)`; the client re-resolves via coordination and retries. |
 | **Partition momentarily unowned** (handover gap: after the old owner releases or its lease lapses, before the new owner acquires) | The node replies `RESPONSE_UNAVAILABLE`, never `NOT_FOUND`, which is reserved for a missing Box or key. The client treats that, a missing lease holder, and a crashed holder (no longer a member, or refusing connections, while its lease runs out) as a gap: it re-resolves with exponential backoff for up to `routerUnownedRetryMillis`, then fails with `NotOwnerException` (S3 gateway: `503 ServiceUnavailable` + `Retry-After`). A request already in flight when its node dies is not replayed (it may have applied); it fails at once with a retriable `NotOwnerException`. The transport has no connect timeout yet ([#79](https://github.com/predatorray/candybox/issues/79)), so an owner host that drops packets instead of refusing can hold a request well past this budget. The wait is per partition and holds the calling thread (an S3 gateway worker), but partitions orphaned together are usually re-owned in the same balancer round, so a fan-out listing rarely waits much longer than one gap. `RESPONSE_UNAVAILABLE` is new in 0.2: upgrade clients and gateways before nodes, since older clients cannot decode it. |
 | **Clock skew** | HLC ordering survives a regressing wall clock; an observed HLC leading local time by more than `maxClockSkewMillis` is rejected. The manifest keeps the highest HLC ever flushed, so once an owner with a far-ahead clock has flushed, every later takeover fails until real time catches up; fix that clock, or temporarily raise `maxClockSkewMillis` on the recovering node. |
-| **Crash mid cross-partition rename** | Converges by roll-forward: the source owner finalizes its durable rename intent against the destination's rendezvous marker — synchronously, on its background maintenance sweep, or after a handover replays the intent. Marker present ⇒ source tombstoned; absent past `rename.intent.abandon.millis` ⇒ intent dropped, source stays live. It never leaves both keys live forever and never loses data. |
+| **Crash mid cross-partition rename** | Converges by roll-forward: the source owner finalizes its durable rename intent against the destination's rendezvous marker — synchronously, on its background maintenance sweep, or after a handover replays the intent. The destination PUT and receipt share one WAL entry; recovery/maintenance republishes a missing marker. Marker present ⇒ conditionally delete the captured source version and acknowledge completion. Absence alone never proves abort: only an unclaimed relay CAS or a recovered/fenced destination with no receipt permits abandonment. Convergence requires recovery and successful maintenance/coordination; no client retry is needed. A rewritten source survives. |
 
 With the balancer enabled (`balancerIntervalMillis > 0`), a dead node's partitions are reassigned
 and taken over automatically within a round or two once both its leases and its ZooKeeper session
@@ -131,20 +139,19 @@ Delimiter listings (S3 `CommonPrefixes`) are rolled up by the nodes as of 0.2. O
 still interoperate: a 0.2 gateway rolls up whatever a 0.1 node returns un-rolled, so until the nodes
 are upgraded, delimiter listings behave as in 0.1 (a prefix can repeat across pages).
 
-Manifest records are written in format v6, which older nodes cannot read. Once an upgraded node has
-owned a partition, an older node cannot take it over, and the nodes cannot be rolled back to an older
-build either; finish the node rollout promptly (or disable the balancer during it). An older node
-given such a partition fences the manifest, fails to decode it and releases the lease, so the
-partition stays unowned (`RESPONSE_UNAVAILABLE`) until an upgraded node takes it. No data is lost.
+Manifest records use format v7; upgraded readers still accept v2–v6. Older binaries cannot
+recover v7 records or roll back a partition after an upgraded writer has owned it. Follow the
+coordinated upgrade below rather than assigning new-format partitions to older readers.
 
-Same-partition rename now immediately writes WAL kind 3 (atomic batch v1). Older builds only
-understand kinds 1 and 2 and cannot recover a WAL containing kind 3. **Use a coordinated maintenance
+Same-partition rename immediately writes WAL kind 3 (atomic batch v1); cross-partition rename
+writes kind 4 (PUT plus receipt v1), and manifests use version 7 for retained receipts. Older
+builds cannot recover these new records. **Use a coordinated maintenance
 upgrade for this change:** stop traffic and all nodes, back up the stopped cluster, install the
-batch-capable binary on every node, then restart all nodes and resume traffic. Do not run mixed
+receipt/batch-capable binary on every node, then restart all nodes and resume traffic. Do not run mixed
 old/new owners or downgrade binaries after new nodes start writing; restore the pre-upgrade backup
 if rollback is necessary. Runtime reader capability checks and a separate writer activation gate
 remain tracked by [#157](https://github.com/predatorray/candybox/issues/157); this release does not
-provide a zero-downtime mixed-version rollout. WAL batches are capped at 1 MiB including framing;
+provide a zero-downtime mixed-version rollout. WAL batches and PUT/receipt envelopes are capped at 1 MiB including framing;
 BookKeeper frame limits must accommodate that payload plus its protocol overhead (the standard
 5 MiB frame setting does).
 

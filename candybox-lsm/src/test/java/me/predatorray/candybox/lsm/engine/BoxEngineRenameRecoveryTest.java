@@ -115,6 +115,98 @@ class BoxEngineRenameRecoveryTest {
         checkRecovery(true, true);
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void renameReceiptAndDestinationHaveOneDurabilityDecision(boolean durable) {
+        try (FaultStore store = new FaultStore();
+             BoxEngine owner = BoxEngine.createNew(BOX, CONFIG, store, 1, new ManualClock(1000), 1)) {
+            owner.putCandy(SRC, new byte[]{1}, null, Map.of(), null);
+            var source = owner.resolveLocator(SRC);
+            store.failNext = true;
+            store.durable = durable;
+            assertThatThrownBy(() -> owner.zeroCopyRename(DST, source, "rename-token", "box-epoch",
+                    "relay-token", 0, SRC.value())).isInstanceOf(StorageException.class);
+            try (BoxEngine recovered = BoxEngine.recover(BOX, CONFIG, store, 2,
+                    new ManualClock(1000), owner.manifestLedgerId(), 2)) {
+                if (durable) {
+                    assertThat(recovered.getCandy(DST)).containsExactly((byte) 1);
+                    assertThat(recovered.listRenameReceipts()).singleElement().satisfies(receipt -> {
+                        assertThat(receipt.srcHlc()).isEqualTo(source.hlc());
+                        assertThat(receipt.incarnation()).isEqualTo("box-epoch");
+                        assertThat(receipt.result()).isEqualTo(recovered.resolveLocator(DST));
+                    });
+                    recovered.flush();
+                    try (BoxEngine successor = BoxEngine.recover(BOX, CONFIG, store, 3,
+                            new ManualClock(1000), recovered.manifestLedgerId(), 3)) {
+                        assertThat(successor.listRenameReceipts()).hasSize(1);
+                        var original = successor.resolveLocator(DST);
+                        successor.zeroCopyRename(DST, source, "rename-token", "box-epoch", "relay-token", 0, SRC.value());
+                        assertThat(successor.resolveLocator(DST)).isEqualTo(original);
+                        successor.clearRenameReceipt("rename-token");
+                        try (BoxEngine cleaned = BoxEngine.recover(BOX, CONFIG, store, 4,
+                                new ManualClock(1000), successor.manifestLedgerId(), 4)) {
+                            assertThat(cleaned.listRenameReceipts()).isEmpty();
+                            assertThat(cleaned.getCandy(DST)).containsExactly((byte) 1);
+                        }
+                    }
+                } else {
+                    assertThat(recovered.listRenameReceipts()).isEmpty();
+                    assertThatThrownBy(() -> recovered.getCandy(DST)).isInstanceOf(CandyNotFoundException.class);
+                }
+            }
+        }
+    }
+
+    @Test
+    void retryWithFreshRelayKeepsOriginalResultAcrossRecovery() {
+        try (FaultStore store = new FaultStore();
+             BoxEngine owner = BoxEngine.createNew(BOX, CONFIG, store, 1, new ManualClock(1000), 1)) {
+            owner.putCandy(SRC, new byte[]{1}, null, Map.of(), null);
+            var source = owner.resolveLocator(SRC);
+            var first = owner.zeroCopyRename(DST, source, "token", "epoch", "relay-one", 0, SRC.value());
+            try (BoxEngine recovered = BoxEngine.recover(BOX, CONFIG, store, 2,
+                    new ManualClock(2000), owner.manifestLedgerId(), 2)) {
+                assertThat(recovered.zeroCopyRename(DST, source, "token", "epoch", "relay-two", 0,
+                        SRC.value())).isEqualTo(first);
+                assertThat(recovered.listRenameReceipts()).singleElement()
+                        .satisfies(r -> assertThat(r.relayToken()).isEqualTo("relay-one"));
+            }
+        }
+    }
+
+    @Test
+    void receiptAdmissionLeavesCheckpointHeadroomAndCleanupCanDrainAtBackendLimit() {
+        try (FaultStore store = new FaultStore();
+             BoxEngine owner = BoxEngine.createNew(BOX, CONFIG, store, 1, new ManualClock(1000), 1)) {
+            owner.putCandy(SRC, new byte[]{1}, null, Map.of(), null);
+            var small = owner.resolveLocator(SRC);
+            var large = new me.predatorray.candybox.common.CandyLocator(small.hlc(), small.type(),
+                    small.contentType(), small.userMetadata(), small.createdAtMillis(),
+                    java.util.Collections.nCopies(10_000, small.parts().get(0)), small.acl());
+            int accepted = 0;
+            for (; accepted < 64; accepted++) {
+                long tail = store.openLedger(owner.manifestState().walLedgerId()).lastAddConfirmed();
+                try {
+                    owner.zeroCopyRename(CandyKey.of("dst-" + accepted), large, "token-" + accepted,
+                            "epoch", "relay-" + accepted, 0, SRC.value());
+                } catch (me.predatorray.candybox.common.exception.BusyException full) {
+                    assertThat(store.openLedger(owner.manifestState().walLedgerId()).lastAddConfirmed())
+                            .isEqualTo(tail);
+                    break;
+                }
+            }
+            assertThat(accepted).isBetween(1, 63);
+            owner.flush();
+            try (BoxEngine recovered = BoxEngine.recover(BOX, CONFIG, store, 2,
+                    new ManualClock(2000), owner.manifestLedgerId(), 2)) {
+                assertThat(recovered.listRenameReceipts()).hasSize(accepted);
+                for (var receipt : recovered.listRenameReceipts()) { recovered.clearRenameReceipt(receipt.token()); }
+                recovered.zeroCopyRename(DST, large, "after-drain", "epoch", "relay", 0, SRC.value());
+                recovered.flush();
+            }
+        }
+    }
+
     private void checkRecovery(boolean durable, boolean crash) {
         try (FaultStore store = new FaultStore();
              BoxEngine owner = BoxEngine.createNew(BOX, CONFIG, store, 1, new ManualClock(1000), 1)) {
@@ -157,6 +249,7 @@ class BoxEngineRenameRecoveryTest {
             return new WritableLedger() {
                 @Override
                 public long append(byte[] data) {
+                    if (data.length > 5 * 1024 * 1024) { throw new StorageException("backend entry limit"); }
                     if (failNext) {
                         failNext = false;
                         if (durable) {

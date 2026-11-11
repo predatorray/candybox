@@ -82,6 +82,40 @@ class Phase1EngineIT {
     }
 
     @Test
+    void retainedRenameReceiptsStayCheckpointableAndDrainOnRealLedgers() {
+        BoxName box = BoxName.of("receipt-budget");
+        var config = CandyboxConfig.defaults();
+        try (BoxEngine owner = BoxEngine.createNew(box, config, store, 1, SystemClock.INSTANCE, 1)) {
+            CandyKey src = CandyKey.of("src");
+            owner.putCandy(src, bytes("A"), null, Map.of(), null);
+            var small = owner.resolveLocator(src);
+            var large = new me.predatorray.candybox.common.CandyLocator(small.hlc(), small.type(),
+                    small.contentType(), small.userMetadata(), small.createdAtMillis(),
+                    java.util.Collections.nCopies(10_000, small.parts().get(0)), small.acl());
+            int accepted = 0;
+            for (; accepted < 64; accepted++) {
+                try {
+                    owner.zeroCopyRename(CandyKey.of("dst-" + accepted), large, "token-" + accepted,
+                            "epoch", "relay-" + accepted, 0, "src");
+                } catch (me.predatorray.candybox.common.exception.BusyException full) { break; }
+            }
+            assertThat(accepted).isBetween(1, 63);
+            owner.flush();
+            try (BoxEngine recovered = BoxEngine.recover(box, config, store, 2,
+                    SystemClock.INSTANCE, owner.manifestLedgerId(), 2)) {
+                assertThat(recovered.listRenameReceipts()).hasSize(accepted);
+                for (var receipt : recovered.listRenameReceipts()) { recovered.clearRenameReceipt(receipt.token()); }
+                recovered.zeroCopyRename(CandyKey.of("after"), large, "after", "epoch", "relay", 0, "src");
+                recovered.flush();
+                assertThat(recovered.resolveLocator(CandyKey.of("after")).contentLength()).isEqualTo(10_000);
+                var out = new java.io.ByteArrayOutputStream();
+                recovered.getCandyRange(CandyKey.of("after"), 0, 0, out);
+                assertThat(out.toByteArray()).isEqualTo(bytes("A"));
+            }
+        }
+    }
+
+    @Test
     void putGetDeleteListOnRealLedgers() {
         BoxName box = BoxName.of("it-box");
         try (BoxEngine engine = BoxEngine.createNew(box, CandyboxConfig.defaults(), store, 1,
@@ -126,8 +160,9 @@ class Phase1EngineIT {
         }
     }
 
-    @Test
-    void renameWithLostWalAcknowledgementRecoversAtomicallyOnRealLedgers() {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void renameWithLostWalAcknowledgementRecoversAtomicallyOnRealLedgers(boolean crossPartition) {
         AtomicBoolean loseNextAck = new AtomicBoolean();
         // The decorator loses the response after the real BookKeeper quorum acknowledged the entry.
         LedgerStore faultStore = new LedgerStore() {
@@ -167,14 +202,37 @@ class Phase1EngineIT {
                 SystemClock.INSTANCE, 1)) {
             owner.putCandy(src, bytes("A"), null, Map.of(), null);
             owner.putCandy(dst, bytes("B"), null, Map.of(), null);
+            var source = owner.resolveLocator(src);
             loseNextAck.set(true);
-            assertThatThrownBy(() -> owner.renameCandy(src, dst, null))
-                    .isInstanceOf(StorageException.class);
+            assertThatThrownBy(() -> {
+                if (crossPartition) {
+                    owner.zeroCopyRename(dst, source, "transfer", "incarnation", "relay", 0, src.value());
+                } else {
+                    owner.renameCandy(src, dst, null);
+                }
+            }).isInstanceOf(StorageException.class);
             assertThat(owner.getCandy(src)).isEqualTo(bytes("A"));
             assertThat(owner.getCandy(dst)).isEqualTo(bytes("B"));
             // Recover-open fences the still-open original handles; no clean shutdown/flush first.
             try (BoxEngine recovered = BoxEngine.recover(box, config, store, 2,
                     SystemClock.INSTANCE, owner.manifestLedgerId(), 2)) {
+                if (crossPartition) {
+                    assertThat(recovered.getCandy(src)).isEqualTo(bytes("A"));
+                    assertThat(recovered.listRenameReceipts()).hasSize(1);
+                    recovered.flush();
+                    try (BoxEngine next = BoxEngine.recover(box, config, store, 3,
+                            SystemClock.INSTANCE, recovered.manifestLedgerId(), 3)) {
+                        assertThat(next.listRenameReceipts()).hasSize(1);
+                        assertThat(next.getCandy(dst)).isEqualTo(bytes("A"));
+                        next.clearRenameReceipt("transfer");
+                        try (BoxEngine cleaned = BoxEngine.recover(box, config, store, 4,
+                                SystemClock.INSTANCE, next.manifestLedgerId(), 4)) {
+                            assertThat(cleaned.listRenameReceipts()).isEmpty();
+                            assertThat(cleaned.getCandy(dst)).isEqualTo(bytes("A"));
+                        }
+                    }
+                    return;
+                }
                 assertThatThrownBy(() -> recovered.getCandy(src)).isInstanceOf(CandyNotFoundException.class);
                 assertThat(recovered.getCandy(dst)).isEqualTo(bytes("A"));
                 recovered.putCandy(src, bytes("new"), null, Map.of(), null);

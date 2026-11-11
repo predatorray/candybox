@@ -57,6 +57,7 @@ import me.predatorray.candybox.common.serial.BinaryWriter;
 import me.predatorray.candybox.lsm.engine.BoxEngine;
 import me.predatorray.candybox.lsm.engine.CandyMetadata;
 import me.predatorray.candybox.lsm.manifest.RenameIntent;
+import me.predatorray.candybox.lsm.manifest.RenameReceipt;
 import me.predatorray.candybox.protocol.transport.RequestHandler;
 import me.predatorray.candybox.server.PartitionAssignment.BoxPartition;
 import org.slf4j.Logger;
@@ -675,13 +676,12 @@ public final class CandyboxNode implements AutoCloseable {
     }
 
     /**
-     * Finalizes (or abandons) the cross-partition rename intents owed by every partition this node
-     * owns: a present coordination rendezvous marker ⇒ LWW-conditioned delete of the source key, then
-     * clear the intent and the marker; no marker past {@code renameIntentAbandonMillis} ⇒ drop the
-     * intent (the rename never reached the destination — the source stays live). Idempotent; also runs
-     * after a handover replays an intent. Exposed for manual/operational triggering and tests.
+     * Finalizes committed renames using the source intent's expected HLC and acknowledges the
+     * durable source delete. Timed-out preparations may be aborted only by winning the pending
+     * relay's CAS against destination consumption. Claimed transfers retain their intent until a
+     * commit receipt is published or a recovered destination has fenced and aborted the consumer.
      *
-     * @return the number of intents finalized (source actually tombstoned)
+     * @return the number of committed intents acknowledged (a rewritten source is retained)
      */
     public int finalizeRenameIntentsOnce() {
         long abandon = config.renameIntentAbandonMillis();
@@ -704,13 +704,15 @@ public final class CandyboxNode implements AutoCloseable {
             }
             for (RenameIntent intent : intents) {
                 try {
-                    if (renameMarkerPresent(box, intent.token())) {
-                        engine.deleteCandyConditional(CandyKey.of(intent.srcKey()), intent.srcHlc());
-                        engine.clearRenameIntent(intent.token());
-                        deleteRenameMarker(box, intent.token());
-                        finalized++;
-                    } else if (clock.currentTimeMillis() - intent.createdAtMillis() > abandon) {
-                        engine.clearRenameIntent(intent.token());
+                    synchronized (engine) {
+                        // A fresh Prepare may have refreshed this token since the maintenance snapshot.
+                        if (!engine.listRenameIntents().contains(intent)) { continue; }
+                        if (finalizeRenameIntent(engine, box, intent.token(), intent.srcKey())) {
+                            finalized++;
+                        } else if (clock.currentTimeMillis() - intent.createdAtMillis() > abandon
+                                && abortUnclaimedRename(box, ownership.partition(), intent.token())) {
+                            engine.clearRenameIntent(intent.token());
+                        }
                     }
                 } catch (NotOwnerException lost) {
                     break;
@@ -998,25 +1000,161 @@ public final class CandyboxNode implements AutoCloseable {
         }
     }
 
+    /** Called under the destination engine lock, serializing with receipt removal. */
+    void requirePendingRename(String box, int srcPartition, String relayToken) {
+        var relayValue = coordination.get(CandyboxKeys.locatorRelayKey(box, srcPartition, relayToken));
+        if (relayValue.isEmpty()) { throw new BusyException("Rename attempt already retired"); }
+        var relay = LocatorRelay.deserialize(relayValue.get().value());
+        String key = CandyboxKeys.renameMarkerKey(box, relay.renameToken());
+        for (int attempt = 0; attempt < 4; attempt++) {
+            var decision = coordination.get(key);
+            if (decision.isEmpty()) { throw new BusyException("Rename decision already retired"); }
+            var marker = RenameMarker.deserialize(decision.get().value());
+            if (marker.completed()) { throw new BusyException("Rename decision already acknowledged"); }
+            try {
+                // Refresh even an existing reservation: a newer generation must invalidate
+                // a fenced claimant's captured version before it appends another receipt.
+                coordination.compareAndSet(key, marker.reserve().serialize(), decision.get().version());
+                return;
+            } catch (CasConflictException raced) { /* retry decision; never append after abort */ }
+        }
+        throw new BusyException("Rename reservation raced repeatedly");
+    }
+
+    /** Only preparation may create a decision. Publication can never recreate a cleaned token. */
+    void prepareRenameMarker(String box, String token, String srcKey, int srcPartition, Hlc srcHlc,
+                             String dstKey) {
+        var prepared = new RenameMarker(descriptor(BoxName.of(box)).incarnation(), srcKey,
+                srcPartition, srcHlc, dstKey, false, false);
+        String key = CandyboxKeys.renameMarkerKey(box, token);
+        try { coordination.create(key, prepared.serialize()); }
+        catch (CasConflictException exists) {
+            var current = RenameMarker.deserialize(coordination.get(key).orElseThrow().value());
+            if (!current.commit().acknowledge().equals(prepared.commit().acknowledge())) {
+                throw new IllegalStateException("Conflicting rename preparation " + token);
+            }
+        }
+    }
+
+    void publishRenameMarker(String box, String token, String srcKey, int srcPartition, Hlc srcHlc,
+                             String dstKey, String incarnation) {
+        var expected = new RenameMarker(incarnation, srcKey, srcPartition, srcHlc, dstKey, false);
+        String key = CandyboxKeys.renameMarkerKey(box, token);
+        for (int attempt = 0; attempt < 4; attempt++) {
+            var value = coordination.get(key);
+            if (value.isEmpty()) { return; } // terminal cleanup won; never create here
+            var current = RenameMarker.deserialize(value.get().value());
+            if (!current.commit().acknowledge().equals(expected.acknowledge())) {
+                throw new IllegalStateException("Conflicting rename decision " + token);
+            }
+            if (current.committed()) { return; }
+            try {
+                coordination.compareAndSet(key, current.commit().serialize(), value.get().version());
+                return;
+            } catch (CasConflictException raced) { /* ACK or terminal cleanup won; reread. */ }
+        }
+        throw new BusyException("Rename publication raced repeatedly");
+    }
+
     /**
      * Writes the rendezvous marker telling the source partition's owner that a cross-partition
      * rename's destination put is durable. Idempotent (a retried write is a no-op).
      */
     void writeRenameMarker(String box, String token, String srcKey, int srcPartition, Hlc srcHlc,
                            String dstKey) {
-        BinaryWriter w = new BinaryWriter(64);
-        w.writeString(srcKey);
-        w.writeVarInt(srcPartition);
-        w.writeVarLong(srcHlc == null ? 0L : srcHlc.physicalMillis());
-        w.writeVarInt(srcHlc == null ? 0 : srcHlc.logicalCounter());
-        w.writeInt(srcHlc == null ? 0 : srcHlc.nodeId());
-        w.writeString(dstKey == null ? "" : dstKey);
+        writeRenameMarker(box, token, srcKey, srcPartition, srcHlc, dstKey,
+                descriptor(BoxName.of(box)).incarnation());
+    }
+
+    void writeRenameMarker(String box, String token, String srcKey, int srcPartition, Hlc srcHlc,
+                           String dstKey, String incarnation) {
+        if (!descriptor(BoxName.of(box)).incarnation().equals(incarnation)) {
+            throw new NotOwnerException("Rename belongs to a deleted Box incarnation");
+        }
+        var marker = new RenameMarker(incarnation, srcKey,
+                srcPartition, srcHlc, dstKey, false);
         String key = CandyboxKeys.renameMarkerKey(box, token);
         try {
-            coordination.create(key, w.toByteArray());
+            coordination.create(key, marker.serialize());
         } catch (CasConflictException alreadyThere) {
-            // Idempotent: the marker is already present.
+            var value = coordination.get(key).orElseThrow();
+            var existing = RenameMarker.deserialize(value.value());
+            if (existing.incarnation().isEmpty() && existing.srcKey().equals(srcKey)
+                    && existing.srcPartition() == srcPartition && existing.srcHlc().equals(srcHlc)
+                    && existing.dstKey().equals(dstKey)) {
+                coordination.compareAndSet(key, (existing.completed() ? marker.acknowledge() : marker).serialize(),
+                        value.version());
+                return;
+            }
+            if (!existing.acknowledge().equals(marker.acknowledge())) {
+                throw new IllegalStateException("Conflicting rename decision " + token);
+            }
         }
+    }
+
+    /** Uses only the source's durable expected HLC; a client cannot choose the deleted version. */
+    boolean finalizeRenameIntent(BoxEngine engine, String box, String token, String srcKey) {
+        synchronized (engine) {
+            return finalizeRenameIntentLocked(engine, box, token, srcKey);
+        }
+    }
+
+    private boolean finalizeRenameIntentLocked(BoxEngine engine, String box, String token, String srcKey) {
+        var intent = engine.listRenameIntents().stream().filter(i -> i.token().equals(token))
+                .findFirst().orElse(null);
+        if (intent == null || !intent.srcKey().equals(srcKey)) { return false; }
+        String key = CandyboxKeys.renameMarkerKey(box, token);
+        var value = coordination.get(key);
+        if (value.isEmpty()) { return false; }
+        var marker = RenameMarker.deserialize(value.get().value());
+        if ((!marker.incarnation().isEmpty() && !marker.incarnation().equals(descriptor(BoxName.of(box)).incarnation()))
+                || marker.srcPartition() != descriptor(BoxName.of(box)).partitionOf(intent.srcKey())
+                || !marker.srcKey().equals(intent.srcKey()) || !marker.srcHlc().equals(intent.srcHlc())
+                || !marker.dstKey().equals(intent.dstKey())
+                || descriptor(BoxName.of(box)).partitionOf(marker.dstKey()) != intent.dstPartition()) {
+            throw new IllegalStateException("Rename marker does not match source intent " + token);
+        }
+        if (!marker.committed()) { return false; }
+        engine.deleteCandyConditional(CandyKey.of(intent.srcKey()), intent.srcHlc());
+        // ACK follows the durable tombstone, precedes intent removal. Recovery can repeat both.
+        if (!marker.completed()) {
+            coordination.compareAndSet(key, marker.acknowledge().serialize(), value.get().version());
+        }
+        engine.clearRenameIntent(token);
+        // Legacy/manual markers without a transfer need no destination receipt cleanup.
+        if (!hasRenameRelay(box, marker.srcPartition(), token)) { deleteRenameMarker(box, token); }
+        return true;
+    }
+
+    private boolean hasRenameRelay(String box, int partition, String renameToken) {
+        for (String token : coordination.children(CandyboxKeys.locatorRelaysPath(box, partition))) {
+            var value = coordination.get(CandyboxKeys.locatorRelayKey(box, partition, token));
+            if (value.isPresent() && renameToken.equals(LocatorRelay.deserialize(value.get().value()).renameToken())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Pending-to-aborted races the destination's pending-to-claimed CAS on the same record. */
+    private boolean abortUnclaimedRename(String box, int partition, String renameToken) {
+        String markerKey = CandyboxKeys.renameMarkerKey(box, renameToken);
+        var decision = coordination.get(markerKey);
+        if (decision.isPresent()) {
+            var marker = RenameMarker.deserialize(decision.get().value());
+            if (marker.reserved() || marker.committed()) { return false; }
+        }
+        for (String token : coordination.children(CandyboxKeys.locatorRelaysPath(box, partition))) {
+            var value = coordination.get(CandyboxKeys.locatorRelayKey(box, partition, token));
+            if (value.isEmpty()) { continue; }
+            var relay = LocatorRelay.deserialize(value.get().value());
+            if (!renameToken.equals(relay.renameToken())) { continue; }
+            if (relay.consumer() != null) { return false; }
+            coordination.delete(CandyboxKeys.locatorRelayKey(box, partition, token), value.get().version());
+            if (config.ledgerEnumerationGraceMillis() > 0) { releaseRelayPins(token, relay); }
+        }
+        if (decision.isPresent()) { coordination.delete(markerKey, decision.get().version()); }
+        return true;
     }
 
     /**
@@ -1154,7 +1292,7 @@ public final class CandyboxNode implements AutoCloseable {
      * pin for a later pass. Same-generation failures deliberately keep their claims until handover.
      */
     public int reconcileClaimedLocatorRelaysOnce() {
-        int reconciled = 0;
+        int reconciled = reconcileRenameReceiptsOnce();
         Set<String> boxes = new HashSet<>();
         for (BoxPartition bp : partitions.keySet()) { boxes.add(bp.box()); }
         for (String box : boxes) {
@@ -1169,19 +1307,122 @@ public final class CandyboxNode implements AutoCloseable {
                         PartitionOwnership destination = partitions.get(
                                 new BoxPartition(box, relay.consumer().partition()));
                         if (destination == null || !destination.isOwner()
-                                || !destination.incarnation().equals(relay.consumer().incarnation())
-                                || destination.fencingToken() <= relay.consumer().fencingToken()) {
+                                || !destination.incarnation().equals(relay.consumer().incarnation())) {
                             continue;
                         }
-                        if (tryPublishPartitionRefs(destination)) {
-                            completeLocatorRelay(box, src, token, relay);
-                            reconciled++;
+                        synchronized (destination.engine()) {
+                            boolean acknowledged = false;
+                            String markerKey = null;
+                            Optional<VersionedValue> decision = Optional.empty();
+                            RenameMarker marker = null;
+                            if (relay.isRename()) {
+                                // Admission shares this monitor, so a receipt cannot appear between
+                                // this absence check and the versioned release of the reservation.
+                                boolean committed = destination.engine().listRenameReceipts().stream()
+                                        .anyMatch(r -> r.token().equals(relay.renameToken()));
+                                if (committed) { continue; }
+                                markerKey = CandyboxKeys.renameMarkerKey(box, relay.renameToken());
+                                decision = coordination.get(markerKey);
+                                if (decision.isPresent()) {
+                                    marker = RenameMarker.deserialize(decision.get().value());
+                                    acknowledged = marker.completed();
+                                    if (marker.committed() && !acknowledged) { continue; }
+                                }
+                            }
+                            if (!acknowledged && destination.fencingToken() <= relay.consumer().fencingToken()) {
+                                continue; // no commit/abort proof until this consumer is fenced
+                            }
+                            if (tryPublishPartitionRefs(destination)) {
+                                if (marker != null && !marker.committed()) {
+                                    // Retire only this captured reservation, never the logical token.
+                                    // Fresh admission always CAS-refreshes it, including after handover.
+                                    var prepared = new RenameMarker(marker.incarnation(), marker.srcKey(),
+                                            marker.srcPartition(), marker.srcHlc(), marker.dstKey(), false, false);
+                                    coordination.compareAndSet(markerKey, prepared.serialize(), decision.get().version());
+                                }
+                                completeLocatorRelay(box, src, token, relay);
+                                reconciled++;
+                            }
                         }
                     }
                 }
             } catch (RuntimeException failure) {
                 LOG.warn("Claimed relay reconciliation failed for box {}: {}", box,
                         failure.getMessage());
+            }
+        }
+        cleanupAcknowledgedRenameMarkers();
+        return reconciled;
+    }
+
+    /** Completes cleanup if the previous pass crashed after deleting its relay. */
+    private void cleanupAcknowledgedRenameMarkers() {
+        Set<String> boxes = new HashSet<>();
+        for (BoxPartition bp : partitions.keySet()) { boxes.add(bp.box()); }
+        for (String box : boxes) {
+            try {
+                for (String token : coordination.children(CandyboxKeys.BOXES_ROOT + "/" + box + "/renames")) {
+                    String key = CandyboxKeys.renameMarkerKey(box, token);
+                    var value = coordination.get(key);
+                    if (value.isEmpty()) { continue; }
+                    var marker = RenameMarker.deserialize(value.get().value());
+                    var source = partitions.get(new BoxPartition(box, marker.srcPartition()));
+                    if (!marker.committed() && source != null && source.isOwner()
+                            && source.incarnation().equals(marker.incarnation())
+                            && value.get().modifiedAtMillis() >= 0
+                            && clock.currentTimeMillis() - value.get().modifiedAtMillis() > config.renameIntentAbandonMillis()
+                            && source.engine().listRenameIntents().stream().noneMatch(i -> i.token().equals(token))
+                            && !hasRenameRelay(box, marker.srcPartition(), token)) {
+                        coordination.delete(key, value.get().version());
+                        continue;
+                    }
+                    var destination = partitions.get(new BoxPartition(box,
+                            descriptor(BoxName.of(box)).partitionOf(marker.dstKey())));
+                    if (marker.completed() && destination != null && destination.isOwner()
+                            && destination.incarnation().equals(marker.incarnation())
+                            && destination.engine().listRenameReceipts().stream().noneMatch(r -> r.token().equals(token))
+                            && !hasRenameRelay(box, marker.srcPartition(), token)) {
+                        coordination.delete(key, value.get().version());
+                    }
+                }
+            } catch (RuntimeException failure) {
+                LOG.warn("Acknowledged rename cleanup failed for box {}: {}", box, failure.getMessage());
+            }
+        }
+    }
+
+    /** Replays destination decisions without depending on a client or a marker having survived. */
+    public int reconcileRenameReceiptsOnce() {
+        int reconciled = 0;
+        for (PartitionOwnership ownership : partitions.values()) {
+            try {
+                if (!ownership.isOwner()) { continue; }
+                var engine = ownership.engine();
+                String box = ownership.box().value();
+                for (RenameReceipt receipt : engine.listRenameReceipts()) {
+                    if (!ownership.incarnation().equals(receipt.incarnation())) {
+                        throw new IllegalStateException("Receipt from a different Box incarnation");
+                    }
+                    if (!tryPublishPartitionRefs(ownership)) { continue; }
+                    publishRenameMarker(box, receipt.token(), receipt.srcKey(), receipt.srcPartition(),
+                            receipt.srcHlc(), receipt.dstKey(), receipt.incarnation());
+                    var value = coordination.get(CandyboxKeys.renameMarkerKey(box, receipt.token()));
+                    if (value.isEmpty() || !RenameMarker.deserialize(value.get().value()).completed()) { continue; }
+                    engine.clearRenameReceipt(receipt.token());
+                    // Every retry can have its own claim. ACK authorizes releasing all attempts.
+                    for (String relayToken : coordination.children(CandyboxKeys.locatorRelaysPath(box, receipt.srcPartition()))) {
+                        var relayValue = coordination.get(CandyboxKeys.locatorRelayKey(box, receipt.srcPartition(), relayToken));
+                        if (relayValue.isEmpty()) { continue; }
+                        var relay = LocatorRelay.deserialize(relayValue.get().value());
+                        if (receipt.token().equals(relay.renameToken())) {
+                            completeLocatorRelay(box, receipt.srcPartition(), relayToken, relay);
+                        }
+                    }
+                    deleteRenameMarker(box, receipt.token());
+                    reconciled++;
+                }
+            } catch (RuntimeException failure) {
+                LOG.warn("Rename receipt reconciliation failed on node {}: {}", nodeId, failure.getMessage());
             }
         }
         return reconciled;

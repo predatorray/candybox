@@ -212,7 +212,7 @@ public final class CandyboxConfig {
 
     /**
      * How long a source-side cross-partition rename intent may sit without its destination completion
-     * marker appearing before it is abandoned (the rename never reached the destination; the source
+     * marker appearing before an unclaimed preparation may be CAS-aborted (the source
      * stays live). Roll-forward otherwise: a present marker finalizes the source delete.
      */
     public long renameIntentAbandonMillis() {
@@ -253,7 +253,7 @@ public final class CandyboxConfig {
         private int partitionsPerBoxDefault = 8;                        // write spread vs. per-engine cost
         private long balancerIntervalMillis = 0L;                       // balancing round; 0 disables
         private int balancerMaxMovesPerRound = 4;                       // migration rate limit
-        private long renameIntentAbandonMillis = 60_000L;               // abandon a stuck rename intent
+        private long renameIntentAbandonMillis = 60_000L;               // consider aborting an unclaimed rename preparation
         private long zeroCopyRelayBudgetBytes = 32L * 1024 * 1024;      // pending relay bytes per node
 
         public Builder sizeLimits(SizeLimits v) {

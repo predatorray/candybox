@@ -48,7 +48,7 @@ import me.predatorray.candybox.lsm.sstable.SSTableMeta;
  */
 public final class ManifestSerializer {
 
-    public static final byte FORMAT_VERSION = 6;
+    public static final byte FORMAT_VERSION = 7;
 
     private ManifestSerializer() {
     }
@@ -114,6 +114,10 @@ public final class ManifestSerializer {
             w.writeVarLong(Math.max(0, e.getValue()));
         }
         writeLongSet(w, edit.removedPendingDeletes());
+        w.writeVarInt(edit.addedRenameReceipts().size());
+        for (RenameReceipt receipt : edit.addedRenameReceipts()) { w.writeBytes(receipt.serialize()); }
+        w.writeVarInt(edit.removedRenameReceipts().size());
+        for (String token : edit.removedRenameReceipts()) { w.writeString(token); }
         return w.toByteArray();
     }
 
@@ -178,9 +182,19 @@ public final class ManifestSerializer {
             removedPendingDeletes = readLongSet(r);
         }
 
+        List<RenameReceipt> receipts = new ArrayList<>();
+        Set<String> removedReceipts = new LinkedHashSet<>();
+        if (version >= 7) {
+            int count = r.readVarInt();
+            if (count < 0 || count > r.remaining()) { throw new SerializationException("Invalid receipt count"); }
+            for (int i = 0; i < count; i++) { receipts.add(RenameReceipt.deserialize(r.readBytes())); }
+            count = r.readVarInt();
+            if (count < 0 || count > r.remaining()) { throw new SerializationException("Invalid receipt removal count"); }
+            for (int i = 0; i < count; i++) { removedReceipts.add(r.readString()); }
+        }
         return new ManifestEdit(tables, removedTables, addedSyrups, removedSyrups, newWal,
                 addedUploads, upserts, removedUploads, addedIntents, removedIntents,
-                addedPendingDeletes, removedPendingDeletes, maxHlc, ownerFencingToken);
+                addedPendingDeletes, removedPendingDeletes, maxHlc, ownerFencingToken, receipts, removedReceipts);
     }
 
     private static void writeHlc(BinaryWriter w, Hlc hlc) {
