@@ -603,12 +603,15 @@ final class NodeRequestHandler implements RequestHandler {
                     : effectiveAcl(principal, m.owner(), m.grants());
             CandyMetadata meta = relay.consumer().committed();
             if (meta == null) {
-                meta = relay.isRename()
-                        ? engine.zeroCopyRename(CandyKey.of(m.dstKey()), source, relay.renameToken(),
-                                relay.consumer().incarnation(), m.relayToken(), m.srcPartition(), relay.srcKey(),
-                                () -> node.requirePendingRename(m.box(), m.srcPartition(), m.relayToken()))
-                        : engine.zeroCopyPut(CandyKey.of(m.dstKey()), source.parts(),
-                                source.contentType(), source.userMetadata(), 0L, acl, m.idempotencyToken());
+                // Share admission with fenced-claim retirement, including its receipt-absence check.
+                synchronized (engine) {
+                    meta = relay.isRename()
+                            ? engine.zeroCopyRename(CandyKey.of(m.dstKey()), source, relay.renameToken(),
+                                    relay.consumer().incarnation(), m.relayToken(), m.srcPartition(), relay.srcKey(),
+                                    () -> node.requirePendingRename(m.box(), m.srcPartition(), m.relayToken()))
+                            : engine.zeroCopyPut(CandyKey.of(m.dstKey()), source.parts(),
+                                    source.contentType(), source.userMetadata(), 0L, acl, m.idempotencyToken());
+                }
                 relay = node.recordCommittedLocatorRelay(m.box(), m.srcPartition(), m.relayToken(),
                         relay, meta);
             }

@@ -1010,9 +1010,9 @@ public final class CandyboxNode implements AutoCloseable {
             if (decision.isEmpty()) { throw new BusyException("Rename decision already retired"); }
             var marker = RenameMarker.deserialize(decision.get().value());
             if (marker.completed()) { throw new BusyException("Rename decision already acknowledged"); }
-            if (marker.reserved()) { return; }
             try {
-                // A source abort deletes only this unreserved version. Exactly one CAS wins.
+                // Refresh even an existing reservation: a newer generation must invalidate
+                // a fenced claimant's captured version before it appends another receipt.
                 coordination.compareAndSet(key, marker.reserve().serialize(), decision.get().version());
                 return;
             } catch (CasConflictException raced) { /* retry decision; never append after abort */ }
@@ -1309,24 +1309,39 @@ public final class CandyboxNode implements AutoCloseable {
                                 || !destination.incarnation().equals(relay.consumer().incarnation())) {
                             continue;
                         }
-                        boolean acknowledged = false;
-                        if (relay.isRename()) {
-                            // A recovered receipt is authoritative. No receipt after recover-open
-                            // proves that an older claim did not commit, or was already acknowledged.
-                            boolean committed = destination.engine().listRenameReceipts().stream()
-                                    .anyMatch(r -> r.token().equals(relay.renameToken()));
-                            if (committed) { continue; }
-                            var marker = coordination.get(CandyboxKeys.renameMarkerKey(box, relay.renameToken()));
-                            acknowledged = marker.isPresent() && RenameMarker.deserialize(marker.get().value()).completed();
-                            if (marker.isPresent() && RenameMarker.deserialize(marker.get().value()).committed() && !acknowledged) { continue; }
-                        }
-                        if (!acknowledged && destination.fencingToken() <= relay.consumer().fencingToken()) {
-                            continue; // no commit/abort proof until this consumer is fenced
-                        }
-                        if (tryPublishPartitionRefs(destination)) {
-                            completeLocatorRelay(box, src, token, relay);
-                            if (relay.isRename()) { deleteRenameMarker(box, relay.renameToken()); }
-                            reconciled++;
+                        synchronized (destination.engine()) {
+                            boolean acknowledged = false;
+                            String markerKey = null;
+                            Optional<VersionedValue> decision = Optional.empty();
+                            RenameMarker marker = null;
+                            if (relay.isRename()) {
+                                // Admission shares this monitor, so a receipt cannot appear between
+                                // this absence check and the versioned release of the reservation.
+                                boolean committed = destination.engine().listRenameReceipts().stream()
+                                        .anyMatch(r -> r.token().equals(relay.renameToken()));
+                                if (committed) { continue; }
+                                markerKey = CandyboxKeys.renameMarkerKey(box, relay.renameToken());
+                                decision = coordination.get(markerKey);
+                                if (decision.isPresent()) {
+                                    marker = RenameMarker.deserialize(decision.get().value());
+                                    acknowledged = marker.completed();
+                                    if (marker.committed() && !acknowledged) { continue; }
+                                }
+                            }
+                            if (!acknowledged && destination.fencingToken() <= relay.consumer().fencingToken()) {
+                                continue; // no commit/abort proof until this consumer is fenced
+                            }
+                            if (tryPublishPartitionRefs(destination)) {
+                                if (marker != null && !marker.committed()) {
+                                    // Retire only this captured reservation, never the logical token.
+                                    // Fresh admission always CAS-refreshes it, including after handover.
+                                    var prepared = new RenameMarker(marker.incarnation(), marker.srcKey(),
+                                            marker.srcPartition(), marker.srcHlc(), marker.dstKey(), false, false);
+                                    coordination.compareAndSet(markerKey, prepared.serialize(), decision.get().version());
+                                }
+                                completeLocatorRelay(box, src, token, relay);
+                                reconciled++;
+                            }
                         }
                     }
                 }

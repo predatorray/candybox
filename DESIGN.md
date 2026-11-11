@@ -292,6 +292,10 @@ consults range tombstones across all tables rather than pruning by point range.
   the marker before clearing the intent. A later source re-PUT survives. Destination maintenance
   then removes the receipt (first rotating away its WAL record), relay/pin, and marker, in that
   order; interrupted cleanup resumes even when the receipt or relay has already disappeared.
+  Recovery of a fenced attempt serializes receipt-absence checks with destination admission.
+  It CAS-releases only the captured reservation back to prepared; it never deletes the logical
+  decision. Every new destination append refreshes the reservation version, including when it was
+  already reserved, so stale cleanup cannot release a newer generation's reservation.
   Retries compare the stable token/incarnation/source HLC/destination identity, not the random
   relay attempt; cleanup releases every relay attempt for the acknowledged rename.
   Source preparation and retirement serialize per source engine; maintenance revalidates stale

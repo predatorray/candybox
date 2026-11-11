@@ -978,6 +978,59 @@ class CrossPartitionGcAndRenameTest {
 
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void recoveredClaimCannotRetireFreshCommit(boolean anotherHandover) throws Exception {
+        var clock = new ManualClock(1_000_000);
+        var store = new InMemoryLedgerStore(clock);
+        var coordination = new FaultyCoordination(new InMemoryCoordinationService(clock));
+        var config = CandyboxConfig.builder().leaseRenewIntervalMillis(0).build();
+        var snapshot = new CountDownLatch(1); var resume = new CountDownLatch(1);
+        var once = new java.util.concurrent.atomic.AtomicBoolean();
+        var executor = Executors.newFixedThreadPool(2);
+        try (CandyboxNode node = new CandyboxNode(1, config, store, coordination, clock);
+             CandyboxNode recovered = new CandyboxNode(2, config, store, coordination, clock);
+             CandyboxNode successor = new CandyboxNode(3, config, store, coordination, clock)) {
+            node.createBox(BOX, PARTITIONS);
+            String src = keyIn(0, "src"); String dst = keyIn(1, "dst");
+            node.enginePartition(BOX, 0).putCandy(CandyKey.of(src), bytes("payload"), null, Map.of(), null);
+            var request = new Message.PrepareRenameRequest(BOX.value(), src, dst, 1, "recovered-retry");
+            var prepared = (Message.CandyLocatorResponse) send(node.requestHandler(), request);
+            assertThat(node.claimLocatorRelay(BOX.value(), 0, prepared.relayToken(), dst,
+                    node.enginePartition(BOX, 1), relay -> true)).isPresent();
+            node.requirePendingRename(BOX.value(), 0, prepared.relayToken());
+            node.releasePartition(BOX, 1); recovered.openPartition(BOX, 1);
+            coordination.afterGet = key -> {
+                if (key.equals(CandyboxKeys.renameMarkerKey(BOX.value(), "recovered-retry"))
+                        && once.compareAndSet(false, true)) { snapshot.countDown(); await(resume); }
+            };
+            var cleanup = executor.submit(recovered::reconcileClaimedLocatorRelaysOnce);
+            assertThat(snapshot.await(10, TimeUnit.SECONDS)).isTrue();
+            CandyboxNode destination = recovered;
+            if (anotherHandover) {
+                recovered.releasePartition(BOX, 1); successor.openPartition(BOX, 1);
+                destination = successor;
+            }
+            CandyboxNode committer = destination;
+            var retry = (Message.CandyLocatorResponse) send(node.requestHandler(), request);
+            var commit = executor.submit(() -> send(committer.requestHandler(), new Message.ZeroCopyPutRequest(
+                    BOX.value(), dst, 0, retry.relayToken(), null, List.of(), null)));
+            try { commit.get(200, TimeUnit.MILLISECONDS); }
+            catch (java.util.concurrent.TimeoutException blockedByRetirement) { /* admission is serialized */ }
+            resume.countDown(); cleanup.get(10, TimeUnit.SECONDS);
+            assertThat(commit.get(10, TimeUnit.SECONDS)).isInstanceOf(Message.HeadCandyResponse.class);
+            for (int i = 0; i < 3; i++) {
+                destination.reconcileClaimedLocatorRelaysOnce(); node.finalizeRenameIntentsOnce();
+            }
+            assertThatThrownBy(() -> node.enginePartition(BOX, 0).getCandy(CandyKey.of(src)))
+                    .isInstanceOf(CandyNotFoundException.class);
+            assertThat(destination.enginePartition(BOX, 1).getCandy(CandyKey.of(dst))).isEqualTo(bytes("payload"));
+            assertThat(node.enginePartition(BOX, 0).listRenameIntents()).isEmpty();
+            assertThat(destination.enginePartition(BOX, 1).listRenameReceipts()).isEmpty();
+            assertThat(node.renameMarkerPresent(BOX.value(), "recovered-retry")).isFalse();
+        } finally { resume.countDown(); executor.shutdownNow(); }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
     void abandonmentSerializesFreshPreparationAndCannotRetireItsDecision(boolean sourceHandover) throws Exception {
         var clock = new ManualClock(1_000_000);
         var store = new InMemoryLedgerStore(clock);
@@ -1421,6 +1474,7 @@ class CrossPartitionGcAndRenameTest {
         volatile java.util.function.Predicate<byte[]> failValue = value -> true;
         volatile Consumer<String> beforeCreate = key -> { };
         volatile Consumer<String> beforeGet = key -> { };
+        volatile Consumer<String> afterGet = key -> { };
         volatile Consumer<String> beforeChildren = path -> { };
         volatile Consumer<String> afterChildren = path -> { };
         volatile Consumer<String> beforeCompareAndSet = key -> { };
@@ -1444,8 +1498,10 @@ class CrossPartitionGcAndRenameTest {
         @Override
         public Optional<VersionedValue> get(String key) {
             beforeGet.accept(key);
-            return delegate.get(key).map(value -> omitWriteMetadata
+            var result = delegate.get(key).map(value -> omitWriteMetadata
                     ? new VersionedValue(value.version(), value.value()) : value);
+            afterGet.accept(key);
+            return result;
         }
 
         @Override
