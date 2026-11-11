@@ -28,6 +28,7 @@ import me.predatorray.candybox.common.CandyKey;
 import me.predatorray.candybox.common.ManualClock;
 import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.serial.BinaryReader;
+import me.predatorray.candybox.lsm.sstable.SSTableReader;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -88,6 +89,12 @@ class BoxEngineReverseScanTest {
     @Test
     void upperBoundBeforeFirstBlockReturnsEmpty() {
         assertThat(keys(scan("a", null, KEY_COUNT))).isEmpty();
+        // BoxEngine prunes tables outside the query window. Also exercise the reader directly
+        // so positioning before its first block is covered rather than skipped by that pruning.
+        try (var reader = new SSTableReader(store,
+                engine.manifestState().tables().get(0).ledgerId())) {
+            assertThat(reader.scanReverse(CandyKey.of("a")).hasNext()).isFalse();
+        }
     }
 
     @Test
