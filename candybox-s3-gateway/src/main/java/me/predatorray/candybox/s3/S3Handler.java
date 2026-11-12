@@ -785,7 +785,17 @@ final class S3Handler extends ChannelInboundHandlerAdapter {
         S3RequestXml.CompleteMultipartUploadBody parsed = S3RequestXml.parseCompleteMultipart(body);
         List<PartUploadInfo> partList = new ArrayList<>(parsed.parts().size());
         for (S3RequestXml.CompletePart p : parsed.parts()) {
-            int crc = Etag.parseCrc32cHex(p.etag());
+            int crc;
+            try {
+                crc = Etag.parseCrc32cHex(p.etag());
+            } catch (S3Exception e) {
+                // A supplied ETag outside our format cannot match any uploaded part.
+                // Keep missing-field validation separate from part matching.
+                if (p.etag() == null) {
+                    throw e;
+                }
+                throw new S3Exception(S3ErrorCode.INVALID_PART, e.getMessage(), e);
+            }
             partList.add(new PartUploadInfo(p.partNumber(), crc, 0)); // length is server-known
         }
         CandyInfo info = store.completeMultipartUpload(parts.bucket(), parts.key(), uploadId,
