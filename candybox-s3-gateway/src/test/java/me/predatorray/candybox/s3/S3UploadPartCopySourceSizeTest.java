@@ -67,6 +67,18 @@ class S3UploadPartCopySourceSizeTest {
         assertThat(response.body()).contains("<Code>InvalidRange</Code>");
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"bytes=2-5", "bytes=100-200"})
+    void replacementBeforeSourceResolutionCannotBypassSizeRule(String range) {
+        String uploadId = prepare(FIVE_MIB + 1);
+        store.beforePartCopy = () -> store.putCandy("bucket", "source", new byte[10],
+                "application/octet-stream", Map.of());
+        Response response = copy(uploadId, range);
+        assertThat(response.status()).isEqualTo(400);
+        assertThat(response.body()).contains("<Code>InvalidRequest</Code>");
+        assertThat(store.listParts("bucket", "target", uploadId, 0, 1000).parts()).isEmpty();
+    }
+
     @Test
     void wholeObjectCopyAllowsSmallSource() {
         String uploadId = prepare(10);

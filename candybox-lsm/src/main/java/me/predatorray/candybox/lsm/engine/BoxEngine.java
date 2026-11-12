@@ -58,6 +58,7 @@ import me.predatorray.candybox.common.exception.BusyException;
 import me.predatorray.candybox.common.exception.CandyNotFoundException;
 import me.predatorray.candybox.common.exception.LimitExceededException;
 import me.predatorray.candybox.common.exception.ValidationException;
+import me.predatorray.candybox.common.exception.SourceTooSmallException;
 import me.predatorray.candybox.lsm.iterator.MergingIterator;
 import me.predatorray.candybox.lsm.iterator.ReopeningIterator;
 import me.predatorray.candybox.lsm.manifest.Manifest;
@@ -694,6 +695,14 @@ public final class BoxEngine implements AutoCloseable {
     public PartUploadResult uploadPartCopy(String uploadId, int partNumber, CandyKey src,
                                            long firstByte, long lastByte,
                                            Consumer<ObjectAcl> authorizeSource) {
+        return uploadPartCopy(uploadId, partNumber, src, firstByte, lastByte, 0, authorizeSource);
+    }
+
+    /** Checks source size against the same locator used to copy, before resolving the byte range. */
+    public PartUploadResult uploadPartCopy(String uploadId, int partNumber, CandyKey src,
+                                           long firstByte, long lastByte, long minSourceBytesExclusive,
+                                           Consumer<ObjectAcl> authorizeSource) {
+        checkSourceSizeConstraint(minSourceBytesExclusive);
         Validation.checkCandyKey(src, config.sizeLimits());
         if (uploadId == null || uploadId.isEmpty()) {
             throw new ValidationException("uploadId is required");
@@ -713,6 +722,7 @@ public final class BoxEngine implements AutoCloseable {
                     .orElseThrow(() -> new CandyNotFoundException(box.value(), src.value()));
             authorizeSource.accept(source.acl());
             long total = source.contentLength();
+            checkSourceSize(total, minSourceBytesExclusive);
             long resolvedFirst = firstByte < 0 ? 0 : firstByte;
             long resolvedLast = lastByte < 0 ? total - 1 : Math.min(lastByte, total - 1);
             if (total == 0 || resolvedFirst >= total || resolvedLast < resolvedFirst) {
@@ -1443,10 +1453,19 @@ public final class BoxEngine implements AutoCloseable {
     public RangeReadResult getCandyRange(CandyKey key, long firstByte, long lastByte,
                                          OutputStream out, long maxBytes,
                                          Consumer<ObjectAcl> authorizeSource) {
+        return getCandyRange(key, firstByte, lastByte, out, maxBytes, 0, authorizeSource);
+    }
+
+    /** Checks source size against the resolved locator before range validation or reading bytes. */
+    public RangeReadResult getCandyRange(CandyKey key, long firstByte, long lastByte,
+                                         OutputStream out, long maxBytes, long minSourceBytesExclusive,
+                                         Consumer<ObjectAcl> authorizeSource) {
+        checkSourceSizeConstraint(minSourceBytesExclusive);
         CandyLocator locator = resolveLive(key)
                 .orElseThrow(() -> new CandyNotFoundException(box.value(), key.value()));
         authorizeSource.accept(locator.acl());
         long total = locator.contentLength();
+        checkSourceSize(total, minSourceBytesExclusive);
         long resolvedFirst;
         long resolvedLast;
         if (firstByte < 0 && lastByte < 0) {
@@ -1484,6 +1503,18 @@ public final class BoxEngine implements AutoCloseable {
         syrupReader.readRange(locator.parts(), resolvedFirst, resolvedLast, out);
         getCount.incrementAndGet();
         return new RangeReadResult(resolvedFirst, resolvedLast, total, CandyMetadata.from(locator));
+    }
+
+    private static void checkSourceSizeConstraint(long minSourceBytesExclusive) {
+        if (minSourceBytesExclusive < 0) {
+            throw new ValidationException("Minimum source size must be nonnegative");
+        }
+    }
+
+    private static void checkSourceSize(long total, long minSourceBytesExclusive) {
+        if (minSourceBytesExclusive > 0 && total <= minSourceBytesExclusive) {
+            throw new SourceTooSmallException(total, minSourceBytesExclusive);
+        }
     }
 
     private static void checkReadSize(long length, long maxBytes) {

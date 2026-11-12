@@ -761,19 +761,14 @@ final class S3Handler extends ChannelInboundHandlerAdapter {
                 throw new S3Exception(S3ErrorCode.INVALID_ARGUMENT,
                         "Malformed x-amz-copy-source-range: " + rangeHeader);
             }
-            // S3 permits byte-range UploadPartCopy only for sources larger than 5 MiB.
-            // Check eligibility before storage resolves the range (including unsatisfiable ranges).
-            if (store.headCandy(src.bucket(), src.key()).contentLength() <= MIN_RANGE_COPY_SOURCE_BYTES) {
-                throw new S3Exception(S3ErrorCode.INVALID_REQUEST,
-                        "The source object must be larger than 5 MiB for a byte-range copy");
-            }
             firstByte = r.firstByte;
             lastByte = r.lastByte;
         }
         PartUploadInfo info;
         try {
             info = store.uploadPartCopy(parts.bucket(), parts.key(), uploadId, partNumber,
-                    src.key(), firstByte, lastByte);
+                    src.key(), firstByte, lastByte,
+                    rangeHeader != null && !rangeHeader.isBlank() ? MIN_RANGE_COPY_SOURCE_BYTES : 0);
         } catch (IllegalArgumentException e) {
             throw new S3Exception(S3ErrorCode.INVALID_RANGE, e.getMessage(), e);
         }

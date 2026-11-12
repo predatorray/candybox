@@ -49,7 +49,12 @@ public final class MessageCodec {
 
     public Frame encode(Message message) {
         BinaryWriter w = new BinaryWriter(64);
-        w.writeByte(BODY_VERSION);
+        // Only requests carrying the new predicate need v2; native requests retain v1 encoding.
+        boolean constrainedSource = message instanceof Message.RangeGetCandyRequest range
+                && range.minSourceBytesExclusive() != 0
+                || message instanceof Message.UploadPartCopyRequest copy
+                && copy.minSourceBytesExclusive() != 0;
+        w.writeByte(constrainedSource ? 2 : BODY_VERSION);
         if (message instanceof Message.CreateNamespaceBoxRequest m) {
             w.writeString(m.box()).writeVarInt(m.partitionCount());
         } else if (message instanceof Message.NamespaceRequest m) {
@@ -99,6 +104,7 @@ public final class MessageCodec {
             writeBoxKey(w, m.box(), m.key());
             w.writeLong(m.firstByte());
             w.writeLong(m.lastByte());
+            if (constrainedSource) { w.writeLong(m.minSourceBytesExclusive()); }
         } else if (message instanceof Message.HeadCandyRequest m) {
             writeBoxKey(w, m.box(), m.key());
         } else if (message instanceof Message.DeleteCandyRequest m) {
@@ -194,6 +200,7 @@ public final class MessageCodec {
             w.writeString(m.srcKey());
             w.writeLong(m.firstByte());
             w.writeLong(m.lastByte());
+            if (constrainedSource) { w.writeLong(m.minSourceBytesExclusive()); }
         } else if (message instanceof Message.CreateMultipartUploadResponse m) {
             w.writeString(m.uploadId());
         } else if (message instanceof Message.UploadPartResponse m) {
@@ -320,7 +327,8 @@ public final class MessageCodec {
     public Message decode(Frame frame) {
         BinaryReader r = new BinaryReader(frame.payload());
         int version = r.readByte();
-        if (version != BODY_VERSION) {
+        if (version != BODY_VERSION && !(version == 2
+                && (frame.opcode() == Opcode.RANGE_GET_CANDY || frame.opcode() == Opcode.UPLOAD_PART_COPY))) {
             throw new ProtocolException("Unsupported message body version: " + version);
         }
         return switch (frame.opcode()) {
@@ -339,7 +347,7 @@ public final class MessageCodec {
                     readNullable(r), readStrings(r));
             case GET_CANDY -> new Message.GetCandyRequest(r.readString(), r.readString());
             case RANGE_GET_CANDY -> new Message.RangeGetCandyRequest(r.readString(), r.readString(),
-                    r.readLong(), r.readLong());
+                    r.readLong(), r.readLong(), version == 2 ? r.readLong() : 0);
             case HEAD_CANDY -> new Message.HeadCandyRequest(r.readString(), r.readString());
             case DELETE_CANDY -> new Message.DeleteCandyRequest(r.readString(), r.readString());
             case COPY_CANDY -> new Message.CopyCandyRequest(r.readString(), r.readString(),
@@ -374,7 +382,8 @@ public final class MessageCodec {
             case LIST_PARTS -> new Message.ListPartsRequest(r.readString(), r.readString(),
                     r.readString(), r.readVarInt(), r.readVarInt());
             case UPLOAD_PART_COPY -> new Message.UploadPartCopyRequest(r.readString(), r.readString(),
-                    r.readString(), r.readVarInt(), r.readString(), r.readLong(), r.readLong());
+                    r.readString(), r.readVarInt(), r.readString(), r.readLong(), r.readLong(),
+                    version == 2 ? r.readLong() : 0);
             case RESPONSE_CREATE_MULTIPART -> new Message.CreateMultipartUploadResponse(r.readString());
             case RESPONSE_UPLOAD_PART -> new Message.UploadPartResponse(r.readInt(), r.readVarLong());
             case RESPONSE_LIST_MULTIPART_UPLOADS -> decodeListMultipart(r);

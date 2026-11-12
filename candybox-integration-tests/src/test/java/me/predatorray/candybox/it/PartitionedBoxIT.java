@@ -43,6 +43,8 @@ import me.predatorray.candybox.server.CandyboxNode;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * End-to-end behaviour of a hash-partitioned Box whose partitions are owned by <em>two different
@@ -63,6 +65,7 @@ class PartitionedBoxIT {
     private static final class RoutingTransport implements Transport {
         private final Map<Integer, RequestHandler> handlers;
         private final FrameCodec codec = new FrameCodec();
+        java.util.function.Consumer<Message> beforeRequest = message -> { };
 
         RoutingTransport(Map<Integer, RequestHandler> handlers) {
             this.handlers = handlers;
@@ -75,6 +78,7 @@ class PartitionedBoxIT {
                 @Override
                 public Frame call(Frame request) {
                     Frame onWire = codec.decode(codec.encode(request));
+                    beforeRequest.accept(MSG_CODEC.decode(onWire));
                     return codec.decode(codec.encode(handler.handle(onWire)));
                 }
 
@@ -94,6 +98,7 @@ class PartitionedBoxIT {
     private CandyboxNode nodeA;
     private CandyboxNode nodeB;
     private CandyboxClient client;
+    private RoutingTransport transport;
 
     @BeforeEach
     void setUp() {
@@ -110,7 +115,8 @@ class PartitionedBoxIT {
         Map<Integer, RequestHandler> handlers = new HashMap<>();
         handlers.put(1, nodeA.requestHandler());
         handlers.put(2, nodeB.requestHandler());
-        client = new CandyboxClient(new RoutingTransport(handlers), coordination, config);
+        transport = new RoutingTransport(handlers);
+        client = new CandyboxClient(transport, coordination, config);
 
         // Create the Box on node 1 (all partitions land there), then hand partitions 2 and 3 over
         // to node 2 so the Box's ownership genuinely spans two nodes.
@@ -317,6 +323,39 @@ class PartitionedBoxIT {
 
         client.completeMultipartUpload(BOX, target, uploadId, List.of(part), null);
         assertThat(client.getCandy(BOX, target)).isEqualTo(bytes("2345"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 2})
+    void copySourceSizePredicateSurvivesReplacementOnBothPartitionPaths(int sourcePartition) {
+        String source = keyIn(sourcePartition, "predicate-source");
+        String target = keyIn(2, "predicate-target");
+        for (long first : new long[] {2, 100}) {
+            client.putCandy(BOX, source, bytes("0123456789A"), null, Map.of(), null);
+            String uploadId = client.createMultipartUpload(BOX, target, null, Map.of());
+            transport.beforeRequest = request -> {
+                if (request instanceof Message.UploadPartCopyRequest || request instanceof Message.RangeGetCandyRequest) {
+                    transport.beforeRequest = ignored -> { };
+                    client.putCandy(BOX, source, bytes("0123456789"), null, Map.of(), null);
+                }
+            };
+            assertThatThrownBy(() -> client.uploadPartCopy(BOX, target, uploadId, 1,
+                    source, first, first + 3, 10))
+                    .hasMessageStartingWith("SourceTooSmallException:");
+            assertThat(client.listParts(BOX, target, uploadId, 0, 1000).parts()).isEmpty();
+            // Native calls keep their original behavior for small sources.
+            assertThat(client.uploadPartCopy(BOX, target, uploadId, 1, source, 2, 5).partLength())
+                    .isEqualTo(4);
+            client.abortMultipartUpload(BOX, target, uploadId);
+        }
+        client.putCandy(BOX, source, bytes("0123456789A"), null, Map.of(), null);
+        String uploadId = client.createMultipartUpload(BOX, target, null, Map.of());
+        var part = client.uploadPartCopy(BOX, target, uploadId, 1, source, 2, 5, 10);
+        client.completeMultipartUpload(BOX, target, uploadId, List.of(part), null);
+        assertThat(client.getCandy(BOX, target)).isEqualTo(bytes("2345"));
+        String invalidRangeUpload = client.createMultipartUpload(BOX, target, null, Map.of());
+        assertThatThrownBy(() -> client.uploadPartCopy(BOX, target, invalidRangeUpload, 1,
+                source, 100, 200, 10)).hasMessageContaining("InvalidRange");
     }
 
     @Test
