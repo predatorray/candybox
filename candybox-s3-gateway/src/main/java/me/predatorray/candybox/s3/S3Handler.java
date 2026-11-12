@@ -81,6 +81,7 @@ final class S3Handler extends ChannelInboundHandlerAdapter {
     private static final int DEFAULT_MAX_KEYS = 1000;
     private static final int MAX_STREAM_CHUNK_BYTES = 8 << 20;
     private static final int MAX_GET_ATTEMPTS = 3;
+    private static final long MIN_RANGE_COPY_SOURCE_BYTES = 5L * 1024 * 1024;
 
     private final CandyStore store;
     private final S3GatewayConfig config;
@@ -759,6 +760,12 @@ final class S3Handler extends ChannelInboundHandlerAdapter {
             if (r == null) {
                 throw new S3Exception(S3ErrorCode.INVALID_ARGUMENT,
                         "Malformed x-amz-copy-source-range: " + rangeHeader);
+            }
+            // S3 permits byte-range UploadPartCopy only for sources larger than 5 MiB.
+            // Check eligibility before storage resolves the range (including unsatisfiable ranges).
+            if (store.headCandy(src.bucket(), src.key()).contentLength() <= MIN_RANGE_COPY_SOURCE_BYTES) {
+                throw new S3Exception(S3ErrorCode.INVALID_REQUEST,
+                        "The source object must be larger than 5 MiB for a byte-range copy");
             }
             firstByte = r.firstByte;
             lastByte = r.lastByte;
