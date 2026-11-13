@@ -20,6 +20,7 @@ import java.util.EnumSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.Set;
 import me.predatorray.candybox.common.SystemClock;
 import me.predatorray.candybox.common.auth.BoxAcl;
 import me.predatorray.candybox.common.auth.Grant;
@@ -40,11 +41,13 @@ import me.predatorray.candybox.s3.S3Router.S3Action;
  *
  * <p>Also owns the S3↔Candybox ACL translation: canned ACLs ({@code x-amz-acl}), the
  * {@code AccessControlPolicy} XML rendering/parsing pairs, and the permission mapping
- * (S3 {@code FULL_CONTROL} = all five Candybox operations).
+ * (S3 {@code FULL_CONTROL} = READ, WRITE, READ_ACP and WRITE_ACP; never ADMIN).
  */
 final class S3AccessControl {
 
     private static final long CACHE_TTL_MILLIS = 5_000;
+    private static final Set<Operation> S3_FULL_CONTROL = Set.of(
+            Operation.READ, Operation.WRITE, Operation.READ_ACP, Operation.WRITE_ACP);
 
     static final String ALL_USERS_URI = "http://acs.amazonaws.com/groups/global/AllUsers";
     static final String AUTHENTICATED_USERS_URI =
@@ -168,7 +171,7 @@ final class S3AccessControl {
             case "WRITE" -> EnumSet.of(Operation.WRITE);
             case "READ_ACP" -> EnumSet.of(Operation.READ_ACP);
             case "WRITE_ACP" -> EnumSet.of(Operation.WRITE_ACP);
-            case "FULL_CONTROL" -> EnumSet.allOf(Operation.class);
+            case "FULL_CONTROL" -> EnumSet.copyOf(S3_FULL_CONTROL);
             default -> throw new S3Exception(S3ErrorCode.MALFORMED_XML,
                     "Unknown ACL permission: " + permission);
         };
@@ -176,7 +179,7 @@ final class S3AccessControl {
 
     /** The reverse: which S3 permission names one Candybox grant renders as. */
     static List<String> s3PermissionNames(Grant grant) {
-        if (grant.operations().containsAll(EnumSet.allOf(Operation.class))) {
+        if (grant.operations().containsAll(S3_FULL_CONTROL)) {
             return List.of("FULL_CONTROL");
         }
         List<String> names = new ArrayList<>();
