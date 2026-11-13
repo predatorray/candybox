@@ -32,6 +32,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
+import java.util.Set;
 import me.predatorray.candybox.common.ManualClock;
 import me.predatorray.candybox.common.auth.BoxAcl;
 import me.predatorray.candybox.common.auth.Grant;
@@ -245,10 +246,13 @@ class S3AclTranslationTest {
                     policy("<ID>User:bob</ID>", permission), ALICE_KEY, Map.of()).status())
                     .isEqualTo(200);
             EnumSet<Operation> expected = permission.equals("FULL_CONTROL")
-                    ? EnumSet.allOf(Operation.class) : EnumSet.of(Operation.valueOf(permission));
-            assertThat(store.getCandyAcl("bucket", "object").grants()).containsExactly(
-                    new Grant("User:bob", expected));
-            assertThat(S3AccessControl.s3Permission(permission)).isEqualTo(expected);
+                    ? EnumSet.of(Operation.READ, Operation.WRITE, Operation.READ_ACP, Operation.WRITE_ACP)
+                    : EnumSet.of(Operation.valueOf(permission));
+            assertThat(store.getCandyAcl("bucket", "object").grants()).singleElement().satisfies(grant -> {
+                assertThat(grant.grantee()).isEqualTo("User:bob");
+                assertPermissionOperations(permission, grant.operations(), expected);
+            });
+            assertPermissionOperations(permission, S3AccessControl.s3Permission(permission), expected);
             assertThat(renderedGrants(request(ch, HttpMethod.GET, "/bucket/object?acl", null,
                     ALICE_KEY, Map.of()))).containsExactly(
                     new S3RequestXml.AclGrant(null, "User:alice", "FULL_CONTROL"),
@@ -443,6 +447,16 @@ class S3AclTranslationTest {
         // Unsupported routes must reach the handler's 501 response without an ACL decision.
         enabled.authorize(S3Router.S3Action.UNSUPPORTED,
                 new S3Handler.PathParts("bucket", null), Principal.ANONYMOUS);
+    }
+
+    private static void assertPermissionOperations(String permission, Set<Operation> actual,
+                                                  EnumSet<Operation> expected) {
+        if (permission.equals("FULL_CONTROL")) {
+            // #213 covers excluding ADMIN: do not require that reported overgrant to remain here.
+            assertThat(actual).containsAll(expected);
+        } else {
+            assertThat(actual).containsExactlyInAnyOrderElementsOf(expected);
+        }
     }
 
     private static void assertError(Runnable action, S3ErrorCode error) {
