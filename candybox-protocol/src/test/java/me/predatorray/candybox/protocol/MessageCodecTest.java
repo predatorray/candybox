@@ -45,6 +45,31 @@ class MessageCodecTest {
     }
 
     @Test
+    void sourceSizePredicatesUseVersionTwoAndNativeRequestsKeepVersionOne() {
+        var range = new Message.RangeGetCandyRequest("box", "src", 2, 5, 10);
+        var copy = new Message.UploadPartCopyRequest("box", "dst", "upload", 1, "src", 2, 5, 10);
+        for (Message request : List.of(range, copy)) {
+            assertThat(codec.encode(request).payload()[0]).isEqualTo((byte) 2);
+            assertThat(roundTrip(request)).isEqualTo(request);
+        }
+        for (Message request : List.of(new Message.RangeGetCandyRequest("box", "src", 2, 5),
+                new Message.UploadPartCopyRequest("box", "dst", "upload", 1, "src", 2, 5))) {
+            assertThat(codec.encode(request).payload()[0]).isEqualTo((byte) 1);
+            assertThat(roundTrip(request)).isEqualTo(request);
+        }
+        // Historical v1 payloads have no predicate field; decoding must supply the disabled default.
+        var oldRange = new me.predatorray.candybox.common.serial.BinaryWriter(64);
+        oldRange.writeByte(1).writeString("box").writeString("src").writeLong(2).writeLong(5);
+        assertThat(codec.decode(new Frame(Opcode.RANGE_GET_CANDY, oldRange.toByteArray())))
+                .isEqualTo(new Message.RangeGetCandyRequest("box", "src", 2, 5, 0));
+        var oldCopy = new me.predatorray.candybox.common.serial.BinaryWriter(64);
+        oldCopy.writeByte(1).writeString("box").writeString("dst").writeString("upload")
+                .writeVarInt(1).writeString("src").writeLong(2).writeLong(5);
+        assertThat(codec.decode(new Frame(Opcode.UPLOAD_PART_COPY, oldCopy.toByteArray())))
+                .isEqualTo(new Message.UploadPartCopyRequest("box", "dst", "upload", 1, "src", 2, 5, 0));
+    }
+
+    @Test
     void putCandyRequestRoundTrips() {
         Message.PutCandyRequest req = new Message.PutCandyRequest("my-box", "k/1", "text/plain",
                 Map.of("a", "b"), "idem-1", "payload".getBytes());

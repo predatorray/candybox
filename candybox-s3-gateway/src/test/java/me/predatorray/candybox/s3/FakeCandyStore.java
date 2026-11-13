@@ -275,9 +275,23 @@ final class FakeCandyStore implements CandyStore {
     @Override
     public PartUploadInfo uploadPartCopy(String box, String key, String uploadId, int partNumber,
                                          String srcKey, long firstByte, long lastByte) {
+        return uploadPartCopy(box, key, uploadId, partNumber, srcKey, firstByte, lastByte, 0);
+    }
+
+    Runnable beforePartCopy = () -> { };
+
+    @Override
+    public PartUploadInfo uploadPartCopy(String box, String key, String uploadId, int partNumber,
+                                         String srcKey, long firstByte, long lastByte,
+                                         long minSourceBytesExclusive) {
+        beforePartCopy.run();
         PendingUpload upload = upload(box, uploadId);
         Obj source = obj(box, srcKey);
         long total = source.data().length;
+        if (minSourceBytesExclusive > 0 && total <= minSourceBytesExclusive) {
+            throw new me.predatorray.candybox.common.exception.SourceTooSmallException(
+                    total, minSourceBytesExclusive);
+        }
         long resolvedFirst = firstByte < 0 ? 0 : firstByte;
         long resolvedLast = lastByte < 0 ? total - 1 : Math.min(lastByte, total - 1);
         if (total == 0 || resolvedFirst >= total || resolvedLast < resolvedFirst) {

@@ -33,6 +33,7 @@ import me.predatorray.candybox.common.auth.Principal;
 import me.predatorray.candybox.common.config.CandyboxConfig;
 import me.predatorray.candybox.common.exception.CandyNotFoundException;
 import me.predatorray.candybox.common.exception.ValidationException;
+import me.predatorray.candybox.common.exception.SourceTooSmallException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -146,6 +147,38 @@ class BoxEngineEdgeCasesTest {
         assertThatThrownBy(() -> engine.uploadPartCopy(id, 1, CandyKey.of("src"), 100, 200))
                 .isInstanceOf(ValidationException.class)
                 .hasMessageContaining("InvalidRange");
+    }
+
+    @Test
+    void sourceSizePredicatePrecedesRangeValidationAndLeavesExistingPartsUntouched() {
+        engine = newEngine(CandyboxConfig.builder().multipartMinPartBytes(1).build());
+        CandyKey source = CandyKey.of("src");
+        engine.putCandy(source, bytes("0123456789"), null, Map.of(), null);
+        String id = engine.createMultipartUpload(CandyKey.of("dst"), null, Map.of());
+        var existing = engine.uploadPartCopy(id, 1, source, 2, 5);
+        for (long first : new long[] {2, 100}) {
+            assertThatThrownBy(() -> engine.uploadPartCopy(id, 1, source, first, first + 3,
+                    10, acl -> { })).isInstanceOf(SourceTooSmallException.class);
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            assertThatThrownBy(() -> engine.getCandyRange(source, first, first + 3, out,
+                    100, 10, acl -> { })).isInstanceOf(SourceTooSmallException.class);
+            assertThat(out.size()).isZero();
+        }
+        engine.completeMultipartUpload(id, List.of(new BoxEngine.PartCompletion(1, existing.crc32c())), null);
+        assertThat(engine.getCandy(CandyKey.of("dst"))).isEqualTo(bytes("2345"));
+    }
+
+    @Test
+    void sourceSizePredicateUsesResolvedVersionForRangeRead() {
+        engine = newEngine();
+        CandyKey source = CandyKey.of("src");
+        engine.putCandy(source, bytes("0123456789A"), null, Map.of(), null);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        var result = engine.getCandyRange(source, 2, 5, out, 100, 10,
+                acl -> engine.putCandy(source, bytes("tiny"), null, Map.of(), null));
+        assertThat(result.totalLength()).isEqualTo(11);
+        assertThat(out.toByteArray()).isEqualTo(bytes("2345"));
+        assertThat(engine.getCandy(source)).isEqualTo(bytes("tiny"));
     }
 
     @Test

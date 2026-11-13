@@ -608,6 +608,13 @@ Per-role BK quorum (E/Qw/Qa) defaults: **WAL 3/3/2, Manifest 3/3/2, SSTable 3/2/
 - **Buffered wire protocol** — PUT/GET/UploadPart bodies are inlined in one framed message (16 MiB
   of data per frame). Multipart upload partially substitutes for streaming, but each part is still bounded by the
   frame cap. True on-the-wire chunked streaming remains `TODO(phase-2)`.
+- **S3 UploadPartCopy range sources must exceed 5 MiB.** The gateway sends an optional
+  exclusive source-size bound through the client to the source owner. Both same-partition copy and
+  cross-partition range reads check the resolved locator before range validation or mutation, so a
+  concurrent source replacement cannot bypass eligibility. Native calls default to no bound.
+  Constrained `UPLOAD_PART_COPY` / `RANGE_GET_CANDY` request bodies use version 2; their version 1
+  bodies remain decodable and native requests retain version 1 encoding. Older nodes reject the new
+  requests rather than silently ignoring the predicate; upgrade nodes before gateways using it.
 - **UploadPartCopy buffers in memory** — the engine reads the source slice and writes it as a fresh
   part rather than sharing Syrup segments when the range aligns to chunk boundaries; the optimization
   is a strictly-internal future change.

@@ -47,6 +47,7 @@ import me.predatorray.candybox.common.exception.CandyNotFoundException;
 import me.predatorray.candybox.common.exception.CandyboxException;
 import me.predatorray.candybox.common.exception.NotOwnerException;
 import me.predatorray.candybox.common.exception.StorageException;
+import me.predatorray.candybox.common.exception.ValidationException;
 import me.predatorray.candybox.coordination.CoordinationService;
 import me.predatorray.candybox.protocol.Message;
 import me.predatorray.candybox.protocol.transport.Transport;
@@ -311,8 +312,14 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
      * </ul>
      */
     public RangeBytes getCandyRange(String box, String key, long firstByte, long lastByte) {
+        return getCandyRange(box, key, firstByte, lastByte, 0);
+    }
+
+    private RangeBytes getCandyRange(String box, String key, long firstByte, long lastByte,
+                                     long minSourceBytesExclusive) {
         Message response = callKey(box, key, new Message.RangeGetCandyRequest(
-                BoxName.of(box).value(), CandyKey.of(key).value(), firstByte, lastByte));
+                BoxName.of(box).value(), CandyKey.of(key).value(), firstByte, lastByte,
+                minSourceBytesExclusive));
         if (response instanceof Message.CandyDataResponse data) {
             // For range responses, contentLength is the slice length and totalLength is the whole
             // object; the resolved start byte is implicit: totalLength - sliceLength may differ from
@@ -487,18 +494,32 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
      */
     public PartUploadInfo uploadPartCopy(String box, String key, String uploadId, int partNumber,
                                          String srcKey, long firstByte, long lastByte) {
+        return uploadPartCopy(box, key, uploadId, partNumber, srcKey, firstByte, lastByte, 0);
+    }
+
+    /**
+     * Copies from a source larger than {@code minSourceBytesExclusive}, checked on the resolved
+     * source version before range validation. Zero disables the predicate (native API behavior).
+     */
+    public PartUploadInfo uploadPartCopy(String box, String key, String uploadId, int partNumber,
+                                         String srcKey, long firstByte, long lastByte,
+                                         long minSourceBytesExclusive) {
+        if (minSourceBytesExclusive < 0) {
+            throw new ValidationException("Minimum source size must be nonnegative");
+        }
         Validation.checkCandyKey(CandyKey.of(key), limits);
         Validation.checkCandyKey(CandyKey.of(srcKey), limits);
         int n = partitionCount(box);
         if (Partitioning.partitionOf(srcKey, n) != Partitioning.partitionOf(key, n)) {
-            byte[] bytes = (firstByte < 0 && lastByte < 0)
+            byte[] bytes = (firstByte < 0 && lastByte < 0 && minSourceBytesExclusive == 0)
                     ? getCandy(box, srcKey)
-                    : getCandyRange(box, srcKey, firstByte, lastByte).data();
+                    : getCandyRange(box, srcKey, firstByte < 0 && lastByte < 0 ? 0 : firstByte,
+                            lastByte, minSourceBytesExclusive).data();
             return uploadPart(box, key, uploadId, partNumber, bytes);
         }
         Message response = callKey(box, key, new Message.UploadPartCopyRequest(
                 BoxName.of(box).value(), CandyKey.of(key).value(), uploadId, partNumber,
-                CandyKey.of(srcKey).value(), firstByte, lastByte));
+                CandyKey.of(srcKey).value(), firstByte, lastByte, minSourceBytesExclusive));
         if (response instanceof Message.UploadPartResponse up) {
             return new PartUploadInfo(partNumber, up.crc32c(), up.partLength());
         }

@@ -81,6 +81,7 @@ final class S3Handler extends ChannelInboundHandlerAdapter {
     private static final int DEFAULT_MAX_KEYS = 1000;
     private static final int MAX_STREAM_CHUNK_BYTES = 8 << 20;
     private static final int MAX_GET_ATTEMPTS = 3;
+    private static final long MIN_RANGE_COPY_SOURCE_BYTES = 5L * 1024 * 1024;
 
     private final CandyStore store;
     private final S3GatewayConfig config;
@@ -766,7 +767,8 @@ final class S3Handler extends ChannelInboundHandlerAdapter {
         PartUploadInfo info;
         try {
             info = store.uploadPartCopy(parts.bucket(), parts.key(), uploadId, partNumber,
-                    src.key(), firstByte, lastByte);
+                    src.key(), firstByte, lastByte,
+                    rangeHeader != null && !rangeHeader.isBlank() ? MIN_RANGE_COPY_SOURCE_BYTES : 0);
         } catch (IllegalArgumentException e) {
             throw new S3Exception(S3ErrorCode.INVALID_RANGE, e.getMessage(), e);
         }

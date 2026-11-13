@@ -538,7 +538,8 @@ final class NodeRequestHandler implements RequestHandler {
             BoxEngine.RangeReadResult result;
             try {
                 result = engine.getCandyRange(CandyKey.of(m.key()), m.firstByte(), m.lastByte(), out,
-                        maxInlineDataBytes(), sourceReadCheck(principal, m.box(), m.key()));
+                        maxInlineDataBytes(), m.minSourceBytesExclusive(),
+                        sourceReadCheck(principal, m.box(), m.key()));
             } catch (IllegalArgumentException e) {
                 // S3's InvalidRange — surface as a typed error the gateway can map to 416.
                 throw new ValidationException("InvalidRange: " + e.getMessage());
@@ -761,7 +762,7 @@ final class NodeRequestHandler implements RequestHandler {
             BoxEngine engine = samePartitionEngine(m.box(), m.srcKey(), m.key());
             try {
                 BoxEngine.PartUploadResult r = engine.uploadPartCopy(m.uploadId(), m.partNumber(),
-                        CandyKey.of(m.srcKey()), m.firstByte(), m.lastByte(),
+                        CandyKey.of(m.srcKey()), m.firstByte(), m.lastByte(), m.minSourceBytesExclusive(),
                         sourceReadCheck(principal, m.box(), m.srcKey()));
                 return new Message.UploadPartResponse(r.crc32c(), r.partLength());
             } catch (IllegalArgumentException e) {

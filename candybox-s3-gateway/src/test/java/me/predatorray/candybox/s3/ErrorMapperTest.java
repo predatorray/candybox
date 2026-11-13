@@ -32,6 +32,14 @@ import org.junit.jupiter.api.Test;
 class ErrorMapperTest {
 
     @Test
+    void sourceSizeFailureMapsToInvalidRequestLocallyAndOverTheWire() {
+        assertThat(ErrorMapper.toS3(new me.predatorray.candybox.common.exception.SourceTooSmallException(10, 100))
+                .error()).isEqualTo(S3ErrorCode.INVALID_REQUEST);
+        assertThat(ErrorMapper.toS3(new CandyboxException("SourceTooSmallException: source too small"))
+                .error()).isEqualTo(S3ErrorCode.INVALID_REQUEST);
+    }
+
+    @Test
     void concreteTypes() {
         assertThat(ErrorMapper.toS3(new CandyNotFoundException("b", "k")).error())
                 .isEqualTo(S3ErrorCode.NO_SUCH_KEY);
