@@ -30,6 +30,8 @@ import java.util.Properties;
 import java.util.function.Consumer;
 import me.predatorray.candybox.common.checksum.Crc32c;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 class S3HandlerTest {
 
@@ -438,6 +440,69 @@ class S3HandlerTest {
         Response g = get("/photos/big.bin");
         assertThat(g.status).isEqualTo(200);
         assertThat(g.body).isEqualTo("hello candybox");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"zzzzzzzz", "abc", "\"zzzzzzzz\"", "\"abc\""})
+    void unrecognizedCompletionEtagReturnsInvalidPartAndPreservesUpload(String etag) {
+        put("/photos");
+        Response create = exchange(HttpMethod.POST, "/photos/draft?uploads", new byte[0], null);
+        assertThat(create.status).isEqualTo(200);
+        String uploadId = between(create.body, "<UploadId>", "</UploadId>");
+        String uploadPath = "/photos/draft?uploadId=" + uploadId;
+        Response part = exchange(HttpMethod.PUT, uploadPath + "&partNumber=1",
+                "abc".getBytes(StandardCharsets.UTF_8), null);
+        assertThat(part.status).isEqualTo(200);
+
+        String completion = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"
+                + etag + "</ETag></Part></CompleteMultipartUpload>";
+        Response rejected = exchange(HttpMethod.POST, uploadPath,
+                completion.getBytes(StandardCharsets.UTF_8), null);
+        assertThat(rejected.status).isEqualTo(400);
+        assertThat(rejected.body).contains("<Code>InvalidPart</Code>");
+        assertThat(get("/photos/draft").status).isEqualTo(404);
+        Response listed = get(uploadPath);
+        assertThat(listed.status).isEqualTo(200);
+        assertThat(listed.body).contains("<PartNumber>1</PartNumber>");
+
+        String retry = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"
+                + part.etag() + "</ETag></Part></CompleteMultipartUpload>";
+        Response completed = exchange(HttpMethod.POST, uploadPath,
+                retry.getBytes(StandardCharsets.UTF_8), null);
+        assertThat(completed.status).isEqualTo(200);
+        Response object = get("/photos/draft");
+        assertThat(object.status).isEqualTo(200);
+        assertThat(object.body).isEqualTo("abc");
+    }
+
+    @Test
+    void missingCompletionEtagRetainsValidationAndPreservesUpload() {
+        put("/photos");
+        Response create = exchange(HttpMethod.POST, "/photos/draft?uploads", new byte[0], null);
+        assertThat(create.status).isEqualTo(200);
+        String uploadId = between(create.body, "<UploadId>", "</UploadId>");
+        String uploadPath = "/photos/draft?uploadId=" + uploadId;
+        Response part = exchange(HttpMethod.PUT, uploadPath + "&partNumber=1",
+                "abc".getBytes(StandardCharsets.UTF_8), null);
+        assertThat(part.status).isEqualTo(200);
+
+        String completion = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber>"
+                + "</Part></CompleteMultipartUpload>";
+        Response rejected = exchange(HttpMethod.POST, uploadPath,
+                completion.getBytes(StandardCharsets.UTF_8), null);
+        assertThat(rejected.status).isEqualTo(400);
+        assertThat(rejected.body).contains("<Code>InvalidArgument</Code>")
+                .contains("<Message>Missing ETag</Message>");
+        assertThat(get("/photos/draft").status).isEqualTo(404);
+
+        String retry = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"
+                + part.etag() + "</ETag></Part></CompleteMultipartUpload>";
+        Response completed = exchange(HttpMethod.POST, uploadPath,
+                retry.getBytes(StandardCharsets.UTF_8), null);
+        assertThat(completed.status).isEqualTo(200);
+        Response object = get("/photos/draft");
+        assertThat(object.status).isEqualTo(200);
+        assertThat(object.body).isEqualTo("abc");
     }
 
     @Test
