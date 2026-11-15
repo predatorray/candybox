@@ -2,6 +2,10 @@
 
 Guidance for coding agents working in this repository.
 
+Read [CONSTITUTION.md](CONSTITUTION.md) before planning or implementing changes.
+It defines the product guarantees, architecture, and specification, testing, and
+amendment requirements that all work in this repository must follow.
+
 ## Skills
 
 Shared skills live in `.agents/skills/<skill-name>/SKILL.md` and follow the open
