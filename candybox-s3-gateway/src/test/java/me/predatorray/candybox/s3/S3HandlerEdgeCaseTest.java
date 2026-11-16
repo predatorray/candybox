@@ -92,11 +92,51 @@ class S3HandlerEdgeCaseTest {
     }
 
     @ParameterizedTest
-    @CsvSource({"POST, /photos/key", "POST, /photos", "POST, /photos?uploadId=x", "PATCH, /photos/key", "BREW, /photos/key"})
+    @CsvSource({"POST, /photos/key", "POST, /photos", "PATCH, /photos/key", "BREW, /photos/key"})
     void unsupportedRoutesReturn501(String method, String uri) {
         Response r = request(HttpMethod.valueOf(method), uri, "");
         assertThat(r.status).isEqualTo(501);
         assertThat(r.body).contains("<Code>NotImplemented</Code>");
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+        "PUT, ?partNumber=1&uploadId=x", "POST, ?uploadId=x", "POST, ?uploads",
+        "GET, ?uploadId=x", "DELETE, ?uploadId=x"
+    })
+    void multipartObjectOperationsWithoutKeyReturn405(String method, String query) {
+        store.createBox("photos");
+        for (String path : List.of("/photos", "/photos/")) {
+            Response r = request(HttpMethod.valueOf(method), path + query, "");
+            assertThat(r.status).as("%s %s%s", method, path, query).isEqualTo(405);
+            assertThat(r.body).contains("<Code>MethodNotAllowed</Code>")
+                    .contains("<Message>Missing object key</Message>");
+            assertThat(store.headBox("photos")).isTrue();
+            assertThat(store.listMultipartUploads("photos", null, null, null, 100).uploads()).isEmpty();
+        }
+    }
+
+    @Test
+    void missingKeyUploadPartCannotCreateBucket() {
+        Response r = request(HttpMethod.PUT, "/photos?partNumber=1&uploadId=x", "payload");
+        assertThat(r.status).isEqualTo(405);
+        assertThat(r.body).contains("<Code>MethodNotAllowed</Code>")
+                .contains("<Message>Missing object key</Message>");
+        assertThat(store.headBox("photos")).isFalse();
+    }
+
+    @Test
+    void ordinaryBucketOperationsKeepTheirBehavior() {
+        assertThat(request(HttpMethod.PUT, "/photos", "").status).isEqualTo(200);
+        assertThat(request(HttpMethod.HEAD, "/photos/", "").status).isEqualTo(200);
+        Response uploads = request(HttpMethod.GET, "/photos?uploads", "");
+        assertThat(uploads.status).isEqualTo(200);
+        assertThat(uploads.body).contains("<ListMultipartUploadsResult");
+        Response deleted = request(HttpMethod.POST, "/photos?delete", "<Delete></Delete>");
+        assertThat(deleted.status).isEqualTo(200);
+        assertThat(deleted.body).contains("<DeleteResult");
+        assertThat(request(HttpMethod.DELETE, "/photos", "").status).isEqualTo(204);
+        assertThat(store.headBox("photos")).isFalse();
     }
 
     @Test

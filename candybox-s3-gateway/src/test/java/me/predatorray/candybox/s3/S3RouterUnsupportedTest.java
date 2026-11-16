@@ -30,14 +30,28 @@ class S3RouterUnsupportedTest {
                 .isEqualTo(S3Router.S3Action.UNSUPPORTED);
     }
 
-    // The router selects bucket operations before object subresources. These routes cannot reach
-    // S3Handler.requireKey's defensive guard; changing that policy is outside this coverage issue.
     @ParameterizedTest
-    @CsvSource({"PUT, CREATE_BUCKET", "POST, UNSUPPORTED"})
-    void missingKeyMultipartQueriesSelectBucketRoutes(String method, S3Router.S3Action expected) {
-        assertThat(S3Router.route(method, "photos", null, Set.of("partnumber", "uploadid")))
-                .isEqualTo(expected);
-        assertThat(S3Router.route(method, "photos", "", Set.of("partnumber", "uploadid")))
-                .isEqualTo(expected);
+    @CsvSource({
+        "PUT, partnumber:uploadid, UPLOAD_PART", "POST, uploadid, COMPLETE_MULTIPART_UPLOAD",
+        "POST, uploads, CREATE_MULTIPART_UPLOAD", "GET, uploadid, LIST_PARTS",
+        "DELETE, uploadid, ABORT_MULTIPART_UPLOAD"
+    })
+    void missingKeyMultipartQueriesSelectObjectActions(String method, String queries,
+                                                       S3Router.S3Action expected) {
+        Set<String> names = Set.of(queries.split(":"));
+        assertThat(S3Router.route(method, "photos", null, names)).isEqualTo(expected);
+        assertThat(S3Router.route(method, "photos", "", names)).isEqualTo(expected);
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+        "PUT, acl, PUT_BUCKET_ACL", "POST, delete, DELETE_OBJECTS",
+        "GET, uploads, LIST_MULTIPART_UPLOADS", "GET, acl, GET_BUCKET_ACL",
+        "GET, location, GET_BUCKET_LOCATION", "GET, versioning, GET_BUCKET_VERSIONING",
+        "GET, versions, LIST_OBJECT_VERSIONS"
+    })
+    void bucketSubresourcesKeepTheirActions(String method, String query, S3Router.S3Action expected) {
+        assertThat(S3Router.route(method, "photos", null, Set.of(query))).isEqualTo(expected);
+        assertThat(S3Router.route(method, "photos", "", Set.of(query))).isEqualTo(expected);
     }
 }
