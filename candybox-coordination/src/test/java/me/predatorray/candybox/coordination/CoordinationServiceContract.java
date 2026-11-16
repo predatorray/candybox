@@ -41,6 +41,12 @@ public abstract class CoordinationServiceContract {
     /** Produces a fresh, isolated service bound to {@code clock}. */
     protected abstract CoordinationService newService(Clock clock);
 
+    /**
+     * Establishes a backend write time strictly later than {@code previousWriteTime}.
+     * The fake advances its clock; real backends must observe their own write clock instead.
+     */
+    protected abstract long laterBackendWriteTime(ManualClock clock, long previousWriteTime) throws Exception;
+
     private static byte[] b(String s) {
         return s.getBytes(StandardCharsets.UTF_8);
     }
@@ -107,6 +113,22 @@ public abstract class CoordinationServiceContract {
         assertThat(service.get("manifest").orElseThrow().version()).isEqualTo(1);
         assertThat(service.get("manifest").orElseThrow().modifiedAtMillis())
                 .isGreaterThanOrEqualTo(read.modifiedAtMillis());
+    }
+
+    @Test
+    void compareAndSetAdvancesLastWriteTime() throws Exception {
+        service.create("timestamp", b("original"));
+        VersionedValue created = service.get("timestamp").orElseThrow();
+        long later = laterBackendWriteTime(clock, created.modifiedAtMillis());
+        assertThat(later).isGreaterThan(created.modifiedAtMillis());
+
+        service.compareAndSet("timestamp", b("updated"), created.version());
+        VersionedValue updated = service.get("timestamp").orElseThrow();
+        assertThat(updated.value()).isEqualTo(b("updated"));
+        assertThat(updated.version()).isEqualTo(created.version() + 1);
+        assertThat(updated.modifiedAtMillis()).isGreaterThanOrEqualTo(later);
+        assertThat(service.get("timestamp").orElseThrow().modifiedAtMillis())
+                .isEqualTo(updated.modifiedAtMillis());
     }
 
     @Test

@@ -16,11 +16,18 @@
 package me.predatorray.candybox.coordination.fake;
 
 import me.predatorray.candybox.common.Clock;
+import me.predatorray.candybox.common.ManualClock;
 import me.predatorray.candybox.coordination.CoordinationService;
 import me.predatorray.candybox.coordination.CoordinationServiceContract;
 
 /** Runs the shared {@link CoordinationServiceContract} against the in-memory fake. */
 class InMemoryCoordinationServiceContractTest extends CoordinationServiceContract {
+
+    @Override
+    protected long laterBackendWriteTime(ManualClock clock, long previousWriteTime) {
+        clock.advance(previousWriteTime - clock.currentTimeMillis() + 1);
+        return clock.currentTimeMillis();
+    }
 
     @Override
     protected CoordinationService newService(Clock clock) {

@@ -88,6 +88,22 @@ class ZooKeeperCoordinationServiceContractIT extends CoordinationServiceContract
         return new ZooKeeperCoordinationService(newClient("ct-" + NAMESPACE_SEQ.incrementAndGet()), clock);
     }
 
+    @Override
+    protected long laterBackendWriteTime(ManualClock clock, long previousWriteTime) throws Exception {
+        // The injected clock controls leases, not ZooKeeper's server-side znode timestamps.
+        CuratorFramework probe = newClient("time-" + NAMESPACE_SEQ.incrementAndGet());
+        probe.create().forPath("/write-time", new byte[0]);
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (System.nanoTime() < deadline) {
+            Stat written = probe.setData().forPath("/write-time", new byte[0]);
+            if (written.getMtime() > previousWriteTime) {
+                return written.getMtime();
+            }
+            Thread.sleep(1);
+        }
+        throw new AssertionError("ZooKeeper write time did not advance beyond " + previousWriteTime);
+    }
+
     @Test
     void newerEpochBetweenLeaseReadAndPublicationPreventsPointerWrite() throws Exception {
         ManualClock time = new ManualClock(1_000);
