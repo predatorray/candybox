@@ -216,6 +216,12 @@ class Experiment:
             except Exception as error:
                 errors.append(str(error))
         try:
+            ids = self.compose("ps", "-a", "-q").split()
+            if ids:
+                (self.output / "containers-at-cleanup.json").write_text(command(["docker", "inspect", *ids]))
+        except Exception as error:
+            errors.append(str(error))
+        try:
             (self.output / "cluster.log").write_text(self.compose("logs", "--no-color", "--timestamps", timeout=60))
         except Exception as error:
             errors.append(str(error))

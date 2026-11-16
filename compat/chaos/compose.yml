@@ -40,6 +40,8 @@ x-owner: &owner
     bookie3: {condition: service_healthy}
   environment: &owner-env
     CANDYBOX_ZOOKEEPER_CONNECT: zk1:2181,zk2:2181,zk3:2181
+    # BookKeeper URI authorities use semicolons; ZK connect strings use commas.
+    CANDYBOX_BOOKKEEPER_METADATASERVICEURI: zk://zk1:2181;zk2:2181;zk3:2181/ledgers
     CANDYBOX_HEAP_OPTS: -Xms128m -Xmx384m -XX:ActiveProcessorCount=2
     CANDYBOX_BALANCER_INTERVAL_MILLIS: "1000"
     CANDYBOX_OWNERSHIP_LEASE_TTL_MILLIS: "10000"
