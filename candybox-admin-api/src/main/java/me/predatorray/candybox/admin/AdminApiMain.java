@@ -129,7 +129,7 @@ public final class AdminApiMain {
                 orDefault(env.get("CANDYBOX_ADMIN_SCRAPE_TOKEN"), null));
     }
 
-    private static DashboardData buildDataSource(String zk, Deque<AutoCloseable> closeStack,
+    static DashboardData buildDataSource(String zk, Deque<AutoCloseable> closeStack,
                                                  java.util.Map<String, String> env) {
         if (zk == null || zk.isBlank()) {
             LOG.info("No CANDYBOX_ADMIN_ZK set — running with empty data source (UI-only demo).");
@@ -161,7 +161,7 @@ public final class AdminApiMain {
         return new LiveDashboardData(coordination, client);
     }
 
-    private static void closeAll(Deque<AutoCloseable> stack) {
+    static void closeAll(Deque<AutoCloseable> stack) {
         while (!stack.isEmpty()) {
             AutoCloseable c = stack.pop();
             try {
