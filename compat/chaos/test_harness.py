@@ -1,8 +1,10 @@
 """Service-free checks for target refusal and the acknowledged-data oracle."""
 import hashlib
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
 import unittest
+from threading import Thread
 
 import run as harness
 
@@ -59,6 +61,34 @@ class HarnessTest(unittest.TestCase):
                               (b"acknowledged", {"x-amz-meta-version": "v0"})):
             with self.assertRaises(harness.InvariantViolation):
                 self.oracle((200, body, headers)).check_once()
+
+    def test_truncated_success_and_error_bodies_record_unknown_response(self):
+        for response_status in (200, 503):
+            class TruncatedResponse(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    self.send_response(response_status)
+                    self.send_header("Content-Length", "100")
+                    self.end_headers()
+                    self.wfile.write(b"partial")
+
+                def log_message(self, *args):
+                    pass
+
+            with HTTPServer(("127.0.0.1", 0), TruncatedResponse) as server:
+                thread = Thread(target=server.handle_request, daemon=True)
+                thread.start()
+                experiment = harness.Experiment.__new__(harness.Experiment)
+                experiment.endpoint = f"http://127.0.0.1:{server.server_port}"
+                experiment.sequence = 0
+                experiment.http = harness.urllib.request.build_opener(harness.urllib.request.ProxyHandler({}))
+                events = []
+                experiment.event = lambda kind, **fields: events.append((kind, fields))
+                self.assertEqual((None, b"", {}), experiment.request("GET", "key"))
+                self.assertEqual(["invoke", "response"], [kind for kind, _ in events])
+                self.assertEqual("unknown", events[-1][1]["outcome"])
+                self.assertEqual(events[0][1]["operation_id"], events[-1][1]["operation_id"])
+                thread.join(timeout=2)
+                self.assertFalse(thread.is_alive())
 
     def test_only_acknowledged_puts_enter_durability_obligations(self):
         experiment = harness.Experiment.__new__(harness.Experiment)

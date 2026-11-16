@@ -2,6 +2,7 @@
 """Opt-in, disposable, single-host real-process failure experiments (stdlib only)."""
 import argparse
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
@@ -92,12 +93,16 @@ class Experiment:
         request = urllib.request.Request(self.endpoint + "/chaos-data" + ("/" + key if key else ""),
                                          data=data, method=method, headers=headers)
         try:
-            with self.http.open(request, timeout=15) as response:
-                body = response.read()
-                status, response_headers = response.status, dict(response.headers)
-        except urllib.error.HTTPError as error:
-            body, status, response_headers = error.read(), error.code, dict(error.headers)
-        except (OSError, urllib.error.URLError, TimeoutError) as error:
+            try:
+                with self.http.open(request, timeout=15) as response:
+                    body = response.read()
+                    status, response_headers = response.status, dict(response.headers)
+            except urllib.error.HTTPError as error:
+                try:
+                    body, status, response_headers = error.read(), error.code, dict(error.headers)
+                finally:
+                    error.close()
+        except (OSError, urllib.error.URLError, TimeoutError, http.client.HTTPException) as error:
             self.event("response", operation_id=op, outcome="unknown", error=str(error))
             return None, b"", {}
         self.event("response", operation_id=op, outcome="response", status=status,
