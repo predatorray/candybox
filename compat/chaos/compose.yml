@@ -1,0 +1,114 @@
+# Only run through run.py: it supplies a fresh project and disposable namespace.
+x-zookeeper: &zookeeper
+  image: zookeeper:3.9.3
+  restart: "no"
+  labels: &labels
+    io.candybox.chaos.disposable: ${CHAOS_NAMESPACE:?run through run.py}
+  environment: &zk-env
+    ZOO_SERVERS: server.1=zk1:2888:3888;2181 server.2=zk2:2888:3888;2181 server.3=zk3:2888:3888;2181
+    ZOO_STANDALONE_ENABLED: "false"
+    ZOO_4LW_COMMANDS_WHITELIST: srvr,ruok,stat,mntr
+  healthcheck:
+    test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
+    interval: 5s
+    timeout: 3s
+    retries: 30
+x-bookie: &bookie
+  image: apache/bookkeeper:4.17.1
+  restart: "no"
+  labels: *labels
+  depends_on:
+    bk-init: {condition: service_completed_successfully}
+  environment: &bk-env
+    BK_zkServers: zk1:2181,zk2:2181,zk3:2181
+    BK_metadataServiceUri: zk://zk1:2181;zk2:2181;zk3:2181/ledgers
+    BK_zkLedgersRootPath: /ledgers
+    BK_httpServerEnabled: "true"
+  healthcheck:
+    test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8080/heartbeat"]
+    interval: 5s
+    timeout: 3s
+    retries: 40
+x-owner: &owner
+  image: ${CHAOS_CANDYBOX_IMAGE:?set an immutable locally built image ID}
+  restart: "no"
+  labels: *labels
+  command: ["/opt/candybox/conf/candybox.properties.example"]
+  depends_on:
+    bookie1: {condition: service_healthy}
+    bookie2: {condition: service_healthy}
+    bookie3: {condition: service_healthy}
+  environment: &owner-env
+    CANDYBOX_ZOOKEEPER_CONNECT: zk1:2181,zk2:2181,zk3:2181
+    # BookKeeper URI authorities use semicolons; ZK connect strings use commas.
+    CANDYBOX_BOOKKEEPER_METADATASERVICEURI: zk://zk1:2181;zk2:2181;zk3:2181/ledgers
+    CANDYBOX_HEAP_OPTS: -Xms128m -Xmx384m -XX:ActiveProcessorCount=2
+    CANDYBOX_BALANCER_INTERVAL_MILLIS: "1000"
+    CANDYBOX_OWNERSHIP_LEASE_TTL_MILLIS: "10000"
+    CANDYBOX_LEASE_RENEW_INTERVAL_MILLIS: "2000"
+  healthcheck:
+    test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/9709"]
+    interval: 5s
+    timeout: 3s
+    retries: 40
+services:
+  zk1:
+    <<: *zookeeper
+    hostname: zk1
+    environment: {<<: *zk-env, ZOO_MY_ID: "1"}
+  zk2:
+    <<: *zookeeper
+    hostname: zk2
+    environment: {<<: *zk-env, ZOO_MY_ID: "2"}
+  zk3:
+    <<: *zookeeper
+    hostname: zk3
+    environment: {<<: *zk-env, ZOO_MY_ID: "3"}
+  bk-init:
+    image: apache/bookkeeper:4.17.1
+    restart: "no"
+    labels: *labels
+    depends_on:
+      zk1: {condition: service_healthy}
+      zk2: {condition: service_healthy}
+      zk3: {condition: service_healthy}
+    environment: *bk-env
+    working_dir: /opt/bookkeeper
+    entrypoint: ["/bin/bash", "-c"]
+    command: ["python3 scripts/apply-config-from-env.py conf/bk_server.conf && bin/bookkeeper shell initnewcluster"]
+  bookie1:
+    <<: *bookie
+    hostname: bookie1
+    environment: {<<: *bk-env, BK_advertisedAddress: bookie1}
+  bookie2:
+    <<: *bookie
+    hostname: bookie2
+    environment: {<<: *bk-env, BK_advertisedAddress: bookie2}
+  bookie3:
+    <<: *bookie
+    hostname: bookie3
+    environment: {<<: *bk-env, BK_advertisedAddress: bookie3}
+  owner1:
+    <<: *owner
+    hostname: owner1
+    environment: {<<: *owner-env, CANDYBOX_NODE_ID: "1", CANDYBOX_ADVERTISED: "owner1:9709"}
+  owner2:
+    <<: *owner
+    hostname: owner2
+    environment: {<<: *owner-env, CANDYBOX_NODE_ID: "2", CANDYBOX_ADVERTISED: "owner2:9709"}
+  gateway:
+    image: ${CHAOS_CANDYBOX_IMAGE:?set an immutable locally built image ID}
+    restart: "no"
+    labels: *labels
+    command: ["candybox-s3-gateway", "/opt/candybox/conf/candybox-s3-gateway.properties.example"]
+    depends_on:
+      owner1: {condition: service_healthy}
+      owner2: {condition: service_healthy}
+    environment:
+      CANDYBOX_ZOOKEEPER_CONNECT: zk1:2181,zk2:2181,zk3:2181
+      CANDYBOX_S3_BIND: 0.0.0.0:9711
+      CANDYBOX_HEALTH_PORT: "9712"
+      CANDYBOX_NODE_CONNECT_TIMEOUT_MS: "2000"
+      CANDYBOX_NODE_READ_TIMEOUT_MS: "10000"
+      CANDYBOX_HEAP_OPTS: -Xms128m -Xmx256m -XX:ActiveProcessorCount=2
+    ports: ["127.0.0.1::9711"]
