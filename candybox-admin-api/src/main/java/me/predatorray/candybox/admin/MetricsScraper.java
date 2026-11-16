@@ -149,7 +149,8 @@ final class MetricsScraper implements AutoCloseable {
         }
     }
 
-    private void scrapeOnce() {
+    // visible for tests
+    void scrapeOnce() {
         StringBuilder concat = new StringBuilder();
         long ingestMillis = System.currentTimeMillis();
         for (URI target : targets) {
