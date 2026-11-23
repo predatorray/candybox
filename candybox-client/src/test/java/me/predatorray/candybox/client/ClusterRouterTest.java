@@ -619,4 +619,39 @@ class ClusterRouterTest {
             assertThat(transport.contacted).containsExactly(1001, 1001);
         }
     }
+    @Test
+    void anyMemberMutationIsNotReplayedAfterDispatchFailure() {
+        AtomicInteger dispatched = new AtomicInteger();
+        Transport transport = new Transport() {
+            public Connection connect(String host, int port) {
+                return new Connection() {
+                    public Frame call(Frame request) {
+                        dispatched.incrementAndGet();
+                        throw new ProtocolException("response lost", new java.io.IOException());
+                    }
+                    public void close() { }
+                };
+            }
+            public void close() { }
+        };
+        try (var router = new ClusterRouter(transport, coordinationWithMembers(), 5_000,
+                SystemClock.INSTANCE)) {
+            assertThatThrownBy(() -> router.callAny(new Message.CreateBoxRequest("new-box")))
+                    .isInstanceOf(ProtocolException.class).hasMessageContaining("response lost");
+            assertThat(dispatched).hasValue(1);
+        }
+    }
+
+    @Test
+    @org.junit.jupiter.api.Timeout(5)
+    void overallDeadlineAlsoBoundsOwnerRoutingAndBackoff() {
+        var coordination = coordinationWithMembers();
+        coordination.create(CandyboxKeys.boxMetaKey("b"), new byte[0]);
+        try (var router = new ClusterRouter(new RecordingTransport(), coordination, 5_000,
+                SystemClock.INSTANCE, 20_000, Thread::sleep, 1, 4, 100, 200)) {
+            assertThatThrownBy(() -> router.callPartition("b", 0, new Message.GetCandyRequest("b", "k")))
+                    .isInstanceOf(ProtocolException.class).hasMessageContaining("deadline");
+        }
+    }
+
 }
