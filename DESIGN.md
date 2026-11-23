@@ -201,8 +201,12 @@ connection to one handler executor, which keeps that connection's responses in r
 frame header carries no request id, so a client matches responses positionally. Requests are
 pipelined up to `server.max.inflight.per.connection`, beyond which (or while the peer is not
 draining responses) reads are suspended; `close()` stops accepting first and drains in-flight
-requests before cutting sockets. The client side (`TcpTransport`) stays blocking: one pooled
-connection per node, one in-flight request at a time.
+requests before cutting sockets. The client side (`TcpTransport`) stays blocking. Routers borrow
+one exclusive connection per RPC from a bounded per-node pool (default four), with bounded admitted
+RPCs (default 64). Separate acquisition and monotonic overall RPC deadlines cover waiting, routing,
+backoff, setup and I/O. Only known-unsent failures or explicit routing responses permit retry;
+a timeout after dispatch has an unknown mutation outcome. Shutdown cancels admission/waiters and
+closes pooled sockets immediately. See OPERATIONS.md for configuration and late setup cleanup.
 
 ### SSTable on-ledger layout (`SSTableFormat`, footer version 2)
 
