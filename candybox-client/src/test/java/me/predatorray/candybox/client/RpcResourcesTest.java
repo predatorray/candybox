@@ -289,4 +289,13 @@ class RpcResourcesTest {
         } finally { callers.shutdownNow(); }
     }
 
+    @Test
+    void completedSequentialCallsNeverExhaustAdmission() {
+        try (RpcResources resources = new RpcResources(new BlockingTransport(), 1, 1, 100, 5_000)) {
+            for (int i = 0; i < 1_000; i++) {
+                assertThat(resources.call(() -> 1)).isEqualTo(1);
+            }
+        }
+    }
+
 }

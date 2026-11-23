@@ -17,13 +17,16 @@ package me.predatorray.candybox.client;
 
 import java.net.SocketTimeoutException;
 import java.util.ArrayDeque;
-import java.util.HashSet;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
-import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -39,6 +42,7 @@ final class RpcResources implements AutoCloseable {
     private final long acquireMillis;
     private final long requestMillis;
     private final ThreadPoolExecutor executor;
+    private final Semaphore admission;
     private final java.util.concurrent.ConcurrentMap<String, Pool> pools = new ConcurrentHashMap<>();
     private final Set<Call> calls = ConcurrentHashMap.newKeySet();
     private final ThreadLocal<Call> current = new ThreadLocal<>();
@@ -53,17 +57,24 @@ final class RpcResources implements AutoCloseable {
         this.connectionsPerNode = connectionsPerNode;
         this.acquireMillis = acquireMillis;
         this.requestMillis = requestMillis;
-        executor = new ThreadPoolExecutor(0, maxCalls, 30, TimeUnit.SECONDS,
-                new SynchronousQueue<>(), runnable -> {
+        admission = new Semaphore(maxCalls);
+        // A bounded handoff queue accepts the next call after an action has completed but before
+        // its worker has returned to the executor. The permits bound actions including that queue.
+        executor = new ThreadPoolExecutor(maxCalls, maxCalls, 30, TimeUnit.SECONDS,
+                new ArrayBlockingQueue<>(maxCalls), runnable -> {
                     Thread thread = new Thread(runnable, "candybox-client-rpc");
                     thread.setDaemon(true);
                     return thread;
                 });
+        executor.allowCoreThreadTimeOut(true);
     }
 
     <T> T call(Callable<T> action) {
         Call call = new Call();
-        FutureTask<T> future = new FutureTask<>(() -> {
+        if (!admission.tryAcquire()) {
+            throw new BusyException("Client RPC admission limit reached");
+        }
+        FutureTask<T> future = new FutureTask<T>(() -> {
             current.set(call);
             try {
                 call.check();
@@ -72,18 +83,31 @@ final class RpcResources implements AutoCloseable {
                 call.interrupted = Thread.currentThread().isInterrupted();
                 current.remove();
                 calls.remove(call);
+                call.releaseAdmission(); // Before publishing the result to the caller.
             }
-        });
+        }) {
+            @Override
+            public void run() {
+                try {
+                    super.run();
+                } finally {
+                    // Cancellation before execution skips the callable and its finally block.
+                    call.releaseAdmission();
+                }
+            }
+        };
         call.future = future;
         calls.add(call);
         if (closed) {
             calls.remove(call);
+            call.releaseAdmission();
             throw new ProtocolException("Client router is closed");
         }
         try {
             executor.execute(future);
         } catch (java.util.concurrent.RejectedExecutionException e) {
             calls.remove(call);
+            call.releaseAdmission();
             throw new BusyException("Client RPC admission limit reached or router closed");
         }
         try {
@@ -137,7 +161,7 @@ final class RpcResources implements AutoCloseable {
 
     private final class Pool {
         private final ArrayDeque<Connection> idle = new ArrayDeque<>();
-        private final Set<Connection> all = new HashSet<>();
+        private final Set<Connection> all = Collections.newSetFromMap(new IdentityHashMap<>());
         private int opening;
 
         Connection borrow(String host, int port, Call call) {
@@ -211,6 +235,13 @@ final class RpcResources implements AutoCloseable {
         volatile boolean interrupted;
         FutureTask<?> future;
         private Connection borrowed;
+        private final AtomicBoolean admissionReleased = new AtomicBoolean();
+
+        void releaseAdmission() {
+            if (admissionReleased.compareAndSet(false, true)) {
+                admission.release();
+            }
+        }
 
         void check() {
             if (closed || cancelled || System.nanoTime() >= deadline) {

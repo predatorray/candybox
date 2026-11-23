@@ -256,7 +256,7 @@ slot for at most its budget, without cancelling the caller holding that slot. Th
 RPC deadline includes routing, coordination, backoff, acquisition, TLS/SASL setup, writing and reading
 (including trickling responses). It applies per routed RPC, so a sequential multi-partition operation
 can consume multiple RPC budgets. The single-node Java client and CLI use the same default limits.
-Admission has no queue beyond the configured concurrent RPC workers: excess RPCs fail immediately
+Admission counts active and waiting RPC actions with a bounded executor handoff queue: excess RPCs fail immediately
 with `BusyException` (gateway HTTP 503). This bounds node calls occupying gateway workers; the gateway's
 existing worker/HTTP admission limits still apply independently.
 

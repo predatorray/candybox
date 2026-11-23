@@ -189,7 +189,14 @@ final class ClusterRouter implements Router {
         for (int i = 0; i < members.size(); i++) {
             int nodeId = members.get((start + i) % members.size());
             try {
-                return send(addressOfNode(nodeId), request);
+                NodeAddress address;
+                try {
+                    address = addressOfNode(nodeId);
+                } catch (RuntimeException e) {
+                    // Membership may change after enumeration. Nothing has been dispatched.
+                    throw new RpcResources.SetupFailure(e);
+                }
+                return send(address, request);
             } catch (RpcResources.SetupFailure setup) {
                 RuntimeException e = setup.failure();
                 if (failure == null) {

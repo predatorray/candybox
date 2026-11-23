@@ -654,4 +654,37 @@ class ClusterRouterTest {
         }
     }
 
+    @Test
+    void anyMemberCallSkipsAMemberThatDisappearedBeforeDispatch() {
+        var coordination = new me.predatorray.candybox.coordination.CoordinationService() {
+            public List<Integer> members() { return List.of(1, 2); }
+            public java.util.Optional<byte[]> memberInfo(int node) {
+                return node == 1 ? java.util.Optional.empty()
+                        : java.util.Optional.of("host:2002".getBytes(StandardCharsets.UTF_8));
+            }
+            public java.util.Optional<me.predatorray.candybox.coordination.VersionedValue> get(String key) {
+                throw new AssertionError("unused");
+            }
+            public long create(String key, byte[] value) { throw new AssertionError("unused"); }
+            public long compareAndSet(String key, byte[] value, long version) { throw new AssertionError("unused"); }
+            public void delete(String key, long version) { throw new AssertionError("unused"); }
+            public List<String> children(String path) { throw new AssertionError("unused"); }
+            public java.util.Optional<me.predatorray.candybox.coordination.Lease> tryAcquireLease(
+                    String resource, int node, long ttl) { throw new AssertionError("unused"); }
+            public java.util.Optional<me.predatorray.candybox.coordination.LeaseInfo> leaseHolder(String resource) {
+                throw new AssertionError("unused");
+            }
+            public void registerMember(int node, byte[] info) { throw new AssertionError("unused"); }
+            public void unregisterMember(int node) { throw new AssertionError("unused"); }
+            public boolean isConnected() { return true; }
+            public void close() { }
+        };
+        RecordingTransport transport = new RecordingTransport();
+        try (var router = new ClusterRouter(transport, coordination, 5_000, SystemClock.INSTANCE)) {
+            assertThat(router.callAny(new Message.CreateBoxRequest("new-box")))
+                    .isInstanceOf(Message.OkResponse.class);
+            assertThat(transport.contacted).containsExactly(2002);
+        }
+    }
+
 }
