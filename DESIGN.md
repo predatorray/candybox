@@ -390,7 +390,10 @@ Invalidation also prevents an in-flight open from repopulating the cache with an
 Recover-open always fences through a fresh backend open, and invalidates a cached passive view;
 delete and read failures also invalidate cached views. Store close releases idle cache resources
 and retires active views. Active-Syrup reads continue fetching known entry IDs directly from
-bookies, and cached active-ledger tail queries refresh LAC from bookies. No record formats or
+bookies. Explicit tail/sealed queries refresh metadata for a previously active handle so delayed
+close notifications cannot hide the final entry; sealed metadata supplies the authoritative final
+tail, while active LAC is read from bookies. Ordinary known-entry Syrup reads never query this
+metadata. Once sealed, tail/sealed queries use the immutable cached metadata. No record formats or
 configuration change; upgrades and rollback need no migration.
 
 ### 7a. Partition balancing (elected coordinator)

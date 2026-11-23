@@ -24,6 +24,7 @@ import org.apache.bookkeeper.client.BKException;
 import org.apache.bookkeeper.client.BookKeeper;
 import org.apache.bookkeeper.client.BookKeeperAdmin;
 import org.apache.bookkeeper.client.LedgerHandle;
+import org.apache.bookkeeper.client.api.LedgerMetadata;
 import org.apache.bookkeeper.conf.ClientConfiguration;
 import me.predatorray.candybox.bookkeeper.Ledger;
 import me.predatorray.candybox.bookkeeper.LedgerConfig;
@@ -152,16 +153,50 @@ public final class BookKeeperLedgerStore implements LedgerStore {
         try {
             LedgerHandle lh = bookKeeper.openLedgerNoRecovery(ledgerId, DIGEST, password);
             return new BkReadableHandle(lh) {
+                private volatile LedgerMetadata sealedMetadata;
+
+                private LedgerMetadata currentMetadata() {
+                    LedgerMetadata metadata = sealedMetadata;
+                    if (metadata != null) {
+                        return metadata;
+                    }
+                    metadata = lh.getLedgerMetadata();
+                    if (!metadata.isClosed()) {
+                        // A cached active handle can lag the writer's close notification. Explicit
+                        // tail/sealed queries need fresh-open semantics; known-entry Syrup reads
+                        // never enter this path and remain free of metadata RPCs.
+                        try {
+                            metadata = bookKeeper.getLedgerMetadata(ledgerId).get();
+                        } catch (InterruptedException failure) {
+                            throw mapException("read ledger metadata", ledgerId, failure);
+                        } catch (java.util.concurrent.ExecutionException failure) {
+                            Throwable cause = failure.getCause();
+                            throw mapException("read ledger metadata", ledgerId,
+                                    cause instanceof Exception exception ? exception : failure);
+                        }
+                    }
+                    if (metadata.isClosed()) {
+                        sealedMetadata = metadata;
+                    }
+                    return metadata;
+                }
+
                 @Override
                 public long lastAddConfirmed() {
-                    if (lh.isClosed()) {
-                        return lh.getLastAddConfirmed();
+                    LedgerMetadata metadata = currentMetadata();
+                    if (metadata.isClosed()) {
+                        return metadata.getLastEntryId();
                     }
                     try {
                         return lh.readLastConfirmed();
                     } catch (BKException | InterruptedException failure) {
                         throw mapException("read ledger tail", ledgerId, failure);
                     }
+                }
+
+                @Override
+                public boolean isSealed() {
+                    return currentMetadata().isClosed();
                 }
             };
         } catch (BKException | InterruptedException e) {
