@@ -178,6 +178,8 @@ public final class BookKeeperLedgerStore implements LedgerStore {
             return new BkReadableHandle(lh);
         } catch (BKException | InterruptedException e) {
             throw mapException("recover-open ledger", ledgerId, e);
+        } finally {
+            readHandles.invalidate(ledgerId);
         }
     }
 
@@ -188,6 +190,8 @@ public final class BookKeeperLedgerStore implements LedgerStore {
             bookKeeper.deleteLedger(ledgerId);
         } catch (BKException | InterruptedException e) {
             throw mapException("delete ledger", ledgerId, e);
+        } finally {
+            readHandles.invalidate(ledgerId);
         }
     }
 

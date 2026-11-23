@@ -15,6 +15,8 @@
  */
 package me.predatorray.candybox.bookkeeper.bk;
 
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -31,6 +33,7 @@ final class ReadHandleCache implements AutoCloseable {
     private final int capacity;
     private final LongFunction<ReadableLedger> opener;
     private final Map<Long, Entry> entries = new LinkedHashMap<>(16, .75f, true);
+    private final Map<Long, Opening> openings = new HashMap<>();
     private boolean closed;
 
     ReadHandleCache(int capacity, LongFunction<ReadableLedger> opener) {
@@ -41,64 +44,147 @@ final class ReadHandleCache implements AutoCloseable {
         this.opener = opener;
     }
 
-    synchronized ReadableLedger acquire(long id) {
+    ReadableLedger acquire(long id) {
+        Opening opening;
+        synchronized (this) {
+            ensureOpen();
+            Entry cached = entries.get(id);
+            if (cached != null) {
+                return borrow(cached);
+            }
+            opening = openings.computeIfAbsent(id, ignored -> new Opening());
+            opening.users++;
+        }
+        try {
+            // Only misses for this ledger wait for its metadata open. Warm borrows, releases,
+            // invalidations and opens for other ledgers never wait behind this network I/O.
+            synchronized (opening) {
+                long generation;
+                synchronized (this) {
+                    ensureOpen();
+                    Entry cached = entries.get(id);
+                    if (cached != null) {
+                        return borrow(cached);
+                    }
+                    generation = opening.generation;
+                }
+                ReadableLedger physical = opener.apply(id);
+                Entry evicted = null;
+                ReadableLedger borrowed = null;
+                synchronized (this) {
+                    if (!closed) {
+                        Entry entry = new Entry(physical);
+                        borrowed = borrow(entry);
+                        if (generation != opening.generation) {
+                            // Invalidation during the open must not repopulate the cache.
+                            entry.retired = true;
+                        } else {
+                            entries.put(id, entry);
+                            if (entries.size() > capacity) {
+                                Long eldest = entries.keySet().iterator().next();
+                                evicted = retire(entries.remove(eldest));
+                            }
+                        }
+                    }
+                }
+                if (borrowed == null) {
+                    closePhysical(physical);
+                    throw new StorageException("Ledger store is closed");
+                }
+                if (evicted != null) {
+                    closePhysical(evicted.handle);
+                }
+                return borrowed;
+            }
+        } finally {
+            synchronized (this) {
+                if (--opening.users == 0) {
+                    openings.remove(id, opening);
+                }
+            }
+        }
+    }
+
+    private void ensureOpen() {
         if (closed) {
             throw new StorageException("Ledger store is closed");
         }
-        Entry entry = entries.get(id);
-        if (entry == null) {
-            entry = new Entry(opener.apply(id));
-            entries.put(id, entry);
-        }
+    }
+
+    /** Called under the cache monitor; performs no backend work. */
+    private ReadableLedger borrow(Entry entry) {
         entry.borrowers++;
-        if (entries.size() > capacity) {
-            Long eldest = entries.keySet().iterator().next();
-            invalidate(eldest);
-        }
         return new Borrowed(entry);
     }
 
-    synchronized void invalidate(long id) {
-        Entry entry = entries.remove(id);
-        if (entry != null) {
-            retire(entry);
+    void invalidate(long id) {
+        Entry closing;
+        synchronized (this) {
+            Opening opening = openings.get(id);
+            if (opening != null) {
+                opening.generation++;
+            }
+            Entry entry = entries.remove(id);
+            closing = entry == null ? null : retire(entry);
+        }
+        if (closing != null) {
+            closePhysical(closing.handle);
         }
     }
 
-    private void retire(Entry entry) {
+    /** Called under the cache monitor; physical cleanup happens after unlocking. */
+    private Entry retire(Entry entry) {
         entry.retired = true;
-        if (entry.borrowers == 0) {
-            closePhysical(entry);
-        }
+        return entry.borrowers == 0 ? entry : null;
     }
 
-    private void closePhysical(Entry entry) {
+    private void closePhysical(ReadableLedger handle) {
         try {
-            entry.handle.close();
+            handle.close();
         } catch (RuntimeException failure) {
-            LOG.warn("Failed closing cached read handle {}", entry.handle.ledgerId(), failure);
+            LOG.warn("Failed closing cached read handle {}", handle.ledgerId(), failure);
         }
     }
 
-    private synchronized void release(Entry entry) {
-        entry.borrowers--;
-        if (entry.retired && entry.borrowers == 0) {
-            closePhysical(entry);
+    private void release(Entry entry) {
+        boolean closing;
+        synchronized (this) {
+            entry.borrowers--;
+            closing = entry.retired && entry.borrowers == 0;
+        }
+        if (closing) {
+            closePhysical(entry.handle);
         }
     }
 
-    private synchronized void failed(Entry entry) {
-        // A retired borrow must not evict a newer replacement for the same ledger.
-        if (entries.get(entry.handle.ledgerId()) == entry) {
-            invalidate(entry.handle.ledgerId());
+    private void failed(Entry entry) {
+        synchronized (this) {
+            // A retired borrow must not evict a newer replacement for the same ledger.
+            if (entries.get(entry.handle.ledgerId()) == entry) {
+                entries.remove(entry.handle.ledgerId());
+                retire(entry); // the failed caller still pins the handle until its close
+            }
         }
     }
 
     @Override
-    public synchronized void close() {
-        closed = true;
-        entries.values().forEach(this::retire);
-        entries.clear();
+    public void close() {
+        List<Entry> closing = new ArrayList<>();
+        synchronized (this) {
+            closed = true;
+            for (Entry entry : entries.values()) {
+                if (retire(entry) != null) {
+                    closing.add(entry);
+                }
+            }
+            entries.clear();
+        }
+        closing.forEach(entry -> closePhysical(entry.handle));
+    }
+
+    private static final class Opening {
+        int users;
+        long generation;
     }
 
     private static final class Entry {

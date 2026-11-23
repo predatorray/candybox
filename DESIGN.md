@@ -384,7 +384,9 @@ are unchanged; watches and unchanged-version takeover observation remain future 
 
 BookKeeper stores retain an LRU of up to 128 passive read handles. Each `openLedger` returns
 an independently closeable borrowed view; eviction removes the cache reference, while active
-borrowers retain the physical handle until their last close. Reads occur outside the cache lock.
+borrowers retain the physical handle until their last close. Reads, physical opens and closes occur
+outside the global cache lock; simultaneous misses coalesce behind a per-ledger open monitor.
+Invalidation also prevents an in-flight open from repopulating the cache with an obsolete view.
 Recover-open always fences through a fresh backend open, and invalidates a cached passive view;
 delete and read failures also invalidate cached views. Store close releases idle cache resources
 and retires active views. Active-Syrup reads continue fetching known entry IDs directly from
