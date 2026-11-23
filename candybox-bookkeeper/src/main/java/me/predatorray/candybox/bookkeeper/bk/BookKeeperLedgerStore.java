@@ -61,6 +61,7 @@ public final class BookKeeperLedgerStore implements LedgerStore {
     private final ClientConfiguration clientConfiguration;
     private final byte[] password;
     private final boolean ownsClient;
+    private final ReadHandleCache readHandles = new ReadHandleCache(128, this::openPhysical);
 
     /**
      * Builds a store, creating and owning a BookKeeper client from {@code clientConfiguration}.
@@ -144,9 +145,25 @@ public final class BookKeeperLedgerStore implements LedgerStore {
 
     @Override
     public ReadableLedger openLedger(long ledgerId) {
+        return readHandles.acquire(ledgerId);
+    }
+
+    private ReadableLedger openPhysical(long ledgerId) {
         try {
             LedgerHandle lh = bookKeeper.openLedgerNoRecovery(ledgerId, DIGEST, password);
-            return new BkReadableHandle(lh);
+            return new BkReadableHandle(lh) {
+                @Override
+                public long lastAddConfirmed() {
+                    if (lh.isClosed()) {
+                        return lh.getLastAddConfirmed();
+                    }
+                    try {
+                        return lh.readLastConfirmed();
+                    } catch (BKException | InterruptedException failure) {
+                        throw mapException("read ledger tail", ledgerId, failure);
+                    }
+                }
+            };
         } catch (BKException | InterruptedException e) {
             throw mapException("open ledger", ledgerId, e);
         }
@@ -154,6 +171,7 @@ public final class BookKeeperLedgerStore implements LedgerStore {
 
     @Override
     public ReadableLedger recoverOpen(long ledgerId) {
+        readHandles.invalidate(ledgerId);
         try {
             // openLedger performs recovery: it fences the ledger and seals it at the recovered tail.
             LedgerHandle lh = bookKeeper.openLedger(ledgerId, DIGEST, password);
@@ -165,6 +183,7 @@ public final class BookKeeperLedgerStore implements LedgerStore {
 
     @Override
     public void deleteLedger(long ledgerId) {
+        readHandles.invalidate(ledgerId);
         try {
             bookKeeper.deleteLedger(ledgerId);
         } catch (BKException | InterruptedException e) {
@@ -206,6 +225,7 @@ public final class BookKeeperLedgerStore implements LedgerStore {
 
     @Override
     public void close() {
+        readHandles.close();
         if (ownsClient) {
             try {
                 bookKeeper.close();

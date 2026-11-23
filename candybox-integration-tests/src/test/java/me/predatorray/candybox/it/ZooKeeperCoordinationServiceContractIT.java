@@ -206,6 +206,67 @@ class ZooKeeperCoordinationServiceContractIT extends CoordinationServiceContract
     }
 
     @Test
+    void repeatedLeaseChecksDoNotReadZooKeeperAndFailedRenewalInvalidates() throws Exception {
+        CuratorFramework actual = newClient("local-lease-" + NAMESPACE_SEQ.incrementAndGet());
+        AtomicInteger reads = new AtomicInteger();
+        AtomicBoolean failReads = new AtomicBoolean();
+        AtomicBoolean pauseReads = new AtomicBoolean();
+        CountDownLatch renewing = new CountDownLatch(1);
+        CountDownLatch resumeRenewal = new CountDownLatch(1);
+        CuratorFramework counted = (CuratorFramework) java.lang.reflect.Proxy.newProxyInstance(
+                CuratorFramework.class.getClassLoader(), new Class<?>[]{CuratorFramework.class},
+                (proxy, method, args) -> {
+                    if (method.getName().equals("getData")) {
+                        reads.incrementAndGet();
+                        if (pauseReads.get()) {
+                            renewing.countDown();
+                            if (!resumeRenewal.await(10, TimeUnit.SECONDS)) {
+                                throw new IllegalStateException("renewal was not resumed");
+                            }
+                        }
+                        if (failReads.get()) {
+                            throw new IllegalStateException("injected coordination read failure");
+                        }
+                    }
+                    try {
+                        return method.invoke(actual, args);
+                    } catch (java.lang.reflect.InvocationTargetException failure) {
+                        throw failure.getCause();
+                    }
+                });
+        try (ZooKeeperCoordinationService local = new ZooKeeperCoordinationService(counted,
+                new ManualClock(1_000))) {
+            var lease = local.tryAcquireLease("owner", 1, 30_000).orElseThrow();
+            int afterAcquire = reads.get();
+            for (int i = 0; i < 100; i++) {
+                assertThat(lease.isValid()).isTrue();
+            }
+            assertThat(reads.get()).isEqualTo(afterAcquire);
+            var executor = Executors.newSingleThreadExecutor();
+            try {
+                pauseReads.set(true);
+                var renewal = executor.submit(lease::renew);
+                assertThat(renewing.await(10, TimeUnit.SECONDS)).isTrue();
+                // The old local grant remains available while renewal metadata I/O is in flight.
+                assertThat(lease.isValid()).isTrue();
+                resumeRenewal.countDown();
+                renewal.get(10, TimeUnit.SECONDS);
+            } finally {
+                resumeRenewal.countDown();
+                executor.shutdownNow();
+            }
+            assertThat(reads.get()).isEqualTo(afterAcquire + 1);
+            pauseReads.set(false);
+            failReads.set(true);
+            assertThatThrownBy(lease::renew)
+                    .isInstanceOf(me.predatorray.candybox.coordination.CoordinationException.class);
+            assertThat(lease.isValid()).isFalse();
+            assertThat(lease.isValid()).isFalse();
+            assertThat(reads.get()).isEqualTo(afterAcquire + 2);
+        }
+    }
+
+    @Test
     void isConnectedFollowsTheServerGoingDownAndComingBack() throws Exception {
         // A private server: stopping the shared one would disturb the other tests.
         try (TestingServer server = new TestingServer(true);

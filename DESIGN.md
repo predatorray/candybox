@@ -373,6 +373,24 @@ cluster/assignment                    the desired partition→node assignment ta
 members/<nodeId>                      membership (advertised host:port); ephemeral, session-bound
 ```
 
+ZooKeeper lease handles answer `isValid()` locally: acquisition/renewal starts a monotonic
+TTL budget before metadata I/O, subtracting a 5% safety margin capped at 100 ms (at least
+1 ms). The stored wall-clock expiry is an additional upper bound. Failed/ambiguous renewal,
+release, and service close invalidate the local grant. This removes per-request and per-owner
+maintenance validity reads; renewal and balancer enumeration still perform metadata I/O.
+Supersession may be detected at the next renewal or local deadline, so positive local validity
+never replaces durable fencing. Existing clock-skew-sensitive wall-clock takeover semantics
+are unchanged; watches and unchanged-version takeover observation remain future work.
+
+BookKeeper stores retain an LRU of up to 128 passive read handles. Each `openLedger` returns
+an independently closeable borrowed view; eviction removes the cache reference, while active
+borrowers retain the physical handle until their last close. Reads occur outside the cache lock.
+Recover-open always fences through a fresh backend open, and invalidates a cached passive view;
+delete and read failures also invalidate cached views. Store close releases idle cache resources
+and retires active views. Active-Syrup reads continue fetching known entry IDs directly from
+bookies, and cached active-ledger tail queries refresh LAC from bookies. No record formats or
+configuration change; upgrades and rollback need no migration.
+
 ### 7a. Partition balancing (elected coordinator)
 
 `PartitionBalancer` runs a round on every node (`balancer.interval.millis`; 0 disables). Whichever
