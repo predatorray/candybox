@@ -26,24 +26,30 @@ import me.predatorray.candybox.common.serial.BinaryWriter;
  * @param ledgerId   the current manifest ledger id
  * @param ownerToken the fencing token of the owner that wrote this pointer
  */
-record ManifestPointer(long ledgerId, long ownerToken) {
+record ManifestPointer(long ledgerId, long ownerToken, String incarnation) {
 
-    private static final byte FORMAT_VERSION = 1;
+    private static final byte FORMAT_VERSION = 2;
+
+    ManifestPointer(long ledgerId, long ownerToken) {
+        this(ledgerId, ownerToken, "");
+    }
 
     byte[] encode() {
         return new BinaryWriter(20)
                 .writeByte(FORMAT_VERSION)
                 .writeVarLong(ledgerId)
                 .writeVarLong(ownerToken)
+                .writeString(incarnation)
                 .toByteArray();
     }
 
     static ManifestPointer decode(byte[] data) {
         BinaryReader r = new BinaryReader(data);
         int version = r.readByte();
-        if (version != FORMAT_VERSION) {
+        if (version != 1 && version != FORMAT_VERSION) {
             throw new IllegalStateException("Unsupported ManifestPointer version: " + version);
         }
-        return new ManifestPointer(r.readVarLong(), r.readVarLong());
+        long ledger = r.readVarLong(), token = r.readVarLong();
+        return new ManifestPointer(ledger, token, version == 1 ? "" : r.readString());
     }
 }

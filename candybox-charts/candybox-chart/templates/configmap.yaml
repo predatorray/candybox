@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "candybox.fullname" . }}-config
+  labels: {{ include "candybox.labels" . | nindent 4 }}
+data:
+  node.properties: |
+    server.bind=0.0.0.0:9709
+    health.port=9710
+    zookeeper.connect={{ include "candybox.zk" . }}
+    bookkeeper.metadataServiceUri={{ include "candybox.metadata" . }}
+    {{- range $role, $quorum := .Values.node.quorums }}
+    quorum.{{ $role }}={{ $quorum }}
+    {{- end }}
+    {{- range $key, $value := .Values.node.config }}
+    {{ $key }}={{ $value }}
+    {{- end }}
+  gateway.properties: |
+    s3.bind=0.0.0.0:9711
+    health.port=9712
+    zookeeper.connect={{ include "candybox.zk" . }}
+    {{- range $key, $value := .Values.gateway.config }}
+    {{ $key }}={{ $value }}
+    {{- end }}

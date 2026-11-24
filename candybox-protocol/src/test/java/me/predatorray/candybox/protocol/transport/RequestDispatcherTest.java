@@ -74,6 +74,22 @@ class RequestDispatcherTest {
         assertThat(channel.isOpen()).isTrue();
     }
 
+    @Test
+    void closesTheConnectionWhenTheResponseExceedsTheFrameLimit() {
+        ReadGate gate = new ReadGate(4);
+        EmbeddedChannel channel = new EmbeddedChannel(new FrameEncoder(8), gate,
+                new RequestDispatcher(request -> new Frame(Opcode.RESPONSE_OK, new byte[9]), gate));
+        try {
+            channel.writeInbound(new Frame(Opcode.GET_CANDY, new byte[0]));
+
+            assertThat(channel.isOpen()).isFalse();
+            assertThat(gate.inFlight()).isZero();
+            assertThat((Object) channel.readOutbound()).isNull();
+        } finally {
+            channel.finishAndReleaseAll();
+        }
+    }
+
     /**
      * A handler that throws cannot be answered — the response would be positional, and there is no
      * request id to disown it with — so the connection goes. The gate must be released even so, or

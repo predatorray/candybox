@@ -26,6 +26,7 @@ import me.predatorray.candybox.common.exception.FencedException;
 import me.predatorray.candybox.common.exception.LimitExceededException;
 import me.predatorray.candybox.common.exception.NotOwnerException;
 import me.predatorray.candybox.common.exception.ValidationException;
+import me.predatorray.candybox.common.exception.SourceTooSmallException;
 
 /**
  * Translates a thrown {@link Throwable} into an {@link S3Exception} (HTTP status + S3 code). See
@@ -50,6 +51,9 @@ final class ErrorMapper {
     static S3Exception toS3(Throwable t) {
         if (t instanceof S3Exception s3) {
             return s3;
+        }
+        if (t instanceof SourceTooSmallException e) {
+            return new S3Exception(S3ErrorCode.INVALID_REQUEST, e.getMessage(), e);
         }
         if (t instanceof LimitExceededException e) {
             String msg = lower(e.getMessage());
@@ -105,6 +109,7 @@ final class ErrorMapper {
             case "BoxNotEmptyException" -> S3ErrorCode.BUCKET_NOT_EMPTY;
             case "BoxNotFoundException" -> S3ErrorCode.NO_SUCH_BUCKET;
             case "CandyNotFoundException" -> S3ErrorCode.NO_SUCH_KEY;
+            case "SourceTooSmallException" -> S3ErrorCode.INVALID_REQUEST;
             case "ValidationException" -> lower(message).contains("invalidrange")
                     || lower(message).contains("invalid range")
                     ? S3ErrorCode.INVALID_RANGE : S3ErrorCode.INVALID_ARGUMENT;

@@ -108,6 +108,16 @@ interface CandyStore {
     PartUploadInfo uploadPartCopy(String box, String key, String uploadId, int partNumber,
                                   String srcKey, long firstByte, long lastByte);
 
+    /** Source-size predicate must be checked against the source version actually copied. */
+    default PartUploadInfo uploadPartCopy(String box, String key, String uploadId, int partNumber,
+                                          String srcKey, long firstByte, long lastByte,
+                                          long minSourceBytesExclusive) {
+        if (minSourceBytesExclusive != 0) {
+            throw new UnsupportedOperationException("Atomic source-size preconditions are not supported");
+        }
+        return uploadPartCopy(box, key, uploadId, partNumber, srcKey, firstByte, lastByte);
+    }
+
     CandyInfo completeMultipartUpload(String box, String key, String uploadId,
                                       List<PartUploadInfo> parts);
 

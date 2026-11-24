@@ -67,7 +67,7 @@ public final class InMemoryCoordinationService implements CoordinationService {
     @Override
     public synchronized Optional<VersionedValue> get(String key) {
         Entry e = kv.get(key);
-        return e == null ? Optional.empty() : Optional.of(new VersionedValue(e.version, e.value.clone()));
+        return e == null ? Optional.empty() : Optional.of(new VersionedValue(e.version, e.value.clone(), e.modifiedAtMillis));
     }
 
     @Override
@@ -76,7 +76,7 @@ public final class InMemoryCoordinationService implements CoordinationService {
         if (existing != null) {
             throw new CasConflictException(key, -1, existing.version);
         }
-        kv.put(key, new Entry(0, value.clone()));
+        kv.put(key, new Entry(0, value.clone(), clock.currentTimeMillis()));
         return 0;
     }
 
@@ -88,8 +88,18 @@ public final class InMemoryCoordinationService implements CoordinationService {
             throw new CasConflictException(key, expectedVersion, actual);
         }
         long newVersion = expectedVersion + 1;
-        kv.put(key, new Entry(newVersion, value.clone()));
+        kv.put(key, new Entry(newVersion, value.clone(), clock.currentTimeMillis()));
         return newVersion;
+    }
+
+    @Override
+    public synchronized long compareAndSetWithLease(String key, byte[] value, long expectedVersion,
+                                                    String resource, long fencingToken) {
+        LeaseState state = leases.get(resource);
+        if (state == null || state.token != fencingToken || !isCurrentAndLive(state)) {
+            throw new LeaseExpiredException(resource, fencingToken);
+        }
+        return compareAndSet(key, value, expectedVersion);
     }
 
     @Override
@@ -212,7 +222,10 @@ public final class InMemoryCoordinationService implements CoordinationService {
         final long version;
         final byte[] value;
 
-        Entry(long version, byte[] value) {
+        final long modifiedAtMillis;
+
+        Entry(long version, byte[] value, long modifiedAtMillis) {
+            this.modifiedAtMillis = modifiedAtMillis;
             this.version = version;
             this.value = value;
         }

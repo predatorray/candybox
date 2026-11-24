@@ -15,6 +15,9 @@
  */
 package me.predatorray.candybox.protocol;
 
+import me.predatorray.candybox.common.namespace.NamespaceState;
+import me.predatorray.candybox.common.namespace.NamespaceOperation;
+
 import java.util.List;
 import java.util.Map;
 import me.predatorray.candybox.common.Hlc;
@@ -42,6 +45,24 @@ public sealed interface Message {
 
     /** The opcode that identifies this message on the wire. */
     Opcode opcode();
+
+    record CreateNamespaceBoxRequest(String box, int partitionCount) implements Message {
+        public Opcode opcode() { return Opcode.CREATE_NAMESPACE_BOX; }
+    }
+
+    /** Address-routed operation. ENUMERATE uses explicit partition, others ignore it. */
+    record NamespaceRequest(String box, String address,
+            NamespaceOperation operation,
+            String key, byte[] data, long idleTtlMillis, long expectedVersion,
+            int pageSize, String cursor, int partition) implements Message {
+        public Opcode opcode() { return Opcode.NAMESPACE; }
+    }
+
+    record NamespaceResponse(String outcome,
+            NamespaceState state,
+            byte[] data, List<String> keys, String cursor) implements Message {
+        public Opcode opcode() { return Opcode.RESPONSE_NAMESPACE; }
+    }
 
     // ---- Box admin requests ----------------------------------------------------------------
 
@@ -115,8 +136,12 @@ public sealed interface Message {
      * server; {@code firstByte == -1} means "the last {@code lastByte} bytes" (suffix range) and the
      * server resolves to {@code [contentLength - lastByte, contentLength - 1]}.
      */
-    record RangeGetCandyRequest(String box, String key, long firstByte, long lastByte)
-            implements Message {
+    record RangeGetCandyRequest(String box, String key, long firstByte, long lastByte,
+                                long minSourceBytesExclusive) implements Message {
+        public RangeGetCandyRequest(String box, String key, long firstByte, long lastByte) {
+            this(box, key, firstByte, lastByte, 0);
+        }
+
         public Opcode opcode() {
             return Opcode.RANGE_GET_CANDY;
         }
@@ -297,7 +322,13 @@ public sealed interface Message {
      * (inclusive on both ends; {@code -1} = open-ended).
      */
     record UploadPartCopyRequest(String box, String key, String uploadId, int partNumber,
-                                 String srcKey, long firstByte, long lastByte) implements Message {
+                                 String srcKey, long firstByte, long lastByte,
+                                 long minSourceBytesExclusive) implements Message {
+        public UploadPartCopyRequest(String box, String key, String uploadId, int partNumber,
+                                      String srcKey, long firstByte, long lastByte) {
+            this(box, key, uploadId, partNumber, srcKey, firstByte, lastByte, 0);
+        }
+
         public Opcode opcode() {
             return Opcode.UPLOAD_PART_COPY;
         }

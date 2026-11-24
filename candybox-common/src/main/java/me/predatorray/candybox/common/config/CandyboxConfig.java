@@ -35,11 +35,16 @@ public final class CandyboxConfig {
     private final long ownershipLeaseTtlMillis;
     private final long leaseRenewIntervalMillis;
     private final long routerCacheTtlMillis;
+    private final int clientConnectionsPerNode;
+    private final int clientMaxConcurrentRequests;
+    private final long clientAcquireTimeoutMillis;
+    private final long clientRequestTimeoutMillis;
     private final long routerUnownedRetryMillis;
     private final long compactionIntervalMillis;
     private final long maxClockSkewMillis;
     private final long tombstoneGcGraceMillis;
     private final long ledgerGcGraceMillis;
+    private final long ledgerEnumerationGraceMillis;
     private final int l0CompactionTrigger;
     private final int l0StallThreshold;
     private final long compactionTargetFileSizeBytes;
@@ -63,11 +68,16 @@ public final class CandyboxConfig {
         this.ownershipLeaseTtlMillis = b.ownershipLeaseTtlMillis;
         this.leaseRenewIntervalMillis = b.leaseRenewIntervalMillis;
         this.routerCacheTtlMillis = b.routerCacheTtlMillis;
+        this.clientConnectionsPerNode = b.clientConnectionsPerNode;
+        this.clientMaxConcurrentRequests = b.clientMaxConcurrentRequests;
+        this.clientAcquireTimeoutMillis = b.clientAcquireTimeoutMillis;
+        this.clientRequestTimeoutMillis = b.clientRequestTimeoutMillis;
         this.routerUnownedRetryMillis = b.routerUnownedRetryMillis;
         this.compactionIntervalMillis = b.compactionIntervalMillis;
         this.maxClockSkewMillis = b.maxClockSkewMillis;
         this.tombstoneGcGraceMillis = b.tombstoneGcGraceMillis;
         this.ledgerGcGraceMillis = b.ledgerGcGraceMillis;
+        this.ledgerEnumerationGraceMillis = b.ledgerEnumerationGraceMillis;
         this.l0CompactionTrigger = b.l0CompactionTrigger;
         this.l0StallThreshold = b.l0StallThreshold;
         this.compactionTargetFileSizeBytes = b.compactionTargetFileSizeBytes;
@@ -132,6 +142,14 @@ public final class CandyboxConfig {
      * How long the client keeps retrying a partition that has no owner (a handover gap) before
      * failing with a retriable {@code NotOwnerException}. {@code 0} fails at once.
      */
+    public int clientConnectionsPerNode() { return clientConnectionsPerNode; }
+
+    public int clientMaxConcurrentRequests() { return clientMaxConcurrentRequests; }
+
+    public long clientAcquireTimeoutMillis() { return clientAcquireTimeoutMillis; }
+
+    public long clientRequestTimeoutMillis() { return clientRequestTimeoutMillis; }
+
     public long routerUnownedRetryMillis() {
         return routerUnownedRetryMillis;
     }
@@ -150,6 +168,10 @@ public final class CandyboxConfig {
     }
 
     /** Grace period before an obsoleted ledger (compaction input, dead Syrup) is physically deleted. */
+    public long ledgerEnumerationGraceMillis() {
+        return ledgerEnumerationGraceMillis;
+    }
+
     public long ledgerGcGraceMillis() {
         return ledgerGcGraceMillis;
     }
@@ -206,7 +228,7 @@ public final class CandyboxConfig {
 
     /**
      * How long a source-side cross-partition rename intent may sit without its destination completion
-     * marker appearing before it is abandoned (the rename never reached the destination; the source
+     * marker appearing before an unclaimed preparation may be CAS-aborted (the source
      * stays live). Roll-forward otherwise: a present marker finalizes the source delete.
      */
     public long renameIntentAbandonMillis() {
@@ -231,10 +253,15 @@ public final class CandyboxConfig {
         private long ownershipLeaseTtlMillis = 10_000L;        // 10s lease
         private long leaseRenewIntervalMillis = 3_000L;        // renew well within the TTL; 0 disables
         private long routerCacheTtlMillis = 5_000L;            // client Box->owner cache TTL
+        private int clientConnectionsPerNode = 4;
+        private int clientMaxConcurrentRequests = 64;
+        private long clientAcquireTimeoutMillis = 5_000;
+        private long clientRequestTimeoutMillis = 120_000;
         private long routerUnownedRetryMillis = 15_000L;       // ~ lease TTL + a balancer round
         private long compactionIntervalMillis = 0L;            // background compaction; 0 disables
         private long maxClockSkewMillis = 300_000L;            // 5 min HLC skew bound
         private long tombstoneGcGraceMillis = 24L * 3600 * 1000; // 24h late-write window
+        private long ledgerEnumerationGraceMillis; // opt-in; 0 disables enumeration
         private long ledgerGcGraceMillis = 300_000L;           // 5 min before deleting obsolete ledgers
         private int l0CompactionTrigger = 4;
         private int l0StallThreshold = 12;
@@ -246,7 +273,7 @@ public final class CandyboxConfig {
         private int partitionsPerBoxDefault = 8;                        // write spread vs. per-engine cost
         private long balancerIntervalMillis = 0L;                       // balancing round; 0 disables
         private int balancerMaxMovesPerRound = 4;                       // migration rate limit
-        private long renameIntentAbandonMillis = 60_000L;               // abandon a stuck rename intent
+        private long renameIntentAbandonMillis = 60_000L;               // consider aborting an unclaimed rename preparation
         private long zeroCopyRelayBudgetBytes = 32L * 1024 * 1024;      // pending relay bytes per node
 
         public Builder sizeLimits(SizeLimits v) {
@@ -294,6 +321,30 @@ public final class CandyboxConfig {
             return this;
         }
 
+        public Builder clientConnectionsPerNode(int v) {
+            if (v < 1) { throw new IllegalArgumentException("clientConnectionsPerNode must be positive"); }
+            this.clientConnectionsPerNode = v;
+            return this;
+        }
+
+        public Builder clientMaxConcurrentRequests(int v) {
+            if (v < 1) { throw new IllegalArgumentException("clientMaxConcurrentRequests must be positive"); }
+            this.clientMaxConcurrentRequests = v;
+            return this;
+        }
+
+        public Builder clientAcquireTimeoutMillis(long v) {
+            if (v < 1) { throw new IllegalArgumentException("clientAcquireTimeoutMillis must be positive"); }
+            this.clientAcquireTimeoutMillis = v;
+            return this;
+        }
+
+        public Builder clientRequestTimeoutMillis(long v) {
+            if (v < 1) { throw new IllegalArgumentException("clientRequestTimeoutMillis must be positive"); }
+            this.clientRequestTimeoutMillis = v;
+            return this;
+        }
+
         public Builder routerUnownedRetryMillis(long v) {
             this.routerUnownedRetryMillis = v;
             return this;
@@ -311,6 +362,14 @@ public final class CandyboxConfig {
 
         public Builder tombstoneGcGraceMillis(long v) {
             this.tombstoneGcGraceMillis = v;
+            return this;
+        }
+
+        public Builder ledgerEnumerationGraceMillis(long v) {
+            if (v < 0) {
+                throw new IllegalArgumentException("ledgerEnumerationGraceMillis must be >= 0");
+            }
+            this.ledgerEnumerationGraceMillis = v;
             return this;
         }
 

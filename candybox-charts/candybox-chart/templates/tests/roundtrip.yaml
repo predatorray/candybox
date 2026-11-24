@@ -1,0 +1,62 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "candybox.fullname" . }}-test
+  labels: {{ include "candybox.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: test
+    # Retain completed pods so `helm test --logs` can read their output.
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext: {{ toYaml .Values.podSecurityContext | nindent 4 }}
+  {{- with .Values.imagePullSecrets }}
+  imagePullSecrets: {{ toYaml . | nindent 4 }}
+  {{- end }}
+  nodeSelector: {{ toYaml .Values.node.nodeSelector | nindent 4 }}
+  {{- with .Values.node.tolerations }}
+  tolerations: {{ toYaml . | nindent 4 }}
+  {{- end }}
+  containers:
+    - name: roundtrip
+      image: {{ include "candybox.image" . | quote }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      securityContext: {{ toYaml .Values.securityContext | nindent 8 }}
+      command: [bash, -ec]
+      args:
+        - |
+          box="helm-test-$(date +%s)"
+          candybox create-box "$box"
+          printf 'helm-roundtrip' | candybox put "$box" probe
+          test "$(candybox get "$box" probe)" = helm-roundtrip
+          candybox delete "$box" probe
+          candybox delete-box "$box"
+      env:
+        - name: CANDYBOX_SERVER
+          value: "{{ include "candybox.fullname" . }}-node-0.{{ include "candybox.fullname" . }}-node.{{ .Release.Namespace }}.svc:9709"
+        - {name: CANDYBOX_HEAP_OPTS, value: "-Xms64m -Xmx128m"}
+        {{- with .Values.commonEnv }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.test.env }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with concat .Values.commonEnvFrom .Values.test.envFrom }}
+      envFrom: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      resources:
+        requests: {cpu: 100m, memory: 256Mi}
+        limits: {memory: 512Mi}
+      volumeMounts:
+        - {name: logs, mountPath: /opt/candybox/logs}
+        - {name: tmp, mountPath: /tmp}
+        {{- with .Values.volumeMounts }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+  volumes:
+    - {name: logs, emptyDir: {}}
+    - {name: tmp, emptyDir: {}}
+    {{- with .Values.volumes }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}

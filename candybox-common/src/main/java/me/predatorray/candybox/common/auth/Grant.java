@@ -27,7 +27,9 @@ import java.util.stream.Collectors;
  * ACL grants are additive only — there is no deny entry, matching S3 ACL semantics.
  *
  * <p>Text form (used in the ZK document and the CLI): {@code <grantee>:<OP>[+<OP>...]}, e.g.
- * {@code AllUsers:READ} or {@code User:alice:READ+WRITE}.
+ * {@code AllUsers:READ} or {@code User:alice:READ+WRITE}. Built-in principal types are
+ * canonicalized on construction, including when reading existing ACL documents; names and
+ * virtual group spellings remain case-sensitive. The persisted text grammar is unchanged.
  */
 public record Grant(String grantee, Set<Operation> operations) {
 
@@ -41,11 +43,17 @@ public record Grant(String grantee, Set<Operation> operations) {
         if (operations == null || operations.isEmpty()) {
             throw new IllegalArgumentException("a grant needs at least one operation");
         }
+        grantee = normalizeGrantee(grantee);
         operations = Set.copyOf(operations);
     }
 
     public static Grant of(String grantee, Operation... operations) {
         return new Grant(grantee, EnumSet.copyOf(Arrays.asList(operations)));
+    }
+
+    /** Canonicalizes a typed grantee; virtual groups and bare grantees retain their spelling. */
+    public static String normalizeGrantee(String grantee) {
+        return grantee.indexOf(':') >= 0 ? Principal.parse(grantee).toString() : grantee;
     }
 
     /** Whether this entry applies to {@code principal}. */

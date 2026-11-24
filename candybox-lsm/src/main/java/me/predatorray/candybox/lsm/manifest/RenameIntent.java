@@ -29,14 +29,14 @@ import me.predatorray.candybox.common.Hlc;
  * {@code CompleteRename}, or after handover replay) by checking the coordination rendezvous marker
  * {@code boxes/<box>/renames/<token>}: present ⇒ tombstone {@code srcKey} (LWW-conditioned on
  * {@code srcHlc}, so a legitimately re-{@code put} source is never clobbered) and clear the intent;
- * absent past the abandon window ⇒ drop the intent (the rename never reached the destination).
+ * absent ⇒ retain the intent until an unclaimed relay CAS or fenced destination recovery proves abort.
  *
  * @param token         the rename's idempotency/rendezvous token (also the coordination marker key)
  * @param srcKey        the source key to delete once the destination is confirmed durable
  * @param srcHlc        the HLC of the source locator captured at prepare time (LWW delete guard)
  * @param dstKey        the destination key (informational; the marker confirms the destination put)
  * @param dstPartition  the destination key's partition (informational / diagnostics)
- * @param createdAtMillis when the intent was recorded, used to abandon stale intents
+ * @param createdAtMillis when the intent was recorded, used to consider aborting unclaimed preparations
  */
 public record RenameIntent(String token, String srcKey, Hlc srcHlc, String dstKey, int dstPartition,
                            long createdAtMillis) {

@@ -17,10 +17,13 @@ package me.predatorray.candybox.bookkeeper;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.jupiter.api.Assertions.assertTimeout;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.List;
 import me.predatorray.candybox.common.config.LedgerRole;
+import me.predatorray.candybox.common.config.QuorumConfig;
 import me.predatorray.candybox.common.exception.FencedException;
 import me.predatorray.candybox.common.exception.StorageException;
 import org.junit.jupiter.api.AfterEach;
@@ -42,6 +45,9 @@ public abstract class LedgerStoreContract {
     /** Produces a fresh, empty store for one test. */
     protected abstract LedgerStore newStore();
 
+    /** Number of bookies available to this test store. */
+    protected abstract int availableBookies();
+
     /** The ledger config (quorum) the contract uses. Default: the SSTABLE role's 3/2/2. */
     protected LedgerConfig config() {
         return LedgerConfig.forRole(LedgerRole.SSTABLE);
@@ -61,6 +67,25 @@ public abstract class LedgerStoreContract {
         if (store != null) {
             store.close();
         }
+    }
+
+    @Test
+    void metadataReadDoesNotFenceAndReturnsCreationMetadata() {
+        long before = System.currentTimeMillis();
+        WritableLedger writer = store.createLedger(new LedgerConfig(config().quorum(),
+                java.util.Map.of("candybox-role", bytes("SYRUP"))));
+        LedgerMetadata metadata = store.readMetadata(writer.ledgerId());
+        assertThat(metadata.createdAtMillis()).isBetween(before, System.currentTimeMillis());
+        assertThat(metadata.customMetadata().get("candybox-role")).isEqualTo(bytes("SYRUP"));
+        metadata.customMetadata().get("candybox-role")[0] = 0;
+        assertThat(store.readMetadata(writer.ledgerId()).customMetadata().get("candybox-role"))
+                .isEqualTo(bytes("SYRUP"));
+        assertThat(writer.append(bytes("still writable"))).isZero();
+        writer.close();
+        assertThat(store.listLedgers()).contains(writer.ledgerId());
+        store.deleteLedger(writer.ledgerId());
+        assertThatThrownBy(() -> store.readMetadata(writer.ledgerId()))
+                .isInstanceOf(LedgerNotFoundException.class);
     }
 
     @Test
@@ -96,6 +121,34 @@ public abstract class LedgerStoreContract {
         w.close();
         ReadableLedger r = store.openLedger(w.ledgerId());
         assertThat(r.readRange(0, 2)).hasSize(3);
+    }
+
+    @Test
+    void independentReadViewsAndReopenedTailObserveNewAppends() {
+        WritableLedger writer = store.createLedger(config());
+        writer.append(bytes("first"));
+        ReadableLedger first = store.openLedger(writer.ledgerId());
+        ReadableLedger second = store.openLedger(writer.ledgerId());
+        first.close();
+        first.close();
+        assertThat(second.read(0).data()).isEqualTo(bytes("first"));
+        second.close();
+        writer.append(bytes("second"));
+        try (ReadableLedger active = store.openLedger(writer.ledgerId())) {
+            assertThat(active.read(1).data()).isEqualTo(bytes("second"));
+        }
+        writer.close();
+        try (ReadableLedger reopened = store.openLedger(writer.ledgerId())) {
+            assertThat(reopened.lastAddConfirmed()).isEqualTo(1);
+            assertThat(reopened.isSealed()).isTrue();
+            assertThat(reopened.read(1).data()).isEqualTo(bytes("second"));
+        }
+        try (ReadableLedger recovered = store.recoverOpen(writer.ledgerId())) {
+            assertThat(recovered.lastAddConfirmed()).isEqualTo(1);
+        }
+        store.deleteLedger(writer.ledgerId());
+        assertThatThrownBy(() -> store.openLedger(writer.ledgerId()))
+                .isInstanceOf(LedgerNotFoundException.class);
     }
 
     @Test
@@ -147,6 +200,46 @@ public abstract class LedgerStoreContract {
         w.close();
         ReadableLedger r = store.openLedger(w.ledgerId());
         assertThatThrownBy(() -> r.read(5)).isInstanceOf(StorageException.class);
+    }
+
+    @Test
+    void readRangeRejectsAnInvertedOrNegativeRange() {
+        WritableLedger writer = store.createLedger(config());
+        writer.append(bytes("one"));
+        writer.append(bytes("two"));
+        writer.append(bytes("three"));
+        writer.close();
+
+        try (ReadableLedger reader = store.openLedger(writer.ledgerId())) {
+            assertThatThrownBy(() -> reader.readRange(2, 1)).isInstanceOf(StorageException.class);
+            assertThatThrownBy(() -> reader.readRange(-1, 0)).isInstanceOf(StorageException.class);
+        }
+    }
+
+    @Test
+    void recoverOpenOfAMissingLedgerThrowsLedgerNotFound() {
+        WritableLedger writer = store.createLedger(config());
+        writer.close();
+        long id = writer.ledgerId();
+        store.deleteLedger(id);
+
+        assertThatThrownBy(() -> store.recoverOpen(id)).isInstanceOf(LedgerNotFoundException.class);
+    }
+
+    @Test
+    void createLedgerFailsWhenTheEnsembleExceedsAvailableBookies() {
+        LedgerConfig tooLarge = new LedgerConfig(new QuorumConfig(availableBookies() + 1, 2, 2));
+        // Placement must reject an impossible ensemble without waiting for bookies to appear.
+        assertTimeout(Duration.ofSeconds(2), () ->
+                assertThatThrownBy(() -> store.createLedger(tooLarge))
+                        .isInstanceOf(StorageException.class));
+    }
+
+    @Test
+    void operationsAfterCloseFail() {
+        store.close();
+        assertThatThrownBy(() -> store.createLedger(config())).isInstanceOf(StorageException.class);
+        // @AfterEach closes it again, also verifying that close is idempotent.
     }
 
     @Test

@@ -15,10 +15,15 @@
  */
 package me.predatorray.candybox.server;
 
+import me.predatorray.candybox.common.namespace.NamespaceKeys;
+import me.predatorray.candybox.common.namespace.NamespaceOperation;
+
 import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
+import java.util.function.Consumer;
 import java.util.regex.Pattern;
 import me.predatorray.candybox.common.BoxName;
 import me.predatorray.candybox.common.CandyKey;
@@ -28,6 +33,10 @@ import me.predatorray.candybox.common.auth.ObjectAcl;
 import me.predatorray.candybox.common.auth.Operation;
 import me.predatorray.candybox.common.auth.Principal;
 import me.predatorray.candybox.common.auth.Resource;
+import me.predatorray.candybox.common.exception.AccessDeniedException;
+import me.predatorray.candybox.common.exception.AuthenticationException;
+import me.predatorray.candybox.common.exception.BoxAlreadyExistsException;
+import me.predatorray.candybox.common.exception.BoxNotEmptyException;
 import me.predatorray.candybox.common.exception.BoxNotFoundException;
 import me.predatorray.candybox.common.exception.BusyException;
 import me.predatorray.candybox.common.exception.CandyNotFoundException;
@@ -114,6 +123,8 @@ final class NodeRequestHandler implements RequestHandler {
                         principal + " is not allowed READ on " + boxOf(message) + "/" + sourceKey));
             }
             return codec.encode(dispatch(message, principal));
+        } catch (AccessDeniedException e) {
+            return codec.encode(new Message.AccessDeniedResponse(safe(e.getMessage())));
         } catch (BusyException e) {
             return codec.encode(new Message.BusyResponse(100));
         } catch (CandyNotFoundException e) {
@@ -122,11 +133,22 @@ final class NodeRequestHandler implements RequestHandler {
             // We don't own this partition: re-route, retry later, or the Box is gone.
             return codec.encode(movedOrNotFound(message, e));
         } catch (CandyboxException e) {
-            return codec.encode(new Message.ErrorResponse(e.getClass().getSimpleName(), safe(e.getMessage())));
+            String errorType = e.getClass().getSimpleName();
+            if (e instanceof ValidationException || e instanceof BoxAlreadyExistsException
+                    || e instanceof BoxNotEmptyException || e instanceof AuthenticationException) {
+                return codec.encode(new Message.ErrorResponse(errorType, safe(e.getMessage())));
+            }
+            return codec.encode(internalError(errorType, e));
         } catch (RuntimeException e) {
-            LOG.warn("Unexpected error handling request", e);
-            return codec.encode(new Message.ErrorResponse("InternalError", safe(e.getMessage())));
+            return codec.encode(internalError("InternalError", e));
         }
+    }
+
+    /** Internal details stay in the server log; the reference lets operators find the failure. */
+    private static Message.ErrorResponse internalError(String errorType, RuntimeException cause) {
+        String reference = UUID.randomUUID().toString();
+        LOG.warn("Error handling request; reference={}", reference, cause);
+        return new Message.ErrorResponse(errorType, "Internal server error. Reference: " + reference);
     }
 
     /** Reads larger than this would not fit in one response frame, so they are refused unread. */
@@ -134,15 +156,16 @@ final class NodeRequestHandler implements RequestHandler {
         return Message.maxInlineDataBytes(node.config().maxFrameSizeBytes());
     }
 
-    /** What a request needs the caller to be allowed to do, or {@code null} for SASL frames. */
+    /** Required permission, or {@code null} for routing metadata and SASL frames. */
     private record Access(Operation operation, Resource resource) {
     }
 
     /**
      * The S3 union rule: a READ / READ_ACP / WRITE_ACP the Box ACL denies is still allowed when the
      * <em>object's own</em> grants (locator v3) permit it. Only single-object read-side requests
-     * qualify; resolution failures (no such object, partition moved) deny rather than leak
-     * existence — the box-level outcome stands.
+     * qualify. Missing objects and malformed keys deny without revealing object existence.
+     * Ownership failures follow the normal routing response so the owner can evaluate the grants;
+     * redirects reveal partition ownership, never whether the object exists.
      */
     private boolean objectGrantPermits(Message message, Principal principal, Operation operation) {
         String box = boxOf(message);
@@ -163,6 +186,8 @@ final class NodeRequestHandler implements RequestHandler {
         try {
             ObjectAcl acl = node.engine(BoxName.of(box), key).getCandyAcl(CandyKey.of(key));
             return acl.permits(principal, operation);
+        } catch (NotOwnerException | BoxNotFoundException routingFailed) {
+            throw routingFailed;
         } catch (CandyboxException | IllegalArgumentException resolveFailed) {
             return false;
         }
@@ -193,9 +218,24 @@ final class NodeRequestHandler implements RequestHandler {
                 || objectGrantPermits(box, key, principal, Operation.READ);
     }
 
+    /**
+     * The preflight grant lookup only rejects clearly denied requests. This check must also run on
+     * the ACL resolved by the actual operation, so an intervening overwrite cannot grant access to
+     * a different version. Resolve Box permission before entering an engine write lock; the returned
+     * callback only examines the immutable ACL passed by the engine.
+     */
+    private Consumer<ObjectAcl> sourceReadCheck(Principal principal, String box, String key) {
+        boolean boxRead = node.authorizer().authorize(principal, Operation.READ, Resource.box(box));
+        return acl -> {
+            if (!boxRead && !acl.permits(principal, Operation.READ)) {
+                throw new AccessDeniedException(principal + " is not allowed READ on " + box + "/" + key);
+            }
+        };
+    }
+
     private static Access requiredAccess(Message message) {
         // Cluster-level requests first; everything Box-scoped derives from boxOf().
-        if (message instanceof Message.CreateBoxRequest) {
+        if (message instanceof Message.CreateBoxRequest || message instanceof Message.CreateNamespaceBoxRequest) {
             return new Access(Operation.WRITE, Resource.CLUSTER);
         }
         if (message instanceof Message.ListBoxesRequest) {
@@ -219,10 +259,21 @@ final class NodeRequestHandler implements RequestHandler {
         if (message instanceof Message.HeadBoxRequest m) {
             return new Access(Operation.READ, Resource.box(m.box()));
         }
-        if (message instanceof Message.BoxInfoRequest m) {
-            return new Access(Operation.READ, Resource.box(m.box()));
+        if (message instanceof Message.BoxInfoRequest) {
+            // Partition discovery precedes every fresh client's keyed request, including object-only
+            // READ/READ_ACP/WRITE_ACP grants. This reveals only Box existence and partition count;
+            // the eventual data/ACL request must still pass its own authorization check at the owner.
+            return null;
         }
         String box = boxOf(message);
+        if (message instanceof Message.NamespaceRequest m) {
+            Operation permission = switch (m.operation()) {
+                case GET, HEAD, LIST -> Operation.READ;
+                case CLAIM_EXPIRY, CLEANUP, ENUMERATE -> Operation.ADMIN;
+                default -> Operation.WRITE;
+            };
+            return new Access(permission, Resource.box(m.box()));
+        }
         if (box == null) {
             return null; // SASL frames are consumed by the authentication gate before this handler
         }
@@ -256,7 +307,9 @@ final class NodeRequestHandler implements RequestHandler {
 
     /** The target Box of a Box- or partition-routed request, or {@code null} for cluster-wide ones. */
     private static String boxOf(Message message) {
-        if (message instanceof Message.PutCandyRequest m) {
+        if (message instanceof Message.NamespaceRequest m) {
+            return m.box();
+        } else if (message instanceof Message.PutCandyRequest m) {
             return m.box();
         } else if (message instanceof Message.GetCandyRequest m) {
             return m.box();
@@ -327,7 +380,10 @@ final class NodeRequestHandler implements RequestHandler {
     }
 
     private static Integer explicitPartitionOf(Message message) {
-        if (message instanceof Message.ListCandiesRequest m) {
+        if (message instanceof Message.NamespaceRequest m
+                && m.operation() == NamespaceOperation.ENUMERATE) {
+            return m.partition();
+        } else if (message instanceof Message.ListCandiesRequest m) {
             return m.partition();
         } else if (message instanceof Message.DeleteRangeRequest m) {
             return m.partition();
@@ -339,7 +395,10 @@ final class NodeRequestHandler implements RequestHandler {
 
     /** The key whose hash partition a keyed request routes by, or {@code null}. */
     private static String routingKeyOf(Message message) {
-        if (message instanceof Message.PutCandyRequest m) {
+        if (message instanceof Message.NamespaceRequest m) {
+            return m.address() == null ? null
+                    : NamespaceKeys.lifecycle(m.address());
+        } else if (message instanceof Message.PutCandyRequest m) {
             return m.key();
         } else if (message instanceof Message.GetCandyRequest m) {
             return m.key();
@@ -382,6 +441,45 @@ final class NodeRequestHandler implements RequestHandler {
     }
 
     private Message dispatch(Message message, Principal principal) {
+        if (message instanceof Message.CreateNamespaceBoxRequest m) {
+            node.createBox(BoxName.of(m.box()), m.partitionCount(), true);
+            if (!principal.isAnonymous()) {
+                node.aclStore().seed(m.box(), BoxAcl.privateTo(principal));
+            }
+            return new Message.OkResponse();
+        }
+        String target = boxOf(message);
+        if (target != null && node.descriptor(BoxName.of(target)).namespaceManaged()) {
+            if (message instanceof Message.NamespaceRequest m) {
+                BoxEngine engine = m.operation() == NamespaceOperation.ENUMERATE
+                        ? node.enginePartition(BoxName.of(target), m.partition())
+                        : node.engine(BoxName.of(target), routingKeyOf(message));
+                if (m.data().length > maxInlineDataBytes()) {
+                    throw new ValidationException("Namespace payload exceeds inline frame budget");
+                }
+                if (m.pageSize() < 1 || m.pageSize() > 128) {
+                    throw new ValidationException("Namespace page size must be 1..128");
+                }
+                int pageSize = m.pageSize();
+                if (m.operation() == NamespaceOperation.LIST || m.operation() == NamespaceOperation.ENUMERATE) {
+                    long rowBudget = (long) node.config().sizeLimits().maxCandyKeyBytes() + 16;
+                    long rows = maxInlineDataBytes() / rowBudget;
+                    if (rows < 1) { throw new ValidationException("Namespace page cannot fit frame budget"); }
+                    pageSize = (int) Math.min(pageSize, rows);
+                }
+                var result = engine.namespace(m.operation(), m.address(), m.key(), m.data(),
+                        m.idleTtlMillis(), m.expectedVersion(), pageSize, m.cursor(), maxInlineDataBytes());
+                return new Message.NamespaceResponse(result.outcome(), result.state(), result.data(),
+                        result.keys(), result.cursor());
+            }
+            if (!(message instanceof Message.GetBoxAclRequest)
+                    && !(message instanceof Message.SetBoxAclRequest)) {
+                throw new ValidationException("Managed Box requires namespace operations");
+            }
+        } else if (message instanceof Message.NamespaceRequest) {
+            throw new ValidationException("Namespace operation requires a managed Box");
+        }
+
         if (message instanceof Message.CreateBoxRequest m) {
             node.createBox(BoxName.of(m.box()), m.partitionCount());
             // The creator owns the Box (private by default). An anonymous create (auth disabled)
@@ -430,7 +528,8 @@ final class NodeRequestHandler implements RequestHandler {
         } else if (message instanceof Message.GetCandyRequest m) {
             BoxEngine engine = node.engine(BoxName.of(m.box()), m.key());
             ByteArrayOutputStream out = new ByteArrayOutputStream();
-            CandyMetadata meta = engine.getCandy(CandyKey.of(m.key()), out, maxInlineDataBytes());
+            CandyMetadata meta = engine.getCandy(CandyKey.of(m.key()), out, maxInlineDataBytes(),
+                    sourceReadCheck(principal, m.box(), m.key()));
             return new Message.CandyDataResponse(meta.contentLength(), meta.contentType(),
                     meta.userMetadata(), meta.crc32c(), out.toByteArray());
         } else if (message instanceof Message.RangeGetCandyRequest m) {
@@ -439,7 +538,8 @@ final class NodeRequestHandler implements RequestHandler {
             BoxEngine.RangeReadResult result;
             try {
                 result = engine.getCandyRange(CandyKey.of(m.key()), m.firstByte(), m.lastByte(), out,
-                        maxInlineDataBytes());
+                        maxInlineDataBytes(), m.minSourceBytesExclusive(),
+                        sourceReadCheck(principal, m.box(), m.key()));
             } catch (IllegalArgumentException e) {
                 // S3's InvalidRange — surface as a typed error the gateway can map to 416.
                 throw new ValidationException("InvalidRange: " + e.getMessage());
@@ -449,7 +549,8 @@ final class NodeRequestHandler implements RequestHandler {
                     meta.contentType(), meta.userMetadata(), meta.crc32c(), out.toByteArray());
         } else if (message instanceof Message.HeadCandyRequest m) {
             BoxEngine engine = node.engine(BoxName.of(m.box()), m.key());
-            CandyMetadata meta = engine.headCandy(CandyKey.of(m.key()));
+            CandyMetadata meta = engine.headCandy(CandyKey.of(m.key()),
+                    sourceReadCheck(principal, m.box(), m.key()));
             return new Message.HeadCandyResponse(meta.contentLength(), meta.contentType(),
                     meta.userMetadata(), meta.crc32c(), meta.createdAtMillis());
         } else if (message instanceof Message.DeleteCandyRequest m) {
@@ -458,68 +559,85 @@ final class NodeRequestHandler implements RequestHandler {
         } else if (message instanceof Message.CopyCandyRequest m) {
             CandyMetadata meta = samePartitionEngine(m.box(), m.srcKey(), m.dstKey())
                     .copyCandy(CandyKey.of(m.srcKey()), CandyKey.of(m.dstKey()),
-                            m.idempotencyToken(), effectiveAcl(principal, m.owner(), m.grants()));
+                            m.idempotencyToken(), effectiveAcl(principal, m.owner(), m.grants()),
+                            sourceReadCheck(principal, m.box(), m.srcKey()));
             return new Message.HeadCandyResponse(meta.contentLength(), meta.contentType(),
                     meta.userMetadata(), meta.crc32c(), meta.createdAtMillis());
         } else if (message instanceof Message.RenameCandyRequest m) {
             CandyMetadata meta = samePartitionEngine(m.box(), m.srcKey(), m.dstKey())
                     .renameCandy(CandyKey.of(m.srcKey()), CandyKey.of(m.dstKey()),
-                            m.idempotencyToken());
+                            m.idempotencyToken(), sourceReadCheck(principal, m.box(), m.srcKey()));
             return new Message.HeadCandyResponse(meta.contentLength(), meta.contentType(),
                     meta.userMetadata(), meta.crc32c(), meta.createdAtMillis());
         } else if (message instanceof Message.GetCandyLocatorRequest m) {
             BoxEngine engine = node.engine(BoxName.of(m.box()), m.key());
             CandyLocator locator = engine.resolveLocator(CandyKey.of(m.key()));
+            sourceReadCheck(principal, m.box(), m.key()).accept(locator.acl());
             return relayLocator(engine, m.box(), m.key(), principal, null, null, locator);
         } else if (message instanceof Message.PrepareRenameRequest m) {
-            // The source partition's owner: resolve the locator (relayed to the destination) and
-            // durably record the rename intent so the owed source delete survives a crash/handover.
             BoxEngine engine = node.engine(BoxName.of(m.box()), m.srcKey());
-            CandyLocator locator = engine.resolveLocator(CandyKey.of(m.srcKey()));
-            engine.recordRenameIntent(new RenameIntent(m.renameToken(), m.srcKey(), locator.hlc(),
-                    m.dstKey(), m.dstPartition(), node.currentTimeMillis()));
-            try {
-                return relayLocator(engine, m.box(), m.srcKey(), principal, m.renameToken(),
+            // The same source-engine monitor protects maintenance retirement and preparation.
+            synchronized (engine) {
+                CandyLocator locator = engine.resolveLocator(CandyKey.of(m.srcKey()));
+                sourceReadCheck(principal, m.box(), m.srcKey()).accept(locator.acl());
+                var prepared = relayLocator(engine, m.box(), m.srcKey(), principal, m.renameToken(),
                         m.dstKey(), locator);
-            } catch (RuntimeException e) {
                 try {
-                    engine.clearRenameIntent(m.renameToken());
-                } catch (RuntimeException cleanup) {
-                    e.addSuppressed(cleanup); // the abandon sweep drops the intent instead
+                    node.prepareRenameMarker(m.box(), m.renameToken(), m.srcKey(),
+                            node.descriptor(BoxName.of(m.box())).partitionOf(m.srcKey()), locator.hlc(), m.dstKey());
+                    engine.recordRenameIntent(new RenameIntent(m.renameToken(), m.srcKey(), locator.hlc(),
+                            m.dstKey(), m.dstPartition(), node.currentTimeMillis()));
+                    return prepared;
+                } catch (RuntimeException e) {
+                    node.deleteLocatorRelay(m.box(), node.descriptor(BoxName.of(m.box())).partitionOf(m.srcKey()),
+                            prepared.relayToken());
+                    throw e;
                 }
-                throw e;
             }
         } else if (message instanceof Message.ZeroCopyPutRequest m) {
             BoxName box = BoxName.of(m.box());
             BoxEngine engine = node.engine(box, m.dstKey());
             // The parts and a rename's ACL come from the source owner's relay, never from the client.
-            LocatorRelay relay = consumableRelay(m, principal);
+            LocatorRelay relay = consumableRelay(m, principal, engine);
             CandyLocator source = relay.locator();
             // A rename keeps the object's identity, so the source's owner/grants travel with it; a
             // copy belongs to the requester (effectiveAcl applies the super-user owner rule).
             ObjectAcl acl = relay.isRename()
                     ? source.acl()
                     : effectiveAcl(principal, m.owner(), m.grants());
-            CandyMetadata meta = engine.zeroCopyPut(CandyKey.of(m.dstKey()), source.parts(),
-                    source.contentType(), source.userMetadata(), 0L, acl, m.idempotencyToken());
+            CandyMetadata meta = relay.consumer().committed();
+            if (meta == null) {
+                // Share admission with fenced-claim retirement, including its receipt-absence check.
+                synchronized (engine) {
+                    meta = relay.isRename()
+                            ? engine.zeroCopyRename(CandyKey.of(m.dstKey()), source, relay.renameToken(),
+                                    relay.consumer().incarnation(), m.relayToken(), m.srcPartition(), relay.srcKey(),
+                                    () -> node.requirePendingRename(m.box(), m.srcPartition(), m.relayToken()))
+                            : engine.zeroCopyPut(CandyKey.of(m.dstKey()), source.parts(),
+                                    source.contentType(), source.userMetadata(), 0L, acl, m.idempotencyToken());
+                }
+                relay = node.recordCommittedLocatorRelay(m.box(), m.srcPartition(), m.relayToken(),
+                        relay, meta);
+            }
             // Publish this partition's refs before the source delete can run, so the Box-global GC
             // already sees the new cross-partition reference (no premature reclaim of the shared Syrup).
             node.publishPartitionRefs(box, node.descriptor(box).partitionOf(m.dstKey()));
             if (relay.isRename()) {
-                node.writeRenameMarker(m.box(), relay.renameToken(), relay.srcKey(),
-                        m.srcPartition(), source.hlc(), m.dstKey());
+                node.publishRenameMarker(m.box(), relay.renameToken(), relay.srcKey(),
+                        m.srcPartition(), source.hlc(), m.dstKey(), relay.consumer().incarnation());
             }
-            // Only now: a put that failed (MOVED, BUSY, marker write) stays retryable with this token.
-            node.deleteLocatorRelay(m.box(), m.srcPartition(), m.relayToken());
+            // Only now: committed retries finish publication without ever appending another locator.
+            // Rename claims remain the durable transfer decision until the source acknowledges.
+            if (!relay.isRename()) {
+                node.completeLocatorRelay(m.box(), m.srcPartition(), m.relayToken(), relay);
+            }
             return new Message.HeadCandyResponse(meta.contentLength(), meta.contentType(),
                     meta.userMetadata(), meta.crc32c(), meta.createdAtMillis());
         } else if (message instanceof Message.CompleteRenameRequest m) {
             // The source partition's owner finalizes the rename (also reachable via the maintenance
             // sweep / after handover): LWW-conditioned delete of the source, then clear intent + marker.
             BoxEngine engine = node.engine(BoxName.of(m.box()), m.srcKey());
-            engine.deleteCandyConditional(CandyKey.of(m.srcKey()), m.srcHlc());
-            engine.clearRenameIntent(m.renameToken());
-            node.deleteRenameMarker(m.box(), m.renameToken());
+            node.finalizeRenameIntent(engine, m.box(), m.renameToken(), m.srcKey());
             return new Message.OkResponse();
         } else if (message instanceof Message.DeleteRangeRequest m) {
             BoxEngine engine = node.enginePartition(BoxName.of(m.box()), m.partition());
@@ -644,7 +762,8 @@ final class NodeRequestHandler implements RequestHandler {
             BoxEngine engine = samePartitionEngine(m.box(), m.srcKey(), m.key());
             try {
                 BoxEngine.PartUploadResult r = engine.uploadPartCopy(m.uploadId(), m.partNumber(),
-                        CandyKey.of(m.srcKey()), m.firstByte(), m.lastByte());
+                        CandyKey.of(m.srcKey()), m.firstByte(), m.lastByte(), m.minSourceBytesExclusive(),
+                        sourceReadCheck(principal, m.box(), m.srcKey()));
                 return new Message.UploadPartResponse(r.crc32c(), r.partLength());
             } catch (IllegalArgumentException e) {
                 throw new ValidationException("InvalidRange: " + e.getMessage());
@@ -697,14 +816,15 @@ final class NodeRequestHandler implements RequestHandler {
     }
 
     /**
-     * The relay a zero-copy put names, provided the same principal created it and, for a rename, it
-     * was prepared for this destination key. Anything else, including an expired relay, is
+     * Claims the relay a zero-copy put names, provided the same principal created it and, for a rename,
+     * it was prepared for this destination key. Anything else, including an expired pending relay, is
      * indistinguishable from a missing one.
      */
-    private LocatorRelay consumableRelay(Message.ZeroCopyPutRequest m, Principal principal) {
+    private LocatorRelay consumableRelay(Message.ZeroCopyPutRequest m, Principal principal,
+                                          BoxEngine engine) {
         Optional<LocatorRelay> relay = m.relayToken() != null
                 && RELAY_TOKEN.matcher(m.relayToken()).matches()
-                ? node.readLocatorRelay(m.box(), m.srcPartition(), m.relayToken(),
+                ? node.claimLocatorRelay(m.box(), m.srcPartition(), m.relayToken(), m.dstKey(), engine,
                         r -> r.requester().equals(principal.toString())
                                 && (!r.isRename() || r.dstKey().equals(m.dstKey())))
                 : Optional.empty();

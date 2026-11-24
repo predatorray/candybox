@@ -238,7 +238,7 @@ export type MetricSample = z.infer<typeof MetricSampleSchema>;
 
 export const MetricSeriesSchema = z.object({
   name: z.string(),
-  labels: z.record(z.string()).optional(),
+  labels: z.record(z.string(), z.string()).optional(),
   samples: z.array(MetricSampleSchema),
 });
 export type MetricSeries = z.infer<typeof MetricSeriesSchema>;

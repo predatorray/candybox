@@ -24,6 +24,7 @@ import me.predatorray.candybox.common.exception.BoxAlreadyExistsException;
 import me.predatorray.candybox.common.exception.BoxNotFoundException;
 import me.predatorray.candybox.common.exception.NotOwnerException;
 import me.predatorray.candybox.coordination.CandyboxKeys;
+import me.predatorray.candybox.coordination.BoxDescriptor;
 import me.predatorray.candybox.coordination.CasConflictException;
 import me.predatorray.candybox.coordination.CoordinationService;
 import me.predatorray.candybox.coordination.Lease;
@@ -46,9 +47,8 @@ import org.slf4j.LoggerFactory;
  *   <li>read the {@code boxes/&lt;box&gt;/partitions/&lt;p&gt;/manifest} pointer;</li>
  *   <li>create a brand-new engine (pointer absent) or recover the prior one (pointer present), stamping
  *       every manifest edit with the lease's fencing token;</li>
- *   <li>publish the new manifest ledger id by creating / compare-and-setting the pointer — aborting and
- *       releasing the lease if the CAS loses, which (given we hold the lease) only happens on a stale
- *       read.</li>
+ *   <li>publish the new manifest ledger id by atomically checking the lease epoch and creating /
+ *       compare-and-setting the pointer; abort and release on conflict or lost ownership.</li>
  * </ol>
  *
  * <p>The lease is the real serialization point; the pointer CAS is a backstop. Engine access is gated
@@ -61,16 +61,20 @@ final class PartitionOwnership implements AutoCloseable {
     private final BoxName box;
     private final int partition;
     private final CoordinationService coordination;
-    private final Lease lease;
+    private final OwnershipLeases.Held lease;
     private final BoxEngine engine;
+    private LedgerRetention.ScopedStore retentionScope;
+    private String pointerKey;
+    private String incarnation;
 
     private PartitionOwnership(BoxName box, int partition, CoordinationService coordination,
-                               Lease lease, BoxEngine engine) {
+                               OwnershipLeases.Held lease, BoxEngine engine) {
         this.box = box;
         this.partition = partition;
         this.coordination = coordination;
         this.lease = lease;
         this.engine = engine;
+        this.pointerKey = manifestKey(box, partition);
     }
 
     static String ownerResource(BoxName box, int partition) {
@@ -85,21 +89,75 @@ final class PartitionOwnership implements AutoCloseable {
     static PartitionOwnership createNew(BoxName box, int partition, CandyboxConfig config,
                                         LedgerStore store, CoordinationService coordination,
                                         int nodeId, Clock clock) {
-        Lease lease = acquireLease(box, partition, coordination, nodeId, config);
+        return createNew(box, partition, config, store, coordination, nodeId, clock, new OwnershipLeases());
+    }
+
+    static PartitionOwnership createNew(BoxName box, int partition, CandyboxConfig config,
+                                        LedgerStore store, CoordinationService coordination,
+                                        int nodeId, Clock clock, OwnershipLeases leases) {
+        OwnershipLeases.Held lease = leases.register(acquireLease(box, partition, coordination, nodeId, config));
         try {
-            if (coordination.get(manifestKey(box, partition)).isPresent()) {
+            LedgerRetention.ScopedStore scope = null;
+            String incarnation = coordination.get(CandyboxKeys.boxMetaKey(box.value()))
+                    .map(value -> BoxDescriptor.decode(value.value()).incarnation()).orElse("");
+            String pointerKey = manifestKey(box, partition);
+            if (!incarnation.isEmpty()) {
+                String generationKey = CandyboxKeys.incarnationManifestKey(box.value(), partition, incarnation);
+                if (coordination.get(generationKey).isPresent()) { pointerKey = generationKey; }
+            }
+            if (config.ledgerEnumerationGraceMillis() > 0) {
+                var descriptor = BoxDescriptor.decode(coordination.get(CandyboxKeys.boxMetaKey(box.value()))
+                        .orElseThrow(() -> new BoxNotFoundException(box.value())).value());
+                incarnation = descriptor.incarnation();
+                pointerKey = CandyboxKeys.incarnationManifestKey(box.value(), partition, incarnation);
+                scope = new LedgerRetention(store, coordination, clock)
+                        .allocate(box.value(), descriptor.incarnation(), partition, lease.fencingToken());
+                store = scope;
+            }
+            var existingPointer = coordination.get(pointerKey);
+            if (existingPointer.isPresent() && !incarnation.isEmpty()) {
+                byte[] priorValue = existingPointer.get().value();
+                String priorIncarnation = "";
+                if (priorValue.length != 0) {
+                    try { priorIncarnation = ManifestPointer.decode(priorValue).incarnation(); }
+                    catch (RuntimeException malformed) {
+                        // Unknown nonempty state remains occupied; never overwrite it.
+                    }
+                }
+                if (priorValue.length == 0 || (!priorIncarnation.isEmpty() && !priorIncarnation.equals(incarnation))) {
+                    pointerKey = CandyboxKeys.incarnationManifestKey(box.value(), partition, incarnation);
+                    existingPointer = coordination.get(pointerKey);
+                }
+            }
+            if (existingPointer.isPresent()) {
                 throw new BoxAlreadyExistsException(box.value());
             }
             BoxEngine engine = BoxEngine.createNew(box, config, store, nodeId, clock,
                     lease.fencingToken());
             try {
-                coordination.create(manifestKey(box, partition),
-                        new ManifestPointer(engine.manifestLedgerId(), lease.fencingToken()).encode());
+                lease.publish(coordination, pointerKey,
+                        new ManifestPointer(engine.manifestLedgerId(), lease.fencingToken(), incarnation).encode(), -1);
             } catch (CasConflictException raced) {
                 engine.close(); // a concurrent creator won; abandon our ledgers (GC: phase-3)
                 throw new BoxAlreadyExistsException(box.value());
+            } catch (RuntimeException failure) {
+                engine.close();
+                throw failure;
             }
-            return new PartitionOwnership(box, partition, coordination, lease, engine);
+            if (scope != null) {
+                try {
+                    scope.inheritAndRetire(engine.retainedLedgers(), engine.manifestState().pendingDeletes().keySet());
+                } catch (RuntimeException failure) {
+                    engine.close();
+                    throw failure;
+                }
+            }
+            lease.attach(engine);
+            PartitionOwnership owned = new PartitionOwnership(box, partition, coordination, lease, engine);
+            owned.retentionScope = scope;
+            owned.pointerKey = pointerKey;
+            owned.incarnation = incarnation;
+            return owned;
         } catch (RuntimeException e) {
             lease.release();
             throw e;
@@ -110,18 +168,49 @@ final class PartitionOwnership implements AutoCloseable {
     static PartitionOwnership recover(BoxName box, int partition, CandyboxConfig config,
                                       LedgerStore store, CoordinationService coordination,
                                       int nodeId, Clock clock) {
-        Lease lease = acquireLease(box, partition, coordination, nodeId, config);
+        return recover(box, partition, config, store, coordination, nodeId, clock, new OwnershipLeases());
+    }
+
+    static PartitionOwnership recover(BoxName box, int partition, CandyboxConfig config,
+                                      LedgerStore store, CoordinationService coordination,
+                                      int nodeId, Clock clock, OwnershipLeases leases) {
+        OwnershipLeases.Held lease = leases.register(acquireLease(box, partition, coordination, nodeId, config));
         try {
-            VersionedValue pointer = coordination.get(manifestKey(box, partition))
+            LedgerRetention.ScopedStore scope = null;
+            String incarnation = coordination.get(CandyboxKeys.boxMetaKey(box.value()))
+                    .map(value -> BoxDescriptor.decode(value.value()).incarnation()).orElse("");
+            String pointerKey = manifestKey(box, partition);
+            if (!incarnation.isEmpty()) {
+                String generationKey = CandyboxKeys.incarnationManifestKey(box.value(), partition, incarnation);
+                if (coordination.get(generationKey).isPresent()) { pointerKey = generationKey; }
+            }
+            if (config.ledgerEnumerationGraceMillis() > 0) {
+                var descriptor = BoxDescriptor.decode(coordination.get(CandyboxKeys.boxMetaKey(box.value()))
+                        .orElseThrow(() -> new BoxNotFoundException(box.value())).value());
+                incarnation = descriptor.incarnation();
+                pointerKey = CandyboxKeys.incarnationManifestKey(box.value(), partition, incarnation);
+                scope = new LedgerRetention(store, coordination, clock)
+                        .allocate(box.value(), descriptor.incarnation(), partition, lease.fencingToken());
+                store = scope;
+            }
+            Optional<VersionedValue> incarnationPointer = coordination.get(pointerKey);
+            VersionedValue pointer = incarnationPointer.or(() -> coordination.get(manifestKey(box, partition)))
                     .orElseThrow(() -> new BoxNotFoundException(box.value()));
-            long priorManifestLedgerId = ManifestPointer.decode(pointer.value()).ledgerId();
+            ManifestPointer previous = ManifestPointer.decode(pointer.value());
+            if ((scope != null && !previous.incarnation().equals(incarnation))
+                    || (!previous.incarnation().isEmpty() && !incarnation.isEmpty()
+                        && !previous.incarnation().equals(incarnation))) {
+                throw new NotOwnerException("Manifest pointer has no matching Box incarnation; "
+                        + "recover once with enumeration disabled before enabling it");
+            }
+            long priorManifestLedgerId = previous.ledgerId();
 
             BoxEngine engine = BoxEngine.recover(box, config, store, nodeId, clock,
                     priorManifestLedgerId, lease.fencingToken());
             try {
-                coordination.compareAndSet(manifestKey(box, partition),
-                        new ManifestPointer(engine.manifestLedgerId(), lease.fencingToken()).encode(),
-                        pointer.version());
+                byte[] next = new ManifestPointer(engine.manifestLedgerId(), lease.fencingToken(), incarnation).encode();
+                lease.publish(coordination, pointerKey, next,
+                        incarnationPointer.isEmpty() && scope != null ? -1 : pointer.version());
             } catch (CasConflictException raced) {
                 engine.close();
                 throw new NotOwnerException(box.value()); // someone advanced the pointer; we lost
@@ -131,7 +220,20 @@ final class PartitionOwnership implements AutoCloseable {
             }
             LOG.info("Node {} recovered ownership of box {} partition {} (token {})", nodeId, box,
                     partition, lease.fencingToken());
-            return new PartitionOwnership(box, partition, coordination, lease, engine);
+            if (scope != null) {
+                try {
+                    scope.inheritAndRetire(engine.retainedLedgers(), engine.manifestState().pendingDeletes().keySet());
+                } catch (RuntimeException failure) {
+                    engine.close();
+                    throw failure;
+                }
+            }
+            lease.attach(engine);
+            PartitionOwnership owned = new PartitionOwnership(box, partition, coordination, lease, engine);
+            owned.retentionScope = scope;
+            owned.pointerKey = pointerKey;
+            owned.incarnation = incarnation;
+            return owned;
         } catch (RuntimeException e) {
             lease.release();
             throw e;
@@ -173,7 +275,7 @@ final class PartitionOwnership implements AutoCloseable {
     boolean renew() {
         try {
             lease.renew();
-            return true;
+            return lease.isValid();
         } catch (RuntimeException e) {
             LOG.warn("Lost lease on box {} partition {}: {}", box, partition, e.getMessage());
             return false;
@@ -182,7 +284,7 @@ final class PartitionOwnership implements AutoCloseable {
 
     /** The coordination key + version are needed to delete the pointer when the Box is dropped. */
     Optional<VersionedValue> currentPointer() {
-        return coordination.get(manifestKey(box, partition));
+        return coordination.get(pointerKey);
     }
 
     /**
@@ -201,12 +303,20 @@ final class PartitionOwnership implements AutoCloseable {
         close();
     }
 
+    boolean allocationRotationDue(long graceMillis) {
+        return retentionScope != null && retentionScope.rotationDue(graceMillis);
+    }
+
+    String pointerKey() { return pointerKey; }
+
+    String incarnation() { return incarnation; }
+
+    void retireDeletedAllocations() {
+        if (retentionScope != null) { retentionScope.retireDeleted(); }
+    }
+
     @Override
     public void close() {
-        try {
-            engine.close();
-        } finally {
-            lease.release();
-        }
+        lease.release();
     }
 }

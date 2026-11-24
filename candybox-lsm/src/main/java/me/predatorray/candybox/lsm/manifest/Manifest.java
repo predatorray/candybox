@@ -145,6 +145,7 @@ public final class Manifest implements AutoCloseable {
                 .newWalLedgerId(wal)
                 .addedUploads(new ArrayList<>(state.multipartUploads().values()))
                 .addedRenameIntents(new ArrayList<>(state.renameIntents().values()))
+                .addedRenameReceipts(new ArrayList<>(state.renameReceipts().values()))
                 .addedPendingDeletes(state.pendingDeletes())
                 .maxHlc(state.maxHlc())
                 .build();

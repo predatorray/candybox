@@ -45,6 +45,21 @@ public final class HealthServer implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(HealthServer.class);
 
     private final HttpServer http;
+    private java.util.function.Supplier<LedgerRetention.Report> retentionMetrics;
+
+    public void retentionMetrics(java.util.function.Supplier<LedgerRetention.Report> source) {
+        retentionMetrics = source;
+    }
+
+    private String renderRetentionMetrics() {
+        if (retentionMetrics == null) { return ""; }
+        LedgerRetention.Report report = retentionMetrics.get();
+        return "candybox_ledger_enumeration_candidates " + report.candidates() + "\n"
+                + "candybox_ledger_enumeration_held " + report.held() + "\n"
+                + "candybox_ledger_enumeration_deleted " + report.deleted() + "\n"
+                + "candybox_ledger_enumeration_errors " + report.errors() + "\n"
+                + "candybox_ledger_enumeration_oldest_age_millis " + report.oldestAgeMillis() + "\n";
+    }
 
     /**
      * @param port        the HTTP port to bind
@@ -80,7 +95,7 @@ public final class HealthServer implements AutoCloseable {
                 respond(exchange, 401, "metrics require Authorization: Bearer <token>\n");
                 return;
             }
-            respond(exchange, 200, renderMetrics(nodeId, statsSource.get()));
+            respond(exchange, 200, renderMetrics(nodeId, statsSource.get()) + renderRetentionMetrics());
         });
         http.setExecutor(null); // default executor (a small internal pool)
     }
@@ -124,6 +139,12 @@ public final class HealthServer implements AutoCloseable {
         metric(sb, "candybox_compactions_total", "Total compactions.", nodeId, byBox, BoxEngineStats::compactions);
         metric(sb, "candybox_stall_rejections_total", "Total writes rejected for L0 stall.", nodeId,
                 byBox, BoxEngineStats::stallRejections);
+        metric(sb, "candybox_namespace_renewals_total", "Committed namespace renewals.", nodeId, byBox, BoxEngineStats::namespaceRenewals);
+        metric(sb, "candybox_namespace_rejected_claims_total", "Stale expiry claims.", nodeId, byBox, BoxEngineStats::namespaceRejectedClaims);
+        metric(sb, "candybox_namespace_retirements_total", "Committed namespace retirements.", nodeId, byBox, BoxEngineStats::namespaceRetirements);
+        metric(sb, "candybox_namespace_cleanup_batches_total", "Completed cleanup pages.", nodeId, byBox, BoxEngineStats::namespaceCleanupBatches);
+        metric(sb, "candybox_namespace_cleanup_items_total", "Items tombstoned by cleanup.", nodeId, byBox, BoxEngineStats::namespaceCleanupItems);
+        metric(sb, "candybox_namespace_failures_total", "Uncertain commits requiring recovery.", nodeId, byBox, BoxEngineStats::namespaceFailures);
         sb.append("# HELP candybox_owned_boxes Number of Boxes this node currently owns.\n");
         sb.append("# TYPE candybox_owned_boxes gauge\n");
         sb.append("candybox_owned_boxes{node=\"").append(nodeId).append("\"} ")

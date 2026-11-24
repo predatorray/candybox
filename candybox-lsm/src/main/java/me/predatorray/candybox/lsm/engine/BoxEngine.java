@@ -15,6 +15,10 @@
  */
 package me.predatorray.candybox.lsm.engine;
 
+import me.predatorray.candybox.common.namespace.NamespaceKeys;
+import me.predatorray.candybox.common.namespace.NamespaceState;
+import me.predatorray.candybox.common.namespace.NamespaceOperation;
+
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -30,6 +34,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Consumer;
 import me.predatorray.candybox.bookkeeper.LedgerConfig;
 import me.predatorray.candybox.bookkeeper.LedgerStore;
 import me.predatorray.candybox.bookkeeper.ReadableLedger;
@@ -53,6 +58,7 @@ import me.predatorray.candybox.common.exception.BusyException;
 import me.predatorray.candybox.common.exception.CandyNotFoundException;
 import me.predatorray.candybox.common.exception.LimitExceededException;
 import me.predatorray.candybox.common.exception.ValidationException;
+import me.predatorray.candybox.common.exception.SourceTooSmallException;
 import me.predatorray.candybox.lsm.iterator.MergingIterator;
 import me.predatorray.candybox.lsm.iterator.ReopeningIterator;
 import me.predatorray.candybox.lsm.manifest.Manifest;
@@ -60,6 +66,7 @@ import me.predatorray.candybox.lsm.manifest.ManifestEdit;
 import me.predatorray.candybox.lsm.manifest.ManifestState;
 import me.predatorray.candybox.lsm.manifest.MultipartUploadState;
 import me.predatorray.candybox.lsm.manifest.RenameIntent;
+import me.predatorray.candybox.lsm.manifest.RenameReceipt;
 import me.predatorray.candybox.lsm.memtable.Memtable;
 import me.predatorray.candybox.lsm.sstable.SSTableMeta;
 import me.predatorray.candybox.lsm.sstable.SSTableReader;
@@ -114,6 +121,13 @@ public final class BoxEngine implements AutoCloseable {
     // GC sees them; held for siblings' GC until then (heldSyrups). Guarded by the write lock, which
     // every Syrup write holds.
     private final Set<Long> unflushedSyrups = new LinkedHashSet<>();
+
+    // Destination commit decisions survive independently of mutable user keys. Guarded by lock.
+    // Reserve most of BookKeeper's default 5 MiB entry for the remaining checkpoint metadata.
+    // Admission happens before the destination WAL append, so ACK cleanup can always rotate it.
+    private static final int MAX_RENAME_RECEIPT_BYTES = 1 << 20;
+    private static final int MAX_RENAME_RECEIPTS = 1024;
+    private final Map<String, RenameReceipt> renameReceipts = new LinkedHashMap<>();
 
     // Lightweight operational counters (snapshotted via stats()).
     private final AtomicLong putCount = new AtomicLong();
@@ -187,6 +201,7 @@ public final class BoxEngine implements AutoCloseable {
             Set<Long> replayedSyrups = new LinkedHashSet<>();
             Hlc highWater = state.maxHlc();
             long priorWalId = state.walLedgerId();
+            Map<String, RenameReceipt> recoveredReceipts = new LinkedHashMap<>(state.renameReceipts());
             int replayedEntries = 0;
             if (priorWalId >= 0) {
                 // recover-open fences the prior WAL so a resurrected old owner cannot keep appending.
@@ -199,13 +214,21 @@ public final class BoxEngine implements AutoCloseable {
                 }
                 replayedEntries = replay.entries().size();
                 for (WalEntry e : replay.entries()) {
-                    if (e instanceof WalEntry.PointMutation pm) {
-                        memtable.put(pm.mutation());
-                        for (SegmentRef seg : pm.mutation().locator().segments()) {
-                            replayedSyrups.add(seg.syrupId());
-                        }
-                    } else if (e instanceof WalEntry.RangeDelete rd) {
+                    if (e instanceof WalEntry.RangeDelete rd) {
                         memtable.delete(rd.tombstone());
+                    } else {
+                        if (e instanceof WalEntry.RenamePut rename) {
+                            recoveredReceipts.put(rename.receipt().token(), rename.receipt());
+                        }
+                        List<Mutation> mutations = e instanceof WalEntry.PointMutation pm
+                                ? List.of(pm.mutation()) : e instanceof WalEntry.RenamePut rename
+                                ? List.of(rename.mutation()) : ((WalEntry.Batch) e).mutations();
+                        for (Mutation mutation : mutations) {
+                            memtable.put(mutation);
+                            for (SegmentRef seg : mutation.locator().segments()) {
+                                replayedSyrups.add(seg.syrupId());
+                            }
+                        }
                     }
                 }
                 if (replay.maxHlc().isAfter(highWater)) {
@@ -228,6 +251,7 @@ public final class BoxEngine implements AutoCloseable {
             newWal = WriteAheadLog.create(ledgerStore,
                     roleConfig(config, ledgerStore, box, LedgerRole.WAL));
             engine = new BoxEngine(box, config, ledgerStore, hlc, clock, manifest, newWal);
+            engine.renameReceipts.putAll(recoveredReceipts);
             engine.openReadersFor(state);
             // The prior manifest and WAL are superseded by this one: the rotation below leaves the
             // prior WAL unreachable, so a non-empty replay is flushed to L0 in the same edit, or the
@@ -241,13 +265,15 @@ public final class BoxEngine implements AutoCloseable {
             }
             if (memtable.isEmpty()) {
                 manifest.apply(ManifestEdit.builder().newWalLedgerId(newWal.ledgerId())
-                        .maxHlc(highWater).addedPendingDeletes(superseded).build());
+                        .maxHlc(highWater).addedPendingDeletes(superseded)
+                        .addedRenameReceipts(new ArrayList<>(recoveredReceipts.values())).build());
             } else {
                 L0Table table = engine.writeL0(memtable);
                 Set<Long> syrups = new LinkedHashSet<>(table.syrups());
                 syrups.addAll(replayedSyrups);
                 manifest.apply(ManifestEdit.flush(table.meta(), syrups, newWal.ledgerId(), highWater)
-                        .withAddedPendingDeletes(superseded));
+                        .withAddedPendingDeletes(superseded)
+                        .withRenameReceipts(new ArrayList<>(recoveredReceipts.values())));
                 engine.readers.put(table.meta().ledgerId(),
                         new SSTableReader(ledgerStore, table.meta().ledgerId()));
                 engine.flushCount.incrementAndGet();
@@ -295,6 +321,206 @@ public final class BoxEngine implements AutoCloseable {
     /** The id of the manifest ledger this owner writes to (used to hand off to the next owner). */
     public long manifestLedgerId() {
         return manifest.ledgerId();
+    }
+
+    // ---- managed namespaces (trusted callers must enforce managed Box isolation) -------------
+
+    private boolean namespaceUncertain;
+    private final AtomicLong namespaceRenewals = new AtomicLong();
+    private final AtomicLong namespaceRejectedClaims = new AtomicLong();
+    private final AtomicLong namespaceRetirements = new AtomicLong();
+    private final AtomicLong namespaceCleanupBatches = new AtomicLong();
+    private final AtomicLong namespaceCleanupItems = new AtomicLong();
+    private final AtomicLong namespaceFailures = new AtomicLong();
+
+    public record NamespaceResult(String outcome,
+            NamespaceState state,
+            byte[] data, List<String> keys, String cursor) {
+        public NamespaceResult(String outcome,
+                NamespaceState state) {
+            this(outcome, state, new byte[0], List.of(), null);
+        }
+    }
+
+    /** One owner-fenced operation; all data and lifecycle publication share this engine's lock. */
+    public NamespaceResult namespace(
+            NamespaceOperation operation,
+            String address, String key, byte[] data, long ttl, long expectedVersion,
+            int pageSize, String cursor, int maxReadBytes) {
+        var op = java.util.Objects.requireNonNull(operation);
+        if (pageSize < 1 || pageSize > 128) {
+            throw new ValidationException("Namespace page size must be 1..128");
+        }
+        String life = op == NamespaceOperation.ENUMERATE
+                ? null : NamespaceKeys.lifecycle(address);
+        String prefix = life == null ? "l/"
+                : NamespaceKeys.prefix(address);
+        CandyKey item = null;
+        if (op == NamespaceOperation.PUT
+                || op == NamespaceOperation.GET
+                || op == NamespaceOperation.DELETE) {
+            item = CandyKey.of(NamespaceKeys.item(address, key));
+            Validation.checkCandyKey(item, config.sizeLimits());
+        }
+        if (life != null) {
+            Validation.checkCandyKey(CandyKey.of(life), config.sizeLimits());
+        }
+        if (cursor != null && !cursor.startsWith(prefix)) {
+            throw new ValidationException("Cursor is outside namespace");
+        }
+        if (op == NamespaceOperation.CREATE
+                && (ttl < 1 || ttl > 365L * 24 * 60 * 60 * 1000)) {
+            throw new ValidationException("Namespace TTL must be 1ms..365 days");
+        }
+        if (op == NamespaceOperation.PUT) {
+            java.util.Objects.requireNonNull(data, "data");
+            Validation.checkCandySize(data.length, config.sizeLimits());
+        }
+        lock.writeLock().lock();
+        try {
+            if (namespaceUncertain) {
+                throw new IllegalStateException("Namespace outcome unknown; owner recovery required");
+            }
+            if (life == null) {
+                var page = listCandies(prefix, cursor, pageSize);
+                return new NamespaceResult("OK", null, new byte[0],
+                        page.entries().stream().map(e -> e.key().value()).toList(), page.nextStartAfter());
+            }
+            var existing = resolveLiveLocked(CandyKey.of(life));
+            var state = existing.map(l ->
+                    NamespaceState.from(l.userMetadata()))
+                    .orElse(null);
+            if (op == NamespaceOperation.CREATE) {
+                if (state != null) { return new NamespaceResult("EXISTS", state); }
+                long now = namespaceNow();
+                state = new NamespaceState(
+                        1, now, ttl, Math.addExact(now, ttl), false);
+                namespaceCommit(List.of(namespaceLifecycle(life, state)));
+                return new NamespaceResult("OK", state);
+            }
+            if (state == null) { return new NamespaceResult("MISSING", null); }
+            if (op == NamespaceOperation.CLAIM_EXPIRY) {
+                if (state.retired()) { return new NamespaceResult("RETIRED", state); }
+                if (state.version() != expectedVersion) {
+                    namespaceRejectedClaims.incrementAndGet();
+                    return new NamespaceResult("STALE", state);
+                }
+                if (namespaceNow() < state.expiresAtMillis()) { return new NamespaceResult("NOT_DUE", state); }
+                state = namespaceRetire(life, state);
+                return new NamespaceResult("RETIRED", state);
+            }
+            if (op == NamespaceOperation.CLEANUP) {
+                if (!state.retired()) { return new NamespaceResult("NOT_RETIRED", state); }
+                var result = namespaceDeletePage(prefix, null, pageSize, state);
+                namespaceCleanupBatches.incrementAndGet();
+                return result;
+            }
+            if (state.retired()) { return new NamespaceResult("EXPIRED", state); }
+            if (namespaceNow() >= state.expiresAtMillis()) {
+                state = namespaceRetire(life, state);
+                return new NamespaceResult("EXPIRED", state);
+            }
+            switch (op) {
+                case PUT -> {
+                    rejectIfStalled();
+                    SyrupWriteResult written = syrupManager.writeCandy(new ByteArrayInputStream(data));
+                    // Payload append may block past the deadline. Recheck before the commit decision.
+                    long now = namespaceNow();
+                    if (now >= state.expiresAtMillis()) {
+                        state = namespaceRetire(life, state);
+                        return new NamespaceResult("EXPIRED", state);
+                    }
+                    var renewed = new NamespaceState(
+                            Math.addExact(state.version(), 1), state.createdAtMillis(),
+                            state.idleTtlMillis(), Math.addExact(now, state.idleTtlMillis()), false);
+                    CandyLocator locator = CandyLocator.singlePart(hlc.tick(), written.contentLength(),
+                            config.sizeLimits().chunkSizeBytes(), null, Map.of(), written.crc32c(),
+                            now, written.segments(), ObjectAcl.NONE);
+                    namespaceCommit(List.of(new Mutation(item, locator), namespaceLifecycle(life, renewed)));
+                    namespaceRenewals.incrementAndGet();
+                    return new NamespaceResult("OK", renewed);
+                }
+                case GET -> {
+                    var locator = resolveLiveLocked(item);
+                    if (locator.isEmpty()) { return new NamespaceResult("ITEM_MISSING", state); }
+                    checkReadSize(locator.get().contentLength(), maxReadBytes);
+                    return new NamespaceResult("OK", state, getCandy(item), List.of(), null);
+                }
+                case DELETE -> {
+                    namespaceCommit(List.of(new Mutation(item,
+                            CandyLocator.tombstone(hlc.tick(), namespaceNow()))));
+                    return new NamespaceResult("OK", state);
+                }
+                case LIST -> {
+                    var page = listCandies(prefix, cursor, pageSize);
+                    return new NamespaceResult("OK", state, new byte[0],
+                            page.entries().stream().map(e ->
+                                    NamespaceKeys.decode(
+                                            e.key().value().substring(prefix.length()))).toList(),
+                            page.nextStartAfter());
+                }
+                case CLEAR -> { return namespaceDeletePage(prefix, cursor, pageSize, state); }
+                case HEAD -> { return new NamespaceResult("OK", state); }
+                default -> throw new ValidationException("Unsupported namespace action");
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    private long namespaceNow() {
+        return Math.max(0, Math.max(clock.currentTimeMillis(), hlc.peek().physicalMillis()));
+    }
+
+    private Mutation namespaceLifecycle(String key,
+            NamespaceState state) {
+        return new Mutation(CandyKey.of(key), new CandyLocator(hlc.tick(), LocatorType.PUT,
+                null, state.metadata(), namespaceNow(), List.of(), ObjectAcl.NONE));
+    }
+
+    private NamespaceState namespaceRetire(String life,
+            NamespaceState state) {
+        var retired = new NamespaceState(state.version(),
+                state.createdAtMillis(), state.idleTtlMillis(), state.expiresAtMillis(), true);
+        namespaceCommit(List.of(namespaceLifecycle(life, retired)));
+        namespaceRetirements.incrementAndGet();
+        return retired;
+    }
+
+    private NamespaceResult namespaceDeletePage(String prefix, String cursor, int pageSize,
+            NamespaceState state) {
+        int batchLimit = Math.max(1, (int) ((me.predatorray.candybox.lsm.wal.WalEntrySerializer.MAX_BATCH_BYTES - 1024L)
+                / ((long) config.sizeLimits().maxCandyKeyBytes() + 128)));
+        var page = listCandies(prefix, cursor, Math.min(pageSize, batchLimit));
+        List<Mutation> deletes = new ArrayList<>();
+        for (var entry : page.entries()) {
+            deletes.add(new Mutation(entry.key(), CandyLocator.tombstone(hlc.tick(), namespaceNow())));
+        }
+        if (!deletes.isEmpty()) {
+            namespaceCommit(deletes);
+            if (state.retired()) { namespaceCleanupItems.addAndGet(deletes.size()); }
+        }
+        return new NamespaceResult("OK", state, new byte[0], List.of(), page.nextStartAfter());
+    }
+
+    private void namespaceCommit(List<Mutation> mutations) {
+        rejectIfStalled();
+        // Serialize before append: deterministic bounds errors must not poison service.
+        for (Mutation mutation : mutations) {
+            me.predatorray.candybox.common.serial.CandyLocatorSerializer.serialize(
+                    mutation.locator(), config.sizeLimits().maxLocatorBytes());
+        }
+        var batch = WalEntry.batch(mutations);
+        me.predatorray.candybox.lsm.wal.WalEntrySerializer.serialize(batch);
+        try {
+            wal.append(batch);
+            for (Mutation mutation : mutations) { active.put(mutation); }
+            maybeFlushLocked();
+        } catch (RuntimeException | Error failure) {
+            namespaceUncertain = true;
+            namespaceFailures.incrementAndGet();
+            throw failure;
+        }
     }
 
     // ---- writes ----------------------------------------------------------------------------
@@ -462,6 +688,21 @@ public final class BoxEngine implements AutoCloseable {
      */
     public PartUploadResult uploadPartCopy(String uploadId, int partNumber, CandyKey src,
                                            long firstByte, long lastByte) {
+        return uploadPartCopy(uploadId, partNumber, src, firstByte, lastByte, acl -> { });
+    }
+
+    /** Checks the resolved source ACL before reading bytes or updating the upload. */
+    public PartUploadResult uploadPartCopy(String uploadId, int partNumber, CandyKey src,
+                                           long firstByte, long lastByte,
+                                           Consumer<ObjectAcl> authorizeSource) {
+        return uploadPartCopy(uploadId, partNumber, src, firstByte, lastByte, 0, authorizeSource);
+    }
+
+    /** Checks source size against the same locator used to copy, before resolving the byte range. */
+    public PartUploadResult uploadPartCopy(String uploadId, int partNumber, CandyKey src,
+                                           long firstByte, long lastByte, long minSourceBytesExclusive,
+                                           Consumer<ObjectAcl> authorizeSource) {
+        checkSourceSizeConstraint(minSourceBytesExclusive);
         Validation.checkCandyKey(src, config.sizeLimits());
         if (uploadId == null || uploadId.isEmpty()) {
             throw new ValidationException("uploadId is required");
@@ -479,7 +720,9 @@ public final class BoxEngine implements AutoCloseable {
             }
             CandyLocator source = resolveLiveLocked(src)
                     .orElseThrow(() -> new CandyNotFoundException(box.value(), src.value()));
+            authorizeSource.accept(source.acl());
             long total = source.contentLength();
+            checkSourceSize(total, minSourceBytesExclusive);
             long resolvedFirst = firstByte < 0 ? 0 : firstByte;
             long resolvedLast = lastByte < 0 ? total - 1 : Math.min(lastByte, total - 1);
             if (total == 0 || resolvedFirst >= total || resolvedLast < resolvedFirst) {
@@ -712,24 +955,38 @@ public final class BoxEngine implements AutoCloseable {
      */
     public CandyMetadata copyCandy(CandyKey src, CandyKey dst, String idempotencyToken,
                                    ObjectAcl dstAcl) {
-        return copyOrRename(src, dst, idempotencyToken, false, dstAcl);
+        return copyCandy(src, dst, idempotencyToken, dstAcl, acl -> { });
+    }
+
+    /** Checks the resolved source ACL under the write lock, before copying that version. */
+    public CandyMetadata copyCandy(CandyKey src, CandyKey dst, String idempotencyToken,
+                                   ObjectAcl dstAcl, Consumer<ObjectAcl> authorizeSource) {
+        return copyOrRename(src, dst, idempotencyToken, false, dstAcl, authorizeSource);
     }
 
     /**
      * Server-side, zero-copy rename/move: like {@link #copyCandy} but also writes a DELETE tombstone at
-     * {@code src}, atomically (the single owner serializes both into the WAL and memtable under one
-     * write lock). The Candy's bytes never move; only locator pointers are rewritten. Same-Box only.
+     * {@code src}, atomically (one WAL batch is durable before either memtable mutation is applied
+     * under the write lock). The Candy's bytes never move; only locator pointers are rewritten.
+     * Same-Box only.
      *
      * @throws CandyNotFoundException if there is no live Candy at {@code src}
      */
     public CandyMetadata renameCandy(CandyKey src, CandyKey dst, String idempotencyToken) {
+        return renameCandy(src, dst, idempotencyToken, acl -> { });
+    }
+
+    /** Checks the resolved source ACL under the write lock, before moving that version. */
+    public CandyMetadata renameCandy(CandyKey src, CandyKey dst, String idempotencyToken,
+                                     Consumer<ObjectAcl> authorizeSource) {
         // A rename is a move: the object keeps its identity, so owner + grants travel with it.
-        return copyOrRename(src, dst, idempotencyToken, true, null);
+        return copyOrRename(src, dst, idempotencyToken, true, null, authorizeSource);
     }
 
     /** {@code dstAcl == null} ⇒ keep the source's owner/grants (rename); else stamp it (copy). */
     private CandyMetadata copyOrRename(CandyKey src, CandyKey dst, String idempotencyToken,
-                                       boolean tombstoneSource, ObjectAcl dstAcl) {
+                                       boolean tombstoneSource, ObjectAcl dstAcl,
+                                       Consumer<ObjectAcl> authorizeSource) {
         Validation.checkCandyKey(src, config.sizeLimits());
         Validation.checkCandyKey(dst, config.sizeLimits());
         if (src.equals(dst)) {
@@ -748,6 +1005,7 @@ public final class BoxEngine implements AutoCloseable {
             rejectIfStalled();
             CandyLocator source = resolveLiveLocked(src)
                     .orElseThrow(() -> new CandyNotFoundException(box.value(), src.value()));
+            authorizeSource.accept(source.acl());
 
             // The destination locator reuses the source's parts verbatim — zero copy of the bytes
             // *and* zero rebuild of the part list, so a multipart source becomes a multipart-shaped
@@ -757,15 +1015,20 @@ public final class BoxEngine implements AutoCloseable {
                     source.userMetadata(), clock.currentTimeMillis(), source.parts(),
                     dstAcl == null ? source.acl() : dstAcl);
             Mutation dstMutation = new Mutation(dst, dstLocator);
-            wal.append(dstMutation);
+            // Reject oversized locators and serialize the complete batch before any append.
+            me.predatorray.candybox.common.serial.CandyLocatorSerializer.serialize(dstLocator,
+                    config.sizeLimits().maxLocatorBytes());
 
             Mutation tombstone = null;
             if (tombstoneSource) {
                 tombstone = new Mutation(src,
                         CandyLocator.tombstone(hlc.tick(), clock.currentTimeMillis()));
-                wal.append(tombstone);
+                wal.append(WalEntry.batch(List.of(dstMutation, tombstone)));
+            } else {
+                wal.append(dstMutation);
             }
-            // Apply to the memtable only after both are durable in the WAL (atomic to readers).
+            // Apply only after the whole record is durable. Ambiguous failures are recovered;
+            // never compensate by deleting dst, since the batch may already be committed.
             active.put(dstMutation);
             if (tombstone != null) {
                 active.put(tombstone);
@@ -799,6 +1062,38 @@ public final class BoxEngine implements AutoCloseable {
                 .orElseThrow(() -> new CandyNotFoundException(box.value(), key.value()));
     }
 
+    /** Pending destination decisions to publish or clean after source acknowledgement. */
+    public List<RenameReceipt> listRenameReceipts() {
+        lock.readLock().lock();
+        try { return List.copyOf(renameReceipts.values()); }
+        finally { lock.readLock().unlock(); }
+    }
+
+    /** Forget an acknowledged receipt without allowing its old WAL entry to resurrect it. */
+    public void clearRenameReceipt(String token) {
+        lock.writeLock().lock();
+        try {
+            // Rotate away the commit record before recording its removal: replay must not resurrect it.
+            flushLocked();
+            manifest.apply(ManifestEdit.builder().removedRenameReceipts(Set.of(token)).build());
+            renameReceipts.remove(token);
+        } finally { lock.writeLock().unlock(); }
+    }
+
+    /** Commit the destination PUT and its recovery receipt in one ledger entry. */
+    public CandyMetadata zeroCopyRename(CandyKey dst, CandyLocator source, String token,
+            String incarnation, String relayToken, int srcPartition, String srcKey) {
+        return zeroCopyRename(dst, source, token, incarnation, relayToken, srcPartition, srcKey, () -> { });
+    }
+
+    /** Revalidate the transfer under the engine lock before a new commit; retries of a receipt reuse it. */
+    public CandyMetadata zeroCopyRename(CandyKey dst, CandyLocator source, String token,
+            String incarnation, String relayToken, int srcPartition, String srcKey, Runnable beforeCommit) {
+        return zeroCopyPut(dst, source.parts(), source.contentType(), source.userMetadata(), 0,
+                source.acl(), null, result -> new RenameReceipt(token, incarnation, relayToken,
+                        srcPartition, srcKey, source.hlc(), dst.value(), result), token, beforeCommit);
+    }
+
     /**
      * Writes a fresh PUT at {@code dst} that reuses {@code parts} verbatim — the zero-copy trick, but
      * across partitions: the {@code parts} were resolved from a source Candy in <em>another</em>
@@ -810,6 +1105,14 @@ public final class BoxEngine implements AutoCloseable {
     public CandyMetadata zeroCopyPut(CandyKey dst, List<Part> parts, String contentType,
                                      Map<String, String> userMetadata, long createdAtMillis,
                                      ObjectAcl acl, String idempotencyToken) {
+        return zeroCopyPut(dst, parts, contentType, userMetadata, createdAtMillis, acl,
+                idempotencyToken, null, null, () -> { });
+    }
+
+    private CandyMetadata zeroCopyPut(CandyKey dst, List<Part> parts, String contentType,
+            Map<String, String> userMetadata, long createdAtMillis, ObjectAcl acl,
+            String idempotencyToken, java.util.function.Function<CandyLocator, RenameReceipt> receiptFactory,
+            String renameToken, Runnable beforeCommit) {
         Validation.checkCandyKey(dst, config.sizeLimits());
         Map<String, String> metadata = userMetadata == null ? Map.of() : Map.copyOf(userMetadata);
         CandyMetadata cached = idempotentResult(idempotencyToken);
@@ -818,17 +1121,36 @@ public final class BoxEngine implements AutoCloseable {
         }
         lock.writeLock().lock();
         try {
+            RenameReceipt prior = renameReceipts.get(renameToken);
+            if (prior != null) {
+                if (!prior.sameTransfer(receiptFactory.apply(prior.result()))) {
+                    throw new ValidationException("Rename token belongs to a different transfer");
+                }
+                return CandyMetadata.from(prior.result());
+            }
             CandyMetadata replay = idempotentResult(idempotencyToken);
             if (replay != null) {
                 return replay;
             }
             rejectIfStalled();
+            beforeCommit.run();
             Hlc stamp = hlc.tick();
             CandyLocator dstLocator = new CandyLocator(stamp, LocatorType.PUT, contentType, metadata,
                     createdAtMillis > 0 ? createdAtMillis : clock.currentTimeMillis(),
                     List.copyOf(parts), acl == null ? ObjectAcl.NONE : acl);
             Mutation mutation = new Mutation(dst, dstLocator);
-            wal.append(mutation);
+            RenameReceipt receipt = receiptFactory == null ? null : receiptFactory.apply(dstLocator);
+            if (receipt != null) {
+                long bytes = receipt.serialize().length + 5L;
+                for (RenameReceipt retained : renameReceipts.values()) { bytes += retained.serialize().length + 5L; }
+                if (renameReceipts.size() >= MAX_RENAME_RECEIPTS || bytes > MAX_RENAME_RECEIPT_BYTES) {
+                    throw new BusyException("Unacknowledged rename receipt budget exhausted");
+                }
+            }
+            ledgerStore.retainLedgers(dstLocator.segments().stream()
+                    .map(SegmentRef::syrupId).toList());
+            wal.append(receipt == null ? WalEntry.of(mutation) : new WalEntry.RenamePut(mutation, receipt));
+            if (receipt != null) { renameReceipts.put(receipt.token(), receipt); }
             active.put(mutation);
             // The parts may point at a Syrup this partition already counts as a pending orphan. Clear it
             // here so its grace period restarts: the next recompute may only run once this reference is
@@ -1043,8 +1365,14 @@ public final class BoxEngine implements AutoCloseable {
 
     /** Returns metadata for a live Candy, or throws {@link CandyNotFoundException}. */
     public CandyMetadata headCandy(CandyKey key) {
+        return headCandy(key, acl -> { });
+    }
+
+    /** Checks the ACL of the same resolved version whose metadata is returned. */
+    public CandyMetadata headCandy(CandyKey key, Consumer<ObjectAcl> authorizeSource) {
         CandyLocator locator = resolveLive(key)
                 .orElseThrow(() -> new CandyNotFoundException(box.value(), key.value()));
+        authorizeSource.accept(locator.acl());
         headCount.incrementAndGet();
         return CandyMetadata.from(locator);
     }
@@ -1067,8 +1395,15 @@ public final class BoxEngine implements AutoCloseable {
      * @throws LimitExceededException if the Candy is longer than {@code maxBytes}
      */
     public CandyMetadata getCandy(CandyKey key, OutputStream out, long maxBytes) {
+        return getCandy(key, out, maxBytes, acl -> { });
+    }
+
+    /** Checks the resolved version's ACL before reading any of its bytes. */
+    public CandyMetadata getCandy(CandyKey key, OutputStream out, long maxBytes,
+                                   Consumer<ObjectAcl> authorizeSource) {
         CandyLocator locator = resolveLive(key)
                 .orElseThrow(() -> new CandyNotFoundException(box.value(), key.value()));
+        authorizeSource.accept(locator.acl());
         checkReadSize(locator.contentLength(), maxBytes);
         syrupReader.readParts(locator.parts(), out);
         getCount.incrementAndGet();
@@ -1111,9 +1446,26 @@ public final class BoxEngine implements AutoCloseable {
      */
     public RangeReadResult getCandyRange(CandyKey key, long firstByte, long lastByte,
                                          OutputStream out, long maxBytes) {
+        return getCandyRange(key, firstByte, lastByte, out, maxBytes, acl -> { });
+    }
+
+    /** Checks the resolved version's ACL before returning range information or reading bytes. */
+    public RangeReadResult getCandyRange(CandyKey key, long firstByte, long lastByte,
+                                         OutputStream out, long maxBytes,
+                                         Consumer<ObjectAcl> authorizeSource) {
+        return getCandyRange(key, firstByte, lastByte, out, maxBytes, 0, authorizeSource);
+    }
+
+    /** Checks source size against the resolved locator before range validation or reading bytes. */
+    public RangeReadResult getCandyRange(CandyKey key, long firstByte, long lastByte,
+                                         OutputStream out, long maxBytes, long minSourceBytesExclusive,
+                                         Consumer<ObjectAcl> authorizeSource) {
+        checkSourceSizeConstraint(minSourceBytesExclusive);
         CandyLocator locator = resolveLive(key)
                 .orElseThrow(() -> new CandyNotFoundException(box.value(), key.value()));
+        authorizeSource.accept(locator.acl());
         long total = locator.contentLength();
+        checkSourceSize(total, minSourceBytesExclusive);
         long resolvedFirst;
         long resolvedLast;
         if (firstByte < 0 && lastByte < 0) {
@@ -1151,6 +1503,18 @@ public final class BoxEngine implements AutoCloseable {
         syrupReader.readRange(locator.parts(), resolvedFirst, resolvedLast, out);
         getCount.incrementAndGet();
         return new RangeReadResult(resolvedFirst, resolvedLast, total, CandyMetadata.from(locator));
+    }
+
+    private static void checkSourceSizeConstraint(long minSourceBytesExclusive) {
+        if (minSourceBytesExclusive < 0) {
+            throw new ValidationException("Minimum source size must be nonnegative");
+        }
+    }
+
+    private static void checkSourceSize(long total, long minSourceBytesExclusive) {
+        if (minSourceBytesExclusive > 0 && total <= minSourceBytesExclusive) {
+            throw new SourceTooSmallException(total, minSourceBytesExclusive);
+        }
     }
 
     private static void checkReadSize(long length, long maxBytes) {
@@ -1443,6 +1807,26 @@ public final class BoxEngine implements AutoCloseable {
         }
     }
 
+    /** All recovery roots, including allocations not yet flushed and durable pending deletes. */
+    public Set<Long> retainedLedgers() {
+        lock.readLock().lock();
+        try {
+            ManifestState state = manifest.current();
+            Set<Long> retained = referencedSyrupsLocked();
+            retained.addAll(unflushedSyrups);
+            retained.addAll(state.liveSyrups());
+            retained.addAll(state.pendingDeletes().keySet());
+            state.tables().forEach(table -> retained.add(table.ledgerId()));
+            retained.add(state.walLedgerId());
+            retained.add(wal.ledgerId());
+            retained.add(manifest.ledgerId());
+            retained.remove(-1L);
+            return retained;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
     /** A consistent snapshot of the current LSM state (for compaction picking / inspection). */
     public ManifestState manifestState() {
         return manifest.current();
@@ -1451,7 +1835,9 @@ public final class BoxEngine implements AutoCloseable {
     /** A snapshot of this engine's cumulative operational counters. */
     public BoxEngineStats stats() {
         return new BoxEngineStats(putCount.get(), deleteCount.get(), getCount.get(), headCount.get(),
-                listCount.get(), flushCount.get(), compactionCount.get(), stallRejectionCount.get());
+                listCount.get(), flushCount.get(), compactionCount.get(), stallRejectionCount.get(),
+                namespaceRenewals.get(), namespaceRejectedClaims.get(), namespaceRetirements.get(),
+                namespaceCleanupBatches.get(), namespaceCleanupItems.get(), namespaceFailures.get());
     }
 
     @Override
@@ -1671,7 +2057,8 @@ public final class BoxEngine implements AutoCloseable {
         // manifest then points at the new WAL, so it is no longer a recovery source.
         long now = clock.currentTimeMillis();
         manifest.apply(ManifestEdit.flush(table.meta(), table.syrups(), newWal.ledgerId(),
-                table.maxHlc()).withAddedPendingDeletes(Map.of(wal.ledgerId(), now)));
+                table.maxHlc()).withAddedPendingDeletes(Map.of(wal.ledgerId(), now))
+                .withRenameReceipts(new ArrayList<>(renameReceipts.values())));
         unflushedSyrups.clear();
         wal.close();
         wal = newWal;
@@ -1730,6 +2117,7 @@ public final class BoxEngine implements AutoCloseable {
         Map<String, byte[]> metadata = new LinkedHashMap<>();
         metadata.put("candybox-role", role.name().getBytes(java.nio.charset.StandardCharsets.UTF_8));
         metadata.put("candybox-box", box.value().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        metadata.putAll(store.allocationMetadata());
         return new LedgerConfig(config.quorum(role), metadata);
     }
 }

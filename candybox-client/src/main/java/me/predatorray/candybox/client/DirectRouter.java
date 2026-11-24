@@ -15,24 +15,26 @@
  */
 package me.predatorray.candybox.client;
 
-import me.predatorray.candybox.protocol.Frame;
 import me.predatorray.candybox.protocol.Message;
 import me.predatorray.candybox.protocol.MessageCodec;
-import me.predatorray.candybox.protocol.transport.Connection;
 import me.predatorray.candybox.protocol.transport.Transport;
 
 /**
- * A {@link Router} that talks to a single fixed node over one connection, ignoring Box ownership. Used
+ * A {@link Router} that talks to a single fixed node over a bounded connection pool, ignoring Box ownership. Used
  * for single-node deployments and tests; a {@code MOVED} response is passed straight through (the
  * {@link CandyboxClient} surfaces it as a {@code NotOwnerException} rather than re-routing).
  */
 final class DirectRouter implements Router {
 
-    private final Connection connection;
+    private final RpcResources resources;
+    private final String host;
+    private final int port;
     private final MessageCodec codec = new MessageCodec();
 
     DirectRouter(Transport transport, String host, int port) {
-        this.connection = transport.connect(host, port);
+        this.resources = new RpcResources(transport, 4, 64, 5_000, 120_000);
+        this.host = host;
+        this.port = port;
     }
 
     @Override
@@ -46,12 +48,18 @@ final class DirectRouter implements Router {
     }
 
     private Message send(Message request) {
-        Frame response = connection.call(codec.encode(request));
-        return codec.decode(response);
+        return resources.call(() -> {
+            try {
+                return resources.send(host, port,
+                        connection -> codec.decode(connection.call(codec.encode(request))));
+            } catch (RpcResources.SetupFailure e) {
+                throw e.failure();
+            }
+        });
     }
 
     @Override
     public void close() {
-        connection.close();
+        resources.close();
     }
 }

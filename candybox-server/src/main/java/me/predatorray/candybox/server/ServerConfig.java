@@ -312,6 +312,7 @@ public final class ServerConfig {
             applyLong("max.clock.skew.millis", b::maxClockSkewMillis);
             applyLong("tombstone.gc.grace.millis", b::tombstoneGcGraceMillis);
             applyLong("ledger.gc.grace.millis", b::ledgerGcGraceMillis);
+            applyLong("ledger.enumeration.grace.millis", b::ledgerEnumerationGraceMillis);
             applyInt("bloom.bits.per.key", b::bloomBitsPerKey);
             applyInt("max.frame.size.bytes", b::maxFrameSizeBytes);
             applyInt("l0.compaction.trigger", b::l0CompactionTrigger);

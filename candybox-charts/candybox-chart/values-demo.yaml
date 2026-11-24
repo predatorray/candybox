@@ -1,0 +1,31 @@
+# Disposable, anonymous demo. No replica redundancy and no durable volumes.
+node:
+  replicas: 1
+  heapOpts: "-Xms128m -Xmx256m"
+  resources:
+    requests: {cpu: 100m, memory: 384Mi}
+    limits: {memory: 768Mi}
+  quorums:
+    wal: "1/1/1"
+    manifest: "1/1/1"
+    sstable: "1/1/1"
+    syrup: "1/1/1"
+  pdb: {enabled: false}
+gateway:
+  replicas: 1
+  pdb: {enabled: false}
+bookkeeper:
+  replicas: 1
+  heapOpts: "-Xms128m -Xmx256m -XX:MaxDirectMemorySize=256m"
+  resources:
+    requests: {cpu: 100m, memory: 512Mi}
+    limits: {memory: 1Gi}
+  persistence: {enabled: false}
+  pdb: {enabled: false}
+  autoRecovery: {enabled: false}
+zookeeper:
+  replicaCount: 1
+  zookeeperConfig:
+    standaloneEnabled: "true"
+  persistence: {enabled: false}
+  podDisruptionBudget: {enabled: false}

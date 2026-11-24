@@ -1,181 +1,170 @@
 # S3 compatibility tests (ceph/s3-tests)
 
-This harness runs the de-facto industry-standard S3 compatibility suite,
-[`ceph/s3-tests`](https://github.com/ceph/s3-tests), against the Candybox S3 gateway
-(`candybox-s3-gateway`). It is the same suite used to validate Ceph RGW, Garage, SeaweedFS and
-most other S3 clones, so a passing allowlist is a meaningful, externally-recognised statement of
-"S3-compatible — for this subset."
+This harness runs [`ceph/s3-tests`](https://github.com/ceph/s3-tests) against the
+Candybox S3 gateway (`candybox-s3-gateway`). The checked-in allowlist defines a
+regression-tested subset of S3 behavior, not full AWS S3 compatibility.
 
-The suite itself is **not** vendored. `run.sh` clones it on demand, pins it to a git ref, builds a
-throwaway virtualenv, and points it at a gateway endpoint. Everything it generates lives under
-`.work/` (git-ignored).
+The suite is **not** vendored. `run.sh` clones it on demand, checks out
+`S3TESTS_REF`, and creates a reusable virtualenv under `.work/` (git-ignored).
+Rendered configuration and calibration output also live there. Calibration
+rewrites the tracked `allowlist.txt` and `badge.json` beside this README.
 
-## What can pass
+## Supported scope
 
-The suite calibrates the gateway with **SigV4 auth + S3 ACL enforcement enabled** (Phase D/E) — the
-`docker-compose.ci.yml` stack signs every request as the `s3tests` accounts (see
-`gateway-credentials.properties` / `s3tests.conf.in`), so the multi-user, ACL, and cross-account
-access tests are reachable. The gateway is **path-style only** and implements a deliberately small
-slice of S3:
+The [CI Compose stack](docker-compose.ci.yml) enables **SigV4 authentication and
+S3 ACL enforcement**, using the accounts in
+[gateway-credentials.properties](gateway-credentials.properties) and
+[s3tests.conf.in](s3tests.conf.in). Tests include signed and anonymous requests;
+ACLs determine which anonymous and cross-account operations are allowed.
+The gateway supports path-style addressing only.
 
-| Supported (allowlist candidates)        | Not supported in v1 (excluded)                          |
-|------------------------------------------|---------------------------------------------------------|
-| Bucket create / head / delete            | Versioning                                              |
-| ListObjectsV2: prefix, delimiter,        | Bucket policy / public-access block                     |
-| max-keys, continuation-token, start-after| Conditional GET (If-Match / If-None-Match / If-*-Since) |
-| Object PUT / GET / HEAD / DELETE         | Tagging, lifecycle, CORS, SSE                           |
-| Multi-object delete                      | POST object (browser-style form upload)                 |
-| Range GET (Phase 5)                      | Object Lock / retention / legal hold (3 trivial passes) |
-| Multipart upload — create / parts / complete / abort / list (Phase 5) | `UploadPartCopy` / multipart-copy        |
-| `x-amz-meta-*` user metadata, CRC32C ETag| Object attributes / checksums (SHA-256, CRC*)           |
-| **SigV4 auth + canned/grant ACLs, multi-user isolation, cross-account access** | Lifecycle / inventory / replication |
+| Implemented scope (individual edge cases may still fail) | Unsupported scope |
+|---|---|
+| Bucket create / head / delete, ownership-scoped ListBuckets | Object versioning |
+| ListObjects v1/v2 with prefix, delimiter, pagination and start-after (v2) | Bucket policy / public-access block |
+| Object PUT / GET / HEAD / DELETE, multi-object delete | Conditional GET (`If-Match`, `If-None-Match`, `If-*-Since`) |
+| Single-range GET, including open-ended and suffix ranges | Lifecycle, CORS, server-side encryption |
+| Multipart create / upload part / complete / abort / list uploads / list parts | POST object (browser form upload) |
+| Same-bucket CopyObject and UploadPartCopy (including source ranges) | Cross-bucket CopyObject / UploadPartCopy |
+| `x-amz-meta-*` user metadata, CRC32C-based ETags | Full object attributes / checksum APIs, MD5-based ETags |
+| SigV4 header/presigned authentication, canned/grant ACLs and cross-account access | Object Lock / retention / legal hold, inventory / replication |
 
-> **ListBuckets is ownership-scoped.** `ListAllMyBuckets` returns only the buckets a principal owns,
-> never buckets merely granted READ — without that, a `public-read` bucket from one account leaks
-> into every account's listing and the suite's cross-account teardown cascades into errors. Earlier
-> auth-enabled calibration attempts hit exactly this; the fix (gateway `S3AccessControl.owns`) is
-> what makes a clean 0-error auth-mode run possible.
+Same-bucket UploadPartCopy buffers and rewrites bytes; it does not have the
+zero-copy guarantee of CopyObject. The gateway also verifies CRC32/CRC32C
+trailers for supported AWS chunked payloads; this is not full S3 checksum API
+support. Some unsupported subresources have compatibility stubs, so an isolated
+passing test (for example, tagging or Object Lock) does not establish feature support.
+
+**ListBuckets is ownership-scoped when ACL enforcement is enabled:** it returns
+only buckets the caller owns, not buckets merely granted READ.
 
 ## Running
 
-The gateway needs a live cluster behind it. Two ways to stand one up:
+Use a disposable cluster: the suite creates and deletes buckets and objects.
+The runner host needs `python3` with `venv`, `git`, and network access to fetch
+the suite and install its requirements. CI uses Python 3.12. The local example
+also needs Docker Compose and the AWS CLI for the signed readiness probe.
 
-| Stack | Brings up | When |
-|-------|-----------|------|
-| `docker-compose.yml` (repo root) | ZK + 3 bookies + **3** nodes + gateway, from the **published** `zetaplusae/candybox` image | quick demo against a release image |
-| `compat/s3-tests/docker-compose.ci.yml` | ZK + 3 bookies + **1** node + gateway, **built from your local source** | the gate, and the recommended path on a laptop |
+| Stack | Brings up | Use |
+|---|---|---|
+| [`docker-compose.yml`](../../docker-compose.yml) | ZooKeeper, 3 bookies, 3 nodes, gateway and admin API/dashboard from `zetaplusae/candybox:latest` | Demo stack; S3 auth is disabled by default, so it does not reproduce the authenticated gate |
+| [`docker-compose.ci.yml`](docker-compose.ci.yml) | ZooKeeper, 3 bookies, 1 node and an authenticated gateway built from local source | Compatibility gate and recommended local setup |
 
-On an Apple-Silicon laptop, prefer the **CI compose**: building from source produces a native
-arm64 candybox image (the published one is amd64-only and runs emulated), so only the upstream
-BookKeeper image emulates. Both expose the gateway on `:9711`.
+Both expose S3 on port 9711, so run only one at a time. The image publishing
+workflow now builds both `linux/amd64` and `linux/arm64`; published Candybox images
+are no longer described as amd64-only. The CI stack builds Candybox for the local
+architecture; upstream images may still need emulation on an arm64 host.
+
+Run these commands from the repository root in Bash:
 
 ```bash
-# From the repo root. Build the candybox image from source, then start the slimmed stack.
+# Build from the checkout and start the stack. Avoid --wait: bk-init is a one-shot job.
 docker compose -f compat/s3-tests/docker-compose.ci.yml build
 docker compose -f compat/s3-tests/docker-compose.ci.yml up -d
 
-# Wait until the gateway actually serves (PUT a throwaway bucket until it answers 200).
-until [ "$(curl -s -o /dev/null -w '%{http_code}' -X PUT localhost:9711/preflight)" = "200" ]; do sleep 3; done
-curl -s -o /dev/null -X DELETE localhost:9711/preflight
+# Probe the full gateway -> node -> bookies path using the configured test account.
+# An unsigned bucket PUT returns 403 with auth enabled; waiting for 200 would never finish.
+(
+  export AWS_ACCESS_KEY_ID=candybox AWS_SECRET_ACCESS_KEY=candybox
+  export AWS_DEFAULT_REGION=us-east-1 AWS_PAGER=""
+  unset AWS_SESSION_TOKEN AWS_SECURITY_TOKEN
+  bucket="compat-preflight-$(date +%s)-$$"
+  for attempt in {1..60}; do
+    if aws --endpoint-url http://127.0.0.1:9711 s3api create-bucket \
+        --bucket "$bucket" >/dev/null 2>&1; then
+      aws --endpoint-url http://127.0.0.1:9711 s3api delete-bucket --bucket "$bucket"
+      exit $?
+    fi
+    sleep 5
+  done
+  echo "Gateway did not become ready; inspect docker compose logs." >&2
+  exit 1
+) && compat/s3-tests/run.sh
 
-# First run: discover exactly what passes and record it as the allowlist.
-compat/s3-tests/run.sh --calibrate
-
-# Thereafter: regression-gate against the calibrated allowlist (non-zero exit on any failure).
-compat/s3-tests/run.sh
-
-# Tear down (–v also wipes the data volumes).
+# Tear down (-v also removes any attached non-external volumes).
 docker compose -f compat/s3-tests/docker-compose.ci.yml down -v
 ```
 
+The checked-in allowlist is already calibrated: a normal first run should run
+the gate, not overwrite it. To investigate the full suite or deliberately
+refresh the contract, use the modes below.
+
 ### Modes
 
-| Command                         | What it does                                                              |
-|---------------------------------|---------------------------------------------------------------------------|
-| `run.sh`                        | Runs only `allowlist.txt` — the compatibility gate.                       |
-| `run.sh --all`                  | Runs the full boto3 functional suite and reports (expect many failures).  |
-| `run.sh --calibrate`            | Runs `--all`, then rewrites `allowlist.txt` with the tests that PASSED, stamping the suite commit + endpoint. |
-| `run.sh -k test_bucket_list_empty` | Passes `-k EXPR` straight through to pytest for poking at one test.    |
+| Command | Behavior |
+|---|---|
+| `compat/s3-tests/run.sh` | Runs `allowlist.txt`; a pytest failure produces a non-zero exit. |
+| `compat/s3-tests/run.sh --all` | Runs `TEST_PATH` in report-only mode; pytest failures do not make the runner fail. |
+| `compat/s3-tests/run.sh --calibrate` | Runs `TEST_PATH`, records passing node IDs in `allowlist.txt`, and writes `badge.json`; pytest failures are tolerated. |
+| `compat/s3-tests/run.sh -k test_bucket_list_empty` | Filters the allowlist with pytest `-k`. |
+| `compat/s3-tests/run.sh --all -k test_bucket_list_empty` | Filters the full suite, including tests outside the allowlist. |
 
 ### Environment overrides
 
-| Var           | Default                                       | Purpose                                  |
-|---------------|-----------------------------------------------|------------------------------------------|
-| `S3_ENDPOINT` | `http://127.0.0.1:9711`                       | Gateway base URL. Use an **IP** host, not `localhost`, so boto3 stays path-style. |
-| `S3TESTS_REF` | `master`                                      | `ceph/s3-tests` ref to pin. Calibration records the resolved SHA in the allowlist header. |
-| `S3TESTS_REPO`| `https://github.com/ceph/s3-tests.git`        | Clone URL.                               |
-| `TEST_PATH`   | `s3tests/functional/test_s3.py`         | Suite path to run.                       |
-| `PYTEST_ARGS` | _(empty)_                                     | Extra args appended to pytest.           |
+| Variable | Default | Purpose |
+|---|---|---|
+| `S3_ENDPOINT` | `http://127.0.0.1:9711` | Use `http://<IPv4>:<port>` for path-style requests. `localhost` is rewritten to `127.0.0.1`. The template sets `is_secure = False`; an HTTPS URL does not enable TLS. |
+| `S3TESTS_REF` | `master` | Suite ref to check out. Set an explicit commit for a repeatable suite revision; the runner does not read the pin from the allowlist. |
+| `S3TESTS_REPO` | `https://github.com/ceph/s3-tests.git` | Clone URL used when `.work/s3-tests` does not exist. |
+| `TEST_PATH` | `s3tests/functional/test_s3.py` | Suite path for `--all` / `--calibrate`; the gate uses node IDs from the allowlist. |
+| `PYTEST_ARGS` | _(empty)_ | Extra whitespace-separated pytest arguments. |
+
+The virtualenv is reused across runs. If a suite revision changes dependencies,
+remove `.work/venv` to force dependency installation on the next run.
 
 ## The allowlist as a contract
 
-`allowlist.txt` is the checked-in, authoritative pass set — the same "shared external suite defines
-the bar" philosophy as the project's `LedgerStoreContract` / `CoordinationServiceContract`. The
-seed shipped here is **provisional** (marked as such in the file) until a `--calibrate` run pins it
-to a real suite revision. When the gateway gains a feature (e.g. multipart in a later phase),
-re-calibrate and the allowlist grows on its own.
+[allowlist.txt](allowlist.txt) is the authoritative expected pass set. It is
+**calibrated**, not a provisional seed. Do not shrink it to hide regressions.
+Before accepting a calibration, inspect `.work/calibrate.out` for collection,
+fixture and teardown errors, and review every removed test against the previous
+allowlist. Do not use `-k` or other test-selection filters when producing a full
+calibration: the runner would replace the contract with only the selected passes.
 
-Requirements on the runner host: `python3` (with `venv`), `git`, and network access to clone the
-suite and pip-install boto3/pytest the first time.
+To use the suite revision recorded by the current artifact:
 
-## Latest calibration
+```bash
+S3TESTS_REF=5522d1c compat/s3-tests/run.sh
+# Deliberate recalibration after reviewing code/suite changes:
+S3TESTS_REF=5522d1c compat/s3-tests/run.sh --calibrate
+git diff -- compat/s3-tests/allowlist.txt compat/s3-tests/badge.json
+```
 
-Last calibrated against ceph/s3-tests `master` @ `5522d1c` on **2026-06-17**, against the gateway with
-**SigV4 auth + S3 ACLs enabled** over a single-node, single-bookie in-JVM stack (full suite path
-`s3tests/functional/test_s3.py`, all 838 items, **0 errors** — every test ran to a clean pass/fail
-with no fixture/teardown breakage). The result is reproducible: re-running `--calibrate` against the
-same source produces a byte-identical `allowlist.txt` apart from the timestamp header.
+### Recorded calibration
 
-| Outcome | Count | Δ vs prev | Notes |
-|---|---:|---:|---|
-| **Passed** (in `allowlist.txt`) | **192** | +28 | The compatibility gate. |
-| Failed | 552 | −28 | Features the v1 gateway doesn't yet implement (breakdown below). |
-| Skipped | 94 | — | Suite-level `pytest.mark` opt-outs — never executed (bucket logging, cloud-tier lifecycle, restore-status). |
-| Collected | 838 | — | All of `s3tests/functional/test_s3.py`. |
+The checked-in header records **2026-06-17T05:30:57Z**, suite ref
+`master (5522d1c)`, and endpoint `http://127.0.0.1:9711`.
+There are **192** test node IDs in `allowlist.txt`; [badge.json](badge.json)
+records **22% (192/838)** (integer percentage rounded down).
 
-What changed since the previous calibration (164 passes, after Phase 5's multipart + Range GET):
-turning **SigV4 auth + S3 ACLs** on (Phase D/E) — plus the `ListBuckets` ownership-scoping fix that
-makes a clean auth-mode run possible — brought a **net +28**, **28 newly passing, 0 regressions**.
-The new passes are exactly the tests real authentication unlocks:
-
-- **ACLs (`bucket_acl_*`, `object_acl_*`, `*_canned_*`):** default ACLs, canned-ACL round-trips,
-  full-control attribute checks, concurrent canned-ACL sets.
-- **Cross-account access (`access_bucket_private_*`, `object_copy_not_owned_*`):** a private
-  bucket/object correctly denies another account; public-read/-write grants correctly allow it.
-- **Auth negatives (`list_buckets_bad_auth`, `list_buckets_invalid_auth`):** bad/garbage SigV4
-  credentials are rejected with the right error.
-- **Anonymous access (`bucket_list*_objects_anonymous*`, `object_anon_put`):** unsigned requests are
-  allowed or denied per ACL.
-- Plus the not-found / error-response-shape edges (`bucket_notexist`, `object_copy_bucket_not_found`,
-  `object_write_to_nonexist_bucket`, …).
-
-The 552 remaining failures are the **growth surface** — implementing any of these would expand the
-allowlist on the next `--calibrate`. Each failing test is counted once (first matching family):
-
-| Failures | Feature family |
-|---:|---|
-| 133 | Server-side encryption — SSE-C / SSE-S3 / SSE-KMS (incl. the `copy_enc[…]` matrix) |
-| 51 | Versioning (`versioning_*`, `delete_marker_*`, `*_versioned`) |
-| 43 | ACLs / grants / ownership edges still unimplemented (beyond the basics now passing) |
-| 43 | Lifecycle / expiration / non-current-version rules |
-| 41 | Bucket policy / block-public-access |
-| 36 | Object Lock / retention / legal hold / governance bypass (beyond the few that pass) |
-| 31 | POST object (browser-style form uploads) |
-| 28 | Bucket logging (the bits not behind the `pytest.mark` skip) |
-| 22 | Conditional GET/PUT — `If-Match` / `If-None-Match` / `If-*-Since` |
-| 20 | `ListObjects(V2)` edge cases — encoding-type, exotic keys, sort order, markers |
-| 18 | Bucket create / naming negative + misc bucket-level |
-| 14 | CORS preflight + actual cross-origin |
-| 14 | Tagging beyond the basic put/get already in the allowlist |
-| 14 | Object attributes / checksums (SHA-256, CRC*) |
-| 13 | Object copy edges (metadata-directive, content-type override, ACL on copy) |
-| 12 | Multipart upload edges — `copy_part` / `multipart_copy`, checksum-on-complete, resume / list-parts pagination |
-| 19 | Other — `expected_bucket_owner`, account-usage, raw-HTTP negatives, misc PUT/GET/HEAD/DELETE response-shape edges |
-
-The headers in `allowlist.txt` always record the exact suite SHA + endpoint a result was calibrated
-against, so the table above can be reproduced verbatim from the checked-in artifact.
+These are historical artifacts, not a fresh measurement of the current gateway
+or upstream `master`. The allowlist does not retain failed/skipped test results,
+fixture errors, or the gateway source revision/topology. Those details, and a
+current failure-family breakdown, require the corresponding run log or a new
+full calibration. Later implementation work, including same-bucket part-copy,
+does not automatically expand the checked-in pass set.
 
 ### The compatibility badge
 
-`run.sh --calibrate` also writes `badge.json` (a [Shields endpoint](https://shields.io/badges/endpoint-badge)
-payload) next to `allowlist.txt`, so the **S3 compatibility** badge in the top-level README — which
-points at `badge.json` on `main` — tracks the calibrated `passed / collected` percentage
-automatically. Re-calibrate, commit `badge.json` alongside `allowlist.txt`, and the badge follows.
+`--calibrate` writes a [Shields endpoint](https://shields.io/badges/endpoint-badge)
+payload to `badge.json`. The top-level README badge reads it from `main`.
+Review and commit **both** `allowlist.txt` and `badge.json` after a local calibration.
+The badge is a recorded full-suite pass ratio, not the status of the latest gate.
 
 ## In CI
 
-[`.github/workflows/s3-compat.yml`](../../.github/workflows/s3-compat.yml) runs this gate on **every
-PR and every push to `main`**, with **no path filter** — a change in any module (LSM, BookKeeper
-SPI, client, protocol) can break the gateway end-to-end, so the gate always runs. It builds
-`candybox:ci` from the checkout (never pulls), starts `docker-compose.ci.yml`, runs the suite, and
-posts a sticky pass/fail comment on the PR plus a job summary.
+[`.github/workflows/s3-compat.yml`](../../.github/workflows/s3-compat.yml) runs on
+pushes and PRs targeting **`main` or `release/**`**, without a path filter. It
+builds `candybox:ci` from the checkout, starts the CI stack, performs a signed
+readiness probe, runs the suite, and writes a job summary and sticky PR comment.
+It currently uses the runner's default `S3TESTS_REF=master`, not the historical
+SHA in the allowlist header.
 
-Two behaviours keep it honest:
-
-- **Provisional vs calibrated.** While `allowlist.txt` still carries the `PROVISIONAL SEED` marker,
-  the workflow runs `--all` in **report-only** mode (never red) and the comment nudges you to
-  calibrate. Once you commit a calibrated allowlist (the marker is gone), it becomes a real **gate**
-  that fails the build on any regression.
-- **Calibrate on a native runner.** Trigger the workflow manually (Actions → *S3 compatibility* →
-  Run workflow → `calibrate = true`) to run `--calibrate` on a native amd64 runner — faster than an
-  emulated laptop — then download the `allowlist.txt` artifact and commit it.
+- The current calibrated allowlist makes this a regression gate. The workflow
+  retains a report-only fallback if an allowlist contains `PROVISIONAL SEED`.
+- For manual calibration, select **Actions → S3 compatibility → Run workflow →
+  calibrate = true**. This mode records results without gating on pytest failures.
+  Review the run log and download the `allowlist.txt` artifact before committing.
+  The workflow currently uploads **only the allowlist**, not `badge.json`; obtain
+  the matching badge from a local calibration or reconstruct its payload from
+  that same run's passed/collected counts using the calculation in `run.sh`.

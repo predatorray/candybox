@@ -22,11 +22,13 @@ import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
+import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -310,18 +312,34 @@ class TcpTransportServerTest {
     /** Binding a port already in use fails loudly — and must not leave its thread pools running. */
     @Test
     void aFailedBindReportsAndLeavesNoThreads() throws Exception {
-        try (TcpTransportServer taken = server(ECHO, TcpTransportServer.Options.defaults())) {
-            int occupied = taken.port();
-            int ioBefore = liveThreads("candybox-io");
-            int acceptBefore = liveThreads("candybox-accept");
+        // Reserve the port without starting another transport's lazily created thread pools.
+        try (ServerSocket taken = new ServerSocket()) {
+            taken.bind(new InetSocketAddress("127.0.0.1", 0));
+            int occupied = taken.getLocalPort();
+            Set<Thread> threadsBefore = Thread.getAllStackTraces().keySet();
 
-            assertThatThrownBy(() -> new TcpTransportServer(null, occupied, ECHO, CODEC, null, false,
-                    TcpTransportServer.Options.defaults()))
+            assertThatThrownBy(() -> new TcpTransportServer("127.0.0.1", occupied, ECHO, CODEC,
+                    null, false, new TcpTransportServer.Options(1, 1, 8, Duration.ofSeconds(5))))
                     .isInstanceOf(ProtocolException.class)
                     .hasMessageContaining("Failed to bind server socket on port " + occupied);
 
-            assertThat(liveThreads("candybox-io")).isEqualTo(ioBefore);
-            assertThat(liveThreads("candybox-accept")).isEqualTo(acceptBefore);
+            List<Thread> started = Thread.getAllStackTraces().keySet().stream()
+                    .filter(thread -> !threadsBefore.contains(thread))
+                    .filter(thread -> thread.getName().startsWith("candybox-io")
+                            || thread.getName().startsWith("candybox-accept")
+                            || thread.getName().startsWith("candybox-conn"))
+                    .toList();
+            // Netty's termination future can complete just before the actual thread exits.
+            // Join within one shared deadline so a leaked pool still fails promptly.
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            for (Thread thread : started) {
+                long remaining = deadline - System.nanoTime();
+                if (remaining > 0) {
+                    TimeUnit.NANOSECONDS.timedJoin(thread, remaining);
+                }
+            }
+            assertThat(started).filteredOn(Thread::isAlive)
+                    .extracting(Thread::getName).isEmpty();
         }
     }
 

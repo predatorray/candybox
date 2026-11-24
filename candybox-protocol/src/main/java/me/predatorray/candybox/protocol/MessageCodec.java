@@ -15,6 +15,9 @@
  */
 package me.predatorray.candybox.protocol;
 
+import me.predatorray.candybox.common.namespace.NamespaceState;
+import me.predatorray.candybox.common.namespace.NamespaceOperation;
+
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -31,10 +34,50 @@ public final class MessageCodec {
 
     private static final byte BODY_VERSION = 1;
 
+    private static NamespaceOperation namespaceOperation(int code) {
+        var values = NamespaceOperation.values();
+        if (code < 0 || code >= values.length) { throw new ProtocolException("Unknown namespace action"); }
+        return values[code];
+    }
+
+    private static Message.NamespaceResponse decodeNamespaceResponse(BinaryReader r) {
+        String outcome = r.readString();
+        var state = r.readBoolean() ? new NamespaceState(
+                r.readLong(), r.readLong(), r.readLong(), r.readLong(), r.readBoolean()) : null;
+        return new Message.NamespaceResponse(outcome, state, r.readBytes(), readStrings(r), readNullable(r));
+    }
+
     public Frame encode(Message message) {
         BinaryWriter w = new BinaryWriter(64);
-        w.writeByte(BODY_VERSION);
-        if (message instanceof Message.CreateBoxRequest m) {
+        // Only requests carrying the new predicate need v2; native requests retain v1 encoding.
+        boolean constrainedSource = message instanceof Message.RangeGetCandyRequest range
+                && range.minSourceBytesExclusive() != 0
+                || message instanceof Message.UploadPartCopyRequest copy
+                && copy.minSourceBytesExclusive() != 0;
+        w.writeByte(constrainedSource ? 2 : BODY_VERSION);
+        if (message instanceof Message.CreateNamespaceBoxRequest m) {
+            w.writeString(m.box()).writeVarInt(m.partitionCount());
+        } else if (message instanceof Message.NamespaceRequest m) {
+            w.writeString(m.box());
+            writeNullable(w, m.address());
+            w.writeByte(m.operation().ordinal());
+            writeNullable(w, m.key());
+            w.writeBytes(m.data() == null ? new byte[0] : m.data());
+            w.writeLong(m.idleTtlMillis()).writeLong(m.expectedVersion()).writeVarInt(m.pageSize());
+            writeNullable(w, m.cursor());
+            w.writeVarInt(m.partition());
+        } else if (message instanceof Message.NamespaceResponse m) {
+            w.writeString(m.outcome()).writeBoolean(m.state() != null);
+            if (m.state() != null) {
+                var state = m.state();
+                w.writeLong(state.version()).writeLong(state.createdAtMillis())
+                        .writeLong(state.idleTtlMillis()).writeLong(state.expiresAtMillis())
+                        .writeBoolean(state.retired());
+            }
+            w.writeBytes(m.data());
+            writeStrings(w, m.keys());
+            writeNullable(w, m.cursor());
+        } else if (message instanceof Message.CreateBoxRequest m) {
             w.writeString(m.box());
             w.writeVarInt(m.partitionCount());
         } else if (message instanceof Message.BoxInfoRequest m) {
@@ -61,6 +104,7 @@ public final class MessageCodec {
             writeBoxKey(w, m.box(), m.key());
             w.writeLong(m.firstByte());
             w.writeLong(m.lastByte());
+            if (constrainedSource) { w.writeLong(m.minSourceBytesExclusive()); }
         } else if (message instanceof Message.HeadCandyRequest m) {
             writeBoxKey(w, m.box(), m.key());
         } else if (message instanceof Message.DeleteCandyRequest m) {
@@ -156,6 +200,7 @@ public final class MessageCodec {
             w.writeString(m.srcKey());
             w.writeLong(m.firstByte());
             w.writeLong(m.lastByte());
+            if (constrainedSource) { w.writeLong(m.minSourceBytesExclusive()); }
         } else if (message instanceof Message.CreateMultipartUploadResponse m) {
             w.writeString(m.uploadId());
         } else if (message instanceof Message.UploadPartResponse m) {
@@ -282,10 +327,16 @@ public final class MessageCodec {
     public Message decode(Frame frame) {
         BinaryReader r = new BinaryReader(frame.payload());
         int version = r.readByte();
-        if (version != BODY_VERSION) {
+        if (version != BODY_VERSION && !(version == 2
+                && (frame.opcode() == Opcode.RANGE_GET_CANDY || frame.opcode() == Opcode.UPLOAD_PART_COPY))) {
             throw new ProtocolException("Unsupported message body version: " + version);
         }
         return switch (frame.opcode()) {
+            case CREATE_NAMESPACE_BOX -> new Message.CreateNamespaceBoxRequest(r.readString(), r.readVarInt());
+            case NAMESPACE -> new Message.NamespaceRequest(r.readString(), readNullable(r),
+                    namespaceOperation(r.readByte()), readNullable(r), r.readBytes(),
+                    r.readLong(), r.readLong(), r.readVarInt(), readNullable(r), r.readVarInt());
+            case RESPONSE_NAMESPACE -> decodeNamespaceResponse(r);
             case CREATE_BOX -> new Message.CreateBoxRequest(r.readString(), r.readVarInt());
             case BOX_INFO -> new Message.BoxInfoRequest(r.readString());
             case DELETE_BOX -> new Message.DeleteBoxRequest(r.readString(), r.readBoolean());
@@ -296,7 +347,7 @@ public final class MessageCodec {
                     readNullable(r), readStrings(r));
             case GET_CANDY -> new Message.GetCandyRequest(r.readString(), r.readString());
             case RANGE_GET_CANDY -> new Message.RangeGetCandyRequest(r.readString(), r.readString(),
-                    r.readLong(), r.readLong());
+                    r.readLong(), r.readLong(), version == 2 ? r.readLong() : 0);
             case HEAD_CANDY -> new Message.HeadCandyRequest(r.readString(), r.readString());
             case DELETE_CANDY -> new Message.DeleteCandyRequest(r.readString(), r.readString());
             case COPY_CANDY -> new Message.CopyCandyRequest(r.readString(), r.readString(),
@@ -331,7 +382,8 @@ public final class MessageCodec {
             case LIST_PARTS -> new Message.ListPartsRequest(r.readString(), r.readString(),
                     r.readString(), r.readVarInt(), r.readVarInt());
             case UPLOAD_PART_COPY -> new Message.UploadPartCopyRequest(r.readString(), r.readString(),
-                    r.readString(), r.readVarInt(), r.readString(), r.readLong(), r.readLong());
+                    r.readString(), r.readVarInt(), r.readString(), r.readLong(), r.readLong(),
+                    version == 2 ? r.readLong() : 0);
             case RESPONSE_CREATE_MULTIPART -> new Message.CreateMultipartUploadResponse(r.readString());
             case RESPONSE_UPLOAD_PART -> new Message.UploadPartResponse(r.readInt(), r.readVarLong());
             case RESPONSE_LIST_MULTIPART_UPLOADS -> decodeListMultipart(r);

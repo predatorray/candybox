@@ -37,7 +37,11 @@ public interface Lease {
     /** The monotonically increasing fencing token for this acquisition. */
     long fencingToken();
 
-    /** Whether the lease is currently held (not expired, released, or superseded by a newer holder). */
+    /**
+     * Local validity of this grant. Implementations may cache it up to a conservative TTL deadline;
+     * supersession can therefore be observed on renewal rather than on every check. A positive
+     * result is not a write fence: durable writes still require the fencing token/recover-open.
+     */
     boolean isValid();
 
     /**

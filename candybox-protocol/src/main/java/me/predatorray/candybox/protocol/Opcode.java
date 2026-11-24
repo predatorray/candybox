@@ -20,6 +20,10 @@ package me.predatorray.candybox.protocol;
  * dedicated retriable backpressure signal returned under write-stall.
  */
 public enum Opcode {
+    CREATE_NAMESPACE_BOX(60),
+    NAMESPACE(61),
+    RESPONSE_NAMESPACE(62),
+
     CREATE_BOX(1),
     DELETE_BOX(2),
     LIST_BOXES(3),

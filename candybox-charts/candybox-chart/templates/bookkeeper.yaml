@@ -1,0 +1,132 @@
+{{- if .Values.bookkeeper.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "candybox.fullname" . }}-bookkeeper
+  labels: {{ include "candybox.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: {{ include "candybox.selector" (dict "root" . "component" "bookkeeper") | nindent 4 }}
+  ports:
+    - {name: bookie, port: 3181, targetPort: bookie}
+    - {name: health, port: 8080, targetPort: health}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "candybox.fullname" . }}-bookkeeper
+  labels: {{ include "candybox.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "candybox.fullname" . }}-bookkeeper
+  replicas: {{ .Values.bookkeeper.replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {{ include "candybox.selector" (dict "root" . "component" "bookkeeper") | nindent 6 }}
+  template:
+    metadata:
+      labels: {{ include "candybox.selector" (dict "root" . "component" "bookkeeper") | nindent 8 }}
+      annotations:
+        checksum/scripts: {{ include (print $.Template.BasePath "/bookkeeper-configmap.yaml") . | sha256sum }}
+        checksum/settings: {{ toJson .Values.bookkeeper | sha256sum }}
+        checksum/metadata: {{ include "candybox.metadata" . | sha256sum }}
+        {{- with .Values.bookkeeper.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext: {{ toYaml .Values.bookkeeper.podSecurityContext | nindent 8 }}
+      {{- with .Values.bookkeeper.imagePullSecrets }}
+      imagePullSecrets: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "candybox.scheduling" .Values.bookkeeper | nindent 6 }}
+      initContainers:
+        - name: initialize-metadata
+          image: "{{ .Values.bookkeeper.image.repository }}:{{ .Values.bookkeeper.image.tag }}"
+          imagePullPolicy: {{ .Values.bookkeeper.image.pullPolicy }}
+          securityContext: {{ toYaml .Values.bookkeeper.securityContext | nindent 12 }}
+          command: [bash, /etc/bookkeeper-scripts/initialize.sh]
+          env:
+            {{- include "candybox.bkEnv" . | nindent 12 }}
+            - {name: BOOKIE_MEM, value: "-Xms128m -Xmx256m"}
+          {{- with .Values.bookkeeper.envFrom }}
+          envFrom: {{ toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 512Mi}
+          volumeMounts:
+            - {name: scripts, mountPath: /etc/bookkeeper-scripts, readOnly: true}
+            {{- with .Values.bookkeeper.volumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      containers:
+        - name: bookkeeper
+          image: "{{ .Values.bookkeeper.image.repository }}:{{ .Values.bookkeeper.image.tag }}"
+          imagePullPolicy: {{ .Values.bookkeeper.image.pullPolicy }}
+          securityContext: {{ toYaml .Values.bookkeeper.securityContext | nindent 12 }}
+          command: [bash, -ec]
+          args:
+            - |
+              source /etc/bookkeeper-scripts/configure.sh
+              exec bin/bookkeeper bookie
+          ports:
+            - {name: bookie, containerPort: 3181}
+            - {name: health, containerPort: 8080}
+          env:
+            {{- include "candybox.bkEnv" . | nindent 12 }}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - name: BK_advertisedAddress
+              value: "$(POD_NAME).{{ include "candybox.fullname" . }}-bookkeeper.$(POD_NAMESPACE).svc"
+            - name: BOOKIE_MEM
+              value: {{ .Values.bookkeeper.heapOpts | quote }}
+          {{- with .Values.bookkeeper.envFrom }}
+          envFrom: {{ toYaml . | nindent 12 }}
+          {{- end }}
+          resources: {{ toYaml .Values.bookkeeper.resources | nindent 12 }}
+          startupProbe:
+            httpGet: {path: /heartbeat, port: health}
+            failureThreshold: 120
+            periodSeconds: 5
+          readinessProbe:
+            httpGet: {path: /heartbeat, port: health}
+          livenessProbe:
+            httpGet: {path: /heartbeat, port: health}
+            periodSeconds: 10
+          volumeMounts:
+            - {name: scripts, mountPath: /etc/bookkeeper-scripts, readOnly: true}
+            - {name: journal, mountPath: /data/journal}
+            - {name: ledgers, mountPath: /data/ledgers}
+            {{- with .Values.bookkeeper.volumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: scripts
+          configMap: {name: {{ include "candybox.fullname" . }}-bookkeeper}
+        {{- if not .Values.bookkeeper.persistence.enabled }}
+        - {name: journal, emptyDir: {}}
+        - {name: ledgers, emptyDir: {}}
+        {{- end }}
+        {{- with .Values.bookkeeper.volumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+  {{- if .Values.bookkeeper.persistence.enabled }}
+  volumeClaimTemplates:
+    {{- range $name, $size := dict "journal" .Values.bookkeeper.persistence.journalSize "ledgers" .Values.bookkeeper.persistence.ledgerSize }}
+    - metadata:
+        name: {{ $name }}
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- with $.Values.bookkeeper.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $size | quote }}
+    {{- end }}
+  {{- end }}
+{{- end }}

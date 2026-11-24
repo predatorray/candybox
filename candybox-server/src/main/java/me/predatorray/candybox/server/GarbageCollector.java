@@ -55,8 +55,7 @@ import org.slf4j.LoggerFactory;
  * </ol>
  * So any owner deletes only what every later owner also treats as dead.
  *
- * <p>TODO(phase-3+): an enumeration backstop for ledgers no manifest ever recorded (e.g. written by an
- * operation that then failed, or by an owner that crashed before committing them).
+ * <p>The opt-in {@link LedgerRetention} reconciler covers allocations no manifest recorded.
  */
 public final class GarbageCollector {
 
@@ -65,8 +64,15 @@ public final class GarbageCollector {
     private final LedgerStore ledgerStore;
     private final long graceMillis;
     private final Clock clock;
+    private final java.util.function.BiPredicate<BoxEngine, Long> deletionGate;
 
     public GarbageCollector(LedgerStore ledgerStore, long graceMillis, Clock clock) {
+        this(ledgerStore, graceMillis, clock, (engine, ledger) -> true);
+    }
+
+    GarbageCollector(LedgerStore ledgerStore, long graceMillis, Clock clock,
+                     java.util.function.BiPredicate<BoxEngine, Long> deletionGate) {
+        this.deletionGate = deletionGate;
         this.ledgerStore = ledgerStore;
         this.graceMillis = graceMillis;
         this.clock = clock;
@@ -131,6 +137,7 @@ public final class GarbageCollector {
         int deleted = 0;
         for (long ledgerId : engine.reclaimableLedgers(cutoff)) {
             try {
+                if (!deletionGate.test(engine, ledgerId)) { continue; }
                 ledgerStore.deleteLedger(ledgerId); // idempotent: an already-deleted ledger is gone
                 deleted++;
                 gone.add(ledgerId);

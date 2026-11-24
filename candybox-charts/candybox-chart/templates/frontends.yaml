@@ -1,0 +1,111 @@
+{{- $root := . -}}
+{{- range $component := list "gateway" "admin" -}}
+{{- $settings := index $root.Values $component -}}
+{{- if $settings.enabled }}
+{{- $port := ternary 9711 9713 (eq $component "gateway") }}
+{{- $health := ternary 9712 9713 (eq $component "gateway") }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "candybox.fullname" $root }}-{{ $component }}
+  labels: {{ include "candybox.labels" $root | nindent 4 }}
+  {{- with $settings.service.annotations }}
+  annotations: {{ toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $settings.service.type }}
+  selector: {{ include "candybox.selector" (dict "root" $root "component" $component) | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $settings.service.port }}
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "candybox.fullname" $root }}-{{ $component }}
+  labels: {{ include "candybox.labels" $root | nindent 4 }}
+spec:
+  replicas: {{ $settings.replicas }}
+  selector:
+    matchLabels: {{ include "candybox.selector" (dict "root" $root "component" $component) | nindent 6 }}
+  template:
+    metadata:
+      labels: {{ include "candybox.selector" (dict "root" $root "component" $component) | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $root.Template.BasePath "/configmap.yaml") $root | sha256sum }}
+        {{- with $settings.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext: {{ toYaml $root.Values.podSecurityContext | nindent 8 }}
+      {{- with $root.Values.imagePullSecrets }}
+      imagePullSecrets: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "candybox.scheduling" $settings | nindent 6 }}
+      containers:
+        - name: {{ $component }}
+          image: {{ include "candybox.image" $root | quote }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          securityContext: {{ toYaml $root.Values.securityContext | nindent 12 }}
+          {{- if eq $component "gateway" }}
+          args: [s3-gateway, /etc/candybox-config/gateway.properties]
+          {{- else }}
+          args: [admin-api]
+          {{- end }}
+          ports:
+            - {name: http, containerPort: {{ $port }}}
+            {{- if ne $port $health }}
+            - {name: health, containerPort: {{ $health }}}
+            {{- end }}
+          env:
+            - name: CANDYBOX_HEAP_OPTS
+              value: {{ $settings.heapOpts | quote }}
+            {{- if eq $component "admin" }}
+            - name: CANDYBOX_ADMIN_ZK
+              value: {{ include "candybox.zk" $root | quote }}
+            - name: CANDYBOX_ADMIN_SCRAPE_TARGETS
+              {{- $targets := list -}}
+              {{- range $i := until (int $root.Values.node.replicas) -}}
+              {{- $targets = append $targets (printf "http://%s-node-%d.%s-node.%s.svc:9710/metrics" (include "candybox.fullname" $root) $i (include "candybox.fullname" $root) $root.Release.Namespace) -}}
+              {{- end }}
+              value: {{ join "," $targets | quote }}
+            {{- end }}
+            {{- with $root.Values.commonEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- with $settings.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with concat $root.Values.commonEnvFrom $settings.envFrom }}
+          envFrom: {{ toYaml . | nindent 12 }}
+          {{- end }}
+          resources: {{ toYaml $settings.resources | nindent 12 }}
+          startupProbe:
+            httpGet: {path: /healthz, port: {{ $health }}, scheme: {{ default "HTTP" $settings.probeScheme }}}
+            periodSeconds: 5
+            failureThreshold: 120
+          readinessProbe:
+            httpGet: {path: /readyz, port: {{ $health }}, scheme: {{ default "HTTP" $settings.probeScheme }}}
+          livenessProbe:
+            httpGet: {path: /healthz, port: {{ $health }}, scheme: {{ default "HTTP" $settings.probeScheme }}}
+          volumeMounts:
+            - {name: config, mountPath: /etc/candybox-config, readOnly: true}
+            - {name: logs, mountPath: /opt/candybox/logs}
+            - {name: tmp, mountPath: /tmp}
+            {{- with $root.Values.volumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap: {name: {{ include "candybox.fullname" $root }}-config}
+        - {name: logs, emptyDir: {}}
+        - {name: tmp, emptyDir: {}}
+        {{- with $root.Values.volumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+{{- end }}
+{{- end }}
