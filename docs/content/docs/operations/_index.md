@@ -57,6 +57,20 @@ for the full configuration.
 
 ## Running on Kubernetes
 
+The [Helm chart](https://github.com/predatorray/candybox/blob/main/candybox-charts/README.md) deploys
+Candybox nodes, the S3 gateway, and the admin/dashboard service, with optional BookKeeper and
+ZooKeeper backends. See the
+[typical Kubernetes deployment]({{< relref "/docs/architecture#typical-kubernetes-deployment" >}})
+for a diagram of the replicated topology, request routing, and persistent storage.
+
+The chart documentation includes a disposable demo, a persistent replicated baseline, and a
+[production configuration](https://github.com/predatorray/candybox/blob/main/candybox-charts/README.md#production-configuration)
+with authentication, workload placement, and a spare bookie. It also covers external backends,
+StorageClass and PVC configuration, and ingress access. Follow its security setup for transport TLS
+and backend authentication before exposing a production installation.
+
+### Standalone node manifests
+
 A multi-stage `Dockerfile` at the repo root builds a node image straight from source
 (`docker build -t candybox:latest .`). The image is **dual-mode**: it defaults to the storage node,
 but `docker run … <image> candybox <args…>` runs the bundled client CLI instead.
