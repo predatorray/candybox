@@ -155,6 +155,7 @@ class Experiment:
                    source_revision=command(["git", "-C", str(HERE), "rev-parse", "HEAD"]).strip(),
                    source_dirty=bool(command(["git", "-C", str(HERE), "status", "--porcelain"]).strip()),
                    image_labels=info["Config"].get("Labels"),
+                   experiment_timeout_seconds=self.args.experiment_seconds,
                    setup_timeout_seconds=self.args.setup_seconds,
                    recovery_timeout_seconds=self.args.recovery_seconds, objects=self.args.objects)
         (self.output / "compose.yml").write_text(self.compose("config"))
@@ -251,6 +252,8 @@ def main():
     parser.add_argument("--output", default="/tmp/candybox-chaos")
     parser.add_argument("--seed", type=int, default=167)
     parser.add_argument("--objects", type=int, choices=range(1, 101), default=16)
+    parser.add_argument("--experiment-seconds", type=int, choices=range(60, 3601), default=1200,
+                        help="absolute setup/workload/fault deadline, followed by bounded cleanup (POSIX)")
     parser.add_argument("--setup-seconds", type=int, choices=range(1, 181), default=120,
                         help="one bucket creation request; never retried on ambiguity")
     parser.add_argument("--recovery-seconds", type=int, choices=range(1, 181), default=90)
@@ -262,6 +265,8 @@ def main():
         raise HarnessFailure(f"interrupted by signal {signum}")
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
+    signal.signal(signal.SIGALRM, interrupted)
+    signal.alarm(args.experiment_seconds)
     try:
         experiment = Experiment(args)
         print(experiment.output, flush=True)
@@ -273,6 +278,7 @@ def main():
     except Exception as error:
         status, detail, code = "harness-error", str(error), 2
     finally:
+        signal.alarm(0)  # cleanup gets its own bounded subprocess budgets
         if experiment:
             errors = experiment.cleanup()
             if errors:

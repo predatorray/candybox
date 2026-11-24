@@ -36,7 +36,7 @@ target guards without services. These tests do not prove the Docker experiments.
 
 ## Run
 
-Requires Python 3.9+, Java 17+, Maven 3.9+, Docker Engine and Compose v2. Budget at
+Requires a POSIX host with Python 3.9+, Java 17+, Maven 3.9+, Docker Engine and Compose v2. Budget at
 least 6 GiB of available Docker memory. From the repository root:
 
 ```sh
@@ -85,9 +85,12 @@ network paths or prove all network fault modes.
 Each subprocess has a timeout. Bucket creation gets one bounded 120-second request
 (`--setup-seconds`); the gateway node read budget is 120 seconds to accommodate
 creating all eight partitions on a cold backend. Bucket creation is never retried,
-and HTTP 409 is a setup failure. Ordinary HTTP requests have a 15-second timeout; object
-count is capped at 100. Stabilization checks have a configured deadline (default
-90 seconds), with at most one request-timeout overrun. SIGINT/SIGTERM unwind through
+and HTTP 409 is a setup failure. Ordinary HTTP requests have a 15-second socket
+inactivity timeout; object count is capped at 100. Stabilization checks stop
+between requests at their configured deadline (default 90 seconds); a response
+that continues trickling bytes can exceed that deadline. A separate absolute
+`--experiment-seconds` budget (default 1200 seconds, maximum 3600) interrupts all
+setup/workload/fault activity even in that case, then runs bounded cleanup. SIGINT/SIGTERM unwind through
 restoration and teardown. SIGKILL of the harness or daemon failure cannot execute
 cleanup: use the archived exact project/config to unpause and `down -v` manually.
 Cleanup removes project containers, networks and anonymous volumes. Repeated
