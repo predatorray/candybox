@@ -148,6 +148,13 @@ class Experiment:
             time.sleep(1)
         raise InvariantViolation(f"acknowledged objects unavailable after {self.args.recovery_seconds}s: {scenario}")
 
+    def gateway_endpoint(self):
+        address = self.compose("port", "gateway", "9711").strip()
+        if not re.fullmatch(r"127\.0\.0\.1:[0-9]+", address):
+            raise HarnessFailure(f"unexpected gateway binding {address!r}")
+        self.endpoint = "http://" + address
+        self.event("gateway-endpoint", endpoint=self.endpoint)
+
     def setup(self):
         if command(["docker", "ps", "-aq", "--filter", f"label=com.docker.compose.project={self.project}"]).strip():
             raise HarnessFailure("fresh project unexpectedly exists")
@@ -169,10 +176,7 @@ class Experiment:
         self.compose("up", "-d", "--wait", "--wait-timeout", "300", timeout=360)
         (self.output / "containers-bootstrap.json").write_text(command(
             ["docker", "inspect", *self.compose("ps", "-a", "-q").split()]))
-        address = self.compose("port", "gateway", "9711").strip()
-        if not re.fullmatch(r"127\.0\.0\.1:[0-9]+", address):
-            raise HarnessFailure(f"unexpected gateway binding {address!r}")
-        self.endpoint = "http://" + address
+        self.gateway_endpoint()
         # Wait only for read-only gateway availability. A mutating timeout is never retried.
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
@@ -205,6 +209,7 @@ class Experiment:
         (self.output / "gateway-before-bootstrap-restart.log").write_text(
             self.compose("logs", "--no-color", "--timestamps", "gateway", timeout=60))
         command(["docker", "restart", *gateway_targets])
+        self.gateway_endpoint()  # Docker may reallocate an ephemeral host port on restart.
         containers = json.loads(command(["docker", "inspect", *self.compose("ps", "-a", "-q").split()]))
         (self.output / "containers.json").write_text(json.dumps(containers, indent=2) + "\n")
         for info in containers:

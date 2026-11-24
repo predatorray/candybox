@@ -90,7 +90,9 @@ with both owners configured for normal balancing; lease TTL, safety graces and
 replication quorums retain their production settings. Both rendered configurations,
 bootstrap/fault-phase IDs and logs are archived. Fixing concurrent bucket creation
 is separate runtime work. Owner recreation may swap Docker IPs; gateway restart
-before baseline prevents bootstrap pools from retaining the previous endpoints.
+before baseline prevents bootstrap pools from retaining the previous endpoints
+([#227](https://github.com/predatorray/candybox/issues/227)). The driver resolves the
+gateway's random host port again after restart and records both bindings.
 The measured kill/start controls retain the same owner containers and IPs.
 
 The pause test observes externally visible integrity after owner resumption. It
