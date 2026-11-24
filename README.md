@@ -68,15 +68,15 @@ Build it with `mvn -pl candybox-charts package`; release charts are published to
 
 ### Download and Maven Central
 
-Release **0.1.0** is out. The distribution archive is attached to the
-[GitHub Release](https://github.com/predatorray/candybox/releases/tag/v0.1.0), and the Java client is on
+Release **0.1.1** is out. The distribution archive is attached to the
+[GitHub Release](https://github.com/predatorray/candybox/releases/tag/v0.1.1), and the Java client is on
 Maven Central:
 
 ```xml
 <dependency>
   <groupId>me.predatorray.candybox</groupId>
   <artifactId>candybox-client</artifactId>
-  <version>0.1.0</version>
+  <version>0.1.1</version>
 </dependency>
 ```
 
