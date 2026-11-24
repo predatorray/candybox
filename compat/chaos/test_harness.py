@@ -68,6 +68,28 @@ class HarnessTest(unittest.TestCase):
         finally:
             harness.command = original
 
+    def test_gateway_binding_refreshes_after_restart_and_rejects_foreign_bindings(self):
+        experiment = harness.Experiment.__new__(harness.Experiment)
+        bindings = iter(("127.0.0.1:32771", "127.0.0.1:32772", "0.0.0.0:32773",
+                         "remote.example:32774", "127.0.0.1:32775\n127.0.0.1:32776"))
+        calls, events = [], []
+        def compose(*args):
+            calls.append(args)
+            return next(bindings)
+        experiment.compose = compose
+        experiment.event = lambda kind, **fields: events.append((kind, fields))
+        experiment.gateway_endpoint()
+        self.assertEqual("http://127.0.0.1:32771", experiment.endpoint)
+        experiment.gateway_endpoint()
+        self.assertEqual("http://127.0.0.1:32772", experiment.endpoint)
+        self.assertEqual(["http://127.0.0.1:32771", "http://127.0.0.1:32772"],
+                         [fields["endpoint"] for _, fields in events])
+        for _ in range(3):
+            with self.assertRaises(harness.HarnessFailure):
+                experiment.gateway_endpoint()
+        self.assertEqual("http://127.0.0.1:32772", experiment.endpoint)
+        self.assertEqual([("port", "gateway", "9711")] * 5, calls)
+
     def oracle(self, response):
         experiment = harness.Experiment.__new__(harness.Experiment)
         experiment.expected = {"key": (hashlib.sha256(b"acknowledged").hexdigest(), "v1")}
