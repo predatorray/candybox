@@ -71,6 +71,7 @@ class Experiment:
 
     def fault(self, action, *services):
         # Validate every target immediately before destructive controls, including restoration.
+        targets = []
         for service in services:
             ids = self.compose("ps", "-a", "-q", service).split()
             if len(ids) != 1:
@@ -80,8 +81,11 @@ class Experiment:
             if (labels.get("com.docker.compose.project") != self.project or
                     labels.get("io.candybox.chaos.disposable") != self.project):
                 raise HarnessFailure(f"refusing non-disposable target {service}")
+            targets.append(ids[0])
         self.event("fault-invoke", action=action, services=services)
-        self.compose(*action.split(), *services)
+        # Compose start may rerun exited dependencies, including one-shot metadata init.
+        # Faults/restoration must touch only the exact existing, validated containers.
+        command(["docker", *action.split(), *targets])
         self.event("fault-response", action=action, services=services)
 
     def request(self, method, key="", data=None, version=None, *, timeout=15):

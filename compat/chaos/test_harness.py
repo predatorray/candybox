@@ -46,6 +46,28 @@ class HarnessTest(unittest.TestCase):
         finally:
             harness.command = original
 
+    def test_restore_starts_only_validated_container_without_dependencies(self):
+        experiment = harness.Experiment.__new__(harness.Experiment)
+        experiment.project = "chaos-test-unique"
+        experiment.compose = lambda *args: "owner-container-id\n"
+        events, commands = [], []
+        experiment.event = lambda kind, **fields: events.append(kind)
+        original = harness.command
+        def command(args):
+            commands.append(args)
+            if args[1] == "inspect":
+                return json.dumps([{"Config": {"Labels": {
+                    "com.docker.compose.project": experiment.project,
+                    "io.candybox.chaos.disposable": experiment.project}}}])
+            return "owner-container-id\n"
+        try:
+            harness.command = command
+            experiment.fault("start", "owner1")
+            self.assertEqual(["docker", "start", "owner-container-id"], commands[-1])
+            self.assertEqual(["fault-invoke", "fault-response"], events)
+        finally:
+            harness.command = original
+
     def oracle(self, response):
         experiment = harness.Experiment.__new__(harness.Experiment)
         experiment.expected = {"key": (hashlib.sha256(b"acknowledged").hexdigest(), "v1")}

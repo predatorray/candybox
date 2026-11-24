@@ -62,7 +62,9 @@ release. Do not describe two such builds as a mixed-version test.
 
 The explicit environment marker and `chaos-...` namespace are required. Every run
 appends a random suffix, refuses an existing project, and checks both Compose
-project and disposable labels immediately before faulting containers. Run against
+project and disposable labels immediately before faulting containers. Controls act
+on those exact container IDs; restoration does not rerun the one-shot BookKeeper
+metadata initializer or start unrelated dependencies. Run against
 a dedicated development Docker daemon: no production endpoint argument exists.
 
 The fixed schedules are:
