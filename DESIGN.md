@@ -68,8 +68,10 @@ Dependency rule: `candybox-lsm` depends **only** on the two SPIs (`bookkeeper`, 
   listings are scatter-gather merges (each partition's page is consistent; the merged page is not a
   snapshot), and a cross-partition `rename` is copy-then-delete across two owners and only
   **eventually atomic** — it converges to "source gone, destination present" via a durable
-  rename-intent journal plus a coordination rendezvous marker (§6), so a reader can momentarily
-  observe both keys, but the rename never leaves both keys live forever and never loses data. A
+  rename-intent journal, an atomic destination receipt, and a coordination rendezvous marker (§6).
+  With participant recovery and successful maintenance/coordination, the captured source version
+  is eventually deleted without client retry; a later source rewrite survives. Readers may see
+  both keys during reconciliation. A
   same-partition `rename` is still fully atomic (one owner, one write lock). This is the guarantee
   Candybox documents — not general eventual consistency.
 
@@ -147,17 +149,24 @@ logicalCounter | int nodeId`. Carries no Syrup segments; shadows every key in `[
 locator HLC is older.
 
 **WAL entry** (`WalEntrySerializer`) — the WAL is a kind-tagged log so point mutations and range
-deletes replay in one ordered pass: `byte kind (1=point mutation, 2=range delete) | <Mutation or
-RangeTombstone payload>`. Replay reports the max HLC across **both** kinds, so handover's HLC
-`observe` cannot lose a range delete.
+deletes and atomic batches replay in one ordered pass: `byte kind (1=point mutation, 2=range delete,
+3=atomic batch, 4=rename PUT plus receipt) | payload`. Kinds 1 and 2 retain their original payloads. Kind 3 has
+`byte batchVersion (=1) | varint count | bytes(serialized Mutation)[count]`, bounded to 128 mutations
+and 1 MiB including framing (below BookKeeper's default 5 MiB frame limit; deployments must allow
+at least this payload plus BookKeeper overhead). Same-partition rename writes the destination PUT
+and source DELETE as one batch in one ledger entry; neither memtable mutation is applied until it
+is durable. Recovery decodes the entire batch before applying any member and reports the maximum
+HLC across all members, point records and range deletes. Unknown versions, truncated members,
+invalid counts and trailing batch bytes fail recovery. Legacy point/range WAL entries stay readable.
+See OPERATIONS.md for the required coordinated upgrade before writing kinds 3/4 or manifest v7.
 
 **Syrup chunk entry**: `int crc32c | payload[<= chunkSize]`. The crc covers the payload only.
 
-**ManifestEdit** (`ManifestSerializer`, **version 6**): `version | addedTables[]
+**ManifestEdit** (`ManifestSerializer`, **version 7**): `version | addedTables[]
 | removedTableLedgerIds[] | addedSyrups[] | removedSyrups[] | (bool, varlong) newWalLedgerId
 | ownerFencingToken | addedUploads[] | upsertParts[] | removedUploads[] | addedRenameIntents[]
 | removedRenameIntents[] | (bool, hlc) maxHlc | addedPendingDeletes[(varlong id, varlong since)]
-| removedPendingDeletes[]`, where each `SSTableMeta`
+| removedPendingDeletes[] | addedRenameReceipts[] | removedRenameReceipts[]`, where each `SSTableMeta`
 is `varlong ledgerId | varint level | bytes minKey | bytes maxKey | varlong entryCount
 | varlong sizeBytes | referencedSyrups[] | (bool, span) rangeTombstoneSpan | (bool, hlc) minPointHlc`
 (v5+: the keys its range tombstones cover, each bound optional, used to pick compaction inputs; and
@@ -170,7 +179,17 @@ per `removedUpload`. The v3 trailing fields carry in-flight **rename intents** (
 state they are replayed on handover, so a takeover finalizes (or abandons) a rename exactly where
 the prior owner left it. The v4 trailing `maxHlc` is the HLC high-water mark (see §3); v2/v3 records
 read back without one. The v6 trailing fields are the ledgers awaiting physical deletion by GC (§9);
-v2–v5 records read back with none.
+v2–v5 records read back with none. Version 7 adds destination rename receipts, retained until
+source acknowledgement; v2–v6 read with no receipts. WAL kind 4 uses version 1 and encodes the
+mutation and receipt in the same BookKeeper entry. A receipt carries the rename token, Box
+incarnation, relay token, source partition/key/HLC, destination key, and full resulting locator.
+Flush and recovery checkpoint receipts in the same manifest edit that rotates away their WAL.
+Destination admission caps unacknowledged receipts at 1 MiB of serialized records (including
+per-record length overhead) and 1,024 records before WAL append. Excess requests receive Busy;
+ACK cleanup frees capacity. This reserves most of the default 5 MiB backend entry for other
+checkpoint metadata; the general manifest-size bound remains a separate concern.
+These new formats require upgraded readers before use; rolling format activation is a separate
+compatibility concern (#157).
 
 **Protocol frame** (`FrameCodec`): `magic(2)=0xCB0F | version(1)=1 | opcode(1) | length(4) | payload`.
 **Message body** (`MessageCodec`): `bodyVersion(1) | <per-opcode fields>`.
@@ -182,8 +201,12 @@ connection to one handler executor, which keeps that connection's responses in r
 frame header carries no request id, so a client matches responses positionally. Requests are
 pipelined up to `server.max.inflight.per.connection`, beyond which (or while the peer is not
 draining responses) reads are suspended; `close()` stops accepting first and drains in-flight
-requests before cutting sockets. The client side (`TcpTransport`) stays blocking: one pooled
-connection per node, one in-flight request at a time.
+requests before cutting sockets. The client side (`TcpTransport`) stays blocking. Routers borrow
+one exclusive connection per RPC from a bounded per-node pool (default four), with bounded admitted
+RPCs (default 64). Separate acquisition and monotonic overall RPC deadlines cover waiting, routing,
+backoff, setup and I/O. Only known-unsent failures or explicit routing responses permit retry;
+a timeout after dispatch has an unknown mutation outcome. Shutdown cancels admission/waiters and
+closes pooled sockets immediately. See OPERATIONS.md for configuration and late setup cleanup.
 
 ### SSTable on-ledger layout (`SSTableFormat`, footer version 2)
 
@@ -246,20 +269,47 @@ consults range tombstones across all tables rather than pruning by point range.
   (`boxes/<box>/partitions/<p>/relays/<token>`) and hands the client only the token; the destination
   owner (`ZeroCopyPut`) reads that relay — so the parts and a rename's ACL it writes never pass
   through the client — and writes a destination locator reusing the very same Syrup segments. No
-  object bytes are ever moved or re-stored. A relay is bound to the requesting principal, deleted
-  once its put succeeds, consumable only within half of `rename.intent.abandon.millis` (so it can
-  never outlive its rename intent, with the rest as clock-skew margin), and reaped by the source
-  owner past the full window. Pending relays are bounded per node in bytes
+  object bytes are ever moved or re-stored. A relay is bound to the requesting principal. An
+  unclaimed relay is consumable within half of `rename.intent.abandon.millis` and may be reaped
+  past the full window. Claiming it races expiry by CAS; a claimed relay never expires and pins
+  the bytes until destination reference publication and, for rename, source acknowledgement. Source READ authorization checks the ACL of the exact locator being
+  read, copied, or relayed, in union with Box READ permission. For local copy, part-copy, and rename,
+  the engine checks the resolved source ACL before changing state under its write lock. A relay is
+  a bounded capability for that authorized version: later ACL revocation or source overwrite cannot
+  expose a newer version, while the already authorized version stays consumable until relay expiry.
+  Undecodable relays use the coordination backend last-write time
+  for reaping, preserving the full window for consumers that understand newer formats. If that
+  metadata is unavailable, reaping fails safe. Pending relays are bounded per node in bytes
   (`zero.copy.relay.budget.bytes`) and per partition in count (1024). This is safe because the blob layer is physically global (a `SegmentRef` resolves bytes
   by `syrupId` alone, no partition scoping) and because **Box-global GC** (§9) keeps a Syrup alive
   while *any* partition references it. A cross-partition `rename` is still copy-then-delete across
   two owners, but now **eventually atomic**: the source owner records a durable rename intent (§5),
-  the destination owner writes a rendezvous marker once its zero-copy put is durable, and the source
-  owner — synchronously via the client's `CompleteRename`, on its maintenance sweep, or after a
-  handover replays the intent — reads the marker and LWW-conditionally tombstones the source (so a
-  re-PUT source is never clobbered), then clears the intent and marker. A reader may momentarily see
-  both keys; the one residual crash window degrades to "both keys live" (the old observable outcome),
-  never data loss.
+  preparation creates a pending rendezvous decision before exposing its intent. The destination
+  commits its PUT and completion receipt in one WAL entry, publishes its refs, then CAS-advances
+  the decision to committed. Recovery checkpoints receipts across flush/WAL rotation and
+  maintenance republishes uncommitted decisions without a client retry. Publication only updates
+  an existing decision; a delayed request or stale receipt snapshot cannot recreate a cleaned
+  decision. Marker format v3 adds a reserved state (v2 added prepared); older committed markers
+  remain decodable. The source owner — via
+  `CompleteRename`, maintenance, or handover — validates its durable intent against the marker and
+  conditionally tombstones only the captured source HLC. It durably acknowledges that deletion in
+  the marker before clearing the intent. A later source re-PUT survives. Destination maintenance
+  then removes the receipt (first rotating away its WAL record), relay/pin, and marker, in that
+  order; interrupted cleanup resumes even when the receipt or relay has already disappeared.
+  Recovery of a fenced attempt serializes receipt-absence checks with destination admission.
+  It CAS-releases only the captured reservation back to prepared; it never deletes the logical
+  decision. Every new destination append refreshes the reservation version, including when it was
+  already reserved, so stale cleanup cannot release a newer generation's reservation.
+  Retries compare the stable token/incarnation/source HLC/destination identity, not the random
+  relay attempt; cleanup releases every relay attempt for the acknowledged rename.
+  Source preparation and retirement serialize per source engine; maintenance revalidates stale
+  intent snapshots. Before WAL append, the destination CAS-reserves the logical decision under
+  its engine lock. Source abort CAS-deletes only an unreserved prepared decision, so a fresh
+  retry cannot commit through an abandonment snapshot. Source timeout alone cannot abort a claimed transfer. Only CAS removal of an unclaimed relay,
+  or a newer destination owner fencing/recovering the old WAL and finding no receipt, proves
+  abort; otherwise the intent and pin remain pending. A reader may temporarily see both keys.
+  Eventual convergence requires participant recovery and successful maintenance/coordination;
+  it never depends on a live original client or on guessing an uncertain outcome from elapsed time.
 - **range get**: `getCandyRange(key, firstByte, lastByte)` over HTTP `Range: bytes=…` semantics
   (inclusive on both ends). Prefix-sums the part lengths to find the first/last parts, then indexes
   into chunks by `byteWithinPart / part.chunkSize`. Chunks at the slice boundary are read whole —
@@ -321,11 +371,34 @@ boxes/<box>/meta                      BoxDescriptor {partitionCount} — immutab
 boxes/<box>/partitions/<p>/owner      partition p's ownership lease (fenced, TTL'd)
 boxes/<box>/partitions/<p>/manifest   partition p's manifest-ledger pointer (versioned CAS)
 boxes/<box>/partitions/<p>/refs       partition p's published held-Syrup set (Box-global GC, §9(f))
-boxes/<box>/renames/<token>           cross-partition rename rendezvous marker (§6); cleared on finalize
+boxes/<box>/renames/<token>           cross-partition rename commit/ack marker (§6); removed after receipt/relay cleanup
 cluster/balancer                      the balancer's coordinator-election lease
 cluster/assignment                    the desired partition→node assignment table (versioned CAS)
 members/<nodeId>                      membership (advertised host:port); ephemeral, session-bound
 ```
+
+ZooKeeper lease handles answer `isValid()` locally: acquisition/renewal starts a monotonic
+TTL budget before metadata I/O, subtracting a 5% safety margin capped at 100 ms (at least
+1 ms). The stored wall-clock expiry is an additional upper bound. Failed/ambiguous renewal,
+release, and service close invalidate the local grant. This removes per-request and per-owner
+maintenance validity reads; renewal and balancer enumeration still perform metadata I/O.
+Supersession may be detected at the next renewal or local deadline, so positive local validity
+never replaces durable fencing. Existing clock-skew-sensitive wall-clock takeover semantics
+are unchanged; watches and unchanged-version takeover observation remain future work.
+
+BookKeeper stores retain an LRU of up to 128 passive read handles. Each `openLedger` returns
+an independently closeable borrowed view; eviction removes the cache reference, while active
+borrowers retain the physical handle until their last close. Reads, physical opens and closes occur
+outside the global cache lock; simultaneous misses coalesce behind a per-ledger open monitor.
+Invalidation also prevents an in-flight open from repopulating the cache with an obsolete view.
+Recover-open always fences through a fresh backend open, and invalidates a cached passive view;
+delete and read failures also invalidate cached views. Store close releases idle cache resources
+and retires active views. Active-Syrup reads continue fetching known entry IDs directly from
+bookies. Explicit tail/sealed queries refresh metadata for a previously active handle so delayed
+close notifications cannot hide the final entry; sealed metadata supplies the authoritative final
+tail, while active LAC is read from bookies. Ordinary known-entry Syrup reads never query this
+metadata. Once sealed, tail/sealed queries use the immutable cached metadata. No record formats or
+configuration change; upgrades and rollback need no migration.
 
 ### 7a. Partition balancing (elected coordinator)
 
@@ -456,15 +529,38 @@ The detailed rules:
   published sets, then every relay of the Box, then the published sets again, retries unless no set
   changed in between, and claims only Syrups orphaned a grace period before that read (publishes
   compute the set after reading its version). A relay is re-checked against its source after it is
-  written, and deleted only after the destination published its refs. What still rides
-  `ledgerGcGraceMillis` is server-side: a consumer stalling between its relay freshness check (half
-  the abandon window) and its commit past the reap (the full window), clock skew beyond half the
-  window, and the freshness of sibling partitions' published sets. An undecodable relay makes its Box
-  skip Syrup GC until it is removed (#103).
+  written. Before appending a destination locator, the consumer **CAS-claims the relay** with its
+  destination key, partition, Box incarnation and ownership fencing token. Expiry and claim contend
+  on the same relay version: expiry winning rejects the consumer; a claim winning makes the relay's
+  pin non-expiring.
+  There is exactly one WAL-writing consumer. The order across coordination and BookKeeper is:
+  **pending relay → CAS claim → destination WAL append → record committed result → publish destination
+  refs → delete claimed relay**. This is not a transaction between ZooKeeper and the WAL: the durable
+  claim protects the entire gap. Retries of a committed relay finish publication without writing
+  another locator, so a delayed retry cannot resurrect bytes after the pin has gone.
 
-The full compaction-then-GC cycle is covered end-to-end by `CompactionGcCycleIT`. One gap: deleting a
-Box drops its manifest pointer but does not yet reclaim that Box's SSTable/Syrup/WAL/manifest ledgers
-(**TODO(phase-3)**).
+  A failed/uncertain WAL append or committed-result write leaves the claim pinned. Only a newer
+  destination ownership generation may reconcile it: recover-open fences and replays the prior WAL,
+  then the new owner publishes its recovered refs before deleting the old claim. If the append was
+  durable its bytes have transferred to those refs; otherwise the old writer is fenced and cannot
+  resurrect them. GC maintenance runs this reconciliation. Source handover and elapsed time do not
+  revoke a claim. A failed same-generation consumer can hold capacity until destination handover;
+  retained claims count against the existing relay byte/count limits. Failed publication can be
+  retried using the same committed relay, including after its original freshness window. A crash
+  after publication but before relay deletion only retains an extra pin until retry or recovery.
+  A recreated Box cannot reconcile another incarnation's claim. Deleted-incarnation claims are
+  removed after the destination engine closes, or after the allocation registry fences/retires the
+  matching destination writer epoch; this cleanup does not require a live Box descriptor. Missing
+  fencing evidence retains the claim. Cleanup of an old incarnation never releases a new one's pin.
+  Sibling partitions' published-set freshness still rides their maintenance and the GC grace period.
+  An undecodable relay makes its Box skip Syrup GC until it is removed (#103).
+
+  Relay format v2 stores this claim and committed result, while v1 remains readable as pending.
+  Upgrade the whole cluster while stopped: older servers do not understand non-expiring claims.
+
+The full compaction-then-GC cycle and opt-in allocation enumeration are covered by
+`CompactionGcCycleIT`. Deleted-Box allocations carrying epoch tags are reclaimed after writer
+admission closes and every admitted WAL/manifest is fenced; legacy ledgers remain held.
 
 ## 10. Size limits (configurable; enforced at client and node)
 
@@ -506,7 +602,7 @@ Per-role BK quorum (E/Qw/Qa) defaults: **WAL 3/3/2, Manifest 3/3/2, SSTable 3/2/
 | Compaction + GC worker interval | configurable; 0 disables | Background maintenance cadence on the owner. |
 | Tombstone-GC time bound | 24 h | Covers in-flight late writes before a delete is reclaimable. |
 | Ledger-GC grace | 5 min | Margin for in-flight readers / continuation tokens before a physical delete; also gates Box-global GC (§9(f)). |
-| Rename-intent abandon | 60 s (`rename.intent.abandon.millis`) | A cross-partition rename intent whose rendezvous marker never appears is dropped after this (the source stays live). |
+| Rename-intent abandon | 60 s (`rename.intent.abandon.millis`) | An unclaimed preparation may be CAS-aborted after this age (source stays live). Claimed transfers wait for a durable commit or fenced abort decision, regardless of age. |
 | Client router cache TTL | 5 s | How long the client caches a Box→owner mapping before re-resolving. |
 | Continuation token | `lastKey` | `lastKey` alone resumes a range/reverse scan, exclusive in the scan direction. |
 | LWW tiebreaker | `nodeId` (locked) | Deterministic, coordination-free. |
@@ -539,6 +635,13 @@ Per-role BK quorum (E/Qw/Qa) defaults: **WAL 3/3/2, Manifest 3/3/2, SSTable 3/2/
 - **Buffered wire protocol** — PUT/GET/UploadPart bodies are inlined in one framed message (16 MiB
   of data per frame). Multipart upload partially substitutes for streaming, but each part is still bounded by the
   frame cap. True on-the-wire chunked streaming remains `TODO(phase-2)`.
+- **S3 UploadPartCopy range sources must exceed 5 MiB.** The gateway sends an optional
+  exclusive source-size bound through the client to the source owner. Both same-partition copy and
+  cross-partition range reads check the resolved locator before range validation or mutation, so a
+  concurrent source replacement cannot bypass eligibility. Native calls default to no bound.
+  Constrained `UPLOAD_PART_COPY` / `RANGE_GET_CANDY` request bodies use version 2; their version 1
+  bodies remain decodable and native requests retain version 1 encoding. Older nodes reject the new
+  requests rather than silently ignoring the predicate; upgrade nodes before gateways using it.
 - **UploadPartCopy buffers in memory** — the engine reads the source slice and writes it as a fresh
   part rather than sharing Syrup segments when the range aligns to chunk boundaries; the optimization
   is a strictly-internal future change.
@@ -570,9 +673,66 @@ Kubernetes manifests). Fault-injection / failure-path hardening and operational 
   already fencing-gated).
 - **Watch-based coordination.** The `CoordinationService` callers poll today; ZK watches to avoid
   polling are `TODO(phase-2)`.
-- **GC enumeration backstop + Box-delete reclamation.** Ledgers that no manifest ever recorded, and
-  the ledgers of a deleted Box, are not yet reclaimed (§9, `TODO(phase-3)`, #105).
+- **Legacy ledger reclamation.** Untagged allocations remain outside the opt-in epoch backstop;
+  legacy Box-deletion journaling remains tracked by #60.
 - **Read scaling.** Sealed SSTables/Syrups are immutable and replicated, so any node *could* serve
   reads of flushed data; only unflushed-memtable read-your-writes needs the owner. Serving reads off
   the owner is not built in v1.
 - **Syrup defragmentation and small-object inlining** — see §9(d) and §12.
+
+
+### Allocation-epoch enumeration
+
+The opt-in enumeration backstop tags allocations with Box incarnation, partition, and a durable
+allocation epoch. Every live epoch protects all of its allocations, including a writer paused
+immediately after creation. Normal owner rotation seals the old engine and recovers the authoritative
+manifest and WAL before publishing a fresh pointer. The successor pins every recovery root before
+retiring captured epochs with strictly lower lease fencing tokens. Same-token acquisitions
+remain pinned until a genuine subsequent lease epoch; an older operation cannot retire a newer
+owner merely because its allocation was delayed. Epoch retirement is independent of wall-clock
+age. Failed pointer CAS outcomes never authorize retirement. Incarnation-specific pointer keys keep
+old-generation pointer operations separate from a recreated Box's pointers.
+
+A per-ledger coordination CAS serializes retention pins with permanent deletion claims. Backup and
+relay pins are explicit durable roots. Imported zero-copy segments acquire destination-epoch pins
+before their WAL append; the pin does not expire while that epoch could still append. Retiring a
+destination requires recovery of its fenced WAL, so an interrupted transfer is either inherited as
+a root or cannot subsequently commit. The original refs/relays/refs snapshot remains in place for
+normal Syrup orphan claiming. Normal pending-delete GC also passes the retention CAS when enabled.
+Enumeration requires a retired allocating epoch, a recognized matching identity, sufficient age,
+and no active retention pins. Legacy or incomplete evidence is held. Claims and the enumeration
+cursor survive coordinator handover, and failed physical deletes are retried.
+
+## Managed namespace lifecycle
+
+See [the namespace lifecycle contract](docs/design/namespace-lifecycle.md) for
+owner-admission timestamps, atomic renewal/retirement, native examples, resource
+overhead, bounded cleanup, error/retry semantics and upgrade/rollback limits.
+
+### Ownership during slow recovery
+
+The node's lease registry contains both recovering and serving partitions. Acquisition registers
+before any replay, fencing, or checkpoint I/O. The existing node heartbeat renews this registry;
+there are no per-partition schedulers and no registration transfer when recovery succeeds. Failed
+renewal cancels the acquisition permanently, even if the renewal's remote outcome is unknown.
+Recovery checks cancellation before publication and serving, closes local handles after blocked I/O
+returns, and unregisters on failure. Cancelled acquisitions leave the renewal set but remain in the
+cleanup registry until released; same-node retry closes the old engine before reacquisition.
+Shutdown cancels and closes registrations, including in-flight recovery.
+
+Manifest publication uses `CoordinationService.compareAndSetWithLease`: ZooKeeper checks the lease
+record's data version and creates/CAS-updates the pointer in one transaction; the fake checks both
+under one monitor. The operation first verifies the expected live fencing token. Renewal and
+publication on a registration are serialized, avoiding conflicts with its own heartbeat. An epoch
+change or release between that read and the transaction changes the lease version, rejecting the
+entire publication even if the pointer has not yet changed. Pointer conflicts also reject the whole
+transaction. BookKeeper recover-open fencing remains mandatory.
+
+Wall-clock expiry alone is not a ZooKeeper transaction predicate. If execution pauses after the
+lease read until after its TTL, publication can still commit only if the checked lease version has
+not changed. This is safe: a successor acquisition serialized before publication invalidates the
+check; acquisition serialized afterward must read the newly committed pointer before fencing and
+replaying. The expired recoverer cannot serve because engine access rechecks the lease. A late
+publication therefore cannot overwrite a successor's recovery source. A lost transaction response
+may mean publication committed; local handles are closed but allocated ledgers are never deleted
+on this error path, so the next owner can recover whichever pointer actually committed.

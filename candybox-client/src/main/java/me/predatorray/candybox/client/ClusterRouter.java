@@ -21,8 +21,6 @@ import java.net.NoRouteToHostException;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import me.predatorray.candybox.common.Clock;
 import me.predatorray.candybox.common.concurrent.TtlCache;
@@ -35,7 +33,6 @@ import me.predatorray.candybox.protocol.Frame;
 import me.predatorray.candybox.protocol.Message;
 import me.predatorray.candybox.protocol.MessageCodec;
 import me.predatorray.candybox.protocol.ProtocolException;
-import me.predatorray.candybox.protocol.transport.Connection;
 import me.predatorray.candybox.protocol.transport.Transport;
 
 /**
@@ -46,7 +43,7 @@ import me.predatorray.candybox.protocol.transport.Transport;
  * refuses connections, or an {@code UNAVAILABLE} answer) is a handover gap: it is re-resolved with
  * exponential backoff for up to {@code unownedRetryMillis}, then fails with
  * {@link NotOwnerException}.
- * Partition→address resolutions are cached with a TTL and invalidated on redirect; one connection is
+ * Partition→address resolutions are cached with a TTL and invalidated on redirect; a bounded connection pool is
  * kept per node address. Requests that any node can serve rotate across members and fail over to the
  * next member when one is unreachable.
  */
@@ -63,7 +60,6 @@ final class ClusterRouter implements Router {
         void sleep(long millis) throws InterruptedException;
     }
 
-    private final Transport transport;
     private final CoordinationService coordination;
     private final MessageCodec codec = new MessageCodec();
     private final Clock clock;
@@ -71,7 +67,7 @@ final class ClusterRouter implements Router {
     private final long unownedRetryMillis;
 
     private final TtlCache<String, NodeAddress> partitionCache;
-    private final ConcurrentMap<String, Connection> connections = new ConcurrentHashMap<>();
+    private final RpcResources resources;
     private final AtomicInteger nextMember = new AtomicInteger();
 
     /** A router that fails at once on an unowned partition (no handover-gap retry). */
@@ -82,7 +78,15 @@ final class ClusterRouter implements Router {
 
     ClusterRouter(Transport transport, CoordinationService coordination, long cacheTtlMillis,
                   Clock clock, long unownedRetryMillis, Sleeper sleeper) {
-        this.transport = transport;
+        this(transport, coordination, cacheTtlMillis, clock, unownedRetryMillis, sleeper,
+                4, 64, 5_000, 120_000);
+    }
+
+    ClusterRouter(Transport transport, CoordinationService coordination, long cacheTtlMillis,
+                  Clock clock, long unownedRetryMillis, Sleeper sleeper, int connectionsPerNode,
+                  int maxCalls, long acquireMillis, long requestMillis) {
+        this.resources = new RpcResources(transport, connectionsPerNode, maxCalls,
+                acquireMillis, requestMillis);
         this.coordination = coordination;
         this.partitionCache = new TtlCache<>(clock, cacheTtlMillis);
         this.clock = clock;
@@ -92,6 +96,10 @@ final class ClusterRouter implements Router {
 
     @Override
     public Message callPartition(String box, int partition, Message request) {
+        return resources.call(() -> routePartition(box, partition, request));
+    }
+
+    private Message routePartition(String box, int partition, Message request) {
         String cacheKey = box + "#" + partition;
         long deadline = clock.currentTimeMillis() + unownedRetryMillis;
         long backoff = INITIAL_BACKOFF_MILLIS;
@@ -140,10 +148,11 @@ final class ClusterRouter implements Router {
     private Message sendToOwner(String box, int partition, String cacheKey, Message request) {
         NodeAddress address = resolveOwner(box, partition, cacheKey);
         for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-            connectOrGap(address);
             Message response;
             try {
                 response = send(address, request);
+            } catch (RpcResources.SetupFailure e) {
+                throw connectFailure(address, e.failure());
             } catch (ProtocolException e) {
                 if (!(e.getCause() instanceof IOException)) {
                     throw e; // a frame-limit or decode error is not an ownership problem
@@ -167,6 +176,10 @@ final class ClusterRouter implements Router {
 
     @Override
     public Message callAny(Message request) {
+        return resources.call(() -> routeAny(request));
+    }
+
+    private Message routeAny(Message request) {
         List<Integer> members = coordination.members();
         if (members.isEmpty()) {
             throw new CandyboxException("No cluster members to route to");
@@ -176,8 +189,16 @@ final class ClusterRouter implements Router {
         for (int i = 0; i < members.size(); i++) {
             int nodeId = members.get((start + i) % members.size());
             try {
-                return send(addressOfNode(nodeId), request);
-            } catch (RuntimeException e) {
+                NodeAddress address;
+                try {
+                    address = addressOfNode(nodeId);
+                } catch (RuntimeException e) {
+                    // Membership may change after enumeration. Nothing has been dispatched.
+                    throw new RpcResources.SetupFailure(e);
+                }
+                return send(address, request);
+            } catch (RpcResources.SetupFailure setup) {
+                RuntimeException e = setup.failure();
                 if (failure == null) {
                     failure = e;
                 } else {
@@ -218,17 +239,13 @@ final class ClusterRouter implements Router {
      * owner whose lease has not lapsed yet) is an {@link OwnerGap}; anything else, such as a TLS or
      * SASL failure, propagates.
      */
-    private void connectOrGap(NodeAddress address) {
-        try {
-            acquireConnection(address);
-        } catch (ProtocolException e) {
-            if (e.getCause() instanceof ConnectException
-                    || e.getCause() instanceof NoRouteToHostException
-                    || e.getCause() instanceof SocketTimeoutException) {
-                throw new OwnerGap("owner at " + address.key() + " is unreachable", e, false);
-            }
-            throw e;
+    private RuntimeException connectFailure(NodeAddress address, RuntimeException e) {
+        if (e instanceof ProtocolException && (e.getCause() instanceof ConnectException
+                || e.getCause() instanceof NoRouteToHostException
+                || e.getCause() instanceof SocketTimeoutException)) {
+            return new OwnerGap("owner at " + address.key() + " is unreachable", e, false);
         }
+        return e;
     }
 
     private NodeAddress addressOfNode(int nodeId) {
@@ -238,61 +255,15 @@ final class ClusterRouter implements Router {
     }
 
     private Message send(NodeAddress address, Message request) {
-        Connection connection = acquireConnection(address);
-        try {
+        return resources.send(address.host(), address.port(), connection -> {
             Frame response = connection.call(codec.encode(request));
             return codec.decode(response);
-        } catch (RuntimeException e) {
-            // Drop a broken connection so it is reopened on the next attempt.
-            Connection broken = connections.remove(address.key());
-            if (broken != null) {
-                try {
-                    broken.close();
-                } catch (RuntimeException ignored) {
-                    // best effort
-                }
-            }
-            throw e;
-        }
-    }
-
-    /**
-     * Returns a pooled connection to {@code address}, opening one on a miss. The blocking
-     * {@link Transport#connect} runs <em>outside</em> the connection map's locks: doing it inside
-     * {@link ConcurrentMap#computeIfAbsent} would hold a bin lock across network I/O (stalling
-     * unrelated keys that hash to the same bin) and is forbidden from updating the map reentrantly.
-     * The cost of this lock-free approach is that two callers racing on a cold address may both
-     * connect; the loser's surplus connection is closed and the winner's is shared.
-     */
-    private Connection acquireConnection(NodeAddress address) {
-        String key = address.key();
-        Connection existing = connections.get(key);
-        if (existing != null) {
-            return existing;
-        }
-        Connection fresh = transport.connect(address.host(), address.port());
-        Connection raced = connections.putIfAbsent(key, fresh);
-        if (raced != null) {
-            try {
-                fresh.close();
-            } catch (RuntimeException ignored) {
-                // best effort: discard the connection that lost the race
-            }
-            return raced;
-        }
-        return fresh;
+        });
     }
 
     @Override
     public void close() {
-        for (Connection connection : connections.values()) {
-            try {
-                connection.close();
-            } catch (RuntimeException ignored) {
-                // best effort
-            }
-        }
-        connections.clear();
+        resources.close();
     }
 
     /** No reachable owner right now; {@code boxConfirmed} if a node answered that the Box exists. */

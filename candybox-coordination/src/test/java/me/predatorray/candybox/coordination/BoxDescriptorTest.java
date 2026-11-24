@@ -23,6 +23,13 @@ import org.junit.jupiter.api.Test;
 
 class BoxDescriptorTest {
 
+    @Test void managedDescriptorHasDistinctVersionAndOrdinaryEncodingIsPreserved() {
+        var managed = new BoxDescriptor(8, "managed", true);
+        assertThat(managed.encode()[0]).isEqualTo((byte)3);
+        assertThat(BoxDescriptor.decode(managed.encode())).isEqualTo(managed);
+        assertThat(new BoxDescriptor(8).encode()[0]).isEqualTo((byte)2);
+    }
+
     @Test
     void encodeDecodeRoundTrips() {
         for (int count : new int[] {1, 8, 1024}) {
@@ -50,4 +57,14 @@ class BoxDescriptorTest {
         assertThatThrownBy(() -> BoxDescriptor.decode(encoded))
                 .isInstanceOf(CoordinationException.class);
     }
+    @org.junit.jupiter.api.Test
+    void incarnationIsStableOnDecodeAndDistinctAcrossCreations() {
+        BoxDescriptor first = new BoxDescriptor(4);
+        assertThat(BoxDescriptor.decode(first.encode()).incarnation()).isEqualTo(first.incarnation());
+        assertThat(new BoxDescriptor(4).incarnation()).isNotEqualTo(first.incarnation());
+        byte[] legacy = new me.predatorray.candybox.common.serial.BinaryWriter()
+                .writeByte(1).writeVarInt(4).toByteArray();
+        assertThat(BoxDescriptor.decode(legacy)).isEqualTo(new BoxDescriptor(4, "legacy"));
+    }
+
 }

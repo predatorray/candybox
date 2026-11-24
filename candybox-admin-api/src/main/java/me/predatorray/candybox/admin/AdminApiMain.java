@@ -129,7 +129,7 @@ public final class AdminApiMain {
                 orDefault(env.get("CANDYBOX_ADMIN_SCRAPE_TOKEN"), null));
     }
 
-    private static DashboardData buildDataSource(String zk, Deque<AutoCloseable> closeStack,
+    static DashboardData buildDataSource(String zk, Deque<AutoCloseable> closeStack,
                                                  java.util.Map<String, String> env) {
         if (zk == null || zk.isBlank()) {
             LOG.info("No CANDYBOX_ADMIN_ZK set — running with empty data source (UI-only demo).");
@@ -156,12 +156,17 @@ public final class AdminApiMain {
                         security.zkAuthCredentials(), security.zkAclEnabled()));
         closeStack.push(coordination);
         CandyboxClient client =
-                new CandyboxClient(transport, coordination, CandyboxConfig.builder().build());
+                new CandyboxClient(transport, coordination, CandyboxConfig.builder()
+                        .clientConnectionsPerNode(parseIntOr(env.get("CANDYBOX_CLIENT_CONNECTIONS_PER_NODE"), 4))
+                        .clientMaxConcurrentRequests(parseIntOr(env.get("CANDYBOX_CLIENT_MAX_CONCURRENT_REQUESTS"), 64))
+                        .clientAcquireTimeoutMillis(parseIntOr(env.get("CANDYBOX_CLIENT_ACQUIRE_TIMEOUT_MILLIS"), 5_000))
+                        .clientRequestTimeoutMillis(parseIntOr(env.get("CANDYBOX_CLIENT_REQUEST_TIMEOUT_MILLIS"), 120_000))
+                        .build());
         closeStack.push(client);
         return new LiveDashboardData(coordination, client);
     }
 
-    private static void closeAll(Deque<AutoCloseable> stack) {
+    static void closeAll(Deque<AutoCloseable> stack) {
         while (!stack.isEmpty()) {
             AutoCloseable c = stack.pop();
             try {

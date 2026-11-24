@@ -62,7 +62,14 @@ final class RequestDispatcher extends SimpleChannelInboundHandler<Frame> {
         // The request leaves the handler queue here; what is still unflushed is accounted for by
         // the gate's writability check instead.
         gate.completed();
-        ctx.writeAndFlush(response);
+        ctx.writeAndFlush(response).addListener(future -> {
+            if (!future.isSuccess()) {
+                LOG.warn("Closing connection {} after failing to write {} with {} payload bytes",
+                        ctx.channel().remoteAddress(), response.opcode(), response.payload().length,
+                        future.cause());
+                ctx.close();
+            }
+        });
     }
 
     @Override

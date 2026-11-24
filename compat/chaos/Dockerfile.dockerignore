@@ -1,0 +1,5 @@
+**
+!candybox-dist/
+!candybox-dist/target/
+!candybox-dist/target/candybox-*.tar.gz
+!docker-entrypoint.sh

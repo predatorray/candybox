@@ -185,6 +185,15 @@ bytes to Candybox.
 URL shape: `/<bucket>/<key...>` (key may contain slashes). `Host` header is ignored for bucket
 resolution.
 
+Object-only multipart requests require a nonempty key. On either `/<bucket>` or
+`/<bucket>/`, `POST ?uploads`, `PUT ?partNumber=…&uploadId=…`, and
+`GET`/`POST`/`DELETE ?uploadId=…` return HTTP 405 `MethodNotAllowed` with
+`Missing object key` after authentication and authorization, before changing
+bucket or upload state. Ordinary bucket operations retain their routing,
+including `GET ?uploads` for listing uploads and `POST ?delete` for batch deletion.
+This gateway routing correction changes no persisted formats or configuration;
+rolling back restores the earlier error behavior without a data migration.
+
 | Path | Method | Operation |
 |---|---|---|
 | `/` | `GET` | `ListBuckets` |

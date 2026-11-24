@@ -57,11 +57,15 @@
         <module>candybox-web</module>
         <module>candybox-integration-tests</module>
         <module>candybox-dist</module>
+        <module>candybox-charts</module>
     </modules>
 
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <maven.compiler.release>17</maven.compiler.release>
+        <!-- Keep test stdout/stderr in Surefire/Failsafe reports instead of flooding the console.
+             Override with -Dmaven.test.redirectTestOutputToFile=false for live diagnostics. -->
+        <maven.test.redirectTestOutputToFile>true</maven.test.redirectTestOutputToFile>
 
         <!-- dependency versions -->
         <bookkeeper.version>4.17.1</bookkeeper.version>
@@ -84,7 +88,7 @@
         <jacoco.plugin.version>0.8.12</jacoco.plugin.version>
         <frontend.plugin.version>1.15.1</frontend.plugin.version>
         <os.plugin.version>1.7.1</os.plugin.version>
-        <node.version>v20.18.0</node.version>
+        <node.version>v22.21.1</node.version>
         <npm.version>10.9.0</npm.version>
         <source.plugin.version>3.3.1</source.plugin.version>
         <javadoc.plugin.version>3.12.0</javadoc.plugin.version>
@@ -473,6 +477,7 @@
                             <excludeArtifacts>
                                 <excludeArtifact>candybox-integration-tests</excludeArtifact>
                                 <excludeArtifact>candybox-dist</excludeArtifact>
+                                <excludeArtifact>candybox-charts</excludeArtifact>
                             </excludeArtifacts>
                             <waitMaxTime>3600</waitMaxTime>
                         </configuration>

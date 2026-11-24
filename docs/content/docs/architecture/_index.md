@@ -34,6 +34,52 @@ Candybox blends three well-known designs.
   BookKeeper ledger — append-only, replicated, and self-fencing. Candybox never mutates data in
   place; updates and deletes are new appends (with tombstones), Apache-Pulsar-style.
 
+## Typical Kubernetes deployment
+
+The [Candybox Helm chart](https://github.com/predatorray/candybox/blob/main/candybox-charts/README.md)
+deploys the application services and, optionally, BookKeeper and ZooKeeper in a Kubernetes namespace.
+The diagram shows the chart's persistent, replicated baseline.
+
+![Typical Kubernetes deployment: S3 gateway and admin services route to three Candybox nodes, backed by BookKeeper bookies and ZooKeeper with persistent volumes](kubernetes-deployment.excalidraw.svg)
+
+### Request routing
+
+Two stateless S3 gateway replicas serve S3 requests through a ClusterIP Service on port `9711`.
+A separate admin deployment serves the JSON API and web dashboard at `/ui/` through a ClusterIP
+Service on port `9713`. Both use Candybox's client to route requests to the node that owns the
+relevant partition over TCP on port `9709`.
+
+The three Candybox nodes run as a StatefulSet. A headless Service provides stable per-pod DNS names
+for the addresses advertised in cluster membership; requests can therefore reach individual
+partition owners. ZooKeeper tracks membership and ownership leases, and the elected balancer
+distributes partitions across the nodes.
+
+### Durable storage
+
+Candybox nodes keep their durable state in the backends, so their local logs and temporary files
+use disposable storage. The three BookKeeper bookies run as a StatefulSet with separate journal
+and ledger PVCs per bookie. They persist the WALs, SSTables, manifests, and Syrup object bytes in
+replicated ledgers. Three ZooKeeper replicas use persistent volumes for Candybox coordination and
+BookKeeper metadata.
+
+The chart also runs BookKeeper AutoRecovery, omitted from the diagram, to repair under-replicated
+ledgers when sufficient bookies are available. The
+[production example](https://github.com/predatorray/candybox/blob/main/candybox-charts/candybox-chart/values-production.yaml)
+uses four bookies so a failed bookie can be replaced in a three-member ensemble, and adds
+application authentication and workload placement settings. The single-node demo instead uses
+ephemeral storage and does not provide this replicated topology.
+
+### Access and deployment options
+
+Services remain cluster-internal by default. An optional ingress can expose the S3 gateway with
+HTTPS termination; the admin dashboard can be reached through port-forwarding or a private
+authenticated proxy. Direct Java or CLI clients need network access to ZooKeeper and the advertised
+node addresses. The chart can also connect to operator-managed BookKeeper and ZooKeeper clusters
+instead of deploying its own backends.
+
+See [Running on Kubernetes]({{< relref "/docs/operations#running-on-kubernetes" >}}) for deployment
+options and the chart's installation and production configuration instructions.
+
 ## Fenced ownership
 
 Consistency rests on **single, fenced ownership per partition**: every Box is split into a fixed

@@ -73,6 +73,7 @@ final class PartitionBalancer {
     /** One balancing round: coordinate (if elected) then converge on the published assignment. */
     void runOnce() {
         try {
+            node.rotateAllocationEpochs();
             node.sweepDeletedBoxes();
         } catch (RuntimeException e) {
             LOG.warn("Deleted-box sweep failed on node {}", node.nodeId(), e);
@@ -97,6 +98,7 @@ final class PartitionBalancer {
         if (lease.isEmpty()) {
             return; // another node coordinates
         }
+        node.reconcileAllocations();
         List<Integer> members = coordination.members();
         List<BoxPartition> partitions = allPartitions();
         if (members.isEmpty() || partitions.isEmpty()) {

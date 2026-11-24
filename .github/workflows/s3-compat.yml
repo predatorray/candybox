@@ -1,13 +1,14 @@
 name: S3 compatibility
 
 # Runs the ceph/s3-tests gate against a from-source build of the S3 gateway on EVERY PR and every
-# push to main -- regardless of which module changed -- because a change anywhere (LSM, BookKeeper
-# SPI, client, protocol) can break the gateway end-to-end. No `paths:` filter, deliberately.
+# push to main or release/** -- regardless of which module changed -- because a change anywhere
+# (LSM, BookKeeper SPI, client, protocol) can break the gateway end-to-end.
+# No `paths:` filter, deliberately.
 on:
   push:
-    branches: [main]
+    branches: [main, 'release/**']
   pull_request:
-    branches: [main]
+    branches: [main, 'release/**']
   # Manual trigger to (re)calibrate the allowlist on a native amd64 runner and download the result.
   workflow_dispatch:
     inputs:

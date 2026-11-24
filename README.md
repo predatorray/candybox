@@ -58,6 +58,13 @@ docker compose run --rm cli get photos hello.txt   # -> hello candybox
 Tear it down with `docker compose down` (add `-v` to also wipe the data volumes). The
 [quick start guide](https://www.predatorray.me/candybox/docs/getting-started/quickstart/) walks through this in more detail.
 
+### Kubernetes / Helm
+
+The [Candybox Helm chart](candybox-charts/README.md) provides demo and production
+configuration examples, optional BookKeeper/ZooKeeper, and external-cluster support.
+Build it with `mvn -pl candybox-charts package`; release charts are published to
+`oci://registry-1.docker.io/zetaplusae/candybox-chart` with the Maven release version.
+
 ### Download and Maven Central
 
 Release **0.1.0** is out. The distribution archive is attached to the
@@ -179,6 +186,25 @@ are stamped with a hybrid logical clock for last-writer-wins ordering.
 
 Record formats and the fencing and handover protocol are in [`DESIGN.md`](DESIGN.md); see also the
 [architecture docs](https://www.predatorray.me/candybox/docs/architecture/) and [`BOX_PARTITIONING_PLAN.md`](BOX_PARTITIONING_PLAN.md).
+
+### Typical Kubernetes deployment
+
+The [Helm chart](candybox-charts/README.md) runs stateless S3 gateway and admin deployments in front
+of three Candybox nodes. A headless Service gives each node a stable address so clients can route
+requests to the partition owner.
+
+![Typical Kubernetes deployment: S3 gateway and admin services route to three Candybox nodes, backed by BookKeeper bookies and ZooKeeper with persistent volumes](docs/content/docs/architecture/kubernetes-deployment.excalidraw.svg)
+
+This illustrates the chart's replicated baseline: three BookKeeper bookies store object bytes and
+index ledgers on journal and ledger PVCs, while three ZooKeeper replicas persist coordination and
+BookKeeper metadata. Candybox nodes use disposable local storage and recover their state from the
+backends. The chart also runs BookKeeper AutoRecovery (omitted from the diagram).
+
+Services are cluster-internal by default; an optional ingress exposes the S3 gateway, while the
+dashboard can be reached through port-forwarding or a private authenticated proxy. The
+[production configuration](candybox-charts/README.md#production-configuration) adds authentication,
+workload placement, and a fourth bookie for ensemble replacement. Both backends can also be supplied
+as external clusters.
 
 ## Building from source
 

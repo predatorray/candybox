@@ -173,6 +173,7 @@ public final class CandyboxServer {
         HealthServer health = new HealthServer(config.healthPort(), config.nodeId(),
                 () -> ready.get() && node.isReady(),
                 node::ownedBoxStats, security.metricsAuthToken());
+        health.retentionMetrics(node::enumerationReport);
         health.start();
 
         LOG.info("Candybox node {} is up: serving on {}, health on {}", config.nodeId(),

@@ -39,6 +39,8 @@ enum S3ErrorCode {
     BUCKET_NOT_EMPTY(409, "BucketNotEmpty", "The bucket you tried to delete is not empty."),
     INVALID_BUCKET_NAME(400, "InvalidBucketName", "The specified bucket is not valid."),
     INVALID_ARGUMENT(400, "InvalidArgument", "Invalid Argument."),
+    INVALID_PART(400, "InvalidPart",
+            "One or more of the specified parts could not be found or the ETag did not match."),
     INVALID_REQUEST(400, "InvalidRequest", "Invalid Request."),
     KEY_TOO_LONG(400, "KeyTooLongError", "Your key is too long."),
     ENTITY_TOO_LARGE(400, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed object size."),

@@ -54,6 +54,10 @@ public final class S3GatewayConfig {
     private final int maxFrameSizeBytes;
     private final int workerThreads;
     private final long routerCacheTtlMillis;
+    private final int clientConnectionsPerNode;
+    private final int clientMaxConcurrentRequests;
+    private final long clientAcquireTimeoutMillis;
+    private final long clientRequestTimeoutMillis;
     private final long routerUnownedRetryMillis;
     private final int nodeConnectTimeoutMillis;
     private final int nodeReadTimeoutMillis;
@@ -71,6 +75,10 @@ public final class S3GatewayConfig {
         this.maxFrameSizeBytes = b.maxFrameSizeBytes;
         this.workerThreads = b.workerThreads;
         this.routerCacheTtlMillis = b.routerCacheTtlMillis;
+        this.clientConnectionsPerNode = b.clientConnectionsPerNode;
+        this.clientMaxConcurrentRequests = b.clientMaxConcurrentRequests;
+        this.clientAcquireTimeoutMillis = b.clientAcquireTimeoutMillis;
+        this.clientRequestTimeoutMillis = b.clientRequestTimeoutMillis;
         this.routerUnownedRetryMillis = b.routerUnownedRetryMillis;
         this.nodeConnectTimeoutMillis = b.nodeConnectTimeoutMillis;
         this.nodeReadTimeoutMillis = b.nodeReadTimeoutMillis;
@@ -104,6 +112,10 @@ public final class S3GatewayConfig {
                 .workerThreads(r.getInt("s3.worker-threads")
                         .orElse(Math.max(4, Runtime.getRuntime().availableProcessors() * 2)))
                 .routerCacheTtlMillis(r.getLong("s3.router-cache-ttl-ms").orElse(5_000L))
+                .clientConnectionsPerNode(r.getInt("client.connections.per.node").orElse(4))
+                .clientMaxConcurrentRequests(r.getInt("client.max.concurrent.requests").orElse(64))
+                .clientAcquireTimeoutMillis(r.getLong("client.acquire.timeout.millis").orElse(5_000L))
+                .clientRequestTimeoutMillis(r.getLong("client.request.timeout.millis").orElse(120_000L))
                 .routerUnownedRetryMillis(r.getLong("s3.router-unowned-retry-ms").orElse(15_000L))
                 .nodeConnectTimeoutMillis(r.getInt("node.connect.timeout.ms")
                         .orElse(TcpTransport.DEFAULT_CONNECT_TIMEOUT_MILLIS))
@@ -170,6 +182,14 @@ public final class S3GatewayConfig {
     public int nodeReadTimeoutMillis() {
         return nodeReadTimeoutMillis;
     }
+
+    public int clientConnectionsPerNode() { return clientConnectionsPerNode; }
+
+    public int clientMaxConcurrentRequests() { return clientMaxConcurrentRequests; }
+
+    public long clientAcquireTimeoutMillis() { return clientAcquireTimeoutMillis; }
+
+    public long clientRequestTimeoutMillis() { return clientRequestTimeoutMillis; }
 
     public long routerUnownedRetryMillis() {
         return routerUnownedRetryMillis;
@@ -249,6 +269,10 @@ public final class S3GatewayConfig {
         private boolean s3AllowAnonymous = true;
         private int workerThreads = 8;
         private long routerCacheTtlMillis = 5_000L;
+        private int clientConnectionsPerNode = 4;
+        private int clientMaxConcurrentRequests = 64;
+        private long clientAcquireTimeoutMillis = 5_000;
+        private long clientRequestTimeoutMillis = 120_000;
         private long routerUnownedRetryMillis = 15_000L;
         private int nodeConnectTimeoutMillis = TcpTransport.DEFAULT_CONNECT_TIMEOUT_MILLIS;
         private int nodeReadTimeoutMillis = TcpTransport.DEFAULT_READ_TIMEOUT_MILLIS;
@@ -305,6 +329,30 @@ public final class S3GatewayConfig {
 
         Builder nodeReadTimeoutMillis(int v) {
             this.nodeReadTimeoutMillis = v;
+            return this;
+        }
+
+        Builder clientConnectionsPerNode(int v) {
+            if (v < 1) { throw new IllegalArgumentException("client.connections.per.node must be positive"); }
+            this.clientConnectionsPerNode = v;
+            return this;
+        }
+
+        Builder clientMaxConcurrentRequests(int v) {
+            if (v < 1) { throw new IllegalArgumentException("client.max.concurrent.requests must be positive"); }
+            this.clientMaxConcurrentRequests = v;
+            return this;
+        }
+
+        Builder clientAcquireTimeoutMillis(long v) {
+            if (v < 1) { throw new IllegalArgumentException("client.acquire.timeout.millis must be positive"); }
+            this.clientAcquireTimeoutMillis = v;
+            return this;
+        }
+
+        Builder clientRequestTimeoutMillis(long v) {
+            if (v < 1) { throw new IllegalArgumentException("client.request.timeout.millis must be positive"); }
+            this.clientRequestTimeoutMillis = v;
             return this;
         }
 

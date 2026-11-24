@@ -107,10 +107,9 @@ class ClusterRouterConcurrencyTest {
             assertThat(a.isAlive()).as("thread a finished").isFalse();
             assertThat(b.isAlive()).as("thread b finished").isFalse();
 
-            // Both callers connected concurrently (the barrier tripped), and exactly one surplus
-            // connection — the loser of the putIfAbsent race — was closed.
+            // Both callers connected concurrently, and both bounded pool slots remain reusable.
             assertThat(connectStarts).hasValue(2);
-            assertThat(closes).hasValue(1);
+            assertThat(closes).hasValue(0);
 
             // The pooled connection is reused on a later call: no new connect.
             router.callPartition("b", 0, new Message.GetCandyRequest("b", "k"));

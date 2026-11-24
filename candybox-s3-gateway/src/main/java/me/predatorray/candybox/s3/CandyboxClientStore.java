@@ -78,6 +78,14 @@ final class CandyboxClientStore implements CandyStore, AutoCloseable {
     }
 
     @Override
+    public PartUploadInfo uploadPartCopy(String box, String key, String uploadId, int partNumber,
+                                         String srcKey, long firstByte, long lastByte,
+                                         long minSourceBytesExclusive) {
+        return client.uploadPartCopy(box, key, uploadId, partNumber, srcKey, firstByte, lastByte,
+                minSourceBytesExclusive);
+    }
+
+    @Override
     public CandyInfo completeMultipartUpload(String box, String key, String uploadId,
                                              List<PartUploadInfo> parts, String owner,
                                              List<String> grants) {

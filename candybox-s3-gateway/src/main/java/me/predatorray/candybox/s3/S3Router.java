@@ -111,12 +111,29 @@ final class S3Router {
         };
     }
 
+    // Recognize object-only multipart subresources even without a key so the handler can return
+    // Missing object key, rather than performing an unrelated bucket operation.
     private static S3Action routeBucket(String method, Set<String> queries) {
         return switch (method) {
-            case "PUT" -> queries.contains("acl") ? S3Action.PUT_BUCKET_ACL : S3Action.CREATE_BUCKET;
-            case "DELETE" -> S3Action.DELETE_BUCKET;
+            case "PUT" -> {
+                if (queries.contains("partnumber") && queries.contains("uploadid")) {
+                    yield S3Action.UPLOAD_PART;
+                }
+                yield queries.contains("acl") ? S3Action.PUT_BUCKET_ACL : S3Action.CREATE_BUCKET;
+            }
+            case "DELETE" -> queries.contains("uploadid")
+                    ? S3Action.ABORT_MULTIPART_UPLOAD : S3Action.DELETE_BUCKET;
             case "HEAD" -> S3Action.HEAD_BUCKET;
-            case "POST" -> queries.contains("delete") ? S3Action.DELETE_OBJECTS : S3Action.UNSUPPORTED;
+            case "POST" -> {
+                if (queries.contains("delete")) {
+                    yield S3Action.DELETE_OBJECTS;
+                }
+                if (queries.contains("uploads")) {
+                    yield S3Action.CREATE_MULTIPART_UPLOAD;
+                }
+                yield queries.contains("uploadid")
+                        ? S3Action.COMPLETE_MULTIPART_UPLOAD : S3Action.UNSUPPORTED;
+            }
             case "GET" -> {
                 if (queries.contains("location")) {
                     yield S3Action.GET_BUCKET_LOCATION;
@@ -132,6 +149,9 @@ final class S3Router {
                 }
                 if (queries.contains("uploads")) {
                     yield S3Action.LIST_MULTIPART_UPLOADS;
+                }
+                if (queries.contains("uploadid")) {
+                    yield S3Action.LIST_PARTS;
                 }
                 yield S3Action.LIST_OBJECTS;
             }

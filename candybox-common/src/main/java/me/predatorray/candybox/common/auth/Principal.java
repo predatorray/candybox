@@ -22,6 +22,9 @@ package me.predatorray.candybox.common.auth;
  * Gateway:s3-1}). The same namespace is used by the authorizer's ACLs, so an S3 access key, a SASL
  * user and an ACL entry all meet on one identity.
  *
+ * <p>Built-in types are case-insensitive and stored in their canonical spelling. Names and
+ * custom types remain case-sensitive.
+ *
  * @param type the principal type, e.g. {@link #TYPE_USER}
  * @param name the identity within the type
  */
@@ -44,6 +47,12 @@ public record Principal(String type, String name) {
         }
         if (type.indexOf(':') >= 0) {
             throw new IllegalArgumentException("principal type must not contain ':': " + type);
+        }
+        for (String builtin : new String[] {TYPE_USER, TYPE_NODE, TYPE_GATEWAY, TYPE_ADMIN}) {
+            if (builtin.equalsIgnoreCase(type)) {
+                type = builtin;
+                break;
+            }
         }
     }
 

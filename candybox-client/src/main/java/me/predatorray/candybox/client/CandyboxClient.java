@@ -15,6 +15,9 @@
  */
 package me.predatorray.candybox.client;
 
+import me.predatorray.candybox.common.namespace.NamespaceKeys;
+import me.predatorray.candybox.common.namespace.NamespaceOperation;
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -44,6 +47,7 @@ import me.predatorray.candybox.common.exception.CandyNotFoundException;
 import me.predatorray.candybox.common.exception.CandyboxException;
 import me.predatorray.candybox.common.exception.NotOwnerException;
 import me.predatorray.candybox.common.exception.StorageException;
+import me.predatorray.candybox.common.exception.ValidationException;
 import me.predatorray.candybox.coordination.CoordinationService;
 import me.predatorray.candybox.protocol.Message;
 import me.predatorray.candybox.protocol.transport.Transport;
@@ -84,7 +88,9 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
     /** Cluster-aware client: routes each request to the owning node via coordination. */
     public CandyboxClient(Transport transport, CoordinationService coordination, CandyboxConfig config) {
         this(new ClusterRouter(transport, coordination, config.routerCacheTtlMillis(),
-                SystemClock.INSTANCE, config.routerUnownedRetryMillis(), Thread::sleep),
+                SystemClock.INSTANCE, config.routerUnownedRetryMillis(), Thread::sleep,
+                config.clientConnectionsPerNode(), config.clientMaxConcurrentRequests(),
+                config.clientAcquireTimeoutMillis(), config.clientRequestTimeoutMillis()),
                 config.sizeLimits());
     }
 
@@ -96,6 +102,70 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
     // ---- Box admin -------------------------------------------------------------------------
 
     /** Creates a Box with the server's default partition count. */
+    /** Creates a shared Box whose data is accessible only through namespace operations. */
+    public void createNamespaceBox(String box, int partitionCount) {
+        expectOk(router.callAny(new Message.CreateNamespaceBoxRequest(BoxName.of(box).value(), partitionCount)));
+    }
+
+    /** Backend/transport errors propagate; an interrupted PUT may have committed and renewed. */
+    public Message.NamespaceResponse namespace(String box, String address,
+            NamespaceOperation operation,
+            String key, byte[] data, long ttl, long expectedVersion, int pageSize,
+            String cursor, int partition) {
+        var request = new Message.NamespaceRequest(BoxName.of(box).value(), address, operation,
+                key, data == null ? new byte[0] : data, ttl, expectedVersion, pageSize, cursor, partition);
+        Message response = operation == NamespaceOperation.ENUMERATE
+                ? callPartition(box, partition, request)
+                : callKey(box, NamespaceKeys.lifecycle(address), request);
+        if (response instanceof Message.NamespaceResponse result) { return result; }
+        throw mapResponse(response);
+    }
+
+    public Message.NamespaceResponse createNamespace(String box, String address, long idleTtlMillis) {
+        return namespace(box, address, NamespaceOperation.CREATE,
+                null, null, idleTtlMillis, 0, 128, null, 0);
+    }
+
+    public Message.NamespaceResponse putNamespaceItem(String box, String address, String key, byte[] data) {
+        return namespace(box, address, NamespaceOperation.PUT,
+                key, data, 0, 0, 128, null, 0);
+    }
+
+    public Message.NamespaceResponse getNamespaceItem(String box, String address, String key) {
+        return namespace(box, address, NamespaceOperation.GET,
+                key, null, 0, 0, 128, null, 0);
+    }
+
+    public Message.NamespaceResponse claimNamespaceExpiry(String box, String address, long version) {
+        return namespace(box, address, NamespaceOperation.CLAIM_EXPIRY,
+                null, null, 0, version, 128, null, 0);
+    }
+
+    public Message.NamespaceResponse cleanupNamespace(String box, String address, int pageSize) {
+        return namespace(box, address, NamespaceOperation.CLEANUP,
+                null, null, 0, 0, pageSize, null, 0);
+    }
+
+    public Message.NamespaceResponse headNamespace(String box, String address) {
+        return namespace(box, address, NamespaceOperation.HEAD, null, null, 0, 0, 128, null, 0);
+    }
+
+    public Message.NamespaceResponse listNamespaceItems(String box, String address, int pageSize, String cursor) {
+        return namespace(box, address, NamespaceOperation.LIST, null, null, 0, 0, pageSize, cursor, 0);
+    }
+
+    public Message.NamespaceResponse deleteNamespaceItem(String box, String address, String key) {
+        return namespace(box, address, NamespaceOperation.DELETE, key, null, 0, 0, 128, null, 0);
+    }
+
+    public Message.NamespaceResponse clearNamespace(String box, String address, int pageSize, String cursor) {
+        return namespace(box, address, NamespaceOperation.CLEAR, null, null, 0, 0, pageSize, cursor, 0);
+    }
+
+    public Message.NamespaceResponse enumerateNamespaces(String box, int partition, int pageSize, String cursor) {
+        return namespace(box, null, NamespaceOperation.ENUMERATE, null, null, 0, 0, pageSize, cursor, partition);
+    }
+
     public void createBox(String box) {
         createBox(box, 0);
     }
@@ -244,8 +314,14 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
      * </ul>
      */
     public RangeBytes getCandyRange(String box, String key, long firstByte, long lastByte) {
+        return getCandyRange(box, key, firstByte, lastByte, 0);
+    }
+
+    private RangeBytes getCandyRange(String box, String key, long firstByte, long lastByte,
+                                     long minSourceBytesExclusive) {
         Message response = callKey(box, key, new Message.RangeGetCandyRequest(
-                BoxName.of(box).value(), CandyKey.of(key).value(), firstByte, lastByte));
+                BoxName.of(box).value(), CandyKey.of(key).value(), firstByte, lastByte,
+                minSourceBytesExclusive));
         if (response instanceof Message.CandyDataResponse data) {
             // For range responses, contentLength is the slice length and totalLength is the whole
             // object; the resolved start byte is implicit: totalLength - sliceLength may differ from
@@ -420,18 +496,32 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
      */
     public PartUploadInfo uploadPartCopy(String box, String key, String uploadId, int partNumber,
                                          String srcKey, long firstByte, long lastByte) {
+        return uploadPartCopy(box, key, uploadId, partNumber, srcKey, firstByte, lastByte, 0);
+    }
+
+    /**
+     * Copies from a source larger than {@code minSourceBytesExclusive}, checked on the resolved
+     * source version before range validation. Zero disables the predicate (native API behavior).
+     */
+    public PartUploadInfo uploadPartCopy(String box, String key, String uploadId, int partNumber,
+                                         String srcKey, long firstByte, long lastByte,
+                                         long minSourceBytesExclusive) {
+        if (minSourceBytesExclusive < 0) {
+            throw new ValidationException("Minimum source size must be nonnegative");
+        }
         Validation.checkCandyKey(CandyKey.of(key), limits);
         Validation.checkCandyKey(CandyKey.of(srcKey), limits);
         int n = partitionCount(box);
         if (Partitioning.partitionOf(srcKey, n) != Partitioning.partitionOf(key, n)) {
-            byte[] bytes = (firstByte < 0 && lastByte < 0)
+            byte[] bytes = (firstByte < 0 && lastByte < 0 && minSourceBytesExclusive == 0)
                     ? getCandy(box, srcKey)
-                    : getCandyRange(box, srcKey, firstByte, lastByte).data();
+                    : getCandyRange(box, srcKey, firstByte < 0 && lastByte < 0 ? 0 : firstByte,
+                            lastByte, minSourceBytesExclusive).data();
             return uploadPart(box, key, uploadId, partNumber, bytes);
         }
         Message response = callKey(box, key, new Message.UploadPartCopyRequest(
                 BoxName.of(box).value(), CandyKey.of(key).value(), uploadId, partNumber,
-                CandyKey.of(srcKey).value(), firstByte, lastByte));
+                CandyKey.of(srcKey).value(), firstByte, lastByte, minSourceBytesExclusive));
         if (response instanceof Message.UploadPartResponse up) {
             return new PartUploadInfo(partNumber, up.crc32c(), up.partLength());
         }

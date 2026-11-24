@@ -2,6 +2,24 @@
 
 Guidance for coding agents working in this repository.
 
+Read [CONSTITUTION.md](CONSTITUTION.md) before planning or implementing changes.
+It defines the product guarantees, architecture, and specification, testing, and
+amendment requirements that all work in this repository must follow.
+
+## Skills
+
+Shared skills live in `.agents/skills/<skill-name>/SKILL.md` and follow the open
+[Agent Skills specification](https://agentskills.io/specification). Edit skills there;
+`.claude/skills` is a relative symlink to `../.agents/skills` for Claude compatibility.
+Skill inputs come from the user's request, so they do not require agent-specific argument substitution.
+
+Queue skills: `$issue-loop` continuously selects requester-authored GitHub issues,
+dispatches isolated `$resolve-issue NUMBER` workers, independently judges PRs, and
+squash-merges only after checks pass, using `PR title (#number)` with an empty
+commit body. See
+[issue-loop](.agents/skills/issue-loop/SKILL.md) for persistent claims and restart
+handoffs; use `$resolve-issue NUMBER` directly for a single issue.
+
 ## Project
 
 Candybox is a distributed, S3-like object store in Java 17 (Maven multi-module). Its storage engine is
@@ -12,7 +30,9 @@ bytes), and **Syrup** = a data ledger that holds the object bytes.
 
 ## Commands
 
-Requires Java 17+ and Maven 3.9+. No external services are needed: the ITs start an in-JVM BookKeeper
+Requires Java 17+ and Maven 3.9+. The chart module also requires Helm 3.17+ for
+`package` and later phases (`-Dcandybox.charts.skip=true` skips it for image-only builds).
+No external services are needed for the Java tests: the ITs start an in-JVM BookKeeper
 and ZooKeeper.
 
 ```bash
@@ -32,6 +52,22 @@ mvn license:format              # add the Apache header (etc/license-header.txt)
 mvn -DskipTests -Pfrontend package   # also build the React dashboard into candybox-web.jar
 mvn -Prelease,frontend -DskipUpload=true deploy   # Maven Central dry run (needs a GPG key); see RELEASING.md
 ```
+
+### Keep tool output concise
+
+- `.mvn/maven.config` enables `-q` and `--no-transfer-progress` for all Maven commands,
+  including the examples above. Maven errors and test failure summaries still reach the console.
+  Use `mvn --log-file /tmp/candybox-maven.log ...` to capture a build log when needed.
+  For verbose Maven diagnostics, use `mvn -X ...` and capture the output to a file.
+- Test stdout/stderr is saved in each module's `target/surefire-reports/*-output.txt`
+  or `target/failsafe-reports/*-output.txt`. On failure, inspect the failing test's report
+  and a bounded excerpt of its output. Use `-Dmaven.test.redirectTestOutputToFile=false`
+  only when live test output is needed.
+- Use targeted `rg -n` searches and bounded file reads. Avoid dumping whole logs,
+  generated files, or broad directory listings into the conversation.
+- Capture noisy command output to a temporary file, preserve its exit status, and show
+  only the relevant failure excerpt. Do not hide failures with `|| true` or a pipeline
+  that loses the command's exit status. Summarize successful checks briefly.
 
 - `verify` runs `license-maven-plugin:check`, so every `src/{main,test}/java/**/*.java` file needs the
   license header.
@@ -107,6 +143,29 @@ Core invariants (details in `DESIGN.md`):
   When you change SPI behavior, update the contract so that the fake and the real implementation stay
   equivalent.
 - Integration tests (`*IT.java`) live only in `candybox-integration-tests`.
+
+## Keeping S3 compatibility documentation current
+
+When a change affects S3-visible behavior (including changes in the client, protocol, server,
+or storage layers), read [compat/s3-tests/README.md](compat/s3-tests/README.md) and update its
+supported scope and limitations in the same PR. Also review it when changing the compatibility
+runner, test credentials/configuration, Compose stacks, image architectures, or S3 CI workflow;
+keep its commands, defaults, prerequisites, and CI description aligned with those sources.
+
+- Check related S3 claims in the root `README.md`, `OPERATIONS.md`, and `docs/`; update affected
+  claims together. Follow `CONSTITUTION.md` for specification and compatibility evidence before
+  advertising a newly supported feature. A compatibility stub or isolated passing test is not
+  evidence of full feature support.
+- Run the existing `compat/s3-tests/run.sh` gate for S3 behavior changes. When a feature change
+  should expand the expected pass set, perform a full, unfiltered calibration using the README's
+  procedure, review the results and every removed test, and commit `allowlist.txt` and `badge.json`
+  together. Never shrink the allowlist to hide regressions.
+- Keep current implementation claims separate from recorded calibration results. Change counts,
+  percentages, dates, and suite revisions only with evidence from an actual run; retain historical
+  labels when no new calibration was performed. If validation or calibration cannot be run,
+  explain the limitation in the PR rather than inventing results or silently updating the badge.
+- For relevant PRs, state which compatibility documentation was updated, or why the existing
+  wording remains accurate, and summarize the gate/calibration evidence or unrun checks.
 
 ## Further docs
 

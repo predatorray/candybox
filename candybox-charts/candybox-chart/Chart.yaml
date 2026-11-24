@@ -1,0 +1,19 @@
+apiVersion: v2
+name: candybox-chart
+description: Candybox distributed object store with optional BookKeeper and ZooKeeper
+type: application
+# Maven substitutes these only in target/; the parent POM is the version source.
+version: "@project.version@"
+appVersion: "@project.version@"
+kubeVersion: ">=1.32.0-0"
+home: https://github.com/predatorray/candybox
+sources:
+  - https://github.com/predatorray/candybox
+annotations:
+  org.opencontainers.image.source: https://github.com/predatorray/candybox
+  artifacthub.io/license: Apache-2.0
+dependencies:
+  - name: zookeeper
+    version: "0.15.3"
+    repository: oci://registry-1.docker.io/cloudpirates
+    condition: zookeeper.enabled

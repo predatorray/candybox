@@ -16,8 +16,10 @@
 package me.predatorray.candybox.s3;
 
 import java.nio.file.Path;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import me.predatorray.candybox.client.CandyboxClient;
 import me.predatorray.candybox.common.SystemClock;
 import me.predatorray.candybox.common.config.CandyboxConfig;
@@ -49,23 +51,46 @@ public final class S3GatewayMain {
     }
 
     public static void main(String[] args) {
-        Path confFile = resolveConfigFile(args);
+        Path confFile = resolveConfigFile(args, System.getenv());
         LOG.info("Loading S3 gateway configuration from {}", confFile.toAbsolutePath());
         run(S3GatewayConfig.load(confFile));
     }
 
-    private static Path resolveConfigFile(String[] args) {
+    static Path resolveConfigFile(String[] args, Map<String, String> env) {
         if (args.length > 0 && !args[0].isBlank()) {
             return Path.of(args[0]);
         }
-        String confDir = System.getenv("CANDYBOX_CONF_DIR");
+        String confDir = env.get("CANDYBOX_CONF_DIR");
         if (confDir != null && !confDir.isBlank()) {
             return Path.of(confDir, "candybox-s3-gateway.properties");
         }
         return Path.of("conf", "candybox-s3-gateway.properties");
     }
 
+    /** Starts the gateway, installs the shutdown hook and waits for shutdown. */
     static void run(S3GatewayConfig config) {
+        run(config, drain -> Runtime.getRuntime().addShutdownHook(
+                new Thread(drain, "candybox-s3-gateway-shutdown")));
+    }
+
+    /** As {@link #run(S3GatewayConfig)}, with an injectable shutdown-hook registrar. */
+    static void run(S3GatewayConfig config, Consumer<Runnable> registerShutdown) {
+        RunningServer server = start(config);
+        CountDownLatch shutdown = new CountDownLatch(1);
+        registerShutdown.accept(() -> {
+            server.close();
+            shutdown.countDown();
+        });
+        try {
+            shutdown.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        LOG.info("Candybox S3 gateway stopped");
+    }
+
+    /** Starts the gateway without a shutdown hook or blocking the caller. */
+    static RunningServer start(S3GatewayConfig config) {
         SecurityConfig security = config.security();
         LOG.info("Starting Candybox S3 gateway (bind={}:{}, zk={}, region={}, node-tls={}, node-auth={})",
                 config.bindHost(), config.bindPort(), config.zookeeperConnect(), config.region(),
@@ -84,6 +109,10 @@ public final class S3GatewayMain {
                         security.zkAclEnabled()));
         CandyboxConfig clientConfig = CandyboxConfig.builder()
                 .routerCacheTtlMillis(config.routerCacheTtlMillis())
+                .clientConnectionsPerNode(config.clientConnectionsPerNode())
+                .clientMaxConcurrentRequests(config.clientMaxConcurrentRequests())
+                .clientAcquireTimeoutMillis(config.clientAcquireTimeoutMillis())
+                .clientRequestTimeoutMillis(config.clientRequestTimeoutMillis())
                 .routerUnownedRetryMillis(config.routerUnownedRetryMillis())
                 .build();
         CandyboxClient client = new CandyboxClient(transport, coordination, clientConfig);
@@ -100,8 +129,45 @@ public final class S3GatewayMain {
 
         LOG.info("Candybox S3 gateway is up: S3 on {}, health on {}", gateway.port(), health.port());
 
-        CountDownLatch shutdown = new CountDownLatch(1);
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+        return new RunningServer(ready, health, cluster, gateway, client, coordination, transport);
+    }
+
+    /** A running gateway; close drains in reverse startup order and is idempotent. */
+    static final class RunningServer implements AutoCloseable {
+        private final AtomicBoolean ready;
+        private final GatewayHealthServer health;
+        private final GatewayReadiness cluster;
+        private final S3Gateway gateway;
+        private final CandyboxClient client;
+        private final CoordinationService coordination;
+        private final Transport transport;
+        private final AtomicBoolean closed = new AtomicBoolean();
+
+        RunningServer(AtomicBoolean ready, GatewayHealthServer health, GatewayReadiness cluster,
+                      S3Gateway gateway, CandyboxClient client, CoordinationService coordination,
+                      Transport transport) {
+            this.ready = ready;
+            this.health = health;
+            this.cluster = cluster;
+            this.gateway = gateway;
+            this.client = client;
+            this.coordination = coordination;
+            this.transport = transport;
+        }
+
+        int s3Port() {
+            return gateway.port();
+        }
+
+        int healthPort() {
+            return health.port();
+        }
+
+        @Override
+        public void close() {
+            if (!closed.compareAndSet(false, true)) {
+                return;
+            }
             LOG.info("Shutdown signal received; draining S3 gateway");
             ready.set(false);
             closeQuietly("health server", health);
@@ -110,15 +176,7 @@ public final class S3GatewayMain {
             closeQuietly("candybox client", client);
             closeQuietly("coordination", coordination);
             closeQuietly("transport", transport);
-            shutdown.countDown();
-        }, "candybox-s3-gateway-shutdown"));
-
-        try {
-            shutdown.await();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
         }
-        LOG.info("Candybox S3 gateway stopped");
     }
 
     private static void closeQuietly(String what, AutoCloseable closeable) {

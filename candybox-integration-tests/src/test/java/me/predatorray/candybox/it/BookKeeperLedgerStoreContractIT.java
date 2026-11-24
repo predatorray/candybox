@@ -43,6 +43,11 @@ class BookKeeperLedgerStoreContractIT extends LedgerStoreContract {
     }
 
     @Override
+    protected int availableBookies() {
+        return 3;
+    }
+
+    @Override
     protected LedgerStore newStore() {
         return new BookKeeperLedgerStore(bookKeeper.clientConfiguration(),
                 "candybox".getBytes(StandardCharsets.UTF_8));

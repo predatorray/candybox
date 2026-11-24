@@ -467,7 +467,7 @@ public final class CandyboxCli {
                 return 0;
             }
             case "revoke" -> {
-                String grantee = requireArg(args, 0, "grantee");
+                String grantee = Grant.normalizeGrantee(requireArg(args, 0, "grantee"));
                 BoxAcl current = client.getBoxAcl(box).orElseThrow(() -> new IllegalArgumentException(
                         "Box " + box + " has no ACL document"));
                 List<Grant> grants = new ArrayList<>(current.grants());
@@ -515,7 +515,7 @@ public final class CandyboxCli {
                 return 0;
             }
             case "revoke" -> {
-                String grantee = requireArg(args, 0, "grantee");
+                String grantee = Grant.normalizeGrantee(requireArg(args, 0, "grantee"));
                 ObjectAcl current = client.getCandyAcl(box, key);
                 List<Grant> grants = new ArrayList<>(current.grants());
                 if (!grants.removeIf(g -> g.grantee().equals(grantee))) {

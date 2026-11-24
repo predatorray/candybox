@@ -30,6 +30,46 @@ import org.junit.jupiter.api.Test;
 class MetricsScraperTest {
 
     @Test
+    void persistentTargetErrorDoesNotStopOtherTargetsOrLaterTicks() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger failures = new java.util.concurrent.atomic.AtomicInteger();
+        java.net.ProxySelector selector = new java.net.ProxySelector() {
+            @Override
+            public List<java.net.Proxy> select(URI uri) {
+                if (uri.getHost().equals("broken.invalid")) {
+                    failures.incrementAndGet();
+                    throw new AssertionError("persistent target error");
+                }
+                return List.of(java.net.Proxy.NO_PROXY);
+            }
+
+            @Override
+            public void connectFailed(URI uri, java.net.SocketAddress address, java.io.IOException e) {
+            }
+        };
+        HttpServer fake = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        fake.createContext("/metrics", exchange -> {
+            byte[] bytes = "healthy 1\n".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, bytes.length);
+            try (OutputStream out = exchange.getResponseBody()) {
+                out.write(bytes);
+            }
+        });
+        fake.start();
+        URI healthy = URI.create("http://127.0.0.1:" + fake.getAddress().getPort() + "/metrics");
+        try (MetricsScraper scraper = new MetricsScraper(
+                List.of(URI.create("http://broken.invalid/metrics"), healthy), 20, 60, null,
+                java.net.http.HttpClient.newBuilder().proxy(selector).build())) {
+            scraper.start();
+            assertThat(scraper.latestText()).contains("healthy 1");
+            waitUntil(() -> scraper.seriesFor(List.of("healthy")).get("healthy").get(0)
+                    .samples().size() >= 3, 2_000);
+            assertThat(failures.get()).isGreaterThanOrEqualTo(3);
+        } finally {
+            fake.stop(0);
+        }
+    }
+
+    @Test
     void pollsTargetAndAccumulatesRollingWindow() throws Exception {
         AtomicReference<String> body = new AtomicReference<>("candybox_x 1\n");
         HttpServer fake = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);

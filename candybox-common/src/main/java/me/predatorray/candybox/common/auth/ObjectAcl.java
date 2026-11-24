@@ -31,6 +31,9 @@ public record ObjectAcl(String owner, List<Grant> grants) {
     public static final ObjectAcl NONE = new ObjectAcl(null, List.of());
 
     public ObjectAcl {
+        if (owner != null && owner.indexOf(':') >= 0) {
+            owner = Principal.parse(owner).toString();
+        }
         grants = grants == null ? List.of() : List.copyOf(grants);
     }
 

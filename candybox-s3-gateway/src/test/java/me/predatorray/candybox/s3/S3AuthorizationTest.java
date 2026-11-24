@@ -247,6 +247,49 @@ class S3AuthorizationTest {
     }
 
     @Test
+    void fullControlGranteeRetainsS3PermissionsButCannotDeleteBucket() {
+        EmbeddedChannel ch = channel(true);
+        try {
+            assertThat(signedPut(ch, "/team", null, ALICE_KEY).status()).isEqualTo(200);
+            String policy = """
+                    <AccessControlPolicy><Owner><ID>User:alice</ID></Owner><AccessControlList>
+                    <Grant><Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" \
+                    xsi:type="CanonicalUser"><ID>User:bob</ID></Grantee>
+                    <Permission>FULL_CONTROL</Permission></Grant>
+                    </AccessControlList></AccessControlPolicy>""";
+            byte[] policyBytes = policy.getBytes(StandardCharsets.UTF_8);
+            assertThat(signedPut(ch, "/team?acl", policyBytes, ALICE_KEY).status()).isEqualTo(200);
+
+            // Test deletion while the bucket is empty: denial must be authorization, not BucketNotEmpty.
+            Response denied = exchange(ch, HttpMethod.DELETE, "/team", null, BOB_KEY, Map.of());
+            assertThat(denied.status()).isEqualTo(403);
+            assertThat(denied.body()).contains("<Code>AccessDenied</Code>");
+            assertThat(store.getBoxAcl("team").orElseThrow().owner()).isEqualTo(ALICE_KEY.principal());
+
+            Response acl = signedGet(ch, "/team?acl", BOB_KEY); // READ_ACP
+            assertThat(acl.status()).isEqualTo(200);
+            assertThat(S3RequestXml.parseAccessControlPolicy(acl.body().getBytes(StandardCharsets.UTF_8))
+                    .grants()).anySatisfy(grant -> {
+                        assertThat(grant.canonicalId()).isEqualTo("User:bob");
+                        assertThat(grant.permission()).isEqualTo("FULL_CONTROL");
+                    });
+            assertThat(signedPut(ch, "/team?acl", policyBytes, BOB_KEY).status()).isEqualTo(200); // WRITE_ACP
+            byte[] data = "hello".getBytes(StandardCharsets.UTF_8);
+            assertThat(signedPut(ch, "/team/object", data, BOB_KEY).status()).isEqualTo(200); // WRITE
+            assertThat(signedGet(ch, "/team/object", BOB_KEY).body()).isEqualTo("hello"); // READ
+            assertThat(signedGet(ch, "/team", BOB_KEY).status()).isEqualTo(200);
+            assertThat(exchange(ch, HttpMethod.DELETE, "/team/object", null, BOB_KEY, Map.of()).status())
+                    .isEqualTo(204);
+            assertThat(exchange(ch, HttpMethod.DELETE, "/team", null, BOB_KEY, Map.of()).status())
+                    .isEqualTo(403);
+            assertThat(exchange(ch, HttpMethod.DELETE, "/team", null, ALICE_KEY, Map.of()).status())
+                    .isEqualTo(204);
+        } finally {
+            ch.finishAndReleaseAll();
+        }
+    }
+
+    @Test
     void objectAclEndpointFlipsAnObjectPublic() {
         EmbeddedChannel ch = channel(true);
         signedPut(ch, "/flip", null, ALICE_KEY);
