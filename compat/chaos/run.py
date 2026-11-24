@@ -199,13 +199,20 @@ class Experiment:
         new_targets = self.targets("owner1", "owner2")
         if set(old_targets) & set(new_targets):
             raise HarnessFailure("bootstrap owner replacement did not recreate both containers")
+        # Parallel owner recreation can swap container IPs. Discard the gateway's
+        # bootstrap DNS answers/pools before any data acknowledgement or fault schedule.
+        gateway_targets = self.targets("gateway")
+        (self.output / "gateway-before-bootstrap-restart.log").write_text(
+            self.compose("logs", "--no-color", "--timestamps", "gateway", timeout=60))
+        command(["docker", "restart", *gateway_targets])
         containers = json.loads(command(["docker", "inspect", *self.compose("ps", "-a", "-q").split()]))
         (self.output / "containers.json").write_text(json.dumps(containers, indent=2) + "\n")
         for info in containers:
             if info["Id"] in new_targets and "CANDYBOX_BALANCER_INTERVAL_MILLIS=1000" not in info["Config"]["Env"]:
                 raise HarnessFailure("fault-phase owner is not configured for normal balancing")
         self.event("bootstrap-transition-response", balancer_interval_millis=1000,
-                   owner_containers=new_targets, acknowledged_objects=len(self.expected))
+                   owner_containers=new_targets, restarted_gateway_containers=gateway_targets,
+                   acknowledged_objects=len(self.expected))
         # Read-only readiness checks avoid sending ambiguous baseline PUTs while leases recover.
         deadline = time.monotonic() + self.args.recovery_seconds
         while time.monotonic() < deadline:
