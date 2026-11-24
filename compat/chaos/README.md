@@ -40,8 +40,10 @@ Requires Python 3.9+, Java 17+, Maven 3.9+, Docker Engine and Compose v2. Budget
 least 6 GiB of available Docker memory. From the repository root:
 
 ```sh
-mvn -DskipTests -Dcandybox.charts.skip=true package
-docker build -f compat/chaos/Dockerfile -t candybox:chaos .
+mvn -DskipTests -Dcandybox.charts.skip=true clean package
+docker build -f compat/chaos/Dockerfile -t candybox:chaos \
+  --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" \
+  --build-arg DISTRIBUTION_SHA256="$(sha256sum candybox-dist/target/candybox-*.tar.gz | cut -d ' ' -f 1)" .
 CANDYBOX_CHAOS_DISPOSABLE=yes python3 compat/chaos/run.py \
   --namespace chaos-local --image candybox:chaos --seed 167 \
   --output /tmp/candybox-chaos
@@ -50,7 +52,10 @@ CANDYBOX_CHAOS_DISPOSABLE=yes python3 compat/chaos/run.py \
 Candybox is resolved to an existing local immutable image ID before startup (no
 pull of a `latest` Candybox binary). The runtime image is version-pinned and backend
 images are version-pinned in Compose; `containers.json` records the actual image
-IDs, and the rendered `compose.yml` records configuration. Archive those artifacts
+IDs; `image.json` records the image labels with source revision and verified
+distribution SHA-256. The driver also records its own revision and dirty state.
+Use a clean source checkout and the clean build above: a label alone cannot prove
+which sources produced an archive. The rendered `compose.yml` records configuration. Archive those artifacts
 with the distribution/source revision to reproduce a run; tags alone are not
 content-addressed release evidence. Builds use the local source, not a published
 release. Do not describe two such builds as a mixed-version test.
@@ -75,7 +80,10 @@ does not deterministically hold a write inside a stale owner and prove its fenci
 rejection. The bookie test removes write quorum; it does not partition individual
 network paths or prove all network fault modes.
 
-Each subprocess has a timeout; each HTTP request has a 15-second timeout; object
+Each subprocess has a timeout. Bucket creation gets one bounded 120-second request
+(`--setup-seconds`); the gateway node read budget is 120 seconds to accommodate
+creating all eight partitions on a cold backend. Bucket creation is never retried,
+and HTTP 409 is a setup failure. Ordinary HTTP requests have a 15-second timeout; object
 count is capped at 100. Stabilization checks have a configured deadline (default
 90 seconds), with at most one request-timeout overrun. SIGINT/SIGTERM unwind through
 restoration and teardown. SIGKILL of the harness or daemon failure cannot execute
@@ -108,7 +116,7 @@ python3 -m unittest discover -s compat/chaos -p 'test_*.py'
 ## Remaining #167 gates
 
 No passing initial report closes #167. The following are deliberately unimplemented:
-selected-path delay/drop, a reply lost after a verified commit plus explicit-token
+ownership-aware stale-writer rejection, selected-path delay/drop, a reply lost after a verified commit plus explicit-token
 retry, deterministic rename boundary crashes, a delayed zero-copy consumer while
 source deletion/compaction/destructive GC runs, metrics snapshots, and real
 released-artifact mixed-version activation. #157 still owns the absent runtime

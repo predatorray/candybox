@@ -84,17 +84,17 @@ class Experiment:
         self.compose(*action.split(), *services)
         self.event("fault-response", action=action, services=services)
 
-    def request(self, method, key="", data=None, version=None):
+    def request(self, method, key="", data=None, version=None, *, timeout=15):
         self.sequence += 1
         op = str(self.sequence)
         digest = hashlib.sha256(data).hexdigest() if data is not None else None
-        self.event("invoke", operation_id=op, method=method, key=key, version=version, sha256=digest)
+        self.event("invoke", operation_id=op, method=method, key=key, version=version, sha256=digest, timeout_seconds=timeout)
         headers = {"x-amz-meta-version": version} if version else {}
         request = urllib.request.Request(self.endpoint + "/chaos-data" + ("/" + key if key else ""),
                                          data=data, method=method, headers=headers)
         try:
             try:
-                with self.http.open(request, timeout=15) as response:
+                with self.http.open(request, timeout=timeout) as response:
                     body = response.read()
                     status, response_headers = response.status, dict(response.headers)
             except urllib.error.HTTPError as error:
@@ -146,8 +146,13 @@ class Experiment:
         # Resolve Candybox before creating containers; tags cannot silently pull another build.
         info = json.loads(command(["docker", "image", "inspect", self.args.image]))[0]
         self.env["CHAOS_CANDYBOX_IMAGE"] = info["Id"]
+        (self.output / "image.json").write_text(json.dumps(info, indent=2) + "\n")
         self.event("configuration", seed=self.args.seed, project=self.project, image=info["Id"],
-                   source_revision=command(["git", "-C", str(HERE), "rev-parse", "HEAD"]).strip())
+                   source_revision=command(["git", "-C", str(HERE), "rev-parse", "HEAD"]).strip(),
+                   source_dirty=bool(command(["git", "-C", str(HERE), "status", "--porcelain"]).strip()),
+                   image_labels=info["Config"].get("Labels"),
+                   setup_timeout_seconds=self.args.setup_seconds,
+                   recovery_timeout_seconds=self.args.recovery_seconds, objects=self.args.objects)
         (self.output / "compose.yml").write_text(self.compose("config"))
         self.started = True  # partial setup also needs teardown
         self.compose("up", "-d", "--wait", "--wait-timeout", "300", timeout=360)
@@ -167,7 +172,7 @@ class Experiment:
                 break  # HTTP error still proves the listener is serving
             except (OSError, urllib.error.URLError):
                 time.sleep(1)
-        status, _, _ = self.request("PUT")
+        status, _, _ = self.request("PUT", timeout=self.args.setup_seconds)
         if status not in (200, 201, 204):
             raise HarnessFailure(f"bucket creation failed: {status}")
         for index in range(self.args.objects):
@@ -242,6 +247,8 @@ def main():
     parser.add_argument("--output", default="/tmp/candybox-chaos")
     parser.add_argument("--seed", type=int, default=167)
     parser.add_argument("--objects", type=int, choices=range(1, 101), default=16)
+    parser.add_argument("--setup-seconds", type=int, choices=range(1, 181), default=120,
+                        help="one bucket creation request; never retried on ambiguity")
     parser.add_argument("--recovery-seconds", type=int, choices=range(1, 181), default=90)
     args = parser.parse_args()
     experiment = None
@@ -268,7 +275,7 @@ def main():
                 status, detail, code = "harness-error", detail + "; cleanup: " + repr(errors), 2
             report = dict(status=status, detail=detail, seed=args.seed, recovery=experiment.recoveries,
                           acknowledged_objects=len(experiment.expected), cleanup_errors=errors,
-                          uncovered=["selected-path network faults", "delayed relay consumer with destructive GC",
+                          uncovered=["ownership-aware stale-writer rejection", "selected-path network faults", "delayed relay consumer with destructive GC",
                                      "rename crash boundaries", "lost-response explicit-token retry",
                                      "real released-artifact mixed-version activation (#157)", "metrics snapshots"])
             (experiment.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
