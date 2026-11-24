@@ -1,0 +1,837 @@
+{
+  "scope": "Initial schedules only; issue167 remains open for all uncovered gates",
+  "runtime_provenance": {
+    "base_main": "852a076a54c6cbadab8178bd22f063fc599bf15b",
+    "binary_source_revision": "e7799dc1042680d2696b792560df48957ebe426d",
+    "clean_package_exit_code": 0,
+    "build_command": "mvn -s /tmp/issue167-settings.xml -Dmaven.repo.local=/tmp/issue167-m2 -DskipTests -Dcandybox.charts.skip=true clean package",
+    "build_environment": "Temurin17 JDK; session proxy configured in temporary Maven settings; session CA added to private trust store; no shared artifact repository",
+    "distribution_sha256": "39cddd601970a419946f485d77b046eff1de411c1f9d6f08d1764725f289faf2",
+    "image_build_command": "docker build -f compat/chaos/Dockerfile -t candybox:chaos-167-current --build-arg SOURCE_REVISION=e7799dc1042680d2696b792560df48957ebe426d --build-arg DISTRIBUTION_SHA256=39cddd601970a419946f485d77b046eff1de411c1f9d6f08d1764725f289faf2 .",
+    "image_build_exit_code": 0,
+    "versions": {
+      "compile_java": "openjdk version \"17.0.17\" 2025-10-21\nOpenJDK Runtime Environment Temurin-17.0.17+10 (build 17.0.17+10)\nOpenJDK 64-Bit Server VM Temurin-17.0.17+10 (build 17.0.17+10, mixed mode, sharing)",
+      "maven": "3.9.9",
+      "docker_engine": "28.4.0",
+      "compose": "2.40.3",
+      "docker_memory_bytes": 10452459520,
+      "platform": "Linux x86_64"
+    }
+  },
+  "measured_driver_revision": "15bab2344c9ea719a56053342907af2a03eda8f0",
+  "setup_failures": 4,
+  "complete_initial_passes": 2,
+  "runs": [
+    {
+      "project": "chaos-issue167-bootstrap-66a50e0ec41f",
+      "configuration": {
+        "event": "configuration",
+        "wall_ns": 1795492602687890554,
+        "monotonic_ns": 949096657337,
+        "seed": 167,
+        "project": "chaos-issue167-bootstrap-66a50e0ec41f",
+        "image": "sha256:65b162ae164caf77cbc59668352a768c04aef90890e579a0ae5e458804e4d929",
+        "source_revision": "7e5feae9f51c73cb5510d44f383b580ab52a50eb",
+        "source_dirty": false,
+        "image_labels": {
+          "io.candybox.distribution.sha256": "39cddd601970a419946f485d77b046eff1de411c1f9d6f08d1764725f289faf2",
+          "org.opencontainers.image.ref.name": "ubuntu",
+          "org.opencontainers.image.revision": "e7799dc1042680d2696b792560df48957ebe426d",
+          "org.opencontainers.image.version": "22.04"
+        },
+        "experiment_timeout_seconds": 1200,
+        "setup_timeout_seconds": 120,
+        "recovery_timeout_seconds": 90,
+        "objects": 16
+      },
+      "report": {
+        "status": "harness-error",
+        "detail": "normal balancing did not make empty baseline keys readable",
+        "seed": 167,
+        "recovery": [],
+        "acknowledged_objects": 0,
+        "cleanup_errors": [],
+        "uncovered": [
+          "ownership-aware stale-writer rejection",
+          "selected-path network faults",
+          "delayed relay consumer with destructive GC",
+          "rename crash boundaries",
+          "lost-response explicit-token retry",
+          "real released-artifact mixed-version activation (#157)",
+          "metrics snapshots"
+        ]
+      },
+      "invocations": 120,
+      "responses": 120,
+      "mutation_responses": [
+        {
+          "key": "",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 1.350564514
+        }
+      ],
+      "bootstrap_transitions": [
+        {
+          "event": "bootstrap-transition-invoke",
+          "wall_ns": 1795492663887002687,
+          "monotonic_ns": 1010295769467,
+          "balancer_interval_millis": 1000,
+          "replaced_containers": [
+            "3b423b95172a1a08e65a0633f4528452f9223d2f77e6d507d99b97214e6cf1d0",
+            "2dad99832c4c62a662c893194fd742de40927a541ec9da5de26b045fe68b605c"
+          ],
+          "acknowledged_objects": 0
+        },
+        {
+          "event": "bootstrap-transition-response",
+          "wall_ns": 1795492673890092012,
+          "monotonic_ns": 1020298870178,
+          "balancer_interval_millis": 1000,
+          "owner_containers": [
+            "01f747060b06c82e16a2bc6350412ac60f96d12f10bfea5a06fea7d4b4713298",
+            "bf7d641274a3741c7206fcef36eaa4403783878a7f7942c8ceb3e06a031d28c1"
+          ],
+          "acknowledged_objects": 0
+        }
+      ],
+      "gateway_bindings": [],
+      "cleanup_proof": "runs/chaos-issue167-bootstrap-66a50e0ec41f/cleanup-proof.json"
+    },
+    {
+      "project": "chaos-issue167-current-e14e78ae0a4b",
+      "configuration": {
+        "event": "configuration",
+        "wall_ns": 1795492180163379315,
+        "monotonic_ns": 526572146223,
+        "seed": 167,
+        "project": "chaos-issue167-current-e14e78ae0a4b",
+        "image": "sha256:65b162ae164caf77cbc59668352a768c04aef90890e579a0ae5e458804e4d929",
+        "source_revision": "e7799dc1042680d2696b792560df48957ebe426d",
+        "source_dirty": false,
+        "image_labels": {
+          "io.candybox.distribution.sha256": "39cddd601970a419946f485d77b046eff1de411c1f9d6f08d1764725f289faf2",
+          "org.opencontainers.image.ref.name": "ubuntu",
+          "org.opencontainers.image.revision": "e7799dc1042680d2696b792560df48957ebe426d",
+          "org.opencontainers.image.version": "22.04"
+        },
+        "setup_timeout_seconds": 120,
+        "recovery_timeout_seconds": 90,
+        "objects": 16
+      },
+      "report": {
+        "status": "harness-error",
+        "detail": "['docker', 'compose', '-p', 'chaos-issue167-current-e14e78ae0a4b', '-f', '/workspace/issue-167/compat/chaos/compose.yml', 'start', 'owner1']: exit 1:  Container chaos-issue167-current-e14e78ae0a4b-zk1-1  Waiting\n Container chaos-issue167-current-e14e78ae0a4b-zk2-1  Waiting\n Container chaos-issue167-current-e14e78ae0a4b-zk3-1  Waiting\n Container chaos-issue167-current-e14e78ae0a4b-zk2-1  Healthy\n Container chaos-issue167-current-e14e78ae0a4b-zk1-1  Healthy\n Container chaos-issue167-current-e14e78ae0a4b-zk3-1  Healthy\n Container chaos-issue167-current-e14e78ae0a4b-bk-init-1  Starting\n Container chaos-issue167-current-e14e78ae0a4b-bk-init-1  Started\n Container chaos-issue167-current-e14e78ae0a4b-bk-init-1  Waiting\n Container chaos-issue167-current-e14e78ae0a4b-bk-init-1  Waiting\n Container chaos-issue167-current-e14e78ae0a4b-bk-init-1  Waiting\n Container chaos-issue167-current-e14e78ae0a4b-bk-init-1  service \"bk-init\" didn't complete successfully: exit 1\n Container chaos-issue167-current-e14e78ae0a4b-bk-init-1  service \"bk-init\" didn't complete successfully: exit 1\n Container chaos-issue167-current-e14e78ae0a4b-bk-init-1  service \"bk-init\" didn't complete successfully: exit 1\nservice \"bk-init\" didn't complete successfully: exit 1\n",
+        "seed": 167,
+        "recovery": [
+          {
+            "scenario": "baseline",
+            "observation_seconds": 0.3190319970000246
+          },
+          {
+            "scenario": "kill-owner1",
+            "observation_seconds": 15.950070603999961
+          }
+        ],
+        "acknowledged_objects": 16,
+        "cleanup_errors": [],
+        "uncovered": [
+          "ownership-aware stale-writer rejection",
+          "selected-path network faults",
+          "delayed relay consumer with destructive GC",
+          "rename crash boundaries",
+          "lost-response explicit-token retry",
+          "real released-artifact mixed-version activation (#157)",
+          "metrics snapshots"
+        ]
+      },
+      "invocations": 52,
+      "responses": 52,
+      "mutation_responses": [
+        {
+          "key": "",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 1.853534796
+        },
+        {
+          "key": "key-0000",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.197394694
+        },
+        {
+          "key": "key-0001",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.040929602
+        },
+        {
+          "key": "key-0002",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.045168838
+        },
+        {
+          "key": "key-0003",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.057629959
+        },
+        {
+          "key": "key-0004",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 1.821010267
+        },
+        {
+          "key": "key-0005",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.042397865
+        },
+        {
+          "key": "key-0006",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.028299438
+        },
+        {
+          "key": "key-0007",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.028600738
+        },
+        {
+          "key": "key-0008",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.028244957
+        },
+        {
+          "key": "key-0009",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.023439993
+        },
+        {
+          "key": "key-0010",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.024671093
+        },
+        {
+          "key": "key-0011",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.027210478
+        },
+        {
+          "key": "key-0012",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.027546703
+        },
+        {
+          "key": "key-0013",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.022807563
+        },
+        {
+          "key": "key-0014",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.022552239
+        },
+        {
+          "key": "key-0015",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.023234447
+        }
+      ],
+      "bootstrap_transitions": [],
+      "gateway_bindings": [],
+      "cleanup_proof": "runs/chaos-issue167-current-e14e78ae0a4b/cleanup-proof.json"
+    },
+    {
+      "project": "chaos-issue167-final-bed55e9cff4c",
+      "configuration": {
+        "event": "configuration",
+        "wall_ns": 1795492807406243528,
+        "monotonic_ns": 1153815010869,
+        "seed": 167,
+        "project": "chaos-issue167-final-bed55e9cff4c",
+        "image": "sha256:65b162ae164caf77cbc59668352a768c04aef90890e579a0ae5e458804e4d929",
+        "source_revision": "4f4d9e5a7adbee436a74e9cecf0750ccbce70bd3",
+        "source_dirty": false,
+        "image_labels": {
+          "io.candybox.distribution.sha256": "39cddd601970a419946f485d77b046eff1de411c1f9d6f08d1764725f289faf2",
+          "org.opencontainers.image.ref.name": "ubuntu",
+          "org.opencontainers.image.revision": "e7799dc1042680d2696b792560df48957ebe426d",
+          "org.opencontainers.image.version": "22.04"
+        },
+        "experiment_timeout_seconds": 1200,
+        "setup_timeout_seconds": 120,
+        "recovery_timeout_seconds": 90,
+        "objects": 16
+      },
+      "report": {
+        "status": "harness-error",
+        "detail": "normal balancing did not make empty baseline keys readable",
+        "seed": 167,
+        "recovery": [],
+        "acknowledged_objects": 0,
+        "cleanup_errors": [],
+        "uncovered": [
+          "ownership-aware stale-writer rejection",
+          "selected-path network faults",
+          "delayed relay consumer with destructive GC",
+          "rename crash boundaries",
+          "lost-response explicit-token retry",
+          "real released-artifact mixed-version activation (#157)",
+          "metrics snapshots"
+        ]
+      },
+      "invocations": 91,
+      "responses": 91,
+      "mutation_responses": [
+        {
+          "key": "",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 2.215575608
+        }
+      ],
+      "bootstrap_transitions": [
+        {
+          "event": "bootstrap-transition-invoke",
+          "wall_ns": 1795492885669524260,
+          "monotonic_ns": 1232078291363,
+          "balancer_interval_millis": 1000,
+          "replaced_containers": [
+            "ad5ce26038cb5455429397a9fb1e89711785c640472e0e2d902905762c550b25",
+            "8ef75ab6f7cf7b140d5d340fafa5daac10f11b1e7211fdee06f52d57002da256"
+          ],
+          "acknowledged_objects": 0
+        },
+        {
+          "event": "bootstrap-transition-response",
+          "wall_ns": 1795492898071793047,
+          "monotonic_ns": 1244480559939,
+          "balancer_interval_millis": 1000,
+          "owner_containers": [
+            "eee530808747c279a20241bb623cc8535143bf1997097c93b96a1e64b82e4b7c",
+            "57d363fe31634c8c5f9e8527fda4a4e31d29a1cd48926063f51fd9bba27be8c4"
+          ],
+          "restarted_gateway_containers": [
+            "7bb20b52b6b958d34f4ab1c0a91f06561612c7197d04b05cc86b867c5c580e38"
+          ],
+          "acknowledged_objects": 0
+        }
+      ],
+      "gateway_bindings": [],
+      "cleanup_proof": "runs/chaos-issue167-final-bed55e9cff4c/cleanup-proof.json"
+    },
+    {
+      "project": "chaos-issue167-repeat-69a441f7a47d",
+      "configuration": {
+        "event": "configuration",
+        "wall_ns": 1795493203706254053,
+        "monotonic_ns": 1550115021089,
+        "seed": 168,
+        "project": "chaos-issue167-repeat-69a441f7a47d",
+        "image": "sha256:65b162ae164caf77cbc59668352a768c04aef90890e579a0ae5e458804e4d929",
+        "source_revision": "15bab2344c9ea719a56053342907af2a03eda8f0",
+        "source_dirty": false,
+        "image_labels": {
+          "io.candybox.distribution.sha256": "39cddd601970a419946f485d77b046eff1de411c1f9d6f08d1764725f289faf2",
+          "org.opencontainers.image.ref.name": "ubuntu",
+          "org.opencontainers.image.revision": "e7799dc1042680d2696b792560df48957ebe426d",
+          "org.opencontainers.image.version": "22.04"
+        },
+        "experiment_timeout_seconds": 1200,
+        "setup_timeout_seconds": 120,
+        "recovery_timeout_seconds": 90,
+        "objects": 16
+      },
+      "report": {
+        "status": "pass-initial-scenarios",
+        "detail": "Initial schedules only; see uncovered acceptance cases",
+        "seed": 168,
+        "recovery": [
+          {
+            "scenario": "baseline",
+            "observation_seconds": 0.5367388530000881
+          },
+          {
+            "scenario": "kill-owner1",
+            "observation_seconds": 17.340384046000054
+          },
+          {
+            "scenario": "restart-owner1",
+            "observation_seconds": 0.4043394000000262
+          },
+          {
+            "scenario": "kill-owner2",
+            "observation_seconds": 17.97048684099991
+          },
+          {
+            "scenario": "restart-owner2",
+            "observation_seconds": 0.6149068860001989
+          },
+          {
+            "scenario": "owner1-paused-past-ttl",
+            "observation_seconds": 3.2572781819999364
+          },
+          {
+            "scenario": "owner1-resumed",
+            "observation_seconds": 0.28550082600008864
+          },
+          {
+            "scenario": "bookkeeper-quorum-restored",
+            "observation_seconds": 9.603326164999999
+          }
+        ],
+        "acknowledged_objects": 17,
+        "cleanup_errors": [],
+        "uncovered": [
+          "ownership-aware stale-writer rejection",
+          "selected-path network faults",
+          "delayed relay consumer with destructive GC",
+          "rename crash boundaries",
+          "lost-response explicit-token retry",
+          "real released-artifact mixed-version activation (#157)",
+          "metrics snapshots"
+        ]
+      },
+      "invocations": 177,
+      "responses": 177,
+      "mutation_responses": [
+        {
+          "key": "",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 1.581783973
+        },
+        {
+          "key": "key-0000",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.091492354
+        },
+        {
+          "key": "key-0001",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.073927995
+        },
+        {
+          "key": "key-0002",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.040859991
+        },
+        {
+          "key": "key-0003",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.05345262
+        },
+        {
+          "key": "key-0004",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.031560885
+        },
+        {
+          "key": "key-0005",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.023595911
+        },
+        {
+          "key": "key-0006",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.026292336
+        },
+        {
+          "key": "key-0007",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.02200085
+        },
+        {
+          "key": "key-0008",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.025266809
+        },
+        {
+          "key": "key-0009",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.025007
+        },
+        {
+          "key": "key-0010",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.024591084
+        },
+        {
+          "key": "key-0011",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.02691616
+        },
+        {
+          "key": "key-0012",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.028518904
+        },
+        {
+          "key": "key-0013",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.025597753
+        },
+        {
+          "key": "key-0014",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.023929236
+        },
+        {
+          "key": "key-0015",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.035865795
+        },
+        {
+          "key": "written-during-pause",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.041102151
+        },
+        {
+          "key": "quorum-loss-outcome",
+          "status": 500,
+          "outcome": "response",
+          "seconds": 0.027894022
+        }
+      ],
+      "bootstrap_transitions": [
+        {
+          "event": "bootstrap-transition-invoke",
+          "wall_ns": 1795493280264417015,
+          "monotonic_ns": 1626673183721,
+          "balancer_interval_millis": 1000,
+          "replaced_containers": [
+            "a5b0772a9e932751091d8728c337f68e8ddf89dee0bde985f9d328d4635422d2",
+            "92f8d15f087c599e1c197687a7a8588a06cdbc7f345a6fb5d519433bee78d88d"
+          ],
+          "acknowledged_objects": 0
+        },
+        {
+          "event": "bootstrap-transition-response",
+          "wall_ns": 1795493293274419518,
+          "monotonic_ns": 1639683186547,
+          "balancer_interval_millis": 1000,
+          "owner_containers": [
+            "c62418539e9c31c889febf879fc8570fcbd9bcca2bbb2bb71f94f09614654b3d",
+            "8532a82df3fdcbcfcade8ad7f421442675aa12ae785020730b25ea2f2f7da399"
+          ],
+          "restarted_gateway_containers": [
+            "ed7e83b2582113f0bdc34a23a1ddeeca6956f226942a6e70d451d0227a0db44d"
+          ],
+          "acknowledged_objects": 0
+        }
+      ],
+      "gateway_bindings": [
+        "http://127.0.0.1:32775",
+        "http://127.0.0.1:32776"
+      ],
+      "cleanup_proof": "runs/chaos-issue167-repeat-69a441f7a47d/cleanup-proof.json"
+    },
+    {
+      "project": "chaos-issue167-restored-25d18691cf17",
+      "configuration": {
+        "event": "configuration",
+        "wall_ns": 1795492393904652226,
+        "monotonic_ns": 740313419396,
+        "seed": 167,
+        "project": "chaos-issue167-restored-25d18691cf17",
+        "image": "sha256:65b162ae164caf77cbc59668352a768c04aef90890e579a0ae5e458804e4d929",
+        "source_revision": "d768a2b4122f9d0fa9884aa7da4fcaa78c34231d",
+        "source_dirty": false,
+        "image_labels": {
+          "io.candybox.distribution.sha256": "39cddd601970a419946f485d77b046eff1de411c1f9d6f08d1764725f289faf2",
+          "org.opencontainers.image.ref.name": "ubuntu",
+          "org.opencontainers.image.revision": "e7799dc1042680d2696b792560df48957ebe426d",
+          "org.opencontainers.image.version": "22.04"
+        },
+        "experiment_timeout_seconds": 1200,
+        "setup_timeout_seconds": 120,
+        "recovery_timeout_seconds": 90,
+        "objects": 16
+      },
+      "report": {
+        "status": "harness-error",
+        "detail": "bucket creation failed: 500",
+        "seed": 167,
+        "recovery": [],
+        "acknowledged_objects": 0,
+        "cleanup_errors": [],
+        "uncovered": [
+          "ownership-aware stale-writer rejection",
+          "selected-path network faults",
+          "delayed relay consumer with destructive GC",
+          "rename crash boundaries",
+          "lost-response explicit-token retry",
+          "real released-artifact mixed-version activation (#157)",
+          "metrics snapshots"
+        ]
+      },
+      "invocations": 1,
+      "responses": 1,
+      "mutation_responses": [
+        {
+          "key": "",
+          "status": 500,
+          "outcome": "response",
+          "seconds": 1.291918436
+        }
+      ],
+      "bootstrap_transitions": [],
+      "gateway_bindings": [],
+      "cleanup_proof": "runs/chaos-issue167-restored-25d18691cf17/cleanup-proof.json"
+    },
+    {
+      "project": "chaos-issue167-verified-0157a72a0738",
+      "configuration": {
+        "event": "configuration",
+        "wall_ns": 1795493013058858898,
+        "monotonic_ns": 1359467652414,
+        "seed": 167,
+        "project": "chaos-issue167-verified-0157a72a0738",
+        "image": "sha256:65b162ae164caf77cbc59668352a768c04aef90890e579a0ae5e458804e4d929",
+        "source_revision": "15bab2344c9ea719a56053342907af2a03eda8f0",
+        "source_dirty": false,
+        "image_labels": {
+          "io.candybox.distribution.sha256": "39cddd601970a419946f485d77b046eff1de411c1f9d6f08d1764725f289faf2",
+          "org.opencontainers.image.ref.name": "ubuntu",
+          "org.opencontainers.image.revision": "e7799dc1042680d2696b792560df48957ebe426d",
+          "org.opencontainers.image.version": "22.04"
+        },
+        "experiment_timeout_seconds": 1200,
+        "setup_timeout_seconds": 120,
+        "recovery_timeout_seconds": 90,
+        "objects": 16
+      },
+      "report": {
+        "status": "pass-initial-scenarios",
+        "detail": "Initial schedules only; see uncovered acceptance cases",
+        "seed": 167,
+        "recovery": [
+          {
+            "scenario": "baseline",
+            "observation_seconds": 0.5813688309999634
+          },
+          {
+            "scenario": "kill-owner1",
+            "observation_seconds": 17.472613661999958
+          },
+          {
+            "scenario": "restart-owner1",
+            "observation_seconds": 1.5144406389999858
+          },
+          {
+            "scenario": "kill-owner2",
+            "observation_seconds": 18.270893415000046
+          },
+          {
+            "scenario": "restart-owner2",
+            "observation_seconds": 0.49117994399989584
+          },
+          {
+            "scenario": "owner1-paused-past-ttl",
+            "observation_seconds": 2.894735184999945
+          },
+          {
+            "scenario": "owner1-resumed",
+            "observation_seconds": 0.3988145410000925
+          },
+          {
+            "scenario": "bookkeeper-quorum-restored",
+            "observation_seconds": 9.16319373500005
+          }
+        ],
+        "acknowledged_objects": 17,
+        "cleanup_errors": [],
+        "uncovered": [
+          "ownership-aware stale-writer rejection",
+          "selected-path network faults",
+          "delayed relay consumer with destructive GC",
+          "rename crash boundaries",
+          "lost-response explicit-token retry",
+          "real released-artifact mixed-version activation (#157)",
+          "metrics snapshots"
+        ]
+      },
+      "invocations": 183,
+      "responses": 183,
+      "mutation_responses": [
+        {
+          "key": "",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 1.891807595
+        },
+        {
+          "key": "key-0000",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.101796268
+        },
+        {
+          "key": "key-0001",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.050751825
+        },
+        {
+          "key": "key-0002",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.042562658
+        },
+        {
+          "key": "key-0003",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.036677167
+        },
+        {
+          "key": "key-0004",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.02327642
+        },
+        {
+          "key": "key-0005",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.038402206
+        },
+        {
+          "key": "key-0006",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.024239945
+        },
+        {
+          "key": "key-0007",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.023290474
+        },
+        {
+          "key": "key-0008",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.023437324
+        },
+        {
+          "key": "key-0009",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.02692664
+        },
+        {
+          "key": "key-0010",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.023344822
+        },
+        {
+          "key": "key-0011",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.0221912
+        },
+        {
+          "key": "key-0012",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.023290943
+        },
+        {
+          "key": "key-0013",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.024067625
+        },
+        {
+          "key": "key-0014",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.025833334
+        },
+        {
+          "key": "key-0015",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.02592188
+        },
+        {
+          "key": "written-during-pause",
+          "status": 200,
+          "outcome": "response",
+          "seconds": 0.046941148
+        },
+        {
+          "key": "quorum-loss-outcome",
+          "status": 500,
+          "outcome": "response",
+          "seconds": 0.076944605
+        }
+      ],
+      "bootstrap_transitions": [
+        {
+          "event": "bootstrap-transition-invoke",
+          "wall_ns": 1795493089446927990,
+          "monotonic_ns": 1435855694917,
+          "balancer_interval_millis": 1000,
+          "replaced_containers": [
+            "85f8ff07fe54750b7862a16379b181289c8bd7e474bc2724f8f3c5f0dd05e1ab",
+            "27f7488a9442a653895043ae72c3ecf5bb517cadaca438fe9b1e2655e5baab2a"
+          ],
+          "acknowledged_objects": 0
+        },
+        {
+          "event": "bootstrap-transition-response",
+          "wall_ns": 1795493101289111140,
+          "monotonic_ns": 1447697877894,
+          "balancer_interval_millis": 1000,
+          "owner_containers": [
+            "e0108a53b40ebf0bb13bf2680a432b386e781da5a0d2111c8e59bfe78b403b52",
+            "cd879db21e2aaf6e897d8aadc6a952676dee4c61d7d3a66ae21fe164b045cd5c"
+          ],
+          "restarted_gateway_containers": [
+            "b6b56be3f1310dea2ee96224ea835b45cf5d0461531851e05b37f2839db0b21f"
+          ],
+          "acknowledged_objects": 0
+        }
+      ],
+      "gateway_bindings": [
+        "http://127.0.0.1:32773",
+        "http://127.0.0.1:32774"
+      ],
+      "cleanup_proof": "runs/chaos-issue167-verified-0157a72a0738/cleanup-proof.json"
+    }
+  ]
+}

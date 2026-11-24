@@ -136,6 +136,15 @@ Run service-free harness checks with:
 python3 -m unittest discover -s compat/chaos -p 'test_*.py'
 ```
 
+## Measured initial evidence
+
+[The 2026-11-24 report](evidence/2026-11-24/README.md) preserves two completed initial
+runs (seeds 167/168, 17 acknowledged objects each), four preceding setup/control
+failures, exact binary/driver provenance, full histories/logs and resource cleanup
+proofs. The reports retain the uncovered gates below and setup findings
+[#226](https://github.com/predatorray/candybox/issues/226) and
+[#227](https://github.com/predatorray/candybox/issues/227).
+
 ## Remaining #167 gates
 
 No passing initial report closes #167. The following are deliberately unimplemented:
