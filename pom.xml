@@ -88,7 +88,7 @@
         <jacoco.plugin.version>0.8.12</jacoco.plugin.version>
         <frontend.plugin.version>1.15.1</frontend.plugin.version>
         <os.plugin.version>1.7.1</os.plugin.version>
-        <node.version>v20.18.0</node.version>
+        <node.version>v22.21.1</node.version>
         <npm.version>10.9.0</npm.version>
         <source.plugin.version>3.3.1</source.plugin.version>
         <javadoc.plugin.version>3.12.0</javadoc.plugin.version>

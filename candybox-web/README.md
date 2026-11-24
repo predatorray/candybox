@@ -18,6 +18,8 @@ src/
 
 ## Local dev
 
+Requires Node.js 22.12+, 24.x, or 26+ (Maven installs Node.js 22.21.1).
+
 ```bash
 # from candybox-web/
 npm install
