@@ -123,7 +123,7 @@ Pending v1 relays remain readable after the upgrade.
 | **Owner crash / lease loss** | Another node acquires the lease, **recover-opens (fences)** the prior WAL and manifest, replays them, advances its HLC past the max observed, opens fresh WAL/manifest ledgers, flushes the replayed WAL to an SSTable, and CAS-advances the ZK manifest pointer. The old owner is fenced: its writes fail with `FencedException`. Taking over a partition with unflushed writes therefore needs an SSTable ledger to be creatable; until it is, recovery fails and is retried, and the prior WAL stays intact. The node heartbeat registers the lease before recovery starts and renews it independently of replay I/O. Renewal failure or node shutdown permanently cancels that acquisition. Publication atomically checks the ownership epoch together with the manifest-pointer version, so a superseded recoverer cannot publish or serve. Failed or ambiguous publication closes local handles but leaves allocated ledgers for reconciliation. |
 | **Zombie owner / zombie compactor** | A fencing token on every manifest append, plus BookKeeper recover-open, reject any commit from a superseded owner. |
 | **Client hits the wrong node** | The node replies `RESPONSE_MOVED(ownerNodeId)`; the client re-resolves via coordination and retries. |
-| **Partition momentarily unowned** (handover gap: after the old owner releases or its lease lapses, before the new owner acquires) | The node replies `RESPONSE_UNAVAILABLE`, never `NOT_FOUND`, which is reserved for a missing Box or key. The client treats that, a missing lease holder, and a crashed holder (no longer a member, or refusing connections, while its lease runs out) as a gap: it re-resolves with exponential backoff for up to `routerUnownedRetryMillis`, then fails with `NotOwnerException` (S3 gateway: `503 ServiceUnavailable` + `Retry-After`). A request already in flight when its node dies is not replayed (it may have applied); it fails at once with a retriable `NotOwnerException`. The transport has no connect timeout yet ([#79](https://github.com/predatorray/candybox/issues/79)), so an owner host that drops packets instead of refusing can hold a request well past this budget. The wait is per partition and holds the calling thread (an S3 gateway worker), but partitions orphaned together are usually re-owned in the same balancer round, so a fan-out listing rarely waits much longer than one gap. `RESPONSE_UNAVAILABLE` is new in 0.2: upgrade clients and gateways before nodes, since older clients cannot decode it. |
+| **Partition momentarily unowned** (handover gap: after the old owner releases or its lease lapses, before the new owner acquires) | The node replies `RESPONSE_UNAVAILABLE`, never `NOT_FOUND`, which is reserved for a missing Box or key. The client treats that, a missing lease holder, and a crashed holder (no longer a member, or refusing connections, while its lease runs out) as a gap: it re-resolves with exponential backoff for up to `routerUnownedRetryMillis`, then fails with `NotOwnerException` (S3 gateway: `503 ServiceUnavailable` + `Retry-After`). A request already in flight when its node dies is not replayed (it may have applied); it fails at once with a retriable `NotOwnerException`. Connection setup and RPC deadlines also bound unreachable owners (see Client timeouts below). The wait is per partition and holds the calling thread (an S3 gateway worker), but partitions orphaned together are usually re-owned in the same balancer round, so a fan-out listing rarely waits much longer than one gap. `RESPONSE_UNAVAILABLE` is new in 0.2: upgrade clients and gateways before nodes, since older clients cannot decode it. |
 | **Clock skew** | HLC ordering survives a regressing wall clock; an observed HLC leading local time by more than `maxClockSkewMillis` is rejected. The manifest keeps the highest HLC ever flushed, so once an owner with a far-ahead clock has flushed, every later takeover fails until real time catches up; fix that clock, or temporarily raise `maxClockSkewMillis` on the recovering node. |
 | **Crash mid cross-partition rename** | Converges by roll-forward: the source owner finalizes its durable rename intent against the destination's rendezvous marker — synchronously, on its background maintenance sweep, or after a handover replays the intent. The destination PUT and receipt share one WAL entry; recovery/maintenance republishes a missing marker. Marker present ⇒ conditionally delete the captured source version and acknowledge completion. Absence alone never proves abort: only an unclaimed relay CAS or a recovered/fenced destination with no receipt permits abandonment. Convergence requires recovery and successful maintenance/coordination; no client retry is needed. A rewritten source survives. |
 
@@ -241,9 +241,37 @@ All keys below follow the usual convention: any key can come from the environmen
 
 The S3 gateway (`node.connect.timeout.ms`, default 5000, and `node.read.timeout.ms`, default 120000;
 env `CANDYBOX_NODE_CONNECT_TIMEOUT_MS` / `CANDYBOX_NODE_READ_TIMEOUT_MS`) and the admin API (the same
-env vars) bound how long a call to a lost host can stall. The read timeout applies to each blocking
-read, so keep it above the slowest legitimate request. On expiry the connection is closed and the
-router fails over or re-resolves.
+env vars) retain their TCP connect and per-read timeouts. Each borrowed connection completes its
+own TLS/SASL setup. The cluster client additionally uses these positive limits:
+
+| Property (gateway) / CandyboxConfig builder | Default | Environment (gateway and admin) |
+| --- | --- | --- |
+| `client.connections.per.node` / `clientConnectionsPerNode` | 4 | `CANDYBOX_CLIENT_CONNECTIONS_PER_NODE` |
+| `client.max.concurrent.requests` / `clientMaxConcurrentRequests` | 64 | `CANDYBOX_CLIENT_MAX_CONCURRENT_REQUESTS` |
+| `client.acquire.timeout.millis` / `clientAcquireTimeoutMillis` | 5000 | `CANDYBOX_CLIENT_ACQUIRE_TIMEOUT_MILLIS` |
+| `client.request.timeout.millis` / `clientRequestTimeoutMillis` | 120000 | `CANDYBOX_CLIENT_REQUEST_TIMEOUT_MILLIS` |
+
+One exclusive connection serves each RPC; idle connections are reused. Acquisition waits for a
+slot for at most its budget, without cancelling the caller holding that slot. The overall monotonic
+RPC deadline includes routing, coordination, backoff, acquisition, TLS/SASL setup, writing and reading
+(including trickling responses). It applies per routed RPC, so a sequential multi-partition operation
+can consume multiple RPC budgets. The single-node Java client and CLI use the same default limits.
+Admission counts active and waiting RPC actions with a bounded executor handoff queue: excess RPCs fail immediately
+with `BusyException` (gateway HTTP 503). This bounds node calls occupying gateway workers; the gateway's
+existing worker/HTTP admission limits still apply independently.
+
+Expiry or caller interruption cancels that RPC and closes only its borrowed connection. A failed
+connection is discarded individually; healthy peers remain reusable. Shutdown stops admission,
+cancels waiters and closes idle and borrowed connections immediately; it does not drain mutations.
+An uninterruptible DNS lookup or transport setup may finish later; its resulting connection is
+closed before dispatch. Such work continues to count against the bounded worker capacity until it
+returns. Transport implementations must make connection close unblock active I/O, as TCP does.
+
+Failures after dispatch have an **unknown mutation outcome** and are surfaced without automatic
+replay, including requests to any member. Only failed connection setup, explicit MOVED and explicit
+UNAVAILABLE responses permit routing retries. Inspect object state before retrying an ambiguous write.
+No wire format or persisted data changes are involved; old nodes work with new clients, and client
+rollback needs no migration. Listings remain sequential and fail the whole page on a partition error.
 
 ### Clients / S3 gateway / admin API → storage nodes (SASL + TLS)
 

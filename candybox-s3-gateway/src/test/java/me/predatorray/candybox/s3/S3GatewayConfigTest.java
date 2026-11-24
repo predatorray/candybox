@@ -109,4 +109,19 @@ class S3GatewayConfigTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("zookeeper.connect");
     }
+    @Test
+    void poolAndDeadlineLimitsAcceptPropertiesAndEnvironmentOverrides() {
+        S3GatewayConfig c = S3GatewayConfig.fromProperties(props("zookeeper.connect", "zk:2181",
+                "client.connections.per.node", "2", "client.max.concurrent.requests", "8",
+                "client.acquire.timeout.millis", "100", "client.request.timeout.millis", "900"),
+                Map.of("CANDYBOX_CLIENT_CONNECTIONS_PER_NODE", "3"));
+        assertThat(c.clientConnectionsPerNode()).isEqualTo(3);
+        assertThat(c.clientMaxConcurrentRequests()).isEqualTo(8);
+        assertThat(c.clientAcquireTimeoutMillis()).isEqualTo(100);
+        assertThat(c.clientRequestTimeoutMillis()).isEqualTo(900);
+        assertThatThrownBy(() -> S3GatewayConfig.fromProperties(props("zookeeper.connect", "zk:2181",
+                "client.connections.per.node", "0"), Map.of()))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
 }

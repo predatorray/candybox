@@ -35,6 +35,10 @@ public final class CandyboxConfig {
     private final long ownershipLeaseTtlMillis;
     private final long leaseRenewIntervalMillis;
     private final long routerCacheTtlMillis;
+    private final int clientConnectionsPerNode;
+    private final int clientMaxConcurrentRequests;
+    private final long clientAcquireTimeoutMillis;
+    private final long clientRequestTimeoutMillis;
     private final long routerUnownedRetryMillis;
     private final long compactionIntervalMillis;
     private final long maxClockSkewMillis;
@@ -64,6 +68,10 @@ public final class CandyboxConfig {
         this.ownershipLeaseTtlMillis = b.ownershipLeaseTtlMillis;
         this.leaseRenewIntervalMillis = b.leaseRenewIntervalMillis;
         this.routerCacheTtlMillis = b.routerCacheTtlMillis;
+        this.clientConnectionsPerNode = b.clientConnectionsPerNode;
+        this.clientMaxConcurrentRequests = b.clientMaxConcurrentRequests;
+        this.clientAcquireTimeoutMillis = b.clientAcquireTimeoutMillis;
+        this.clientRequestTimeoutMillis = b.clientRequestTimeoutMillis;
         this.routerUnownedRetryMillis = b.routerUnownedRetryMillis;
         this.compactionIntervalMillis = b.compactionIntervalMillis;
         this.maxClockSkewMillis = b.maxClockSkewMillis;
@@ -134,6 +142,14 @@ public final class CandyboxConfig {
      * How long the client keeps retrying a partition that has no owner (a handover gap) before
      * failing with a retriable {@code NotOwnerException}. {@code 0} fails at once.
      */
+    public int clientConnectionsPerNode() { return clientConnectionsPerNode; }
+
+    public int clientMaxConcurrentRequests() { return clientMaxConcurrentRequests; }
+
+    public long clientAcquireTimeoutMillis() { return clientAcquireTimeoutMillis; }
+
+    public long clientRequestTimeoutMillis() { return clientRequestTimeoutMillis; }
+
     public long routerUnownedRetryMillis() {
         return routerUnownedRetryMillis;
     }
@@ -237,6 +253,10 @@ public final class CandyboxConfig {
         private long ownershipLeaseTtlMillis = 10_000L;        // 10s lease
         private long leaseRenewIntervalMillis = 3_000L;        // renew well within the TTL; 0 disables
         private long routerCacheTtlMillis = 5_000L;            // client Box->owner cache TTL
+        private int clientConnectionsPerNode = 4;
+        private int clientMaxConcurrentRequests = 64;
+        private long clientAcquireTimeoutMillis = 5_000;
+        private long clientRequestTimeoutMillis = 120_000;
         private long routerUnownedRetryMillis = 15_000L;       // ~ lease TTL + a balancer round
         private long compactionIntervalMillis = 0L;            // background compaction; 0 disables
         private long maxClockSkewMillis = 300_000L;            // 5 min HLC skew bound
@@ -298,6 +318,30 @@ public final class CandyboxConfig {
 
         public Builder routerCacheTtlMillis(long v) {
             this.routerCacheTtlMillis = v;
+            return this;
+        }
+
+        public Builder clientConnectionsPerNode(int v) {
+            if (v < 1) { throw new IllegalArgumentException("clientConnectionsPerNode must be positive"); }
+            this.clientConnectionsPerNode = v;
+            return this;
+        }
+
+        public Builder clientMaxConcurrentRequests(int v) {
+            if (v < 1) { throw new IllegalArgumentException("clientMaxConcurrentRequests must be positive"); }
+            this.clientMaxConcurrentRequests = v;
+            return this;
+        }
+
+        public Builder clientAcquireTimeoutMillis(long v) {
+            if (v < 1) { throw new IllegalArgumentException("clientAcquireTimeoutMillis must be positive"); }
+            this.clientAcquireTimeoutMillis = v;
+            return this;
+        }
+
+        public Builder clientRequestTimeoutMillis(long v) {
+            if (v < 1) { throw new IllegalArgumentException("clientRequestTimeoutMillis must be positive"); }
+            this.clientRequestTimeoutMillis = v;
             return this;
         }
 

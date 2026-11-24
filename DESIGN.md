@@ -201,8 +201,12 @@ connection to one handler executor, which keeps that connection's responses in r
 frame header carries no request id, so a client matches responses positionally. Requests are
 pipelined up to `server.max.inflight.per.connection`, beyond which (or while the peer is not
 draining responses) reads are suspended; `close()` stops accepting first and drains in-flight
-requests before cutting sockets. The client side (`TcpTransport`) stays blocking: one pooled
-connection per node, one in-flight request at a time.
+requests before cutting sockets. The client side (`TcpTransport`) stays blocking. Routers borrow
+one exclusive connection per RPC from a bounded per-node pool (default four), with bounded admitted
+RPCs (default 64). Separate acquisition and monotonic overall RPC deadlines cover waiting, routing,
+backoff, setup and I/O. Only known-unsent failures or explicit routing responses permit retry;
+a timeout after dispatch has an unknown mutation outcome. Shutdown cancels admission/waiters and
+closes pooled sockets immediately. See OPERATIONS.md for configuration and late setup cleanup.
 
 ### SSTable on-ledger layout (`SSTableFormat`, footer version 2)
 
@@ -372,6 +376,29 @@ cluster/balancer                      the balancer's coordinator-election lease
 cluster/assignment                    the desired partition→node assignment table (versioned CAS)
 members/<nodeId>                      membership (advertised host:port); ephemeral, session-bound
 ```
+
+ZooKeeper lease handles answer `isValid()` locally: acquisition/renewal starts a monotonic
+TTL budget before metadata I/O, subtracting a 5% safety margin capped at 100 ms (at least
+1 ms). The stored wall-clock expiry is an additional upper bound. Failed/ambiguous renewal,
+release, and service close invalidate the local grant. This removes per-request and per-owner
+maintenance validity reads; renewal and balancer enumeration still perform metadata I/O.
+Supersession may be detected at the next renewal or local deadline, so positive local validity
+never replaces durable fencing. Existing clock-skew-sensitive wall-clock takeover semantics
+are unchanged; watches and unchanged-version takeover observation remain future work.
+
+BookKeeper stores retain an LRU of up to 128 passive read handles. Each `openLedger` returns
+an independently closeable borrowed view; eviction removes the cache reference, while active
+borrowers retain the physical handle until their last close. Reads, physical opens and closes occur
+outside the global cache lock; simultaneous misses coalesce behind a per-ledger open monitor.
+Invalidation also prevents an in-flight open from repopulating the cache with an obsolete view.
+Recover-open always fences through a fresh backend open, and invalidates a cached passive view;
+delete and read failures also invalidate cached views. Store close releases idle cache resources
+and retires active views. Active-Syrup reads continue fetching known entry IDs directly from
+bookies. Explicit tail/sealed queries refresh metadata for a previously active handle so delayed
+close notifications cannot hide the final entry; sealed metadata supplies the authoritative final
+tail, while active LAC is read from bookies. Ordinary known-entry Syrup reads never query this
+metadata. Once sealed, tail/sealed queries use the immutable cached metadata. No record formats or
+configuration change; upgrades and rollback need no migration.
 
 ### 7a. Partition balancing (elected coordinator)
 

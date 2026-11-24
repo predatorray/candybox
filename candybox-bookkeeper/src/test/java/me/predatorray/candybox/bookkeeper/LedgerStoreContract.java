@@ -124,6 +124,34 @@ public abstract class LedgerStoreContract {
     }
 
     @Test
+    void independentReadViewsAndReopenedTailObserveNewAppends() {
+        WritableLedger writer = store.createLedger(config());
+        writer.append(bytes("first"));
+        ReadableLedger first = store.openLedger(writer.ledgerId());
+        ReadableLedger second = store.openLedger(writer.ledgerId());
+        first.close();
+        first.close();
+        assertThat(second.read(0).data()).isEqualTo(bytes("first"));
+        second.close();
+        writer.append(bytes("second"));
+        try (ReadableLedger active = store.openLedger(writer.ledgerId())) {
+            assertThat(active.read(1).data()).isEqualTo(bytes("second"));
+        }
+        writer.close();
+        try (ReadableLedger reopened = store.openLedger(writer.ledgerId())) {
+            assertThat(reopened.lastAddConfirmed()).isEqualTo(1);
+            assertThat(reopened.isSealed()).isTrue();
+            assertThat(reopened.read(1).data()).isEqualTo(bytes("second"));
+        }
+        try (ReadableLedger recovered = store.recoverOpen(writer.ledgerId())) {
+            assertThat(recovered.lastAddConfirmed()).isEqualTo(1);
+        }
+        store.deleteLedger(writer.ledgerId());
+        assertThatThrownBy(() -> store.openLedger(writer.ledgerId()))
+                .isInstanceOf(LedgerNotFoundException.class);
+    }
+
+    @Test
     void recoverOpenSealsAndFencesPriorWriter() {
         WritableLedger w = store.createLedger(config());
         w.append(bytes("one"));

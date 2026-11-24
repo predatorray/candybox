@@ -88,6 +88,22 @@ class ZooKeeperCoordinationServiceContractIT extends CoordinationServiceContract
         return new ZooKeeperCoordinationService(newClient("ct-" + NAMESPACE_SEQ.incrementAndGet()), clock);
     }
 
+    @Override
+    protected long laterBackendWriteTime(ManualClock clock, long previousWriteTime) throws Exception {
+        // The injected clock controls leases, not ZooKeeper's server-side znode timestamps.
+        CuratorFramework probe = newClient("time-" + NAMESPACE_SEQ.incrementAndGet());
+        probe.create().forPath("/write-time", new byte[0]);
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (System.nanoTime() < deadline) {
+            Stat written = probe.setData().forPath("/write-time", new byte[0]);
+            if (written.getMtime() > previousWriteTime) {
+                return written.getMtime();
+            }
+            Thread.sleep(1);
+        }
+        throw new AssertionError("ZooKeeper write time did not advance beyond " + previousWriteTime);
+    }
+
     @Test
     void newerEpochBetweenLeaseReadAndPublicationPreventsPointerWrite() throws Exception {
         ManualClock time = new ManualClock(1_000);
@@ -187,6 +203,67 @@ class ZooKeeperCoordinationServiceContractIT extends CoordinationServiceContract
                 return false;
             }
         };
+    }
+
+    @Test
+    void repeatedLeaseChecksDoNotReadZooKeeperAndFailedRenewalInvalidates() throws Exception {
+        CuratorFramework actual = newClient("local-lease-" + NAMESPACE_SEQ.incrementAndGet());
+        AtomicInteger reads = new AtomicInteger();
+        AtomicBoolean failReads = new AtomicBoolean();
+        AtomicBoolean pauseReads = new AtomicBoolean();
+        CountDownLatch renewing = new CountDownLatch(1);
+        CountDownLatch resumeRenewal = new CountDownLatch(1);
+        CuratorFramework counted = (CuratorFramework) java.lang.reflect.Proxy.newProxyInstance(
+                CuratorFramework.class.getClassLoader(), new Class<?>[]{CuratorFramework.class},
+                (proxy, method, args) -> {
+                    if (method.getName().equals("getData")) {
+                        reads.incrementAndGet();
+                        if (pauseReads.get()) {
+                            renewing.countDown();
+                            if (!resumeRenewal.await(10, TimeUnit.SECONDS)) {
+                                throw new IllegalStateException("renewal was not resumed");
+                            }
+                        }
+                        if (failReads.get()) {
+                            throw new IllegalStateException("injected coordination read failure");
+                        }
+                    }
+                    try {
+                        return method.invoke(actual, args);
+                    } catch (java.lang.reflect.InvocationTargetException failure) {
+                        throw failure.getCause();
+                    }
+                });
+        try (ZooKeeperCoordinationService local = new ZooKeeperCoordinationService(counted,
+                new ManualClock(1_000))) {
+            var lease = local.tryAcquireLease("owner", 1, 30_000).orElseThrow();
+            int afterAcquire = reads.get();
+            for (int i = 0; i < 100; i++) {
+                assertThat(lease.isValid()).isTrue();
+            }
+            assertThat(reads.get()).isEqualTo(afterAcquire);
+            var executor = Executors.newSingleThreadExecutor();
+            try {
+                pauseReads.set(true);
+                var renewal = executor.submit(lease::renew);
+                assertThat(renewing.await(10, TimeUnit.SECONDS)).isTrue();
+                // The old local grant remains available while renewal metadata I/O is in flight.
+                assertThat(lease.isValid()).isTrue();
+                resumeRenewal.countDown();
+                renewal.get(10, TimeUnit.SECONDS);
+            } finally {
+                resumeRenewal.countDown();
+                executor.shutdownNow();
+            }
+            assertThat(reads.get()).isEqualTo(afterAcquire + 1);
+            pauseReads.set(false);
+            failReads.set(true);
+            assertThatThrownBy(lease::renew)
+                    .isInstanceOf(me.predatorray.candybox.coordination.CoordinationException.class);
+            assertThat(lease.isValid()).isFalse();
+            assertThat(lease.isValid()).isFalse();
+            assertThat(reads.get()).isEqualTo(afterAcquire + 2);
+        }
     }
 
     @Test

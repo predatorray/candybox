@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import me.predatorray.candybox.common.Clock;
 import me.predatorray.candybox.common.SystemClock;
 import me.predatorray.candybox.common.serial.BinaryReader;
@@ -56,7 +57,8 @@ import org.apache.zookeeper.data.Stat;
  *   <li><b>Leases</b> → a persistent znode per resource storing {@code {owner, token, expiry,
  *       released}}. Acquisition/renewal is a read + version-checked write; the fencing
  *       <b>token is a monotonic counter</b> in that record, bumped on every fresh acquisition.
- *       Expiry is driven by the injected {@link Clock} (so it is identical to the fake and testable),
+ *       Stored expiry is driven by the injected {@link Clock}; local validity is additionally bounded
+ *       by a conservative monotonic deadline, without a ZooKeeper read,
  *       and safety rests on the fencing token, not on session liveness — a fenced owner is detected
  *       because a strictly higher token exists.</li>
  *   <li><b>Membership</b> → ephemeral child znodes under {@code /members}, held by Curator's
@@ -272,6 +274,7 @@ public final class ZooKeeperCoordinationService implements CoordinationService {
 
     @Override
     public Optional<Lease> tryAcquireLease(String resource, int nodeId, long ttlMillis) {
+        long started = System.nanoTime();
         String p = path(resource);
         Stat stat = new Stat();
         LeaseRecord current = readLease(p, stat);
@@ -283,7 +286,7 @@ public final class ZooKeeperCoordinationService implements CoordinationService {
                 // Idempotent re-acquire by the holder: renew, keep the same token.
                 LeaseRecord renewed = new LeaseRecord(nodeId, current.token, now + ttlMillis, false);
                 return writeLease(p, renewed, stat.getVersion(), false)
-                        ? Optional.of(new ZkLease(resource, nodeId, current.token, ttlMillis))
+                        ? Optional.of(new ZkLease(resource, nodeId, current.token, ttlMillis, started, renewed.expiry))
                         : Optional.empty();
             }
             return Optional.empty();
@@ -294,7 +297,7 @@ public final class ZooKeeperCoordinationService implements CoordinationService {
         boolean ok = current == null
                 ? createLease(p, fresh)
                 : writeLease(p, fresh, stat.getVersion(), false);
-        return ok ? Optional.of(new ZkLease(resource, nodeId, token, ttlMillis)) : Optional.empty();
+        return ok ? Optional.of(new ZkLease(resource, nodeId, token, ttlMillis, started, fresh.expiry)) : Optional.empty();
     }
 
     @Override
@@ -500,12 +503,15 @@ public final class ZooKeeperCoordinationService implements CoordinationService {
         private final int ownerNodeId;
         private final long token;
         private final long ttlMillis;
+        private final AtomicReference<LocalLeaseValidity> validity = new AtomicReference<>();
 
-        ZkLease(String resource, int ownerNodeId, long token, long ttlMillis) {
+        ZkLease(String resource, int ownerNodeId, long token, long ttlMillis,
+                long startedNanos, long expiryMillis) {
             this.resource = resource;
             this.ownerNodeId = ownerNodeId;
             this.token = token;
             this.ttlMillis = ttlMillis;
+            this.validity.set(new LocalLeaseValidity(startedNanos, ttlMillis, expiryMillis));
         }
 
         @Override
@@ -525,30 +531,44 @@ public final class ZooKeeperCoordinationService implements CoordinationService {
 
         @Override
         public boolean isValid() {
-            String p = path(resource);
-            Stat stat = new Stat();
-            LeaseRecord cur = readLease(p, stat);
-            return cur != null && cur.token == token && !cur.released
-                    && clock.currentTimeMillis() < cur.expiry;
+            LocalLeaseValidity current = validity.get();
+            if (!closed && current != null
+                    && current.isValid(System.nanoTime(), clock.currentTimeMillis())) {
+                return true;
+            }
+            validity.compareAndSet(current, null);
+            return false;
         }
 
         @Override
-        public void renew() {
-            String p = path(resource);
-            Stat stat = new Stat();
-            LeaseRecord cur = readLease(p, stat);
-            long now = clock.currentTimeMillis();
-            if (cur == null || cur.token != token || cur.released || now >= cur.expiry) {
+        public synchronized void renew() {
+            long started = System.nanoTime();
+            if (closed || validity.get() == null) {
                 throw new LeaseExpiredException(resource, token);
             }
-            LeaseRecord renewed = new LeaseRecord(ownerNodeId, token, now + ttlMillis, false);
-            if (!writeLease(p, renewed, stat.getVersion(), true)) {
-                throw new LeaseExpiredException(resource, token);
+            try {
+                String p = path(resource);
+                Stat stat = new Stat();
+                LeaseRecord cur = readLease(p, stat);
+                long now = clock.currentTimeMillis();
+                if (cur == null || cur.token != token || cur.released || now >= cur.expiry) {
+                    throw new LeaseExpiredException(resource, token);
+                }
+                LeaseRecord renewed = new LeaseRecord(ownerNodeId, token, now + ttlMillis, false);
+                if (!writeLease(p, renewed, stat.getVersion(), true)) {
+                    throw new LeaseExpiredException(resource, token);
+                }
+                validity.set(new LocalLeaseValidity(started, ttlMillis, renewed.expiry));
+            } catch (RuntimeException failure) {
+                // Keep the previous grant available during I/O, but never after a failed refresh.
+                validity.set(null);
+                throw failure;
             }
         }
 
         @Override
-        public void release() {
+        public synchronized void release() {
+            validity.set(null);
             String p = path(resource);
             Stat stat = new Stat();
             LeaseRecord cur = readLease(p, stat);

@@ -88,7 +88,9 @@ public final class CandyboxClient implements BoxClient, AutoCloseable {
     /** Cluster-aware client: routes each request to the owning node via coordination. */
     public CandyboxClient(Transport transport, CoordinationService coordination, CandyboxConfig config) {
         this(new ClusterRouter(transport, coordination, config.routerCacheTtlMillis(),
-                SystemClock.INSTANCE, config.routerUnownedRetryMillis(), Thread::sleep),
+                SystemClock.INSTANCE, config.routerUnownedRetryMillis(), Thread::sleep,
+                config.clientConnectionsPerNode(), config.clientMaxConcurrentRequests(),
+                config.clientAcquireTimeoutMillis(), config.clientRequestTimeoutMillis()),
                 config.sizeLimits());
     }
 
