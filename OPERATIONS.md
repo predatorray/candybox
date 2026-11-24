@@ -401,8 +401,10 @@ authentication.
 - **Distributed compaction offload:** the owner produces and commits its own compactions; offloading
   output production to non-owners under a ZK task lease is future work.
 - **GC enumeration backstop** and **Syrup defragmentation** (see above).
-- **Real multi-bookie chaos testing:** fault injection is covered deterministically on the in-memory
-  fakes; a Jepsen-style harness against a real cluster is future work.
+- **Real multi-bookie chaos testing:** the opt-in [initial failure harness](compat/chaos/README.md)
+  exercises separate containers on one host and records acknowledged-write histories. Its remaining
+  GC, rename, network, retry and mixed-version gates are explicit; it is not production durability
+  proof. Deterministic fake/embedded fault tests remain complementary.
 
 ### Ledger enumeration backstop
 
