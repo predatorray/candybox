@@ -134,6 +134,13 @@ Core invariants (details in `DESIGN.md`):
 - Data is never mutated in place. Updates and deletes are new appends: tombstones and O(1) range
   tombstones, reclaimed by compaction.
 
+## Keeping the design documentation current
+
+Review [DESIGN.md](DESIGN.md) before changing the architecture, behavior guarantees, wire or
+storage formats, or design limits. When a change makes any part of the document outdated,
+update the affected sections in the same PR. This includes updating feature status when a
+previously deferred capability is implemented.
+
 ## Testing conventions
 
 - **No mocking frameworks.** Unit tests use the hand-written in-memory fakes (`InMemoryLedgerStore`,
