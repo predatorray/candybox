@@ -144,6 +144,29 @@ Core invariants (details in `DESIGN.md`):
   equivalent.
 - Integration tests (`*IT.java`) live only in `candybox-integration-tests`.
 
+## Keeping S3 compatibility documentation current
+
+When a change affects S3-visible behavior (including changes in the client, protocol, server,
+or storage layers), read [compat/s3-tests/README.md](compat/s3-tests/README.md) and update its
+supported scope and limitations in the same PR. Also review it when changing the compatibility
+runner, test credentials/configuration, Compose stacks, image architectures, or S3 CI workflow;
+keep its commands, defaults, prerequisites, and CI description aligned with those sources.
+
+- Check related S3 claims in the root `README.md`, `OPERATIONS.md`, and `docs/`; update affected
+  claims together. Follow `CONSTITUTION.md` for specification and compatibility evidence before
+  advertising a newly supported feature. A compatibility stub or isolated passing test is not
+  evidence of full feature support.
+- Run the existing `compat/s3-tests/run.sh` gate for S3 behavior changes. When a feature change
+  should expand the expected pass set, perform a full, unfiltered calibration using the README's
+  procedure, review the results and every removed test, and commit `allowlist.txt` and `badge.json`
+  together. Never shrink the allowlist to hide regressions.
+- Keep current implementation claims separate from recorded calibration results. Change counts,
+  percentages, dates, and suite revisions only with evidence from an actual run; retain historical
+  labels when no new calibration was performed. If validation or calibration cannot be run,
+  explain the limitation in the PR rather than inventing results or silently updating the badge.
+- For relevant PRs, state which compatibility documentation was updated, or why the existing
+  wording remains accurate, and summarize the gate/calibration evidence or unrun checks.
+
 ## Further docs
 
 `RELEASING.md` covers publishing to Maven Central. `DESIGN.md` covers record formats, read/write/merge paths, manifest and fencing, compaction, GC, size
