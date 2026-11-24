@@ -50,7 +50,7 @@ class Experiment:
         self.output.mkdir(parents=True, exist_ok=False)
         self.history = (self.output / "history.jsonl").open("a", buffering=1)
         self.env = dict(os.environ, CHAOS_NAMESPACE=self.project,
-                        CHAOS_CANDYBOX_IMAGE=args.image)
+                        CHAOS_CANDYBOX_IMAGE=args.image, CHAOS_BALANCER_INTERVAL_MILLIS="0")
         self.base = ["docker", "compose", "-p", self.project, "-f", str(HERE / "compose.yml")]
         self.expected = {}
         self.recoveries = []
@@ -69,7 +69,7 @@ class Experiment:
     def compose(self, *args, timeout=120):
         return command(self.base + list(args), timeout=timeout, env=self.env)
 
-    def fault(self, action, *services):
+    def targets(self, *services):
         # Validate every target immediately before destructive controls, including restoration.
         targets = []
         for service in services:
@@ -82,6 +82,10 @@ class Experiment:
                     labels.get("io.candybox.chaos.disposable") != self.project):
                 raise HarnessFailure(f"refusing non-disposable target {service}")
             targets.append(ids[0])
+        return targets
+
+    def fault(self, action, *services):
+        targets = self.targets(*services)
         self.event("fault-invoke", action=action, services=services)
         # Compose start may rerun exited dependencies, including one-shot metadata init.
         # Faults/restoration must touch only the exact existing, validated containers.
@@ -158,10 +162,12 @@ class Experiment:
                    experiment_timeout_seconds=self.args.experiment_seconds,
                    setup_timeout_seconds=self.args.setup_seconds,
                    recovery_timeout_seconds=self.args.recovery_seconds, objects=self.args.objects)
-        (self.output / "compose.yml").write_text(self.compose("config"))
+        configuration = self.compose("config")
+        (self.output / "compose.yml").write_text(configuration)
+        (self.output / "compose-bootstrap.yml").write_text(configuration)
         self.started = True  # partial setup also needs teardown
         self.compose("up", "-d", "--wait", "--wait-timeout", "300", timeout=360)
-        (self.output / "containers.json").write_text(command(
+        (self.output / "containers-bootstrap.json").write_text(command(
             ["docker", "inspect", *self.compose("ps", "-a", "-q").split()]))
         address = self.compose("port", "gateway", "9711").strip()
         if not re.fullmatch(r"127\.0\.0\.1:[0-9]+", address):
@@ -180,6 +186,47 @@ class Experiment:
         status, _, _ = self.request("PUT", timeout=self.args.setup_seconds)
         if status not in (200, 201, 204):
             raise HarnessFailure(f"bucket creation failed: {status}")
+        # A new descriptor is visible before every partition is initialized. Isolate that
+        # known create/balance race from these acknowledged-data schedules; no PUT data yet.
+        old_targets = self.targets("owner1", "owner2")
+        (self.output / "bootstrap.log").write_text(self.compose("logs", "--no-color", "--timestamps", timeout=60))
+        self.env["CHAOS_BALANCER_INTERVAL_MILLIS"] = "1000"
+        (self.output / "compose.yml").write_text(self.compose("config"))
+        self.event("bootstrap-transition-invoke", balancer_interval_millis=1000,
+                   replaced_containers=old_targets, acknowledged_objects=len(self.expected))
+        self.compose("up", "-d", "--no-deps", "--force-recreate", "--wait", "--wait-timeout", "120",
+                     "owner1", "owner2", timeout=180)
+        new_targets = self.targets("owner1", "owner2")
+        if set(old_targets) & set(new_targets):
+            raise HarnessFailure("bootstrap owner replacement did not recreate both containers")
+        containers = json.loads(command(["docker", "inspect", *self.compose("ps", "-a", "-q").split()]))
+        (self.output / "containers.json").write_text(json.dumps(containers, indent=2) + "\n")
+        for info in containers:
+            if info["Id"] in new_targets and "CANDYBOX_BALANCER_INTERVAL_MILLIS=1000" not in info["Config"]["Env"]:
+                raise HarnessFailure("fault-phase owner is not configured for normal balancing")
+        self.event("bootstrap-transition-response", balancer_interval_millis=1000,
+                   owner_containers=new_targets, acknowledged_objects=len(self.expected))
+        # Read-only readiness checks avoid sending ambiguous baseline PUTs while leases recover.
+        deadline = time.monotonic() + self.args.recovery_seconds
+        while time.monotonic() < deadline:
+            ready = True
+            for index in range(self.args.objects):
+                if time.monotonic() >= deadline:
+                    ready = False
+                    break
+                status, _, _ = self.request("GET", f"key-{index:04d}")
+                if status == 200:
+                    raise HarnessFailure("fresh bootstrap unexpectedly contains object data")
+                if status != 404:
+                    ready = False
+                    break
+            if ready:
+                break
+            time.sleep(1)
+        else:
+            raise HarnessFailure("normal balancing did not make empty baseline keys readable")
+        if not ready:
+            raise HarnessFailure("normal balancing readiness deadline exceeded")
         for index in range(self.args.objects):
             if self.put(f"key-{index:04d}") not in (200, 201, 204):
                 raise HarnessFailure("baseline PUT did not acknowledge; inspect history")

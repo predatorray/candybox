@@ -69,13 +69,26 @@ a dedicated development Docker daemon: no production endpoint argument exists.
 
 The fixed schedules are:
 
-1. Create a bucket and PUT 16 seeded objects, recording bytes' SHA-256 and metadata.
+1. Bootstrap an empty bucket with balancing disabled (`0`), using one create
+   request. Recreate only the two owners with balancing enabled (`1000` ms),
+   validate both new IDs/configurations, and wait for read-only empty-key lookups.
+   Only then PUT 16 seeded objects, recording bytes' SHA-256 and metadata.
 2. SIGKILL each owner separately; verify all acknowledged objects while it remains
    down, restart it, and verify again.
 3. Pause owner 1 for 15 seconds (lease TTL is explicitly 10 seconds), verify through
    the survivor, acknowledge a new object, resume the owner and recheck everything.
 4. Stop two bookies, attempt one PUT, restore them and verify every acknowledged
    object. A lost/failed response is not treated as an acknowledged write.
+
+Bootstrap deliberately isolates a known create/balance race: the descriptor is
+published before all partitions exist, so another balancer can take a future
+partition and make creation fail. The captured HTTP 500 setup run is a failure,
+not a successful bucket creation or a runtime fix. No acknowledged object data
+exists during the configuration transition. All measured fault schedules run
+with both owners configured for normal balancing; lease TTL, safety graces and
+replication quorums retain their production settings. Both rendered configurations,
+bootstrap/fault-phase IDs and logs are archived. Fixing concurrent bucket creation
+is separate runtime work.
 
 The pause test observes externally visible integrity after owner resumption. It
 does not deterministically hold a write inside a stale owner and prove its fencing
