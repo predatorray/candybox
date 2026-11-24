@@ -2,17 +2,13 @@
 
 Candybox is a distributed, S3-like object store whose storage engine is a distributed LSM tree built
 on **Apache BookKeeper** ledgers. This document captures the architecture, on-ledger/record formats
-(with their version bytes), size limits, the compaction model, the manifest/GC design, the local
-decisions made (with rationale), and the deliberate v1 simplifications.
+(with their version bytes), size limits, compaction, manifest recovery, and garbage collection.
 
-It is written against the implementation in this repository: **Phases 0–4 are implemented and
-tested** — the LSM engine, ZooKeeper-backed coordination, hash-partitioned Boxes with fenced
-per-partition ownership/handover and an elected-coordinator balancer, the framed TCP protocol with
-cluster membership + client-side routing, multi-level leveled compaction, and reference-counted GC
-all run, with the storage node, CLI, and a packaged distribution (Docker / Kubernetes) on top. A handful of deliberate v1 simplifications remain (true on-the-wire streaming,
-distributed cross-node compaction scheduling, watch-based coordination, a GC enumeration backstop);
-they are called out inline and collected in §12–§13, and a few are still marked `// TODO(phase-N)` in
-code.
+The implementation includes hash-partitioned Boxes with fenced ownership, cluster-aware TCP
+clients and a CLI, multipart uploads and range reads, a path-style S3 gateway, and an admin API
+with a web dashboard. It also includes an opt-in allocation-enumeration backstop for ledger GC
+and managed namespace lifecycle operations. See §12 for current limits and §13 for compatibility
+and failure-test coverage.
 
 ## 1. Domain glossary
 
@@ -28,18 +24,23 @@ code.
 ## 2. Architecture & module map
 
 A cluster of **storage nodes** owns writes, reads, and compaction; a **thin client** routes requests
-to nodes over a minimal framed TCP protocol. Every external dependency sits behind a narrow SPI with
-an in-memory fake, so the whole engine is testable without BookKeeper, ZooKeeper, or sockets.
+to nodes over a framed TCP protocol. The S3 gateway and admin API are stateless frontends that
+use the cluster client for object access. The storage engine uses narrow SPIs with in-memory
+fakes, so it can be tested without BookKeeper, ZooKeeper, or sockets.
 
 ```
-candybox-common         Domain types, versioned serialization, HLC, config, CRC32C, bloom filter.
+candybox-common         Domain types, versioned serialization, HLC, config, CRC32C, bloom filter, authentication, authorization, TLS.
 candybox-bookkeeper     LedgerStore SPI + in-memory fake + real BookKeeper impl. (only module touching raw BK)
 candybox-coordination   Coordination SPI (membership, leases w/ fencing tokens, CAS kv) + in-memory fake + real ZooKeeper impl.
 candybox-lsm            Memtable, WAL, SSTable, Syrup chunking, manifest, merge/read path, compaction. Depends only on the two SPIs.
-candybox-protocol       Framed TCP codec + message types + Transport SPI (Netty NIO server, blocking client, loopback fake).
-candybox-server         Storage node: wires LSM behind the protocol; fenced Box ownership + handover; background compaction + GC workers; health/metrics; runnable entrypoint.
+candybox-protocol       Framed TCP codec, SASL exchanges, and Transport SPI (Netty NIO server, blocking client, loopback fake).
+candybox-server         Storage node: wires LSM behind the protocol; fenced partition ownership + handover; background compaction + GC workers; health/metrics; runnable entrypoint.
 candybox-client         Thin client over Transport, cluster-aware router, and the `candybox` command-line tool.
-candybox-dist           Packages the runnable distribution (`bin/ lib/ conf/`) + the Docker/Kubernetes assets.
+candybox-s3-gateway     Path-style S3 HTTP adapter with optional SigV4 authentication, ACL enforcement, and TLS.
+candybox-admin-api      JSON API, cluster metrics scraping, and static dashboard hosting at /ui/.
+candybox-web            React/TypeScript dashboard packaged with the Maven frontend profile.
+candybox-dist           Packages the runnable distribution (`bin/ lib/ conf/`).
+candybox-charts         Helm chart for Kubernetes deployments.
 candybox-integration-tests  Embedded BookKeeper (LocalBookKeeper, bundles in-JVM ZooKeeper) end-to-end + contract ITs.
 ```
 
@@ -87,18 +88,18 @@ enough: right after a flush (which every graceful handover does) the WAL is empt
 live only in SSTables. So each flush records the max HLC of the flushed memtable (point mutations and
 range tombstones) as a monotonic high-water `maxHlc` in the manifest, the recovering owner observes
 `max(manifest maxHlc, WAL max)` even when the WAL is empty, and records that max in its own rotation
-edit (which also flushes a non-empty replay, §9). Like the WAL path, `observe` fails recovery loudly
+edit (which also flushes a non-empty replay, §7). Like the WAL path, `observe` fails recovery loudly
 if the recorded HLC leads the local clock by more than `maxClockSkewMillis`.
 
 ## 4. Ledger roles & lifecycle
 
-Three distinct ledger roles, kept separate in code:
+Candybox uses four ledger roles.
 
-- **WAL ledger** — per-partition write-ahead log. Each entry is a serialized `Mutation`, appended (ack-quorum
-  durable) before the memtable acknowledges. On handover the new owner uses **recover-open** (fence +
-  seal at a deterministic LAC), *not* a plain read-open, so a resurrected old owner cannot keep
-  appending. Rotated to a fresh ledger on each flush.
-- **SSTable ledger** — an immutable sorted run from a flush or compaction (see §6 format).
+- **WAL ledger** — per-partition write-ahead log. Each entry is a tagged record (§5). The owner
+  waits for an ack-quorum durable append before applying the record to the memtable. During
+  handover, **recover-open** fences the old writer and seals the ledger at a deterministic LAC.
+  Each flush rotates to a fresh WAL.
+- **SSTable ledger** — an immutable sorted run from a flush or compaction (see §5 for the format).
 - **Syrup (data) ledger** — raw Candy bytes, fixed-size chunks (one chunk = one entry), each with its
   own crc32c. One Syrup fills across many Candies and rolls to a new one at a size cap; a Candy that
   straddles a rollover is described by multiple `SegmentRef`s.
@@ -133,9 +134,9 @@ varint  part count           [+ Part records]
 byte    owner present?   [+ string "Type:name"]
 varint  grant count      [+ string "grantee:OP[+OP...]"]
 ```
-The locator is a list of *parts*. A single-PUT or `copy/rename` produces a one-element list; a
-multipart-uploaded Candy stitches its parts together in part-number order. Each Part is internally
-uniform-chunked with its own end-to-end CRC32C — short-tail chunks therefore only sit at part
+The locator is a list of *parts*. A single PUT produces a one-element list. Multipart completion
+assembles its parts in part-number order. Copy and rename preserve the source's parts. Each Part
+has uniform chunk sizing and its own end-to-end CRC32C. Short-tail chunks occur only at part
 boundaries, where the read path knows to look (see `MULTIPART_RANGE_PLAN.md`). A DELETE tombstone
 carries an empty parts list. The 256 KiB cap accommodates a 10,000-part multipart Candy
 (~200 KiB).
@@ -172,7 +173,7 @@ is `varlong ledgerId | varint level | bytes minKey | bytes maxKey | varlong entr
 (v5+: the keys its range tombstones cover, each bound optional, used to pick compaction inputs; and
 the oldest HLC among its points, used by the range-tombstone drop rule; older tables read back
 without either). The
-multipart-tracking trailing fields (Phase 5) carry in-flight upload state: a `MultipartUploadState`
+multipart-tracking trailing fields (v2) carry in-flight upload state: a `MultipartUploadState`
 record per `addedUpload`, a `(uploadId, partNumber, Part)` triple per `upsertParts`, and a string
 per `removedUpload`. The v3 trailing fields carry in-flight **rename intents** (one per cross-partition
 `rename` the partition owns the source of, each pinning the source key and its HLC); like upload
@@ -198,7 +199,7 @@ compatibility concern (#157).
 the framing, and a separate handler pool the (blocking) dispatcher runs on, so ledger I/O never
 stalls an event loop. A connection costs a file descriptor rather than a thread. Netty pins each
 connection to one handler executor, which keeps that connection's responses in request order — the
-frame header carries no request id, so a client matches responses positionally. Requests are
+frame header carries no request ID, so a client matches responses positionally. Requests are
 pipelined up to `server.max.inflight.per.connection`, beyond which (or while the peer is not
 draining responses) reads are suspended; `close()` stops accepting first and drains in-flight
 requests before cutting sockets. The client side (`TcpTransport`) stays blocking. Routers borrow
@@ -313,21 +314,28 @@ consults range tombstones across all tables rather than pruning by point range.
 - **range get**: `getCandyRange(key, firstByte, lastByte)` over HTTP `Range: bytes=…` semantics
   (inclusive on both ends). Prefix-sums the part lengths to find the first/last parts, then indexes
   into chunks by `byteWithinPart / part.chunkSize`. Chunks at the slice boundary are read whole —
-  the per-chunk CRC still validates — and trimmed before emission. Multi-range
-  (`bytes=A-B,C-D`) is rejected; a single absent/unparseable header falls back to a full 200 per
-  RFC 9110 §14.2.
+  the per-chunk CRC still validates — and trimmed before emission. The S3 gateway returns 206 for
+  a satisfiable single interval, open-ended range, or suffix range. It rejects multiple ranges
+  and returns 416 for an unsatisfiable range. With no recognized range, it returns a full 200.
 - **multipart upload**: `CreateMultipartUpload(key, contentType, userMetadata) → uploadId`,
   `UploadPart(uploadId, partNumber, body) → partCrc`, `CompleteMultipartUpload(uploadId, parts) →
   metadata`, `AbortMultipartUpload(uploadId)`, plus `UploadPartCopy` (same-Box only) and
   `ListMultipartUploads`/`ListParts`. In-flight state lives in the manifest's `multipartUploads`
   section (see §7), so it is fencing-gated, replayed on handover, and pins its parts' Syrups via
-  the existing reference-count walk. `Complete` assembles a multi-part `CandyLocator` at the target
-  key in one fenced manifest edit; a part's Syrups join the live set in its `UploadPart` edit, so
-  superseded parts (re-uploading the same `partNumber`) and aborted uploads enter the pending-orphan
-  path for GC. The TTL sweeper on the
-  compaction/GC worker aborts uploads older than `multipart.upload.ttl.millis` (default 7 days).
+  the existing reference-count walk. Under the partition write lock, `Complete` validates the
+  ordered parts and checksums, appends the assembled locator to the WAL, removes the upload in a
+  fenced manifest edit, then applies the locator to the memtable. A part's Syrups join the live set
+  in its `UploadPart` edit. Replaced parts and aborted uploads enter the pending-orphan path for
+  GC. The compaction/GC worker aborts uploads older than `multipart.upload.ttl.millis` (default
+  7 days).
   `ListMultipartUploads` orders by `(key, uploadId)` (key in UTF-8 byte order), not by initiation
   time as S3 does, so each partition's page and the client's merge agree on one total order.
+- **UploadPartCopy source ranges**: S3 requires the source to exceed 5 MiB. The gateway sends an
+  exclusive source-size bound to the source owner. Both same-partition copy and cross-partition
+  range reads check the resolved locator before range validation or mutation. Constrained
+  `UPLOAD_PART_COPY` and `RANGE_GET_CANDY` use request body v2. Native requests without the
+  predicate keep body v1 encoding. Older nodes reject body v2, so upgrade nodes before gateways
+  that send the predicate.
 
 The merged read path spans **all levels** (L0 plus the compaction-produced L1+); within a level keys
 are non-overlapping, while L0 tables may overlap, so L0 is consulted table-by-table. Under
@@ -348,13 +356,15 @@ The manifest is an **append-only metadata ledger**; a partition's manifest has e
 `BoxEngine.recover` then recover-opens and replays the prior WAL, observes the HLC high-water (§3),
 and commits one edit that rotates to a fresh WAL and supersedes the prior WAL and manifest. If the
 replay is non-empty, the same edit adds it as an L0 SSTable, so the replayed writes never live only
-in the new owner's memtable, where a second handover before a flush would lose them (#63). A failed
-recovery leaves the pointer, and so the prior manifest and WAL, untouched for the next attempt.
+in the new owner's memtable, where a second handover before a flush would lose them (#63).
+Recovery failure before publication leaves the prior pointer available for the next attempt. If
+the publication result is ambiguous, the successor reads whichever pointer committed (§7b).
 
-The ZK pointer to the current manifest ledger is advanced with a **compare-and-set on the expected
-ZK version** (never a blind set), and every state-mutating append carries the owner's **fencing
-token** (a counter stored in the lease record, bumped on each fresh acquisition). A zombie former owner's appends fail because its ledger was
-recover-open-fenced — see `ManifestTest.fencedOwnerCannotCommitFurtherEdits`. The pointer and lease
+The ZK pointer to the current manifest ledger advances by **compare-and-set on the expected
+pointer version and current lease record** (§7b). Every state-mutating append carries the owner's
+**fencing token** (a counter stored in the lease record, bumped on each fresh acquisition).
+Recover-open fences the former owner's appends, as tested by
+`ManifestTest.fencedOwnerCannotCommitFurtherEdits`. The pointer and lease
 live in the `CoordinationService` SPI: an in-memory fake that models lease expiry, supersession, and
 CAS conflicts (so these tests are not vacuous — `InMemoryCoordinationServiceTest`), and the real
 `ZooKeeperCoordinationService`. Both run the shared `CoordinationServiceContract` (as a
@@ -367,9 +377,11 @@ points, with a background heartbeat renewing leases within the TTL.
 The coordination layout:
 
 ```
-boxes/<box>/meta                      BoxDescriptor {partitionCount} — immutable, the routing truth
+boxes/<box>/meta                      immutable BoxDescriptor (partition count, incarnation, namespace-managed flag)
 boxes/<box>/partitions/<p>/owner      partition p's ownership lease (fenced, TTL'd)
-boxes/<box>/partitions/<p>/manifest   partition p's manifest-ledger pointer (versioned CAS)
+boxes/<box>/partitions/<p>/manifest   base manifest pointer (versioned CAS)
+boxes/<box>/partitions/<p>/manifest/incarnations/<id>
+                                      incarnation-specific manifest pointer (used with allocation enumeration)
 boxes/<box>/partitions/<p>/refs       partition p's published held-Syrup set (Box-global GC, §9(f))
 boxes/<box>/renames/<token>           cross-partition rename commit/ack marker (§6); removed after receipt/relay cleanup
 cluster/balancer                      the balancer's coordinator-election lease
@@ -419,6 +431,34 @@ elsewhere). Requests that land on the wrong node get `RESPONSE_MOVED` naming the
 current owner, and the client re-routes. If no node holds the lease (a handover gap), the node
 answers `RESPONSE_UNAVAILABLE` and the client retries with bounded backoff; `NOT_FOUND` always
 means the Box or key is really gone.
+
+### 7b. Ownership during slow recovery
+
+The node's lease registry contains both recovering and serving partitions. Acquisition registers
+before any replay, fencing, or checkpoint I/O. The existing node heartbeat renews this registry;
+there are no per-partition schedulers and no registration transfer when recovery succeeds. Failed
+renewal cancels the acquisition permanently, even if the renewal's remote outcome is unknown.
+Recovery checks cancellation before publication and serving, closes local handles after blocked I/O
+returns, and unregisters on failure. Cancelled acquisitions leave the renewal set but remain in the
+cleanup registry until released; same-node retry closes the old engine before reacquisition.
+Shutdown cancels and closes registrations, including in-flight recovery.
+
+Manifest publication uses `CoordinationService.compareAndSetWithLease`: ZooKeeper checks the lease
+record's data version and creates/CAS-updates the pointer in one transaction; the fake checks both
+under one monitor. The operation first verifies the expected live fencing token. Renewal and
+publication on a registration are serialized, avoiding conflicts with its own heartbeat. An epoch
+change or release between that read and the transaction changes the lease version, rejecting the
+entire publication even if the pointer has not yet changed. Pointer conflicts also reject the whole
+transaction. BookKeeper recover-open fencing remains mandatory.
+
+Wall-clock expiry alone is not a ZooKeeper transaction predicate. If execution pauses after the
+lease read until after its TTL, publication can still commit only if the checked lease version has
+not changed. This is safe: a successor acquisition serialized before publication invalidates the
+check; acquisition serialized afterward must read the newly committed pointer before fencing and
+replaying. The expired recoverer cannot serve because engine access rechecks the lease. A late
+publication therefore cannot overwrite a successor's recovery source. A lost transaction response
+may mean publication committed; local handles are closed but allocated ledgers are never deleted
+on this error path, so the next owner can recover whichever pointer actually committed.
 
 ## 8. Compaction model
 
@@ -493,13 +533,11 @@ The detailed rules:
 - (b) a tombstone may be dropped only under the bottommost + time-bound rule (§8);
 - (c) orphaned-Syrup GC is driven by per-SSTable referenced-Syrup tracking plus an in-memory
   **pending-orphan list**, recomputed from the live set at flush and on handover. Ledgers that no
-  manifest ever recorded (written by a flush or compaction that then failed, by an owner that crashed
-  before flushing, or by a recovery that failed or whose pointer CAS lost) need an **enumeration
-  backstop**, still **TODO(phase-3+)** (#105);
-- (d) **v1 Syrup reclamation policy**: because BookKeeper deletes whole ledgers only, a single live
-  Candy pins an otherwise-dead Syrup. **v1 documents and accepts this** — a Syrup is reclaimed only
-  once *every* segment in it is dead. Syrup defragmentation (copying survivors into a fresh Syrup) is
-  deferred;
+  manifest ever recorded can be reclaimed by the opt-in allocation-enumeration backstop (§9a)
+  when their allocation epoch is retired and their identity and liveness can be verified;
+- (d) **whole-Syrup reclamation**: BookKeeper deletes whole ledgers. A single live segment pins
+  its Syrup until every segment in it is dead. This policy can retain dead bytes in partially
+  live Syrups;
 - (e) **shared segments from copy/rename**: orphan detection counts Syrup references by actual
   `SegmentRef`s across the manifest's SSTables and the memtable, so several keys pointing at one
   segment set (a `copyCandy`, or the in-flight state of a `renameCandy`) keep that Syrup live until
@@ -511,8 +549,7 @@ The detailed rules:
   generalized Box-wide. Each partition owner publishes its held-Syrup set (below) to coordination at
   `boxes/<box>/partitions/<p>/refs`; a partition's GC skips any Syrup a sibling partition
   still holds (references, or released less than `ledgerGcGraceMillis` ago), so a
-  Syrup is physically reclaimed only once **no** partition of the Box references it. This supersedes
-  the prior claim (under (e)) that cross-partition copy/rename cannot share segments. Because a
+  Syrup is physically reclaimed only once **no** partition of the Box references it. Because a
   zero-copy put can point a partition back at a Syrup it already counts as a pending orphan, orphan
   tracking is not monotonic: a re-referenced Syrup leaves the pending set (its grace period restarts
   in that partition if it is orphaned again), and GC claims Syrups through one write-locked step that
@@ -562,6 +599,31 @@ The full compaction-then-GC cycle and opt-in allocation enumeration are covered 
 `CompactionGcCycleIT`. Deleted-Box allocations carrying epoch tags are reclaimed after writer
 admission closes and every admitted WAL/manifest is fenced; legacy ledgers remain held.
 
+### 9a. Allocation-epoch enumeration
+
+`ledger.enumeration.grace.millis` enables the backstop (default 0, disabled). It tags allocations
+with Box incarnation, partition, and a durable allocation epoch. A live epoch protects all its
+allocations, including when a writer pauses immediately after creating a ledger. Normal owner
+rotation seals the old engine and recovers the authoritative manifest and WAL before publishing
+a fresh pointer. The successor pins every recovery root before
+retiring captured epochs with strictly lower lease fencing tokens. Same-token acquisitions
+remain pinned until a genuine subsequent lease epoch; an older operation cannot retire a newer
+owner merely because its allocation was delayed. Epoch retirement is independent of wall-clock
+age. Failed pointer CAS outcomes never authorize retirement. Incarnation-specific pointer keys keep
+old-generation pointer operations separate from a recreated Box's pointers.
+
+A per-ledger coordination CAS serializes retention pins with permanent deletion claims. Backup and
+relay pins are explicit durable roots. Imported zero-copy segments acquire destination-epoch pins
+before their WAL append; the pin does not expire while that epoch could still append. Retiring a
+destination requires recovery of its fenced WAL, so an interrupted transfer is either inherited as
+a root or cannot subsequently commit. The original refs/relays/refs snapshot remains in place for
+normal Syrup orphan claiming. Normal pending-delete GC also passes the retention CAS when enabled.
+Enumeration requires a retired allocating epoch, a recognized matching identity, sufficient age,
+and no active retention pins. Legacy or incomplete evidence is held. Claims and the enumeration
+cursor survive coordinator handover, and failed physical deletes are retried. See the
+[operations guide](OPERATIONS.md#ledger-enumeration-backstop) for upgrade, configuration, and
+inspection details.
+
 ## 10. Size limits (configurable; enforced at client and node)
 
 | Limit | Default | Where |
@@ -608,131 +670,52 @@ Per-role BK quorum (E/Qw/Qa) defaults: **WAL 3/3/2, Manifest 3/3/2, SSTable 3/2/
 | LWW tiebreaker | `nodeId` (locked) | Deterministic, coordination-free. |
 | TCP opcodes | incl. dedicated `RESPONSE_BUSY` and `RESPONSE_MOVED`, plus the cross-partition zero-copy ops `GET_CANDY_LOCATOR` / `PREPARE_RENAME` / `ZERO_COPY_PUT` / `COMPLETE_RENAME` and response `RESPONSE_CANDY_LOCATOR` | Backpressure, re-routing, and the cross-partition locator relay are first-class signals. |
 
-## 12. Deliberate v1 simplifications (escape hatches)
+## 12. Current design limits
 
-- **Fixed hash partitioning, no key-range tablets** — a Box's partition count is set at creation and
-  never changes (changing it would re-home every key), and hash partitioning makes every ordered
-  listing a scatter-gather fan-out (each page queries all partitions). Key-range partitions with
-  splits, and re-partitioning, are future work. A partition is still unavailable during its own
-  handover fence+replay+flush window (shrunk by the pre-handover flush).
-- **Cross-partition copy/rename is zero-copy (resolved), but its rename is only *eventually* atomic**
-  — the former byte-copy-through-the-client simplification is gone: cross-partition copy/rename now
-  reuse the source's Syrup segments via the locator relay, kept safe by Box-global GC (§6, §9(f)). A
-  cross-partition `rename` is copy-then-delete across two owners and converges via the rename-intent
-  journal + rendezvous marker — *eventually* (not linearizably) atomic; a reader may briefly see both
-  keys. **`UploadPartCopy` across partitions still byte-copies** (out of scope, see below). S3
-  semantics (CopyObject, no rename) are unaffected.
-- **Box-level `deleteBox` needs takeover or the balancer** — the deleting node takes over partitions
-  whose leases are free; partitions held by other live nodes fail a non-force delete, while a force
-  delete removes the descriptor and lets each owner's balancer sweep drop its partitions.
-- **Reads served by the partition owner** — simple and correct. Sealed SSTables/Syrups are immutable
-  and replicated, so any node *could* serve reads of flushed data; only unflushed-memtable
-  read-your-writes needs the owner. Not built in v1.
-- **No small-object inlining** — all bytes go to Syrups (an extra BK round trip + fragmentation for
-  tiny Candies). The 256 KiB locator cap leaves room to inline small bytes later.
-- **No Syrup defragmentation** — see §9(d). Syrup compaction (copying survivors into a fresh Syrup)
-  is future work.
-- **Buffered wire protocol** — PUT/GET/UploadPart bodies are inlined in one framed message (16 MiB
-  of data per frame). Multipart upload partially substitutes for streaming, but each part is still bounded by the
-  frame cap. True on-the-wire chunked streaming remains `TODO(phase-2)`.
-- **S3 UploadPartCopy range sources must exceed 5 MiB.** The gateway sends an optional
-  exclusive source-size bound through the client to the source owner. Both same-partition copy and
-  cross-partition range reads check the resolved locator before range validation or mutation, so a
-  concurrent source replacement cannot bypass eligibility. Native calls default to no bound.
-  Constrained `UPLOAD_PART_COPY` / `RANGE_GET_CANDY` request bodies use version 2; their version 1
-  bodies remain decodable and native requests retain version 1 encoding. Older nodes reject the new
-  requests rather than silently ignoring the predicate; upgrade nodes before gateways using it.
-- **UploadPartCopy buffers in memory** — the engine reads the source slice and writes it as a fresh
-  part rather than sharing Syrup segments when the range aligns to chunk boundaries; the optimization
-  is a strictly-internal future change.
+- **Fixed hash partitions.** A Box keeps its creation-time partition count. Each ordered listing
+  page queries all partitions. Automatic takeover requires the balancer. The affected partition
+  is temporarily unavailable during fencing, replay, and publication.
+- **Owner-local reads and compaction.** The partition owner serves reads and produces and commits
+  compactions. Coordination callers poll for ownership and membership changes.
+- **Buffered native TCP.** Native PUT, GET, and UploadPart carry data in one frame (16 MiB of data
+  by default). A native GET that exceeds the frame limit requires range reads. The S3 gateway
+  streams large HTTP GET responses using native range reads sized to fit one frame and capped at
+  8 MiB per slice. It checks each slice against the initial HEAD's object length and CRC32C and
+  closes the connection if a later
+  slice detects changed content after streaming has started. S3 single PUT and each multipart
+  part still obey the configured frame limit.
+- **Same-Box copies.** CopyObject and UploadPartCopy are intra-Box operations. Copy and rename
+  share Syrup segments (§6). UploadPartCopy buffers the source slice and writes a fresh part.
+- **Box deletion.** The deleting node takes over partitions whose leases are free. Partitions
+  held by other live nodes fail a non-force delete. A force delete removes the descriptor and
+  lets each owner's balancer sweep drop its partitions. With enumeration enabled, retired tagged
+  allocations of deleted incarnations can be reclaimed (§9a). Legacy untagged ledgers remain
+  outside the backstop. Legacy Box-deletion journaling is tracked in #60.
+- **Syrup layout.** Object bytes always live in Syrups, including small objects. GC reclaims whole
+  Syrups after the last reference is released and the GC grace period passes (§9). Repacking
+  partially live Syrups is outside the baseline.
 
-## 13. What's done vs. remaining
+## 13. Compatibility and failure testing
 
-**Implemented (Phases 0–4):** the LSM engine (memtable/WAL/SSTable/Syrup, merged multi-level read
-path, range tombstones, zero-copy copy/rename); ZooKeeper-backed coordination
-(`ZooKeeperCoordinationService`) with the manifest ZK pointer under versioned CAS and fenced
-ownership/handover; **hash-partitioned Boxes** — per-partition fenced ownership spread across the
-cluster by the elected-coordinator `PartitionBalancer` (sticky, failover-eager, rate-limited
-moves), with partition-aware client routing (keyed ops to the key's partition owner; scatter-gather
-listing; fanned-out range deletes; cross-partition zero-copy copy/rename via the locator relay);
-cluster membership + client-side
-routing over the framed TCP protocol (`RESPONSE_MOVED`); multi-level leveled compaction on a
-background worker; reference-counted GC of SSTable/Syrup/WAL ledgers; the storage node with
-health/metrics, the `candybox` CLI, and a packaged distribution (Docker image + Compose +
-Kubernetes manifests). Fault-injection / failure-path hardening and operational docs
-(`OPERATIONS.md`) landed in Phase 4; Box partitioning is documented in `BOX_PARTITIONING_PLAN.md`.
+The S3 gateway covers bucket and object operations, prefix/delimiter listings, single-range GET,
+multipart uploads, and same-bucket copies. With authentication enabled it verifies SigV4 header
+and presigned requests and enforces bucket and object ACLs. Native TCP supports SASL PLAIN over
+TLS and SCRAM-SHA-256. The admin API supports HTTPS and bearer-token protection for its JSON
+routes. See the [S3 compatibility harness](compat/s3-tests/README.md#supported-scope) for the
+tested S3 subset and [operations guide](OPERATIONS.md#security) for security configuration.
 
-**Remaining future work:**
+Unit tests use in-memory fakes, and integration tests exercise real embedded BookKeeper and
+ZooKeeper. The [disposable failure harness](compat/chaos/README.md) also runs initial multi-bookie
+and owner fault schedules in separate containers and checks the integrity of acknowledged writes.
+Its README records the measured evidence and the outstanding failure-test scenarios.
 
-- **True on-the-wire streaming.** The protocol still inlines a Candy's bytes in one framed message and
-  the client buffers a stream in memory; chunked PUT/GET/UploadPart bodies are future work
-  (`TODO(phase-2)` in `Message`/`CandyboxClient`). Multipart upload partially fills the
-  "resumable / parallel upload" gap, but each part is still bounded by the frame cap.
-- **Distributed cross-node compaction scheduling.** Compaction runs in-process on each partition's owner;
-  claiming work via ZK task leases so it can run off the owner is `TODO(phase-3)` (the *commit* is
-  already fencing-gated).
-- **Watch-based coordination.** The `CoordinationService` callers poll today; ZK watches to avoid
-  polling are `TODO(phase-2)`.
-- **Legacy ledger reclamation.** Untagged allocations remain outside the opt-in epoch backstop;
-  legacy Box-deletion journaling remains tracked by #60.
-- **Read scaling.** Sealed SSTables/Syrups are immutable and replicated, so any node *could* serve
-  reads of flushed data; only unflushed-memtable read-your-writes needs the owner. Serving reads off
-  the owner is not built in v1.
-- **Syrup defragmentation and small-object inlining** — see §9(d) and §12.
+## 14. Managed namespace lifecycle
 
-
-### Allocation-epoch enumeration
-
-The opt-in enumeration backstop tags allocations with Box incarnation, partition, and a durable
-allocation epoch. Every live epoch protects all of its allocations, including a writer paused
-immediately after creation. Normal owner rotation seals the old engine and recovers the authoritative
-manifest and WAL before publishing a fresh pointer. The successor pins every recovery root before
-retiring captured epochs with strictly lower lease fencing tokens. Same-token acquisitions
-remain pinned until a genuine subsequent lease epoch; an older operation cannot retire a newer
-owner merely because its allocation was delayed. Epoch retirement is independent of wall-clock
-age. Failed pointer CAS outcomes never authorize retirement. Incarnation-specific pointer keys keep
-old-generation pointer operations separate from a recreated Box's pointers.
-
-A per-ledger coordination CAS serializes retention pins with permanent deletion claims. Backup and
-relay pins are explicit durable roots. Imported zero-copy segments acquire destination-epoch pins
-before their WAL append; the pin does not expire while that epoch could still append. Retiring a
-destination requires recovery of its fenced WAL, so an interrupted transfer is either inherited as
-a root or cannot subsequently commit. The original refs/relays/refs snapshot remains in place for
-normal Syrup orphan claiming. Normal pending-delete GC also passes the retention CAS when enabled.
-Enumeration requires a retired allocating epoch, a recognized matching identity, sufficient age,
-and no active retention pins. Legacy or incomplete evidence is held. Claims and the enumeration
-cursor survive coordinator handover, and failed physical deletes are retried.
-
-## Managed namespace lifecycle
-
+The native client supports managed Boxes for colocated namespace lifecycle records and items.
+Each namespace's operations route by its lifecycle key. Item PUT and renewal commit together
+in one WAL batch, and conditional retirement checks the lifecycle version and owner-admission
+time under the same write lock. The retired lifecycle record persists as an identity barrier.
+Managed Boxes use descriptor v3 and admit namespace operations and explicit Box administration.
 See [the namespace lifecycle contract](docs/design/namespace-lifecycle.md) for
 owner-admission timestamps, atomic renewal/retirement, native examples, resource
 overhead, bounded cleanup, error/retry semantics and upgrade/rollback limits.
-
-### Ownership during slow recovery
-
-The node's lease registry contains both recovering and serving partitions. Acquisition registers
-before any replay, fencing, or checkpoint I/O. The existing node heartbeat renews this registry;
-there are no per-partition schedulers and no registration transfer when recovery succeeds. Failed
-renewal cancels the acquisition permanently, even if the renewal's remote outcome is unknown.
-Recovery checks cancellation before publication and serving, closes local handles after blocked I/O
-returns, and unregisters on failure. Cancelled acquisitions leave the renewal set but remain in the
-cleanup registry until released; same-node retry closes the old engine before reacquisition.
-Shutdown cancels and closes registrations, including in-flight recovery.
-
-Manifest publication uses `CoordinationService.compareAndSetWithLease`: ZooKeeper checks the lease
-record's data version and creates/CAS-updates the pointer in one transaction; the fake checks both
-under one monitor. The operation first verifies the expected live fencing token. Renewal and
-publication on a registration are serialized, avoiding conflicts with its own heartbeat. An epoch
-change or release between that read and the transaction changes the lease version, rejecting the
-entire publication even if the pointer has not yet changed. Pointer conflicts also reject the whole
-transaction. BookKeeper recover-open fencing remains mandatory.
-
-Wall-clock expiry alone is not a ZooKeeper transaction predicate. If execution pauses after the
-lease read until after its TTL, publication can still commit only if the checked lease version has
-not changed. This is safe: a successor acquisition serialized before publication invalidates the
-check; acquisition serialized afterward must read the newly committed pointer before fencing and
-replaying. The expired recoverer cannot serve because engine access rechecks the lease. A late
-publication therefore cannot overwrite a successor's recovery source. A lost transaction response
-may mean publication committed; local handles are closed but allocated ledgers are never deleted
-on this error path, so the next owner can recover whichever pointer actually committed.
