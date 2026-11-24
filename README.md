@@ -187,6 +187,25 @@ are stamped with a hybrid logical clock for last-writer-wins ordering.
 Record formats and the fencing and handover protocol are in [`DESIGN.md`](DESIGN.md); see also the
 [architecture docs](https://www.predatorray.me/candybox/docs/architecture/) and [`BOX_PARTITIONING_PLAN.md`](BOX_PARTITIONING_PLAN.md).
 
+### Typical Kubernetes deployment
+
+The [Helm chart](candybox-charts/README.md) runs stateless S3 gateway and admin deployments in front
+of three Candybox nodes. A headless Service gives each node a stable address so clients can route
+requests to the partition owner.
+
+![Typical Kubernetes deployment: S3 gateway and admin services route to three Candybox nodes, backed by BookKeeper bookies and ZooKeeper with persistent volumes](docs/content/docs/architecture/kubernetes-deployment.excalidraw.svg)
+
+This illustrates the chart's replicated baseline: three BookKeeper bookies store object bytes and
+index ledgers on journal and ledger PVCs, while three ZooKeeper replicas persist coordination and
+BookKeeper metadata. Candybox nodes use disposable local storage and recover their state from the
+backends. The chart also runs BookKeeper AutoRecovery (omitted from the diagram).
+
+Services are cluster-internal by default; an optional ingress exposes the S3 gateway, while the
+dashboard can be reached through port-forwarding or a private authenticated proxy. The
+[production configuration](candybox-charts/README.md#production-configuration) adds authentication,
+workload placement, and a fourth bookie for ensemble replacement. Both backends can also be supplied
+as external clusters.
+
 ## Building from source
 
 Requires **Java 17+** and **Maven 3.9+**. Nothing else is needed; the integration tests run an
